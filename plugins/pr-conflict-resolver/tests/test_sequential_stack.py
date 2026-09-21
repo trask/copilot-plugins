@@ -14,21 +14,19 @@ CLOUD = existing.CLOUD_MODULE
 
 
 class ReplayTaskBaseTest(unittest.TestCase):
-    def test_creation_and_collection_share_base_without_changing_merge_or_legacy(self):
-        for policy, strategy, base_key in (
-            (CLOUD.SEQUENTIAL_POLICY, "merge", "head_sha"),
-            (CLOUD.SEQUENTIAL_POLICY, "rebase", "base_sha"),
-            (CLOUD.MINIMAL_POLICY, "merge", "head_sha"),
-            (CLOUD.MINIMAL_POLICY, "rebase", "head_sha"),
+    def test_creation_and_collection_share_the_policy_10_task_base(self):
+        for strategy, base_key in (
+            ("merge", "head_sha"),
+            ("rebase", "base_sha"),
         ):
-            with self.subTest(policy=policy["version"], strategy=strategy):
+            with self.subTest(strategy=strategy):
                 request = existing.ManagedTaskPromptTest().minimal_request()
-                request.update(policy=policy, strategy=strategy)
+                request.update(policy=CLOUD.POLICY, strategy=strategy)
                 request["request_sha256"] = CLOUD.request_digest(request)
                 options = CLOUD.Options(
                     strategy, request["model"], request["pull_request"]["url"],
                     Path("request.json"), Path("prompt.txt"), Path("result.json"),
-                    None, request, "Resolve the frozen conflict.", None,
+                    request, "Resolve the frozen conflict.",
                 )
                 snapshot = CLOUD.LocalSnapshot(
                     Path.cwd(), Path.cwd(), request["repository"], "origin",
@@ -47,7 +45,7 @@ class ReplayTaskBaseTest(unittest.TestCase):
                 )
                 prompt = api.call_args.args[-1]["prompt"]
                 self.assertEqual(
-                    policy == CLOUD.SEQUENTIAL_POLICY and strategy == "rebase",
+                    strategy == "rebase",
                     "The task branch starts at the exact replay base" in prompt,
                 )
 
@@ -109,7 +107,7 @@ class SequentialStackTest(unittest.TestCase):
             self.run_git("push", "--quiet", "origin", f"{tip}:refs/heads/{branch}")
         request = existing.ManagedTaskPromptTest().minimal_request()
         request.update(
-            policy=CLOUD.SEQUENTIAL_POLICY,
+            policy=CLOUD.POLICY,
             strategy="native-stack",
             head_commits=[],
             merge_base=self.seed,
@@ -157,13 +155,13 @@ class SequentialStackTest(unittest.TestCase):
         self.options = CLOUD.Options(
             "native-stack", request["model"], request["pull_request"]["url"],
             self.directory / "request.json", self.directory / "prompt.txt",
-            self.directory / "result.json", None, request, "Resolve conflicts.", None,
+            self.directory / "result.json", request, "Resolve conflicts.",
         )
         self.snapshot = CLOUD.LocalSnapshot(
             self.root, self.directory, "owner/repo", "origin", "", self.lower, "", None,
         )
         self.result = CLOUD.Result(
-            schema=CLOUD.MINIMAL_RESULT_SCHEMA, policy=CLOUD.SEQUENTIAL_POLICY,
+            schema=CLOUD.RESULT_SCHEMA, policy=CLOUD.POLICY,
             model=request["model"], repository="owner/repo", strategy="native-stack",
             request_id=request["request_id"], request_sha256=request["request_sha256"],
             pull_request=request["pull_request"],
@@ -437,10 +435,32 @@ class SequentialStackTest(unittest.TestCase):
             self.execute()
         self.assertEqual("not_started", self.result.application_status)
 
-    def test_source_or_base_drift_stops_sequence(self):
+    def test_source_head_drift_preserves_completed_candidates_and_stops_sequence(self):
+        drift = CLOUD.SourceHeadChanged(
+            pr_number=6,
+            expected_head=self.lower,
+            actual_head="f" * 40,
+        )
+
         def guard(*_):
             if self.result.code_refs and len(self.launched) == 1:
-                raise CLOUD.ConflictError("native stack identity changed", "stale_target")
+                raise drift
+
+        with self.assertRaises(CLOUD.SourceHeadChanged) as failure:
+            self.execute(guard)
+
+        self.assertIs(drift, failure.exception)
+        self.assertEqual(1, len(self.launched))
+        self.assertEqual(1, len(self.result.code_refs))
+        self.assertEqual(1, len(self.result.artifact["members"]))
+        self.assertEqual("not_started", self.result.application_status)
+
+    def test_base_or_topology_drift_remains_a_failure(self):
+        def guard(*_):
+            if self.result.code_refs and len(self.launched) == 1:
+                raise CLOUD.ConflictError(
+                    "native stack identity changed", "stale_target"
+                )
 
         with self.assertRaisesRegex(CLOUD.ConflictError, "identity changed"):
             self.execute(guard)
@@ -604,20 +624,6 @@ class PipelineConflictEntryTest(unittest.TestCase):
                     MODULE.command_pipeline(self.arguments(root, state))
                 execute.assert_not_called()
 
-    def test_resume_rejected_before_any_state_write(self):
-        args = self.arguments(Path("repo"), Path("state.json"))
-        args.resume = True
-        with (
-            mock.patch.object(Path, "mkdir") as mkdir,
-            mock.patch.object(Path, "open") as open_file,
-            mock.patch.object(MODULE, "command_agent_task") as execute,
-            self.assertRaisesRegex(MODULE.WorkflowError, "resume.*disabled"),
-        ):
-            MODULE.command_pipeline(args)
-        mkdir.assert_not_called()
-        open_file.assert_not_called()
-        execute.assert_not_called()
-
     def test_state_created_before_lock_acquisition_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary).resolve()
@@ -682,7 +688,7 @@ class PipelineConflictEntryTest(unittest.TestCase):
 
     def test_policy_seven_refuses_a_single_task_stack_boundary_guess(self):
         request = existing.ManagedTaskPromptTest().minimal_request()
-        request.update(policy=CLOUD.SEQUENTIAL_POLICY, strategy="native-stack")
+        request.update(policy=CLOUD.POLICY, strategy="native-stack")
         with self.assertRaisesRegex(CLOUD.ConflictError, "one task cannot identify"):
             CLOUD.prove_generated_minimal(
                 mock.sentinel.runner, mock.sentinel.snapshot, request, {},

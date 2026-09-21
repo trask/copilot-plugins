@@ -808,14 +808,6 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def setUp(self):
         self.instructions = AGENT.read_text(encoding="utf-8")
 
-    def test_resume_is_rejected_before_tools_or_state_access(self):
-        args = MODULE.build_parser().parse_args(
-            ["agent-task", "owner/repo#7", "--resume"]
-        )
-        with mock.patch.object(MODULE, "require_tools") as require_tools:
-            with self.assertRaisesRegex(MODULE.WorkflowError, "disabled"):
-                MODULE.command_agent_task(args)
-        require_tools.assert_not_called()
 
     def request(self, strategy="merge"):
         value = {
@@ -930,7 +922,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "d22684f684af52a3a0a6caa6afd4b25f5733260e2127db81763b2b13946c323a",
+            "c72c8a0836d790128ce3f1e93ed7d1da3c01fbf465f96da3dbe0aa03dae14d04",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -940,14 +932,9 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
             hashlib.sha256(CLOUD_SCRIPT.read_bytes()).hexdigest(),
         )
-        self.assertEqual(MODULE.CONFLICT_POLICY_IDENTITY, CLOUD_MODULE.SEQUENTIAL_POLICY)
+        self.assertEqual(MODULE.CONFLICT_POLICY_IDENTITY, CLOUD_MODULE.POLICY)
         self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@10")
-        self.assertEqual(MODULE.CONFLICT_RESULT_SCHEMA, CLOUD_MODULE.REPLAY_RESULT_SCHEMA)
-        self.assertEqual(MODULE.V5_CONFLICT_POLICY, "marketplace-conflict-worker@5")
-        self.assertEqual(
-            MODULE.V5_CONFLICT_POLICY_SHA256,
-            "21b4142edcb7cb35b805e3f225d16f53a2139eda4e974f56826a3cc9d3c1f933",
-        )
+        self.assertEqual(MODULE.CONFLICT_RESULT_SCHEMA, CLOUD_MODULE.RESULT_SCHEMA)
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
             "github.copilot.agent-task-conflict-request",
@@ -1118,603 +1105,11 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(state, json.loads(state_path.read_text(encoding="utf-8")))
         preflight.assert_not_called()
 
-    @unittest.skip("hosted task resume is intentionally unavailable")
-    def test_completed_task_resume_keeps_owner_and_managed_attempt_count(self):
-        directory = temporary_directory(self)
-        state_path = directory / "state.json"
-        request_path = directory / "request.json"
-        prompt_path = directory / "prompt.txt"
-        prior_result_path = directory / "result-0.json"
-        request = self.request()
-        prior_result = self.success_result(request)
-        prior_result.update(
-            {
-                "status": "error",
-                "error": {
-                    "code": "unexpected_history",
-                    "message": "generated code SHA was treated as a branch",
-                },
-                "application": {"status": "not_started"},
-                "validation": {"complete": False, "outcomes": []},
-            }
-        )
-        task_id = "6d20f0f2-cc3f-446e-b0bc-acbf3a1e5a30"
-        prior_result["task"].update({"id": task_id, "state": "completed"})
-        request_path.write_text(json.dumps(request), encoding="utf-8")
-        prompt_path.write_text("prompt", encoding="utf-8")
-        prior_result_path.write_text(json.dumps(prior_result), encoding="utf-8")
-        owner = "aa0645fb1a049d35"
-        state = {
-            "version": 1,
-            "created_at": "2026-09-17T00:00:00Z",
-            "attempts": 5,
-            "managed_attempts": 5,
-            "managed_task_history": [
-                {"run_id": f"prior-{number}"} for number in range(4)
-            ],
-            "history": [],
-            "escalation": None,
-            "agent_task": {
-                "run_id": owner,
-                "status": "interrupted",
-                "task_id": task_id,
-                "task_id_status": "known",
-                "model": "gpt-5.6-sol",
-                "policy": MODULE.CONFLICT_POLICY,
-                "preflight": {
-                    "pr": {
-                        **MODULE.parse_target("owner/repo#7"),
-                        "head_sha": "b" * 40,
-                        "base_sha": "a" * 40,
-                    },
-                    "request": request,
-                    "strategy": "merge",
-                    "repository_root": str(directory),
-                },
-                "request_file": str(request_path),
-                "prompt_file": str(prompt_path),
-                "result_file": str(prior_result_path),
-                "result": prior_result,
-                "resume_attempts": 0,
-                "recovery_files": [
-                    str(request_path),
-                    str(prompt_path),
-                    str(prior_result_path),
-                ],
-            },
-        }
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-        args = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                "owner/repo#7",
-                "--repo-root",
-                str(directory),
-                "--state",
-                str(state_path),
-                "--model",
-                "sol",
-                "--resume",
-            ]
-        )
-        result = self.success_result(request)
-        result["task"].update({"id": task_id, "state": "completed"})
 
-        def run_helper(command, **_kwargs):
-            self.assertIn("--input-result-file", command)
-            self.assertEqual(
-                str(prior_result_path),
-                command[command.index("--input-result-file") + 1],
-            )
-            result_path = Path(command[command.index("--result-file") + 1])
-            result_path.write_text("{}", encoding="utf-8")
-            return completed(0)
 
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(MODULE, "require_external_path"),
-            mock.patch.object(MODULE, "conflict_preflight") as preflight,
-            mock.patch.object(
-                MODULE, "discover_conflict_task", return_value=directory / "helper.py"
-            ),
-            mock.patch.object(MODULE, "run", side_effect=run_helper),
-            mock.patch.object(MODULE, "load_conflict_result", return_value=result),
-            mock.patch.object(MODULE, "verify_quarantined_result"),
-            mock.patch.object(MODULE, "require_live_conflict_guards"),
-            mock.patch.object(
-                MODULE,
-                "publish_conflict_result",
-                return_value={"result": "published"},
-            ),
-            mock.patch.object(MODULE, "emit") as emit,
-        ):
-            MODULE.command_agent_task(args)
 
-        preflight.assert_not_called()
-        saved = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(owner, saved["agent_task"]["run_id"])
-        self.assertEqual(task_id, saved["agent_task"]["result"]["task"]["id"])
-        self.assertEqual("verified", saved["agent_task"]["status"])
-        self.assertEqual(1, saved["agent_task"]["resume_attempts"])
-        self.assertEqual(5, saved["attempts"])
-        self.assertEqual(5, saved["managed_attempts"])
-        self.assertEqual(state["managed_task_history"], saved["managed_task_history"])
-        self.assertEqual("published", emitted(emit)["result"])
 
-    @unittest.skip("legacy owner replacement is intentionally unavailable")
-    def test_hash_gated_unidentified_owner_replacement_archives_exact_owner(self):
-        directory = temporary_directory(self)
-        state_path = directory / "state.json"
-        old_owner = {
-            "run_id": "old-owner",
-            "status": "interrupted",
-            "task_id": None,
-            "task_id_status": "unknown",
-            "model": "gpt-5.6-sol",
-            "error": {
-                "code": "managed_task_result_missing",
-                "message": "managed conflict helper returned no result file",
-            },
-        }
-        state = {
-            "version": 1,
-            "created_at": "2026-09-17T00:00:00Z",
-            "attempts": 1,
-            "managed_attempts": 1,
-            "history": [],
-            "escalation": None,
-            "agent_task": old_owner,
-        }
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-        state_sha256 = MODULE.sha256_file(state_path)
-        args = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                "owner/repo#7",
-                "--repo-root",
-                str(directory),
-                "--state",
-                str(state_path),
-                "--replace-unidentified-owner",
-                "old-owner",
-                "--expected-state-sha256",
-                state_sha256,
-            ]
-        )
-        target = MODULE.parse_target("owner/repo#7")
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
-            mock.patch.object(MODULE, "resolve_target", return_value=target),
-            mock.patch.object(MODULE, "require_external_path"),
-            mock.patch.object(
-                MODULE,
-                "conflict_preflight",
-                return_value={
-                    "already_mergeable": True,
-                    "pr": pr_metadata(mergeable="MERGEABLE"),
-                    "strategy": "merge",
-                },
-            ),
-            mock.patch.object(MODULE.secrets, "token_hex", return_value="new-owner"),
-            mock.patch.object(MODULE, "emit"),
-        ):
-            MODULE.command_agent_task(args)
 
-        saved = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual([old_owner], saved["managed_task_history"])
-        self.assertEqual("new-owner", saved["agent_task"]["run_id"])
-        self.assertEqual(
-            {
-                "run_id": "old-owner",
-                "state_sha256": state_sha256,
-                "basis": "operator-verified-no-hosted-task",
-            },
-            saved["agent_task"]["replaces_unidentified_owner"],
-        )
-        self.assertEqual("completed", saved["agent_task"]["status"])
-
-    @unittest.skip("legacy owner replacement is intentionally unavailable")
-    def test_unidentified_owner_replacement_rejects_a_changed_state(self):
-        directory = temporary_directory(self)
-        state_path = directory / "state.json"
-        state = {
-            "version": 1,
-            "attempts": 1,
-            "managed_attempts": 1,
-            "history": [],
-            "agent_task": {
-                "run_id": "old-owner",
-                "status": "interrupted",
-                "task_id": None,
-                "task_id_status": "unknown",
-                "error": {"code": "managed_task_result_missing", "message": "missing"},
-            },
-        }
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-        args = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                "owner/repo#7",
-                "--repo-root",
-                str(directory),
-                "--state",
-                str(state_path),
-                "--replace-unidentified-owner",
-                "old-owner",
-                "--expected-state-sha256",
-                "0" * 64,
-            ]
-        )
-        before = state_path.read_bytes()
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(MODULE, "require_external_path"),
-            self.assertRaisesRegex(MODULE.WorkflowError, "state hash does not match"),
-        ):
-            MODULE.command_agent_task(args)
-
-        self.assertEqual(before, state_path.read_bytes())
-
-    @unittest.skip("legacy owner replacement is intentionally unavailable")
-    def test_unidentified_owner_replacement_rejects_a_known_task(self):
-        directory = temporary_directory(self)
-        state_path = directory / "state.json"
-        state = {
-            "version": 1,
-            "attempts": 1,
-            "managed_attempts": 1,
-            "history": [],
-            "agent_task": {
-                "run_id": "old-owner",
-                "status": "interrupted",
-                "task_id": "task-1",
-                "task_id_status": "known",
-                "error": {"code": "managed_task_result_missing", "message": "missing"},
-            },
-        }
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-        state_sha256 = MODULE.sha256_file(state_path)
-        args = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                "owner/repo#7",
-                "--repo-root",
-                str(directory),
-                "--state",
-                str(state_path),
-                "--replace-unidentified-owner",
-                "old-owner",
-                "--expected-state-sha256",
-                state_sha256,
-            ]
-        )
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(MODULE, "require_external_path"),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "not an exact unidentified result failure",
-            ),
-        ):
-            MODULE.command_agent_task(args)
-
-    @unittest.skip("legacy owner replacement is intentionally unavailable")
-    def test_hash_gated_malformed_completed_task_replacement_archives_owner(self):
-        directory = temporary_directory(self)
-        state_path = directory / "state.json"
-        request_path = directory / "request.json"
-        prompt_path = directory / "prompt.txt"
-        original_result_path = directory / "state--old-owner--result-0.json"
-        resumed_result_path = directory / "state--old-owner--result-1.json"
-        request = self.request()
-        request["request_id"] = "pr-7-0123456789abcdef"
-        request["request_sha256"] = MODULE.request_digest(request)
-        prompt = MODULE.build_conflict_prompt({"request": request})
-        report_path = (
-            f".github/agent-task-conflict-reports/{request['request_id']}.md"
-        )
-        receipt_path = (
-            f".github/agent-task-conflict-receipts/{request['request_id']}.json"
-        )
-        task_id = "13e5e9db-b87a-4864-91e2-da14d1adc96c"
-        result = self.success_result(request)
-        result.update(
-            {
-                "status": "error",
-                "error": {
-                    "code": "unexpected_history",
-                    "message": (
-                        f"git show {'b' * 40}:{receipt_path} failed: fatal: path "
-                        f"{receipt_path!r} does not exist"
-                    ),
-                },
-                "generated": {
-                    "artifact": {
-                        "branch": "copilot/resolve-frozen-conflict",
-                        "head_sha": "b" * 40,
-                        "report": {
-                            "path": report_path,
-                            "commit": "b" * 40,
-                            "sha256": None,
-                        },
-                        "receipt": {
-                            "path": receipt_path,
-                            "commit": "b" * 40,
-                        },
-                    },
-                    "code_refs": [],
-                },
-                "application": {"status": "not_started"},
-                "validation": {"complete": False, "outcomes": []},
-            }
-        )
-        result["task"].update({"id": task_id, "state": "completed"})
-        request_path.write_text(json.dumps(request), encoding="utf-8")
-        prompt_path.write_text(prompt, encoding="utf-8")
-        result_text = json.dumps(result)
-        original_result_path.write_text(result_text, encoding="utf-8")
-        resumed_result_path.write_text(result_text, encoding="utf-8")
-        old_owner = {
-            "run_id": "old-owner",
-            "status": "interrupted",
-            "task_id": task_id,
-            "task_id_status": "known",
-            "model": "gpt-5.6-sol",
-            "policy": MODULE.CONFLICT_POLICY,
-            "preflight": {
-                "pr": {
-                    **MODULE.parse_target("owner/repo#7"),
-                    "head_sha": "b" * 40,
-                    "base_sha": "a" * 40,
-                },
-                "request": request,
-                "strategy": "merge",
-                "repository_root": str(directory),
-            },
-            "request_file": str(request_path),
-            "prompt_file": str(prompt_path),
-            "result_file": str(resumed_result_path),
-            "result": result,
-            "resume_attempts": 1,
-            "recovery_files": [
-                str(request_path),
-                str(prompt_path),
-                str(original_result_path),
-                str(resumed_result_path),
-            ],
-            "error": result["error"],
-        }
-        state = {
-            "version": 1,
-            "created_at": "2026-09-17T00:00:00Z",
-            "attempts": 1,
-            "managed_attempts": 1,
-            "managed_task_history": [],
-            "history": [],
-            "escalation": None,
-            "agent_task": old_owner,
-        }
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-        state_sha256 = MODULE.sha256_file(state_path)
-        result_sha256 = MODULE.sha256_file(resumed_result_path)
-        task_prompt_sha256 = "3" * 64
-        args = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                "owner/repo#7",
-                "--repo-root",
-                str(directory),
-                "--state",
-                str(state_path),
-                "--pipeline-run",
-                "pipeline-1",
-                "--pipeline-iteration",
-                "2",
-                "--pipeline-max-iterations",
-                "3",
-                "--replace-malformed-completed-task",
-                task_id,
-                "--expected-state-sha256",
-                state_sha256,
-                "--expected-malformed-result-sha256",
-                result_sha256,
-                "--expected-malformed-task-prompt-sha256",
-                task_prompt_sha256,
-                "--expected-malformed-request-id",
-                request["request_id"],
-                "--expected-malformed-request-sha256",
-                request["request_sha256"],
-            ]
-        )
-        new_request = copy.deepcopy(request)
-        new_request["request_id"] = "pr-7-fedcba9876543210"
-        new_request["iteration"] = {
-            "id": "pipeline-1-2",
-            "number": 2,
-            "budget": 3,
-        }
-        new_request["request_sha256"] = MODULE.request_digest(new_request)
-        target = MODULE.parse_target("owner/repo#7")
-        preflight = {
-            "already_mergeable": False,
-            "pr": {
-                **target,
-                "head_sha": "b" * 40,
-                "base_sha": "a" * 40,
-            },
-            "strategy": "merge",
-            "request": new_request,
-            "repository_root": str(directory),
-        }
-
-        def reject_after_validating_command(command, **_kwargs):
-            expected = {
-                "--replace-malformed-request-file": request_path,
-                "--replace-malformed-prompt-file": prompt_path,
-                "--replace-malformed-original-result-file": original_result_path,
-                "--replace-malformed-resumed-result-file": resumed_result_path,
-            }
-            for option, path in expected.items():
-                self.assertEqual(str(path), command[command.index(option) + 1])
-            self.assertEqual(
-                task_prompt_sha256,
-                command[
-                    command.index("--expected-malformed-task-prompt-sha256") + 1
-                ],
-            )
-            Path(command[command.index("--result-file") + 1]).write_text(
-                "{}",
-                encoding="utf-8",
-            )
-            return completed(2)
-
-        failed_result = {
-            "status": "error",
-            "task": None,
-            "error": {
-                "code": "policy_rejected",
-                "message": "replacement validation stopped before task creation",
-            },
-        }
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
-            mock.patch.object(MODULE, "resolve_target", return_value=target),
-            mock.patch.object(MODULE, "require_external_path"),
-            mock.patch.object(MODULE, "conflict_preflight", return_value=preflight),
-            mock.patch.object(
-                MODULE, "discover_conflict_task", return_value=directory / "helper.py"
-            ),
-            mock.patch.object(MODULE, "run", side_effect=reject_after_validating_command),
-            mock.patch.object(
-                MODULE, "load_conflict_result", return_value=failed_result
-            ),
-            mock.patch.object(MODULE, "emit") as emit,
-        ):
-            MODULE.command_agent_task(args)
-
-        saved = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual([old_owner], saved["managed_task_history"])
-        self.assertEqual(2, saved["managed_attempts"])
-        self.assertEqual(2, saved["attempts"])
-        replacement = saved["agent_task"]["replaces_malformed_completed_task"]
-        self.assertEqual(task_id, replacement["task_id"])
-        self.assertEqual(state_sha256, replacement["state_sha256"])
-        self.assertEqual(result_sha256, replacement["result_sha256"])
-        self.assertEqual("replacement_rejected", saved["agent_task"]["status"])
-        self.assertEqual("not_created", saved["agent_task"]["task_id_status"])
-        payload = emitted(emit)
-        self.assertEqual("recovery_required", payload["result"])
-        self.assertNotIn("retry_command", payload)
-
-    @unittest.skip("legacy owner replacement is intentionally unavailable")
-    def test_malformed_completed_task_replacement_rejects_changed_resume_result(self):
-        directory = temporary_directory(self)
-        state_path = directory / "state.json"
-        request_path = directory / "request.json"
-        prompt_path = directory / "prompt.txt"
-        original_result_path = directory / "state--old-owner--result-0.json"
-        resumed_result_path = directory / "state--old-owner--result-1.json"
-        request = self.request()
-        request["request_id"] = "pr-7-0123456789abcdef"
-        request["request_sha256"] = MODULE.request_digest(request)
-        prompt = MODULE.build_conflict_prompt({"request": request})
-        task_id = "task-1"
-        result = self.success_result(request)
-        result["status"] = "error"
-        result["error"] = {
-            "code": "unexpected_history",
-            "message": "required receipt does not exist",
-        }
-        result["application"] = {"status": "not_started"}
-        result["validation"] = {"complete": False, "outcomes": []}
-        result["task"]["id"] = task_id
-        request_path.write_text(json.dumps(request), encoding="utf-8")
-        prompt_path.write_text(prompt, encoding="utf-8")
-        original_result_path.write_text(json.dumps(result), encoding="utf-8")
-        resumed_result_path.write_text(json.dumps({**result, "extra": True}), encoding="utf-8")
-        state = {
-            "version": 1,
-            "attempts": 1,
-            "managed_attempts": 1,
-            "history": [],
-            "agent_task": {
-                "run_id": "old-owner",
-                "status": "interrupted",
-                "task_id": task_id,
-                "task_id_status": "known",
-                "resume_attempts": 1,
-                "error": result["error"],
-                "result": result,
-                "preflight": {"request": request},
-                "request_file": str(request_path),
-                "prompt_file": str(prompt_path),
-                "result_file": str(resumed_result_path),
-                "recovery_files": [
-                    str(original_result_path),
-                    str(resumed_result_path),
-                ],
-            },
-        }
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-        args = MODULE.build_parser().parse_args(
-            [
-                "agent-task",
-                "owner/repo#7",
-                "--repo-root",
-                str(directory),
-                "--state",
-                str(state_path),
-                "--replace-malformed-completed-task",
-                task_id,
-                "--expected-state-sha256",
-                MODULE.sha256_file(state_path),
-                "--expected-malformed-result-sha256",
-                MODULE.sha256_file(resumed_result_path),
-                "--expected-malformed-task-prompt-sha256",
-                "2" * 64,
-                "--expected-malformed-request-id",
-                request["request_id"],
-                "--expected-malformed-request-sha256",
-                request["request_sha256"],
-            ]
-        )
-        before = state_path.read_bytes()
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(MODULE, "require_external_path"),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "artifact identity changed",
-            ),
-        ):
-            MODULE.command_agent_task(args)
-        self.assertEqual(before, state_path.read_bytes())
 
     def test_task_creation_failure_persists_structured_terminal_state(self):
         directory = temporary_directory(self)
@@ -1787,6 +1182,96 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(failed_result["error"], payload["error"])
         self.assertNotIn("recovery_command", payload)
         self.assertNotIn("retry_command", payload)
+
+    def test_source_head_drift_preserves_candidate_without_publication(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task",
+                "owner/repo#7",
+                "--repo-root",
+                str(directory),
+                "--state",
+                str(state_path),
+            ]
+        )
+        target = MODULE.parse_target("owner/repo#7")
+        request = self.request()
+        preflight = {
+            "already_mergeable": False,
+            "pr": {
+                **target,
+                "head_sha": "b" * 40,
+                "base_sha": "a" * 40,
+            },
+            "strategy": "merge",
+            "request": request,
+            "repository_root": str(directory),
+        }
+        candidate = {
+            "artifact": {"head_sha": "d" * 40},
+            "code_refs": [{"role": "pull-request", "new_sha": "c" * 40}],
+        }
+        drift_result = {
+            "status": "error",
+            "task": {
+                "id": "task-1",
+                "url": "https://github.com/owner/repo/agent-tasks/task-1",
+                "state": "completed",
+                "base_ref": "b" * 40,
+                "base_sha": "b" * 40,
+            },
+            "generated": candidate,
+            "application": {"status": "not_started"},
+            "error": {
+                "code": "source_head_changed",
+                "message": "pull request source head changed",
+                "pr_number": "7",
+                "expected_head": "b" * 40,
+                "actual_head": "e" * 40,
+            },
+        }
+
+        def write_result(command, **_kwargs):
+            path = Path(command[command.index("--result-file") + 1])
+            path.write_text("{}", encoding="utf-8")
+            return completed(2)
+
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "build_conflict_prompt", return_value="prompt"),
+            mock.patch.object(
+                MODULE, "discover_conflict_task", return_value=directory / "helper.py"
+            ),
+            mock.patch.object(MODULE, "run", side_effect=write_result),
+            mock.patch.object(
+                MODULE, "load_conflict_result", return_value=drift_result
+            ),
+            mock.patch.object(MODULE, "publish_conflict_result") as publish,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        publish.assert_not_called()
+        payload = emitted(emit)
+        self.assertEqual("head_changed", payload["result"])
+        self.assertEqual("skipped_incomplete", payload["disposition"])
+        self.assertEqual("skipped", payload["stage_outcome"])
+        self.assertTrue(payload["allowance_consumed"])
+        self.assertEqual(1, payload["managed_attempts"])
+        self.assertEqual("preserved", payload["candidate"]["status"])
+        self.assertEqual(candidate, payload["candidate"]["generated"])
+        self.assertEqual(drift_result["task"], payload["candidate"]["task"])
+        self.assertEqual("not_started", payload["publication"])
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual("superseded", saved["agent_task"]["status"])
+        self.assertEqual(payload["candidate"], saved["agent_task"]["candidate"])
+        self.assertEqual("head_changed", saved["last_result"])
 
     def test_nonzero_helper_without_result_retains_bounded_redacted_diagnostics(self):
         directory = temporary_directory(self)
@@ -2358,22 +1843,6 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertIn("prior results", self.instructions)
         self.assertIn("never seed execution", self.instructions)
 
-    def test_v5_parser_rejects_malformed_or_failed_validation(self):
-        bad_values = [
-            [],
-            [{"command": "test", "result": "failed"}],
-            [{"command": "", "result": "passed"}],
-            [
-                {
-                    "command": "test",
-                    "result": "passed",
-                    "detail": "token=super-secret-value",
-                }
-            ],
-        ]
-        for value in bad_values:
-            with self.subTest(value=value), self.assertRaises(MODULE.WorkflowError):
-                MODULE.validate_passed_validations(value)
 
     def test_success_result_requires_exact_request_and_task_identity(self):
         request = self.request()
@@ -2412,23 +1881,6 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "unsupported fields"):
             MODULE.load_conflict_result(path)
 
-    def test_v5_result_parser_remains_available_for_audit(self):
-        directory = temporary_directory(self)
-        request = self.request()
-        result = self.success_result(request)
-        result["schema"] = MODULE.V5_CONFLICT_RESULT_SCHEMA
-        result["policy"] = MODULE.V5_CONFLICT_POLICY_IDENTITY
-        result["validation"] = {
-            "complete": True,
-            "outcomes": [{"command": "git diff --check", "result": "passed"}],
-        }
-        path = directory / "v5-result.json"
-        path.write_text(json.dumps(result), encoding="utf-8")
-
-        self.assertEqual(
-            MODULE.V5_CONFLICT_RESULT_SCHEMA,
-            MODULE.load_v5_conflict_result(path)["schema"],
-        )
 
     def test_consumer_rejects_a_single_role_code_locator_not_bound_to_artifact(self):
         request = self.request()
@@ -2583,8 +2035,17 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertIn("Never import managed helper internals", self.instructions)
         self.assertIn("Never call Agent Tasks APIs directly", self.instructions)
         self.assertIn("Never scrape helper stdout", self.instructions)
-        self.assertIn("Do not run the legacy", self.instructions)
-        self.assertIn("Resume and owner-replacement arguments fail", self.instructions)
+        self.assertIn(
+            "There is no resume, prepared-task adoption, owner replacement, or "
+            "malformed-result replacement route",
+            self.instructions,
+        )
+        self.assertIn(
+            "Only the current `agent-task`, `pipeline`, `status`, `abort`, "
+            "`escalate`, `cleanup`, and controller-owned descendant propagation "
+            "routes are available",
+            self.instructions,
+        )
         self.assertIn("lost publication response never invokes cloud", self.instructions)
 
     def test_agent_contract_pins_all_three_strategies_and_artifact_separation(self):
@@ -2600,7 +2061,6 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(script.count("_EXECUTION.run if _EXECUTION else subprocess.run"), 2)
         self.assertIn('getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)', script)
         self.assertIn("**windows_no_window_options()", script)
-        self.assertIn("hashlib.sha256(report_bytes).hexdigest()", script)
 
 
 class TargetParsingTest(unittest.TestCase):
@@ -4020,7 +3480,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
 
     def minimal_request(self):
         request = self.request()
-        request["policy"] = CLOUD_MODULE.MINIMAL_POLICY
+        request["policy"] = CLOUD_MODULE.POLICY
         request["request_sha256"] = CLOUD_MODULE.request_digest(request)
         return request
 
@@ -4043,68 +3503,6 @@ class ManagedTaskPromptTest(unittest.TestCase):
             "paths": [path],
         }
 
-    def single_role_evidence(self):
-        request = self.request()
-        request["request_id"] = "pr-16161-d754a7530ef10e03"
-        request["pull_request"]["head_sha"] = (
-            "b490dcba7665ddc6078be7a4e5fafa389f9b62fe"
-        )
-        request["pull_request"]["base_sha"] = (
-            "2515ed4055bb1802c7d21d7a01882b92b6d5c675"
-        )
-        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-        branch = "copilot/conflict-fix-loop-worker-prompt-v2-yet-again"
-        task_id = "deeb5e61-64a2-4fe0-b948-ce3dac511701"
-        task = {
-            "id": task_id,
-            "state": "completed",
-            "head_ref": branch,
-            "artifacts": [
-                {
-                    "provider": "github",
-                    "type": "branch",
-                    "data": {
-                        "base_ref": request["pull_request"]["head_sha"],
-                        "head_ref": branch,
-                    },
-                }
-            ],
-            "sessions": [
-                {
-                    "task_id": task_id,
-                    "state": "completed",
-                    "model": "sweagent-capi:gpt-5.6-sol",
-                    "base_ref": request["pull_request"]["head_sha"],
-                    "head_ref": branch,
-                }
-            ],
-        }
-        semantic_head = "a22ac93eab2fd8b970a1d050fea58eeb005aad9a"
-        code_tip = "c4547b279abbd7957325f8d3192dc2c458cd71a1"
-        content = json.dumps(
-            {
-                "summary": "Resolved the frozen merge conflict.",
-                "validation": [
-                    {
-                        "command": "git diff --check",
-                        "result": "passed",
-                    }
-                ],
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        snapshot = CLOUD_MODULE.LocalSnapshot(
-            Path("C:/repo"),
-            Path("C:/state"),
-            request["repository"],
-            "origin",
-            request["pull_request"]["head_ref"],
-            request["pull_request"]["head_sha"],
-            "",
-            None,
-        )
-        return request, task, branch, semantic_head, code_tip, content, snapshot
 
     def test_large_path_corpus_fails_before_submission_without_losing_scope(self):
         request = self.request()
@@ -4162,12 +3560,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
             "6d35c77707906847ff3ab01d755889c040883c7c81ffd170ea2f394086770432",
             CLOUD_MODULE.value_digest(paths),
         )
-        for policy in (
-            CLOUD_MODULE.LEGACY_POLICY,
-            CLOUD_MODULE.POLICY,
-            CLOUD_MODULE.MINIMAL_POLICY,
-            CLOUD_MODULE.SEQUENTIAL_POLICY,
-        ):
+        for policy in (CLOUD_MODULE.POLICY,):
             with self.subTest(policy=policy):
                 request = self.request()
                 request.update(policy=policy, strategy="rebase", resolution_context_paths=paths)
@@ -4232,7 +3625,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
         )
         request = self.request()
         request.update(
-            policy=CLOUD_MODULE.SEQUENTIAL_POLICY,
+            policy=CLOUD_MODULE.POLICY,
             strategy="rebase",
             native_stack=None,
             resolution_context_paths=paths,
@@ -4324,569 +3717,19 @@ class ManagedTaskPromptTest(unittest.TestCase):
                 self.assertEqual("prompt_too_large", failure.exception.code)
                 api.assert_not_called()
 
-    def test_single_role_semantic_contract_derives_code_tip_from_artifact_parent(self):
-        request = self.request()
-        prompt = CLOUD_MODULE.policy_prompt(self.options(request))
 
-        self.assertIn("Policy: marketplace-conflict-worker@5", prompt)
-        self.assertNotIn(
-            CLOUD_MODULE.assigned_code_ref(request["request_id"], "code"),
-            prompt,
-        )
-        self.assertIn("Do not publish a duplicate code branch", prompt)
-        self.assertIn("verified sole parent", prompt)
-        self.assertIn("derives every SHA", prompt)
-        self.assertIn("dispatcher adds the semantic schema and kind", prompt)
-        self.assertIn("For merge, omit `commit_annotations`", prompt)
-        self.assertNotIn('"commit_annotations"', prompt)
-        self.assertIn('"result": "passed"', prompt)
-        self.assertIn("Do not include SHAs, refs, roles, request identity", prompt)
-        self.assertNotIn("Compact required receipt contract", prompt)
 
-    def test_16161_derives_merge_tip_from_authoritative_task_artifact_parent(self):
-        (
-            request,
-            task,
-            branch,
-            semantic_head,
-            code_tip,
-            content,
-            snapshot,
-        ) = self.single_role_evidence()
 
-        def commit_parents(_runner, _root, commit):
-            if commit == semantic_head:
-                return [code_tip]
-            if commit == code_tip:
-                return [
-                    request["pull_request"]["head_sha"],
-                    request["pull_request"]["base_sha"],
-                ]
-            raise AssertionError(commit)
 
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "fetch_quarantined",
-                return_value=(
-                    CLOUD_MODULE.quarantine_ref(request["request_id"], "artifact"),
-                    semantic_head,
-                ),
-            ) as fetch,
-            mock.patch.object(CLOUD_MODULE, "parents", side_effect=commit_parents),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
-            ),
-            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
-            mock.patch.object(
-                CLOUD_MODULE, "first_parent_chain", return_value=[code_tip]
-            ),
-            mock.patch.object(CLOUD_MODULE, "git", return_value="") as git,
-            mock.patch.object(CLOUD_MODULE, "require_local_unchanged"),
-        ):
-            code_refs, artifact, validations = (
-                CLOUD_MODULE.prove_generated_semantic(
-                    mock.sentinel.runner,
-                    snapshot,
-                    request,
-                    task,
-                )
-            )
 
-        fetch.assert_called_once()
-        self.assertEqual(branch, fetch.call_args.args[2].ref)
-        self.assertEqual(
-            [
-                {
-                    "role": "code",
-                    "pr_number": request["pull_request"]["number"],
-                    "repository": request["repository"],
-                    "ref": branch,
-                    "old_sha": request["pull_request"]["head_sha"],
-                    "new_sha": code_tip,
-                    "base_ref": request["pull_request"]["base_ref"],
-                    "base_sha": request["pull_request"]["base_sha"],
-                    "lease_sha": request["pull_request"]["head_sha"],
-                    "commits": [code_tip],
-                }
-            ],
-            code_refs,
-        )
-        self.assertEqual(semantic_head, artifact["head_sha"])
-        self.assertEqual(CLOUD_MODULE.SEMANTIC_SCHEMA, artifact["semantic"]["schema"])
-        self.assertEqual("conflict-resolution", artifact["semantic"]["kind"])
-        self.assertEqual("passed", validations[0]["result"])
-        git.assert_called_once_with(
-            mock.sentinel.runner,
-            snapshot.root,
-            "update-ref",
-            CLOUD_MODULE.quarantine_ref(request["request_id"], "code"),
-            code_tip,
-        )
 
-    def test_single_role_rejects_semantic_commit_with_wrong_path(self):
-        request, task, _, semantic_head, code_tip, content, snapshot = (
-            self.single_role_evidence()
-        )
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "fetch_quarantined",
-                return_value=("refs/quarantine/artifact", semantic_head),
-            ),
-            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
-            mock.patch.object(
-                CLOUD_MODULE, "changed_paths", return_value=["src/Unrelated.java"]
-            ),
-            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
-            self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError, "changed unexpected paths"
-            ),
-        ):
-            CLOUD_MODULE.prove_generated_semantic(
-                mock.sentinel.runner,
-                snapshot,
-                request,
-                task,
-            )
 
-    def test_single_role_rejects_semantic_merge_commit(self):
-        request, task, _, semantic_head, code_tip, _, snapshot = (
-            self.single_role_evidence()
-        )
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "fetch_quarantined",
-                return_value=("refs/quarantine/artifact", semantic_head),
-            ),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "parents",
-                return_value=[code_tip, request["pull_request"]["head_sha"]],
-            ),
-            self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError, "exactly one parent"
-            ),
-        ):
-            CLOUD_MODULE.prove_generated_semantic(
-                mock.sentinel.runner,
-                snapshot,
-                request,
-                task,
-            )
 
-    def test_single_role_rejects_wrong_merge_parent_topology(self):
-        request, task, _, semantic_head, code_tip, content, snapshot = (
-            self.single_role_evidence()
-        )
 
-        def commit_parents(_runner, _root, commit):
-            if commit == semantic_head:
-                return [code_tip]
-            if commit == code_tip:
-                return [
-                    request["pull_request"]["base_sha"],
-                    request["pull_request"]["head_sha"],
-                ]
-            raise AssertionError(commit)
 
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "fetch_quarantined",
-                return_value=("refs/quarantine/artifact", semantic_head),
-            ),
-            mock.patch.object(CLOUD_MODULE, "parents", side_effect=commit_parents),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
-            ),
-            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
-            mock.patch.object(
-                CLOUD_MODULE, "first_parent_chain", return_value=[code_tip]
-            ),
-            mock.patch.object(CLOUD_MODULE, "git", return_value=""),
-            mock.patch.object(CLOUD_MODULE, "require_local_unchanged"),
-            self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError, "parents are not \\[head, base\\]"
-            ),
-        ):
-            CLOUD_MODULE.prove_generated_semantic(
-                mock.sentinel.runner,
-                snapshot,
-                request,
-                task,
-            )
 
-    def test_single_role_rejects_malformed_semantic_data(self):
-        request, task, _, semantic_head, code_tip, _, snapshot = (
-            self.single_role_evidence()
-        )
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "fetch_quarantined",
-                return_value=("refs/quarantine/artifact", semantic_head),
-            ),
-            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
-            ),
-            mock.patch.object(
-                CLOUD_MODULE, "git_show_file", return_value="{malformed"
-            ),
-            self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError, "semantic output is malformed"
-            ),
-        ):
-            CLOUD_MODULE.prove_generated_semantic(
-                mock.sentinel.runner,
-                snapshot,
-                request,
-                task,
-            )
 
-    def test_16161_policy_3_wrapper_is_not_promoted_into_policy_4(self):
-        request, task, _, semantic_head, code_tip, _, snapshot = (
-            self.single_role_evidence()
-        )
-        content = json.dumps(
-            {
-                "kind": "conflict-resolution",
-                "payload": {
-                    "commit_annotations": [
-                        [
-                            {
-                                "companion_paths": [],
-                                "conflict_paths": ["CHANGELOG.md"],
-                                "rationale": (
-                                    "Retained the gRPC API migration guidance from "
-                                    "the head alongside the Elasticsearch, selector "
-                                    "configuration, and query-capture deprecations "
-                                    "from the base so neither history's release "
-                                    "guidance was lost."
-                                ),
-                            }
-                        ]
-                    ],
-                    "summary": (
-                        "Merged the histories and preserved both sets of "
-                        "changelog deprecation guidance."
-                    ),
-                    "validation": [
-                        {
-                            "command": (
-                                "GitHub Actions Gradle wrapper validation"
-                            ),
-                            "result": "passed",
-                        },
-                        {
-                            "command": (
-                                "CodeQL analysis for Actions and Python"
-                            ),
-                            "result": "passed",
-                        },
-                    ],
-                },
-            },
-            separators=(",", ":"),
-        )
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "fetch_quarantined",
-                return_value=("refs/quarantine/artifact", semantic_head),
-            ),
-            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
-            ),
-            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
-            self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError,
-                "semantic output has an unsupported shape",
-            ),
-        ):
-            CLOUD_MODULE.prove_generated_semantic(
-                mock.sentinel.runner,
-                snapshot,
-                request,
-                task,
-            )
 
-    def test_16161_policy_4_contradictory_payload_is_rejected_by_policy_5(self):
-        request, _, _, semantic_head, code_tip, _, snapshot = (
-            self.single_role_evidence()
-        )
-        content = json.dumps(
-            {
-                "summary": (
-                    "Merged the histories and preserved both sets of "
-                    "changelog deprecation guidance."
-                ),
-                "commit_annotations": [
-                    [
-                        {
-                            "companion_paths": [],
-                            "conflict_paths": ["CHANGELOG.md"],
-                            "rationale": (
-                                "Retained the gRPC API migration guidance from "
-                                "the head alongside the Elasticsearch, selector "
-                                "configuration, and query-capture deprecations "
-                                "from the base so neither history's release "
-                                "guidance was lost."
-                            ),
-                        }
-                    ]
-                ],
-                "validation": [
-                    {
-                        "command": "GitHub Actions Gradle wrapper validation",
-                        "result": "passed",
-                    },
-                    {
-                        "command": "CodeQL analysis for Actions and Python",
-                        "result": "passed",
-                    },
-                ],
-            },
-            separators=(",", ":"),
-        )
-        with (
-            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
-            ),
-            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
-            self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError,
-                "unsupported shape",
-            ),
-        ):
-            CLOUD_MODULE.validate_semantic_artifact(
-                mock.sentinel.runner,
-                snapshot,
-                request,
-                CLOUD_MODULE.RemoteRef(
-                    "artifact",
-                    None,
-                    request["repository"],
-                    "copilot/conflict-fix-loop-worker-v2-another-one",
-                ),
-                semantic_head,
-                code_tip,
-            )
-
-    def test_16161_policy_5_derives_merge_annotations_from_history(self):
-        request, _, _, semantic_head, code_tip, content, snapshot = (
-            self.single_role_evidence()
-        )
-        with (
-            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
-            ),
-            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=content),
-        ):
-            summary, annotations, validations, digest = (
-                CLOUD_MODULE.validate_semantic_artifact(
-                    mock.sentinel.runner,
-                    snapshot,
-                    request,
-                    CLOUD_MODULE.RemoteRef(
-                        "artifact",
-                        None,
-                        request["repository"],
-                        "copilot/conflict-fix-loop-worker-v2-another-one",
-                    ),
-                    semantic_head,
-                    code_tip,
-                )
-            )
-
-        self.assertIn("Resolved the frozen merge conflict", summary)
-        self.assertEqual([[]], annotations)
-        self.assertEqual(
-            [
-                {
-                    "command": "git diff --check",
-                    "result": "passed",
-                },
-            ],
-            validations,
-        )
-        self.assertEqual(
-            hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            digest,
-        )
-
-    def test_policy_4_never_invents_missing_validation_evidence(self):
-        invalid = [
-            [{"command": "git diff --check"}],
-            [{"result": "passed"}],
-            [{"command": "git diff --check", "result": "failed"}],
-            [
-                {
-                    "command": "git diff --check",
-                    "result": "passed",
-                    "status": "passed",
-                }
-            ],
-            [
-                {
-                    "command": "git diff --check",
-                    "result": "passed",
-                    "detail": "clean",
-                }
-            ],
-        ]
-        for value in invalid:
-            with self.subTest(value=value), self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError,
-                "validation",
-            ):
-                CLOUD_MODULE.validate_semantic_validations(value)
-
-    def test_policy_4_rejects_identity_fields_in_the_minimal_payload(self):
-        request, _, _, semantic_head, code_tip, content, snapshot = (
-            self.single_role_evidence()
-        )
-        value = json.loads(content)
-        value["request_id"] = request["request_id"]
-        with (
-            mock.patch.object(CLOUD_MODULE, "parents", return_value=[code_tip]),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
-            ),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "git_show_file",
-                return_value=json.dumps(value),
-            ),
-            self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError,
-                "semantic output has an unsupported shape",
-            ),
-        ):
-            CLOUD_MODULE.validate_semantic_artifact(
-                mock.sentinel.runner,
-                snapshot,
-                request,
-                CLOUD_MODULE.RemoteRef(
-                    "artifact",
-                    None,
-                    request["repository"],
-                    "copilot/conflict-fix-loop-worker-v2-another-one",
-                ),
-                semantic_head,
-                code_tip,
-            )
-
-    def test_single_role_rejects_unrelated_task_session_branch(self):
-        request, task, _, _, _, _, _ = self.single_role_evidence()
-        task["sessions"][0]["head_ref"] = "copilot/unrelated-task"
-
-        with self.assertRaisesRegex(
-            CLOUD_MODULE.ConflictError, "branches differ"
-        ):
-            CLOUD_MODULE.discover_semantic_artifact_ref(task, request)
-
-    def test_missing_semantic_artifact_fails_closed(self):
-        request = self.request()
-        snapshot = CLOUD_MODULE.LocalSnapshot(
-            Path("C:/repo"),
-            Path("C:/state"),
-            request["repository"],
-            "origin",
-            request["pull_request"]["head_ref"],
-            request["pull_request"]["head_sha"],
-            "",
-            None,
-        )
-        remote = CLOUD_MODULE.RemoteRef(
-            "artifact",
-            None,
-            request["repository"],
-            "copilot/task-1",
-        )
-        final_code_head = "c" * 40
-        artifact_head = "d" * 40
-
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "parents",
-                return_value=[final_code_head],
-            ),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=[CLOUD_MODULE.semantic_path(request["request_id"])],
-            ),
-            mock.patch.object(CLOUD_MODULE, "git_show_file", return_value=""),
-            self.assertRaisesRegex(
-                CLOUD_MODULE.ConflictError,
-                "semantic output is malformed",
-            ),
-        ):
-            CLOUD_MODULE.validate_semantic_artifact(
-                mock.Mock(),
-                snapshot,
-                request,
-                remote,
-                artifact_head,
-                final_code_head,
-            )
-
-    def test_runtime_generates_identity_bound_report_and_receipt(self):
-        request = self.request()
-        code_ref = {
-            "role": "code",
-            "pr_number": request["pull_request"]["number"],
-            "repository": request["repository"],
-            "ref": CLOUD_MODULE.assigned_code_ref(request["request_id"], "code"),
-            "old_sha": request["pull_request"]["head_sha"],
-            "new_sha": "c" * 40,
-            "base_ref": request["pull_request"]["base_ref"],
-            "base_sha": request["pull_request"]["head_sha"],
-            "lease_sha": request["pull_request"]["head_sha"],
-            "commits": ["c" * 40],
-        }
-        validations = [
-            {
-                "command": "git diff --check",
-                "result": "passed",
-            }
-        ]
-
-        report, receipt = CLOUD_MODULE.canonical_conflict_artifacts(
-            request,
-            [code_ref],
-            validations,
-            "Resolved both sides.",
-        )
-
-        self.assertIn(request["request_id"], report)
-        self.assertIn(request["request_sha256"], report)
-        self.assertEqual(receipt["request"]["id"], request["request_id"])
-        self.assertEqual(receipt["schema"], CLOUD_MODULE.RECEIPT_SCHEMA)
-        self.assertEqual(receipt["policy"], CLOUD_MODULE.POLICY)
-        self.assertEqual(receipt["generated_refs"][0]["ref"], code_ref)
-        self.assertEqual(receipt["validation"], validations)
 
     def test_small_path_corpus_is_retained_exactly(self):
         paths = ["src/main.py", "src/café.py"]
@@ -4966,188 +3809,6 @@ class ManagedTaskPromptTest(unittest.TestCase):
             with self.subTest(defect=defect), self.assertRaises(ValueError):
                 decode_compact_path_evidence(defect)
 
-    def test_native_stack_retains_every_member_and_commit_identity(self):
-        request = self.request()
-        request["strategy"] = "native-stack"
-        request["head_commits"] = []
-        request["resolution_context_paths"] = [
-            f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
-            for number in range(100)
-        ]
-        repository = "open-telemetry/opentelemetry-java-instrumentation"
-        member_refs = {
-            20070: "trask-redis-redisson-targets",
-            20075: "trask-redis-rediscala-targets",
-        }
-        members = []
-        for member_number, start, count in ((20070, 1, 40), (20075, 41, 10)):
-            old_commits = [
-                self.commit(number, f"module-{member_number}/File{number}.java")
-                for number in range(start, start + count)
-            ]
-            members.append(
-                {
-                    "pr_number": member_number,
-                    "repository": repository,
-                    "head_ref": member_refs[member_number],
-                    "head_sha": old_commits[-1]["sha"],
-                    "direct_base_ref": (
-                        "main" if member_number == 20070 else member_refs[20070]
-                    ),
-                    "direct_base_sha": (
-                        "a" * 40
-                        if member_number == 20070
-                        else members[0]["head_sha"]
-                    ),
-                    "retained_base_sha": f"{100 + member_number:040x}",
-                    "direct_merge_base": f"{200 + member_number:040x}",
-                    "expected_new_parent": {
-                        "role": (
-                            "trunk"
-                            if member_number == 20070
-                            else "member-20070"
-                        ),
-                        "old_sha": (
-                            "a" * 40
-                            if member_number == 20070
-                            else members[0]["head_sha"]
-                        ),
-                    },
-                    "old_commits": old_commits,
-                    "sync_merges": (
-                        []
-                        if member_number == 20070
-                        else [
-                            {
-                                "sha": "b" * 40,
-                                "position": 5,
-                                "parents": ["c" * 40, members[0]["head_sha"]],
-                                "tree": "d" * 40,
-                                "subject": "Synchronize direct base",
-                                "trailers": [
-                                    "Co-authored-by: Example <example@example.com>"
-                                ],
-                                "remerge_diff_sha256": hashlib.sha256(
-                                    b""
-                                ).hexdigest(),
-                            }
-                        ]
-                    ),
-                    "lease_sha": old_commits[-1]["sha"],
-                }
-            )
-        request["repository"] = repository
-        request["pull_request"].update(
-            {
-                "number": 20070,
-                "url": f"https://github.com/{repository}/pull/20070",
-                "head_repository": repository,
-                "head_ref": member_refs[20070],
-                "head_sha": members[0]["head_sha"],
-                "base_repository": repository,
-            }
-        )
-        request["native_stack"] = {
-            "trunk": {"ref": "main", "sha": "a" * 40},
-            "members": members,
-            "outside_dependents": [],
-        }
-        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-
-        first = CLOUD_MODULE.validated_task_prompt(self.options(request))
-        second = CLOUD_MODULE.validated_task_prompt(self.options(request))
-        compact = CLOUD_MODULE.compact_request_contract(request)
-        legacy_prompt = CLOUD_MODULE.policy_prompt(
-            self.options(request),
-            include_per_commit_paths=True,
-        )
-
-        self.assertEqual(first, second)
-        self.assertGreater(len(legacy_prompt), len(first))
-        self.assertGreater(
-            len(legacy_prompt.encode("utf-8")),
-            len(first.encode("utf-8")),
-        )
-        self.assertLessEqual(
-            len(first) + CLOUD_MODULE.TASK_PROMPT_HEADROOM_CHARACTERS,
-            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_CHARACTERS,
-        )
-        self.assertLessEqual(
-            len(first.encode("utf-8")),
-            CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES,
-        )
-        self.assertLessEqual(
-            len(first.encode("utf-8"))
-            + CLOUD_MODULE.TASK_PROMPT_HEADROOM_UTF8_BYTES,
-            CLOUD_MODULE.AGENT_TASK_PROMPT_MAX_UTF8_BYTES,
-        )
-        self.assertIn('"commit_annotations"', first)
-        for role in ("member-20070", "member-20075"):
-            self.assertIn(
-                CLOUD_MODULE.assigned_code_ref(request["request_id"], role),
-                first,
-            )
-        compact_members = compact["native_stack"]["members"]
-        self.assertEqual(
-            [20070, 20075],
-            [member["pr_number"] for member in compact_members],
-        )
-        for original, retained in zip(members, compact_members, strict=True):
-            self.assertEqual(original["head_sha"], retained["head_sha"])
-            self.assertEqual(original["lease_sha"], retained["lease_sha"])
-            self.assertEqual(
-                [commit["sha"] for commit in original["old_commits"]],
-                [commit["sha"] for commit in retained["old_commits"]],
-            )
-            for commit, evidence in zip(
-                original["old_commits"], retained["old_commits"], strict=True
-            ):
-                self.assertEqual(
-                    CLOUD_MODULE.value_digest(commit),
-                    evidence["retained_evidence_sha256"],
-                )
-                self.assertEqual(commit["patch_sha256"], evidence["patch_sha256"])
-                self.assertNotIn("paths", evidence)
-                self.assertIn(commit["sha"], first)
-
-        snapshot = SimpleNamespace(
-            control_root=Path("control"),
-            repository=repository,
-        )
-        task = {"id": "task-1", "state": "queued"}
-        with mock.patch.object(
-            CLOUD_MODULE, "api_json", return_value=task
-        ) as api_json:
-            self.assertEqual(
-                task,
-                CLOUD_MODULE.start_task(
-                    mock.sentinel.runner,
-                    snapshot,
-                    self.options(request),
-                ),
-            )
-        self.assertEqual(first, api_json.call_args.args[4]["prompt"])
-
-        request["resolution_context_paths"] = [
-            f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
-            for number in range(397)
-        ]
-        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-        oversized = CLOUD_MODULE.compact_request_contract(request)
-        self.assertEqual(compact["native_stack"], oversized["native_stack"])
-        self.assertEqual(
-            request["resolution_context_paths"],
-            decode_compact_path_evidence(oversized["resolution_context_paths"]),
-        )
-        with (
-            mock.patch.object(CLOUD_MODULE, "api_json") as api,
-            self.assertRaises(CLOUD_MODULE.ConflictError) as failure,
-        ):
-            CLOUD_MODULE.start_task(
-                mock.sentinel.runner, snapshot, self.options(request)
-            )
-        self.assertEqual("prompt_too_large", failure.exception.code)
-        api.assert_not_called()
 
     def test_final_submitted_prompt_includes_envelope_with_headroom(self):
         request = self.request()
@@ -5321,11 +3982,6 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
             ),
             mock.patch.object(CLOUD_MODULE, "git", side_effect=git_result),
             mock.patch.object(CLOUD_MODULE, "require_local_unchanged"),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "git_show_file",
-                side_effect=AssertionError("advisory report prose must not be parsed"),
-            ),
         ):
             return CLOUD_MODULE.prove_generated_minimal(
                 mock.sentinel.runner,
@@ -5334,15 +3990,15 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 task,
             )
 
-    def test_policy_6_omits_hosted_result_validation_and_annotations(self):
+    def test_policy_10_omits_hosted_result_validation_and_annotations(self):
         request = self.minimal_request()
         prompt = CLOUD_MODULE.policy_prompt(self.options(request))
         result = CLOUD_MODULE.Result(
-            schema=CLOUD_MODULE.MINIMAL_RESULT_SCHEMA,
-            policy=CLOUD_MODULE.MINIMAL_POLICY,
+            schema=CLOUD_MODULE.RESULT_SCHEMA,
+            policy=CLOUD_MODULE.POLICY,
         ).as_dict()
 
-        self.assertIn("Policy: marketplace-conflict-worker@6", prompt)
+        self.assertIn("Policy: marketplace-conflict-worker@10", prompt)
         self.assertIn(CLOUD_MODULE.OUTPUT_REPORT_PATH, prompt)
         self.assertIn("Do not run local validation through the dispatcher", prompt)
         self.assertNotIn("validation", result)
@@ -5652,108 +4308,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 {"app.py"},
             )
 
-    def test_native_stack_prompt_assigns_each_role_an_independent_ref(self):
-        request = self.minimal_request()
-        request["strategy"] = "native-stack"
-        request["head_commits"] = []
-        request["native_stack"] = {
-            "trunk": {"ref": "main", "sha": "a" * 40},
-            "members": [
-                {
-                    "pr_number": number,
-                    "repository": "owner/repo",
-                    "head_ref": f"feature-{number}",
-                    "head_sha": f"{number:040x}",
-                    "direct_base_ref": "main" if number == 6 else "feature-6",
-                    "direct_base_sha": "a" * 40 if number == 6 else f"{6:040x}",
-                    "retained_base_sha": "a" * 40 if number == 6 else f"{6:040x}",
-                    "direct_merge_base": "a" * 40 if number == 6 else f"{6:040x}",
-                    "expected_new_parent": {
-                        "role": "trunk" if number == 6 else "member:6",
-                        "old_sha": "a" * 40 if number == 6 else f"{6:040x}",
-                    },
-                    "old_commits": [
-                        {
-                            "sha": f"{number:040x}",
-                            "subject": f"Feature {number}",
-                            "trailers": [],
-                            "patch_sha256": f"{number:064x}",
-                            "paths": ["app.py"],
-                        }
-                    ],
-                    "sync_merges": [],
-                    "lease_sha": f"{number:040x}",
-                }
-                for number in (6, 7)
-            ],
-            "outside_dependents": [],
-        }
-        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-        refs = CLOUD_MODULE.assigned_code_refs(request)
-        prompt = CLOUD_MODULE.policy_prompt(self.options(request))
 
-        self.assertEqual(["member:6", "member:7"], [ref.role for ref in refs])
-        self.assertEqual(
-            [
-                CLOUD_MODULE.assigned_code_ref(request["request_id"], ref.role)
-                for ref in refs
-            ],
-            [ref.ref for ref in refs],
-        )
-        for ref in refs:
-            self.assertIn(ref.ref, prompt)
-        self.assertIn("must also be the source tip", prompt)
-
-    def test_missing_assigned_native_stack_ref_fails_closed(self):
-        request = self.minimal_request()
-        request["strategy"] = "native-stack"
-        request["head_commits"] = []
-        request["native_stack"] = {
-            "trunk": {"ref": "main", "sha": "a" * 40},
-            "members": [
-                {"pr_number": 6, "repository": "owner/repo"},
-                {"pr_number": 7, "repository": "owner/repo"},
-            ],
-            "outside_dependents": [],
-        }
-        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-        task = self.task(request)
-        snapshot = CLOUD_MODULE.LocalSnapshot(
-            Path("C:/repo"),
-            Path("C:/state"),
-            request["repository"],
-            "origin",
-            request["pull_request"]["head_ref"],
-            request["pull_request"]["head_sha"],
-            "",
-            None,
-        )
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "fetch_quarantined",
-                side_effect=[
-                    ("refs/cloud-conflict-tasks/request-1/artifact", "d" * 40),
-                    ("refs/cloud-conflict-tasks/request-1/member-6", "c" * 40),
-                    CLOUD_MODULE.ConflictError(
-                        "missing assigned ref",
-                        "unexpected_history",
-                    ),
-                ],
-            ),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "changed_paths",
-                return_value=["app.py"],
-            ),
-            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "missing assigned ref"),
-        ):
-            CLOUD_MODULE.prove_generated_minimal(
-                mock.sentinel.runner,
-                snapshot,
-                request,
-                task,
-            )
 
     def test_stale_or_platform_error_task_identity_fails_closed(self):
         request = self.minimal_request()
@@ -5780,268 +4335,6 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
         self.assertEqual("copilot/generated-task", remote.ref)
 
 
-class MalformedCompletedReplacementTest(unittest.TestCase):
-    def setUp(self):
-        self.request = ManagedTaskPromptTest().request()
-        self.request["iteration"]["budget"] = 3
-        self.request["request_sha256"] = CLOUD_MODULE.request_digest(self.request)
-        self.prompt = MODULE.build_conflict_prompt({"request": self.request})
-        self.task_id = "13e5e9db-b87a-4864-91e2-da14d1adc96c"
-        report_path, receipt_path = CLOUD_MODULE.artifact_paths(
-            self.request["request_id"]
-        )
-        self.result = {
-            "schema": CLOUD_MODULE.RESULT_SCHEMA,
-            "status": "error",
-            "error": {
-                "code": "unexpected_history",
-                "message": (
-                    f"git show {self.request['pull_request']['head_sha']}:"
-                    f"{receipt_path} failed: fatal: path {receipt_path!r} "
-                    "does not exist"
-                ),
-            },
-            "model": self.request["model"],
-            "policy": CLOUD_MODULE.POLICY,
-            "repository": self.request["repository"],
-            "task": {
-                "id": self.task_id,
-                "url": f"https://github.com/owner/repo/tasks/{self.task_id}",
-                "state": "completed",
-                "base_ref": self.request["pull_request"]["head_sha"],
-                "base_sha": self.request["pull_request"]["head_sha"],
-            },
-            "mode": CLOUD_MODULE.MODE,
-            "strategy": self.request["strategy"],
-            "request": {
-                "id": self.request["request_id"],
-                "sha256": self.request["request_sha256"],
-            },
-            "pull_request": self.request["pull_request"],
-            "generated": {
-                "artifact": {
-                    "branch": "copilot/resolve-frozen-conflict",
-                    "head_sha": self.request["pull_request"]["head_sha"],
-                    "report": {
-                        "path": report_path,
-                        "commit": self.request["pull_request"]["head_sha"],
-                        "sha256": None,
-                    },
-                    "receipt": {
-                        "path": receipt_path,
-                        "commit": self.request["pull_request"]["head_sha"],
-                    },
-                },
-                "code_refs": [],
-            },
-            "application": {"status": "not_started"},
-            "validation": {"complete": False, "outcomes": []},
-        }
-        options = SimpleNamespace(
-            request=self.request,
-            prompt=self.prompt,
-            strategy=self.request["strategy"],
-        )
-        self.task_prompt = CLOUD_MODULE.validated_task_prompt(options)
-        self.replacement = CLOUD_MODULE.MalformedCompletedReplacement(
-            Path("C:\\control\\request.json"),
-            Path("C:\\control\\prompt.txt"),
-            Path("C:\\control\\result-0.json"),
-            Path("C:\\control\\result-1.json"),
-            self.request,
-            self.prompt,
-            self.result,
-            hashlib.sha256(self.task_prompt.encode("utf-8")).hexdigest(),
-        )
-        self.snapshot = mock.Mock(root=Path("C:\\repo"))
-        self.task = {
-            "id": self.task_id,
-            "state": "completed",
-            "artifacts": [
-                {
-                    "provider": "github",
-                    "type": "branch",
-                    "data": {
-                        "base_ref": self.request["pull_request"]["head_sha"],
-                        "head_ref": "copilot/resolve-frozen-conflict",
-                    },
-                }
-            ],
-            "sessions": [
-                {
-                    "task_id": self.task_id,
-                    "state": "completed",
-                    "model": "sweagent-capi:gpt-5.6-sol",
-                    "base_ref": self.request["pull_request"]["head_sha"],
-                    "head_ref": "copilot/resolve-frozen-conflict",
-                    "prompt": self.task_prompt,
-                }
-            ],
-        }
-
-    def validate(self, *, task=None, artifact_sha=None, paths=""):
-        with (
-            mock.patch.object(
-                CLOUD_MODULE,
-                "get_task",
-                return_value=self.task if task is None else task,
-            ),
-            mock.patch.object(
-                CLOUD_MODULE,
-                "fetch_quarantined",
-                return_value=(
-                    "refs/copilot-agent-task/quarantine/request/artifact",
-                    (
-                        self.request["pull_request"]["head_sha"]
-                        if artifact_sha is None
-                        else artifact_sha
-                    ),
-                ),
-            ),
-            mock.patch.object(CLOUD_MODULE, "git", return_value=paths),
-        ):
-            CLOUD_MODULE.validate_malformed_completed_replacement(
-                mock.sentinel.runner,
-                self.snapshot,
-                self.replacement,
-            )
-
-    def test_accepts_exact_completed_task_without_generated_changes(self):
-        self.validate()
-
-    def test_accepts_exact_legacy_prompt_contract_for_recovery(self):
-        options = SimpleNamespace(
-            request=self.request,
-            prompt=self.prompt,
-            strategy=self.request["strategy"],
-        )
-        legacy_prompt = CLOUD_MODULE.policy_prompt(
-            options,
-            include_per_commit_paths=True,
-        )
-        self.replacement = CLOUD_MODULE.MalformedCompletedReplacement(
-            self.replacement.request_file,
-            self.replacement.prompt_file,
-            self.replacement.original_result_file,
-            self.replacement.resumed_result_file,
-            self.replacement.request,
-            self.replacement.prompt,
-            self.replacement.result,
-            hashlib.sha256(legacy_prompt.encode("utf-8")).hexdigest(),
-        )
-        self.task["sessions"][0]["prompt"] = legacy_prompt
-
-        with mock.patch.object(
-            CLOUD_MODULE,
-            "validated_task_prompt",
-            side_effect=AssertionError("recovery must not apply the submission cap"),
-        ):
-            self.validate()
-
-    def test_parser_rejects_malformed_task_replacement_bundles(self):
-        directory = temporary_directory(self)
-        old_request_path = directory / "old-request.json"
-        old_prompt_path = directory / "old-prompt.txt"
-        original_path = directory / "result-0.json"
-        resumed_path = directory / "result-1.json"
-        new_request_path = directory / "new-request.json"
-        new_prompt_path = directory / "new-prompt.txt"
-        result_path = directory / "next-result.json"
-        new_request = copy.deepcopy(self.request)
-        new_request["request_id"] = "request-2"
-        new_request["iteration"] = {
-            "id": "iteration-2",
-            "number": self.request["iteration"]["number"] + 1,
-            "budget": self.request["iteration"]["budget"],
-        }
-        new_request["request_sha256"] = CLOUD_MODULE.request_digest(new_request)
-        old_request_path.write_text(json.dumps(self.request), encoding="utf-8")
-        old_prompt_path.write_text(self.prompt, encoding="utf-8")
-        prior_text = json.dumps(self.result)
-        original_path.write_text(prior_text, encoding="utf-8")
-        resumed_path.write_text(prior_text, encoding="utf-8")
-        new_request_path.write_text(json.dumps(new_request), encoding="utf-8")
-        new_prompt_path.write_text(
-            MODULE.build_conflict_prompt({"request": new_request}),
-            encoding="utf-8",
-        )
-        arguments = [
-            "--conflict-with-report",
-            "--strategy",
-            "merge",
-            "--model",
-            "sol",
-            "--pr",
-            "https://github.com/owner/repo/pull/7",
-            "--request-file",
-            str(new_request_path),
-            "--prompt-file",
-            str(new_prompt_path),
-            "--result-file",
-            str(result_path),
-            "--policy",
-            CLOUD_MODULE.POLICY_SELECTOR,
-            "--replace-malformed-request-file",
-            str(old_request_path),
-            "--replace-malformed-prompt-file",
-            str(old_prompt_path),
-            "--replace-malformed-original-result-file",
-            str(original_path),
-            "--replace-malformed-resumed-result-file",
-            str(resumed_path),
-            "--expected-malformed-task-prompt-sha256",
-            self.replacement.task_prompt_sha256,
-        ]
-
-        with self.assertRaisesRegex(
-            CLOUD_MODULE.ConflictError,
-            "replacement.*disabled",
-        ):
-            CLOUD_MODULE.parse_args(arguments)
-        with self.assertRaisesRegex(
-            CLOUD_MODULE.ConflictError,
-            "replacement.*disabled",
-        ):
-            CLOUD_MODULE.parse_args(arguments[:-2])
-
-    def test_rejects_active_or_ambiguous_task_state(self):
-        for state in ("in_progress", "pending"):
-            with self.subTest(state=state):
-                task = copy.deepcopy(self.task)
-                task["state"] = state
-                with self.assertRaisesRegex(
-                    CLOUD_MODULE.ConflictError,
-                    "not exactly completed",
-                ):
-                    self.validate(task=task)
-
-    def test_rejects_prompt_or_model_drift(self):
-        for field, value in (
-            ("prompt", self.task_prompt + "changed"),
-            ("model", "sweagent-capi:gpt-6-astra"),
-        ):
-            with self.subTest(field=field):
-                task = copy.deepcopy(self.task)
-                task["sessions"][0][field] = value
-                with self.assertRaisesRegex(
-                    CLOUD_MODULE.ConflictError,
-                    "session identity changed",
-                ):
-                    self.validate(task=task)
-
-    def test_rejects_generated_changes_or_contract_paths(self):
-        with self.assertRaisesRegex(
-            CLOUD_MODULE.ConflictError,
-            "generated repository changes",
-        ):
-            self.validate(artifact_sha="c" * 40)
-        with self.assertRaisesRegex(
-            CLOUD_MODULE.ConflictError,
-            "artifact paths exist",
-        ):
-            self.validate(
-                paths=CLOUD_MODULE.artifact_paths(self.request["request_id"])[1]
-            )
 
 
 class ManagedTaskResultPersistenceTest(unittest.TestCase):
@@ -6372,7 +4665,7 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
         self.assertEqual("success", result.status)
         self.assertEqual("no_changes", result.application_status)
         payload = result.as_dict()
-        self.assertEqual(CLOUD_MODULE.MINIMAL_RESULT_SCHEMA, payload["schema"])
+        self.assertEqual(CLOUD_MODULE.RESULT_SCHEMA, payload["schema"])
         self.assertEqual(
             CLOUD_MODULE.pull_request_result(request),
             payload["pull_request"],
@@ -10347,115 +8640,70 @@ class ParserTest(unittest.TestCase):
     def setUp(self):
         self.parser = MODULE.build_parser()
 
-    def test_every_subcommand_is_available(self):
+    def test_current_operational_subcommands_are_available(self):
+        for command in (
+            "agent-task",
+            "pipeline",
+            "abort",
+            "escalate",
+            "status",
+            "cleanup",
+            "descendant-propagate",
+        ):
+            with self.subTest(command=command):
+                arguments = [command]
+                if command in ("agent-task", "pipeline"):
+                    arguments.append("owner/repo#7")
+                elif command == "status":
+                    arguments.append("--current")
+                else:
+                    arguments.extend(["--state", "s.json"])
+                if command == "escalate":
+                    arguments.extend(["--kind", "contradiction", "--reason", "r"])
+                if command == "descendant-propagate":
+                    arguments = [
+                        command,
+                        "owner/repo#7",
+                        "--fixed-pr",
+                        "7",
+                        "--expected-head",
+                        "a" * 40,
+                        "--stack-number",
+                        "1",
+                        "--stack-request",
+                        "request.json",
+                        "--state",
+                        "s.json",
+                    ]
+                args = self.parser.parse_args(arguments)
+                self.assertTrue(callable(args.function))
+
+    def test_retired_execution_routes_are_unknown(self):
         for command in (
             "preflight",
             "attempt",
             "resolved",
             "continue",
-            "abort",
-            "escalate",
             "publish",
-            "status",
-            "cleanup",
+            "stack-rebase",
+            "stack-continue",
+            "stack-format",
+            "stack-validation-fix",
+            "stack-publish",
         ):
-            with self.subTest(command=command):
-                arguments = [command]
-                if command == "status":
-                    arguments.append("--current")
-                elif command != "preflight":
-                    arguments.extend(["--state", "s.json"])
-                if command == "resolved":
-                    arguments.extend(["--paths", "a.py", "--rationale", "r"])
-                if command == "escalate":
-                    arguments.extend(["--kind", "contradiction", "--reason", "r"])
-                args = self.parser.parse_args(arguments)
-                self.assertTrue(callable(args.function))
+            with self.subTest(command=command), self.assertRaises(SystemExit):
+                self.parser.parse_args([command])
 
-    def test_preflight_defaults_match_the_documented_run(self):
-        args = self.parser.parse_args(["preflight"])
-        self.assertIsNone(args.target)
-        self.assertEqual("auto", args.strategy)
-        self.assertFalse(args.whole_stack)
-        self.assertFalse(hasattr(args, "max_iterations"))
-
-    def test_preflight_rejects_the_arguments_an_outer_loop_used_to_pass(self):
-        """A caller that still passes them would otherwise run unbounded.
-
-        Failing loudly beats silently accepting a cap this resolver no longer
-        honours.
-        """
+    def test_retired_recovery_arguments_are_unknown(self):
         for argument in (
-            "--max-iterations",
-            "--new-invocation",
-            "--invocation-run",
-            "--pipeline-run",
-            "--pipeline-iteration",
-            "--pipeline-max-iterations",
+            "--resume",
+            "--replace-unidentified-owner",
+            "--replace-malformed-completed-task",
+            "--expected-malformed-state-sha256",
+            "--expected-malformed-result-sha256",
         ):
-            with self.subTest(argument=argument):
-                with self.assertRaises(SystemExit):
-                    self.parser.parse_args(["preflight", argument, "1"])
-
-    def test_preflight_accepts_every_argument_shape(self):
-        for target in (
-            "https://github.com/owner/repo/pull/7",
-            "owner/repo#7",
-        ):
-            with self.subTest(target=target):
-                args = self.parser.parse_args(["preflight", target])
-                self.assertEqual(target, args.target)
-
-    def test_preflight_rejects_an_unknown_strategy(self):
-        with self.assertRaises(SystemExit):
-            self.parser.parse_args(["preflight", "--strategy", "squash"])
-
-    def test_resolved_requires_exactly_one_rationale_source(self):
-        with self.assertRaises(SystemExit):
-            self.parser.parse_args(["resolved", "--state", "s.json", "--paths", "a.py"])
-        with self.assertRaises(SystemExit):
-            self.parser.parse_args(
-                [
-                    "resolved",
-                    "--state",
-                    "s.json",
-                    "--paths",
-                    "a.py",
-                    "--rationale",
-                    "r",
-                    "--rationale-file",
-                    "f",
-                ]
-            )
-
-    def test_resolved_takes_several_paths_and_every_override_flag(self):
-        args = self.parser.parse_args(
-            [
-                "resolved",
-                "--state",
-                "s.json",
-                "--paths",
-                "a.py",
-                "b.py",
-                "--rationale",
-                "r",
-                "--accept-one-side",
-                "--accept-deletion",
-                "--accept-line-endings",
-            ]
-        )
-        self.assertEqual(["a.py", "b.py"], args.paths)
-        self.assertTrue(args.accept_one_side)
-        self.assertTrue(args.accept_deletion)
-        self.assertTrue(args.accept_line_endings)
-
-    def test_the_resolved_override_flags_are_off_by_default(self):
-        args = self.parser.parse_args(
-            ["resolved", "--state", "s.json", "--paths", "a.py", "--rationale", "r"]
-        )
-        self.assertFalse(args.accept_one_side)
-        self.assertFalse(args.accept_deletion)
-        self.assertFalse(args.accept_line_endings)
+            with self.subTest(argument=argument), self.assertRaises(SystemExit):
+                self.parser.parse_args(["agent-task", "owner/repo#7", argument])
 
     def test_escalate_only_accepts_a_declared_kind(self):
         for kind in MODULE.ESCALATION_KINDS:
@@ -14409,30 +12657,6 @@ class StackValidationFixCommandTest(GitTestCase):
         )
         self.assertEqual("", self.git_in(self.workspace, "status", "--short"))
 
-    def test_parser_preserves_validation_fix_command_arguments(self):
-        args = MODULE.build_parser().parse_args(
-            [
-                "stack-validation-fix",
-                "--state",
-                "state.json",
-                "--paths",
-                "caller.go",
-                "caller.rb",
-                "--rationale",
-                "Callers must follow the resolved contract.",
-                "--fix-command",
-                "--",
-                "python",
-                "fix.py",
-                "--strict",
-            ]
-        )
-
-        self.assertIs(args.function, MODULE.command_stack_validation_fix)
-        self.assertEqual(
-            ["python", "fix.py", "--strict"],
-            args.fix_command,
-        )
 
 
 class StackPublishCommandTest(unittest.TestCase):
@@ -14803,40 +13027,7 @@ class DescendantPropagationTest(unittest.TestCase):
         )
         self.assertIs(args.function, MODULE.command_descendant_propagate)
 
-    def test_parser_exposes_the_formatting_checkpoint(self):
-        args = MODULE.build_parser().parse_args(
-            ["stack-format", "--state", "state.json", "--no-format"]
-        )
-        self.assertIs(args.function, MODULE.command_stack_format)
-        self.assertTrue(args.no_format)
 
-    def test_parser_preserves_formatter_option_arguments(self):
-        args = MODULE.build_parser().parse_args(
-            [
-                "stack-format",
-                "--state",
-                "state.json",
-                "--format-command",
-                "--",
-                "cargo",
-                "fmt",
-                "--manifest-path",
-                "tools/http/Cargo.toml",
-                "--",
-                "--check",
-            ]
-        )
-        self.assertEqual(
-            [
-                "cargo",
-                "fmt",
-                "--manifest-path",
-                "tools/http/Cargo.toml",
-                "--",
-                "--check",
-            ],
-            args.format_command,
-        )
 
     def test_descendant_propagation_stops_for_formatting_before_publishing(self):
         stack = self.stack()

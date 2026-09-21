@@ -22,8 +22,6 @@ from typing import Any, Iterable
 
 
 STATE_VERSION = 1
-FORMAT_COMMAND_ARGUMENT = "--format-command"
-FIX_COMMAND_ARGUMENT = "--fix-command"
 AUTOMATION_BLOCKER_KIND = "automation_blocker"
 MERGEABILITY_RETRY_DELAYS = (2, 4, 8, 16)
 PR_HEAD_LAG_RETRY_DELAY = 1
@@ -72,18 +70,9 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "d22684f684af52a3a0a6caa6afd4b25f5733260e2127db81763b2b13946c323a"
+    "c72c8a0836d790128ce3f1e93ed7d1da3c01fbf465f96da3dbe0aa03dae14d04"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
-V5_CONFLICT_POLICY = "marketplace-conflict-worker@5"
-V5_CONFLICT_POLICY_SHA256 = (
-    "21b4142edcb7cb35b805e3f225d16f53a2139eda4e974f56826a3cc9d3c1f933"
-)
-V5_CONFLICT_POLICY_IDENTITY = {
-    "id": "marketplace-conflict-worker",
-    "version": 5,
-    "sha256": V5_CONFLICT_POLICY_SHA256,
-}
 CONFLICT_POLICY = "marketplace-conflict-worker@10"
 CONFLICT_POLICY_SHA256 = (
     "7d934b95e5e0b8ef83228e95464a5c4f70d8de9114a50c98811e55b4825a0435"
@@ -101,21 +90,9 @@ CONFLICT_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
     "version": 5,
 }
-V5_CONFLICT_RESULT_SCHEMA = {
-    "id": "github.copilot.agent-task-conflict-result",
-    "version": 3,
-}
 CONFLICT_RECEIPT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-receipt",
     "version": 3,
-}
-V5_CONFLICT_RECEIPT_SCHEMA = {
-    "id": "github.copilot.agent-task-conflict-receipt",
-    "version": 2,
-}
-CONFLICT_SEMANTIC_SCHEMA = {
-    "id": "github.copilot.agent-task-conflict-semantic-output",
-    "version": 2,
 }
 MODEL_ALIASES = {
     "sol": "gpt-5.6-sol",
@@ -124,7 +101,6 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CONFLICT_REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 CONFLICT_RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
-CONFLICT_SEMANTIC_DIRECTORY = ".github/agent-task-conflict-semantic"
 AGENT_TASK_OUTPUT_REPORT = ".github/agent-task-output/report.md"
 
 
@@ -149,36 +125,6 @@ class NativeStackNormalizationRequired(WorkflowError):
 
 class MergedPredecessorLineageError(WorkflowError):
     pass
-
-
-class CommandPassthroughArgumentParser(argparse.ArgumentParser):
-    def parse_args(
-        self,
-        args: list[str] | None = None,
-        namespace: argparse.Namespace | None = None,
-    ) -> argparse.Namespace:
-        arguments = list(sys.argv[1:] if args is None else args)
-        passthrough = None
-        passthrough_attribute = None
-        command_argument = None
-        if arguments[:1] == ["stack-format"]:
-            command_argument = FORMAT_COMMAND_ARGUMENT
-            passthrough_attribute = "format_command"
-        elif arguments[:1] == ["stack-validation-fix"]:
-            command_argument = FIX_COMMAND_ARGUMENT
-            passthrough_attribute = "fix_command"
-        if command_argument is not None and command_argument in arguments:
-            marker = arguments.index(command_argument)
-            passthrough = arguments[marker + 1 :]
-            if passthrough[:1] == ["--"]:
-                passthrough.pop(0)
-            if not passthrough:
-                self.error(f"{command_argument} requires an executable")
-            arguments = arguments[: marker + 1] + ["passthrough-command"]
-        parsed = super().parse_args(arguments, namespace)
-        if passthrough is not None and passthrough_attribute is not None:
-            setattr(parsed, passthrough_attribute, passthrough)
-        return parsed
 
 
 def windows_no_window_options() -> dict[str, int]:
@@ -7151,8 +7097,10 @@ def stage_outcome(state: dict[str, Any] | None) -> str | None:
     if state.get("escalation"):
         return "escalated"
     task = state.get("agent_task") or {}
+    if task.get("status") == "superseded":
+        return "skipped"
     if task.get("status") in {
-        "failed", "interrupted", "replacement_rejected", "normalization_required",
+        "failed", "interrupted", "normalization_required",
     }:
         return "escalated"
     if task.get("code_refs"):
@@ -8393,532 +8341,6 @@ def load_conflict_result(path: Path) -> dict[str, Any]:
         "pull_request",
         "generated",
         "application",
-        "validation",
-    }
-    if (
-        not isinstance(value, dict)
-        or set(value) != expected
-        or value.get("schema") != V5_CONFLICT_RESULT_SCHEMA
-    ):
-        raise WorkflowError("managed conflict result has unsupported fields")
-    require_no_credentials(canonical_json(value), source="managed conflict result")
-    return value
-
-
-def validate_passed_validations(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list) or not value:
-        raise WorkflowError("managed conflict validation is incomplete")
-    outcomes = []
-    for outcome in value:
-        if (
-            not isinstance(outcome, dict)
-            or set(outcome) != {"command", "result"}
-            or not isinstance(outcome.get("command"), str)
-            or not outcome["command"].strip()
-            or outcome.get("result") != "passed"
-        ):
-            raise WorkflowError("managed conflict validation is malformed or failed")
-        require_no_credentials(canonical_json(outcome), source="validation outcome")
-        outcomes.append(outcome)
-    return outcomes
-
-
-def validate_conflict_result_identity(
-    result: dict[str, Any], request: dict[str, Any]
-) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, str]]]:
-    if result.get("status") != "success":
-        error = result.get("error")
-        code = error.get("code") if isinstance(error, dict) else "unknown"
-        message = error.get("message") if isinstance(error, dict) else "no detail"
-        raise WorkflowError(f"managed conflict task failed [{code}]: {message}")
-    task = result.get("task")
-    generated = result.get("generated")
-    application = result.get("application")
-    validation = result.get("validation")
-    expected_request = {
-        "id": request["request_id"],
-        "sha256": request["request_sha256"],
-    }
-    if (
-        result.get("error") is not None
-        or result.get("model") != request["model"]
-        or result.get("policy") != V5_CONFLICT_POLICY_IDENTITY
-        or result.get("repository") != request["repository"]
-        or result.get("mode") != "conflict_with_report"
-        or result.get("strategy") != request["strategy"]
-        or result.get("request") != expected_request
-        or result.get("pull_request") != request["pull_request"]
-        or not isinstance(task, dict)
-        or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
-        or not isinstance(task.get("id"), str)
-        or not task["id"]
-        or task.get("state") != "completed"
-        or task.get("base_ref") != request["pull_request"]["head_sha"]
-        or task.get("base_sha") != request["pull_request"]["head_sha"]
-        or not isinstance(generated, dict)
-        or set(generated) != {"artifact", "code_refs"}
-        or not isinstance(generated.get("code_refs"), list)
-        or not isinstance(generated.get("artifact"), dict)
-        or application != {"status": "quarantined_refs"}
-        or not isinstance(validation, dict)
-        or set(validation) != {"complete", "outcomes"}
-        or validation.get("complete") is not True
-    ):
-        raise WorkflowError("managed conflict result identity does not match the request")
-    validations = validate_passed_validations(validation["outcomes"])
-    return generated["code_refs"], generated["artifact"], validations
-
-
-def quarantine_ref(request_id: str, role: str) -> str:
-    safe_role = re.sub(r"[^A-Za-z0-9._-]", "-", role)
-    return f"refs/cloud-conflict-tasks/{request_id}/{safe_role}"
-
-
-def assigned_code_ref(request_id: str, role: str) -> str:
-    safe_request = re.sub(r"[^A-Za-z0-9._-]", "-", request_id)
-    safe_role = re.sub(r"[^A-Za-z0-9._-]", "-", role)
-    return f"copilot/conflict-{safe_request}-{safe_role}"
-
-
-def verify_commit_mapping(
-    repo_root: Path,
-    old: dict[str, Any],
-    new_sha: str,
-    parent: str,
-    mapping: dict[str, Any],
-    allowed_paths: set[str],
-) -> None:
-    expected_keys = {
-        "old_sha",
-        "new_sha",
-        "subject",
-        "trailers",
-        "patch_sha256",
-        "conflict_paths",
-        "companion_paths",
-        "unaffected_path_digests",
-        "rationale",
-    }
-    if not isinstance(mapping, dict) or set(mapping) != expected_keys:
-        raise WorkflowError("generated commit mapping is malformed")
-    digest = conflict_patch_sha256(repo_root, parent, new_sha)
-    if (
-        mapping["old_sha"] != old["sha"]
-        or mapping["new_sha"] != new_sha
-        or mapping["subject"] != old["subject"]
-        or mapping["subject"] != conflict_commit_subject(repo_root, new_sha)
-        or mapping["trailers"] != old["trailers"]
-        or mapping["trailers"] != conflict_commit_trailers(repo_root, new_sha)
-        or mapping["patch_sha256"] != digest
-    ):
-        raise WorkflowError("generated commit mapping changed commit identity")
-    conflict_paths = mapping["conflict_paths"]
-    companion_paths = mapping["companion_paths"]
-    unaffected = mapping["unaffected_path_digests"]
-    if (
-        not isinstance(conflict_paths, list)
-        or not isinstance(companion_paths, list)
-        or not isinstance(unaffected, dict)
-        or set(conflict_paths) & set(companion_paths)
-        or not (set(conflict_paths) | set(companion_paths)) <= allowed_paths
-    ):
-        raise WorkflowError("generated commit mapping uses unapproved paths")
-    old_paths = set(old["paths"])
-    new_paths = set(conflict_changed_paths(repo_root, new_sha))
-    if (
-        not set(conflict_paths) <= old_paths
-        or new_paths - old_paths != set(companion_paths)
-        or not old_paths - new_paths <= set(conflict_paths)
-    ):
-        raise WorkflowError("generated commit changed undeclared paths")
-    if digest == old["patch_sha256"]:
-        if conflict_paths or companion_paths or mapping["rationale"] not in {"", None}:
-            raise WorkflowError("unchanged commit carries false conflict metadata")
-        return
-    if not conflict_paths or not isinstance(mapping["rationale"], str) or not mapping[
-        "rationale"
-    ].strip():
-        raise WorkflowError("changed commit lacks conflict rationale")
-    unaffected_paths = old_paths - set(conflict_paths)
-    if set(unaffected) != unaffected_paths:
-        raise WorkflowError("unaffected path proof is incomplete")
-    old_parent = commit_parents(repo_root, old["sha"])
-    if len(old_parent) != 1:
-        raise WorkflowError("old rewritten commit is not linear")
-    for path in unaffected_paths:
-        old_digest = conflict_patch_sha256(
-            repo_root, old_parent[0], old["sha"], path
-        )
-        new_digest = conflict_patch_sha256(repo_root, parent, new_sha, path)
-        if unaffected[path] != old_digest or new_digest != old_digest:
-            raise WorkflowError(f"unaffected patch drifted for {path}")
-
-
-def verify_rebased_range(
-    repo_root: Path,
-    base: str,
-    tip: str,
-    old_commits: list[dict[str, Any]],
-    mappings: list[Any],
-    allowed_paths: set[str],
-) -> None:
-    commits = ordered_commits(repo_root, base, tip)
-    if len(commits) != len(old_commits) or len(mappings) != len(old_commits):
-        raise WorkflowError("rewritten range dropped, added, squashed, or reordered commits")
-    parent = base
-    for old, new_sha, mapping in zip(old_commits, commits, mappings):
-        if commit_parents(repo_root, new_sha) != [parent]:
-            raise WorkflowError("rewritten range is not linear")
-        verify_commit_mapping(
-            repo_root, old, new_sha, parent, mapping, allowed_paths
-        )
-        parent = new_sha
-
-
-def verify_native_stack_member_input(
-    repo_root: Path,
-    member: dict[str, Any],
-) -> None:
-    merge_base, commits, sync_merges = native_stack_member_history(
-        repo_root,
-        current_base=member["direct_base_sha"],
-        retained_base=member["retained_base_sha"],
-        head=member["head_sha"],
-    )
-    if (
-        merge_base != member["direct_merge_base"]
-        or commits != [commit["sha"] for commit in member["old_commits"]]
-        or sync_merges != member["sync_merges"]
-    ):
-        raise WorkflowError(
-            "native stack member retained history identity drifted"
-        )
-
-
-def verify_merge_range(
-    repo_root: Path,
-    head: str,
-    base: str,
-    tip: str,
-    commits: list[str],
-    allowed_paths: set[str],
-) -> None:
-    if not commits or commits[-1] != tip:
-        raise WorkflowError("merge result has an incomplete commit range")
-    parent = head
-    for index, commit in enumerate(commits):
-        expected_parents = [head, base] if index == 0 else [parent]
-        if commit_parents(repo_root, commit) != expected_parents:
-            raise WorkflowError("merge result has reversed or unexpected parents")
-        if not set(conflict_diff_paths(repo_root, parent, commit)) <= allowed_paths:
-            raise WorkflowError("merge result changed undeclared paths")
-        parent = commit
-
-
-def verify_quarantined_result(
-    repo_root: Path,
-    request: dict[str, Any],
-    code_refs: list[dict[str, Any]],
-    artifact: dict[str, Any],
-    validations: list[dict[str, str]],
-) -> None:
-    expected_roles = (
-        [f"member:{member['pr_number']}" for member in request["native_stack"]["members"]]
-        if request["strategy"] == "native-stack"
-        else ["code"]
-    )
-    if [item.get("role") for item in code_refs] != expected_roles:
-        raise WorkflowError("generated code roles are missing, duplicated, or reordered")
-    allowed_paths = set(request["resolution_context_paths"])
-    previous_tip = (
-        request["native_stack"]["trunk"]["sha"]
-        if request["strategy"] == "native-stack"
-        else request["pull_request"]["base_sha"]
-    )
-    for index, code_ref in enumerate(code_refs):
-        expected_keys = {
-            "role",
-            "pr_number",
-            "repository",
-            "ref",
-            "old_sha",
-            "new_sha",
-            "base_ref",
-            "base_sha",
-            "lease_sha",
-            "commits",
-        }
-        if not isinstance(code_ref, dict) or set(code_ref) != expected_keys:
-            raise WorkflowError("generated code ref is malformed")
-        role = code_ref["role"]
-        local_ref = quarantine_ref(request["request_id"], role)
-        actual = git(repo_root, "rev-parse", "--verify", local_ref).lower()
-        if actual != code_ref["new_sha"]:
-            raise WorkflowError("quarantined code ref does not match its declared head")
-        expected_locator = (
-            assigned_code_ref(request["request_id"], role)
-            if request["strategy"] == "native-stack"
-            else artifact.get("branch")
-            if isinstance(artifact, dict)
-            else None
-        )
-        if code_ref["ref"] != expected_locator:
-            raise WorkflowError(
-                "generated code locator does not match its trusted source"
-            )
-        if code_ref["repository"] != request["repository"]:
-            raise WorkflowError("generated code ref belongs to another repository")
-        if request["strategy"] != "native-stack" and (
-            code_ref["pr_number"] != request["pull_request"]["number"]
-            or code_ref["base_ref"] != request["pull_request"]["base_ref"]
-            or code_ref["base_sha"] != request["pull_request"]["base_sha"]
-        ):
-            raise WorkflowError("generated code ref does not match the frozen pull request")
-        if request["strategy"] == "merge":
-            commits = list(code_ref["commits"])
-            if (
-                code_ref["old_sha"] != request["pull_request"]["head_sha"]
-                or code_ref["lease_sha"] != request["pull_request"]["head_sha"]
-            ):
-                raise WorkflowError("merge result does not match frozen identities")
-            verify_merge_range(
-                repo_root,
-                request["pull_request"]["head_sha"],
-                request["pull_request"]["base_sha"],
-                code_ref["new_sha"],
-                commits,
-                allowed_paths,
-            )
-        elif request["strategy"] == "rebase":
-            if (
-                code_ref["old_sha"] != request["pull_request"]["head_sha"]
-                or code_ref["lease_sha"] != request["pull_request"]["head_sha"]
-                or code_ref["base_sha"] != request["pull_request"]["base_sha"]
-            ):
-                raise WorkflowError("rebase result does not match frozen identities")
-            verify_rebased_range(
-                repo_root,
-                request["pull_request"]["base_sha"],
-                code_ref["new_sha"],
-                request["head_commits"],
-                code_ref["commits"],
-                allowed_paths,
-            )
-        else:
-            member = request["native_stack"]["members"][index]
-            if (
-                code_ref["pr_number"] != member["pr_number"]
-                or code_ref["old_sha"] != member["head_sha"]
-                or code_ref["lease_sha"] != member["lease_sha"]
-                or code_ref["base_sha"] != previous_tip
-            ):
-                raise WorkflowError("native stack result violates member order or lease")
-            verify_native_stack_member_input(repo_root, member)
-            verify_rebased_range(
-                repo_root,
-                previous_tip,
-                code_ref["new_sha"],
-                member["old_commits"],
-                code_ref["commits"],
-                allowed_paths,
-            )
-            previous_tip = code_ref["new_sha"]
-    if set(artifact) == {"branch", "head_sha", "semantic", "report", "receipt"}:
-        artifact_ref = quarantine_ref(request["request_id"], "artifact")
-        artifact_head = git(repo_root, "rev-parse", "--verify", artifact_ref).lower()
-        semantic = artifact["semantic"]
-        report = artifact["report"]
-        receipt = artifact["receipt"]
-        semantic_path = (
-            f"{CONFLICT_SEMANTIC_DIRECTORY}/{request['request_id']}.json"
-        )
-        semantic_bytes = git_bytes(
-            repo_root,
-            "show",
-            f"{artifact_head}:{semantic_path}",
-        )
-        if (
-            artifact_head != artifact["head_sha"]
-            or artifact_head in {item["new_sha"] for item in code_refs}
-            or commit_parents(repo_root, artifact_head) != [code_refs[-1]["new_sha"]]
-            or conflict_changed_paths(repo_root, artifact_head) != [semantic_path]
-            or semantic_bytes is None
-            or semantic
-            != {
-                "schema": CONFLICT_SEMANTIC_SCHEMA,
-                "kind": "conflict-resolution",
-                "path": semantic_path,
-                "commit": artifact_head,
-                "sha256": hashlib.sha256(semantic_bytes).hexdigest(),
-            }
-            or not isinstance(report, dict)
-            or set(report) != {"sha256", "content"}
-            or not isinstance(report.get("content"), str)
-            or not report["content"].strip()
-            or report.get("sha256")
-            != hashlib.sha256(report["content"].encode("utf-8")).hexdigest()
-            or request["request_id"] not in report["content"]
-            or request["request_sha256"] not in report["content"]
-            or not isinstance(receipt, dict)
-            or set(receipt) != {"sha256", "value"}
-            or not isinstance(receipt.get("value"), dict)
-            or receipt.get("sha256")
-            != hashlib.sha256(
-                canonical_json(receipt["value"]).encode("utf-8")
-            ).hexdigest()
-        ):
-            raise WorkflowError("managed semantic artifact identity is malformed")
-        expected_receipt = {
-            "schema": V5_CONFLICT_RECEIPT_SCHEMA,
-            "request": {
-                "id": request["request_id"],
-                "sha256": request["request_sha256"],
-            },
-            "policy": V5_CONFLICT_POLICY_IDENTITY,
-            "model": request["model"],
-            "mode": "conflict_with_report",
-            "strategy": request["strategy"],
-            "repository": request["repository"],
-            "pull_request": request["pull_request"],
-            "generated_refs": [
-                {
-                    "ref": item,
-                    "sha256": hashlib.sha256(
-                        canonical_json(item).encode("utf-8")
-                    ).hexdigest(),
-                }
-                for item in code_refs
-            ],
-            "validation_complete": True,
-            "validation": validations,
-        }
-        if receipt["value"] != expected_receipt:
-            raise WorkflowError(
-                "mechanical conflict receipt does not match the pinned request"
-            )
-        require_no_credentials(report["content"], source="conflict report")
-        validate_passed_validations(receipt["value"]["validation"])
-        return
-    artifact_keys = {"branch", "head_sha", "report", "receipt"}
-    if not isinstance(artifact, dict) or set(artifact) != artifact_keys:
-        raise WorkflowError("managed artifact identity is malformed")
-    artifact_ref = quarantine_ref(request["request_id"], "artifact")
-    artifact_head = git(repo_root, "rev-parse", "--verify", artifact_ref).lower()
-    if (
-        artifact_head != artifact["head_sha"]
-        or artifact_head in {item["new_sha"] for item in code_refs}
-        or commit_parents(repo_root, artifact_head) != [code_refs[-1]["new_sha"]]
-    ):
-        raise WorkflowError("artifact ref is not separate from publishable code")
-    report_path = (
-        f"{CONFLICT_REPORT_DIRECTORY}/{request['request_id']}.md"
-    )
-    receipt_path = (
-        f"{CONFLICT_RECEIPT_DIRECTORY}/{request['request_id']}.json"
-    )
-    if conflict_changed_paths(repo_root, artifact_head) != sorted(
-        [report_path, receipt_path]
-    ):
-        raise WorkflowError("artifact commit changed publishable code")
-    report_bytes = git_bytes(repo_root, "show", f"{artifact_head}:{report_path}")
-    receipt_bytes = git_bytes(repo_root, "show", f"{artifact_head}:{receipt_path}")
-    if report_bytes is None or receipt_bytes is None:
-        raise WorkflowError("managed artifact files are missing")
-    try:
-        report = report_bytes.decode("utf-8")
-        receipt_text = receipt_bytes.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise WorkflowError("managed artifact files are not UTF-8") from error
-    expected_artifact = {
-        "branch": artifact["branch"],
-        "head_sha": artifact_head,
-        "report": {
-            "path": report_path,
-            "commit": artifact_head,
-            "sha256": hashlib.sha256(report_bytes).hexdigest(),
-        },
-        "receipt": {
-            "path": receipt_path,
-            "commit": artifact_head,
-        },
-    }
-    if artifact != expected_artifact:
-        raise WorkflowError("artifact result identity does not match committed files")
-    require_no_credentials(report, source="conflict report")
-    require_no_credentials(receipt_text, source="conflict receipt")
-    try:
-        receipt = json.loads(receipt_text)
-    except json.JSONDecodeError as error:
-        raise WorkflowError(f"conflict receipt is invalid JSON: {error}") from error
-    receipt_keys = {
-        "schema",
-        "request",
-        "policy",
-        "model",
-        "mode",
-        "strategy",
-        "repository",
-        "pull_request",
-        "generated_refs",
-        "validation_complete",
-        "validation",
-    }
-    expected_refs = [
-        {
-            "ref": item,
-            "sha256": hashlib.sha256(canonical_json(item).encode("utf-8")).hexdigest(),
-        }
-        for item in code_refs
-    ]
-    if (
-        not isinstance(receipt, dict)
-        or set(receipt) != receipt_keys
-        or receipt["schema"] != V5_CONFLICT_RECEIPT_SCHEMA
-        or receipt["request"]
-        != {
-            "id": request["request_id"],
-            "sha256": request["request_sha256"],
-        }
-        or receipt["policy"] != V5_CONFLICT_POLICY_IDENTITY
-        or receipt["model"] != request["model"]
-        or receipt["mode"] != "conflict_with_report"
-        or receipt["strategy"] != request["strategy"]
-        or receipt["repository"] != request["repository"]
-        or receipt["pull_request"] != request["pull_request"]
-        or receipt["generated_refs"] != expected_refs
-        or receipt["validation_complete"] is not True
-        or receipt["validation"] != validations
-    ):
-        raise WorkflowError("conflict receipt does not match the pinned request")
-    validate_passed_validations(receipt["validation"])
-    if request["request_id"] not in report or request["request_sha256"] not in report:
-        raise WorkflowError("conflict report omits the request identity")
-
-
-load_v5_conflict_result = load_conflict_result
-validate_v5_conflict_result_identity = validate_conflict_result_identity
-verify_v5_quarantined_result = verify_quarantined_result
-
-
-def load_conflict_result(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise WorkflowError(f"managed conflict result is invalid: {error}") from error
-    expected = {
-        "schema",
-        "status",
-        "error",
-        "model",
-        "policy",
-        "repository",
-        "task",
-        "mode",
-        "strategy",
-        "request",
-        "pull_request",
-        "generated",
-        "application",
     }
     if (
         not isinstance(value, dict)
@@ -9203,6 +8625,49 @@ def verify_rebased_range_mechanically(
         paths = conflict_changed_paths(repo_root, new_sha)
         require_candidate_code_paths(paths)
         parent = new_sha
+
+
+def quarantine_ref(request_id: str, role: str) -> str:
+    safe_role = re.sub(r"[^A-Za-z0-9._-]", "-", role)
+    return f"refs/cloud-conflict-tasks/{request_id}/{safe_role}"
+
+
+def verify_merge_range(
+    repo_root: Path,
+    head: str,
+    base: str,
+    tip: str,
+    commits: list[str],
+    allowed_paths: set[str],
+) -> None:
+    if not commits or commits[-1] != tip:
+        raise WorkflowError("merge result has an incomplete commit range")
+    parent = head
+    for index, commit in enumerate(commits):
+        expected_parents = [head, base] if index == 0 else [parent]
+        if commit_parents(repo_root, commit) != expected_parents:
+            raise WorkflowError("merge result has reversed or unexpected parents")
+        if not set(conflict_diff_paths(repo_root, parent, commit)) <= allowed_paths:
+            raise WorkflowError("merge result changed undeclared paths")
+        parent = commit
+
+
+def verify_native_stack_member_input(
+    repo_root: Path,
+    member: dict[str, Any],
+) -> None:
+    merge_base, commits, sync_merges = native_stack_member_history(
+        repo_root,
+        current_base=member["direct_base_sha"],
+        retained_base=member["retained_base_sha"],
+        head=member["head_sha"],
+    )
+    if (
+        merge_base != member["direct_merge_base"]
+        or commits != [commit["sha"] for commit in member["old_commits"]]
+        or sync_merges != member["sync_merges"]
+    ):
+        raise WorkflowError("native stack member retained history identity drifted")
 
 
 def verify_source_artifact(
@@ -9817,7 +9282,7 @@ def publish_conflict_result(
             repo_root, "update-ref", "-d",
             quarantine_ref(request["request_id"], f"artifact-member-{member['pr_number']}"),
         )
-    for file_name in task.get("recovery_files") or []:
+    for file_name in task.get("audit_files") or []:
         try:
             Path(file_name).unlink(missing_ok=True)
         except OSError:
@@ -9834,25 +9299,76 @@ def publish_conflict_result(
     }
 
 
-def require_fresh_invocation(args: argparse.Namespace) -> None:
-    replacement_values = (
-        args.replace_unidentified_owner,
-        args.replace_malformed_completed_task,
-        args.expected_malformed_result_sha256,
-        args.expected_malformed_task_prompt_sha256,
-        args.expected_malformed_request_id,
-        args.expected_malformed_request_sha256,
-    )
-    if args.resume or any(value is not None for value in replacement_values):
-        raise WorkflowError(
-            "resume and legacy-owner replacement are disabled; start a fresh "
-            "invocation with --new-invocation"
-        )
+def record_source_head_changed(
+    state_path: Path,
+    state: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    task = state["agent_task"]
+    error = result.get("error")
+    remote_task = result.get("task")
+    generated = result.get("generated")
+    if (
+        not isinstance(error, dict)
+        or error.get("code") != "source_head_changed"
+        or not isinstance(error.get("pr_number"), str)
+        or not error["pr_number"].isdigit()
+        or not re.fullmatch(r"[0-9a-f]{40}", str(error.get("expected_head")))
+        or not re.fullmatch(r"[0-9a-f]{40}", str(error.get("actual_head")))
+        or not isinstance(remote_task, dict)
+        or set(remote_task) != {"id", "url", "state", "base_ref", "base_sha"}
+        or not remote_task.get("id")
+        or remote_task.get("state") != "completed"
+        or not isinstance(generated, dict)
+        or set(generated) != {"artifact", "code_refs"}
+    ):
+        raise WorkflowError("source-head drift result is incomplete")
+    candidate = {
+        "status": "preserved",
+        "result_file": task["result_file"],
+        "task": remote_task,
+        "generated": generated,
+    }
+    task["status"] = "superseded"
+    task["task_id"] = remote_task["id"]
+    task["task_id_status"] = "known"
+    task["error"] = error
+    task["candidate"] = candidate
+    task["publication"] = {
+        "status": "not_started",
+        "reason": "source_head_changed",
+    }
+    state["last_result"] = "head_changed"
+    state["attempt"] = {
+        "id": f"pr-{state['pr']['number']}-attempt-{state['attempts']}",
+        "attempt_number": state["attempts"],
+        "status": "superseded",
+        "strategy": task["preflight"]["request"]["strategy"],
+        "head_sha": error["expected_head"],
+        "observed_head_sha": error["actual_head"],
+        "published_head_sha": None,
+        "mergeable_at_head_sha": None,
+    }
+    save_state(state_path, state)
+    return {
+        "result": "head_changed",
+        "reason": "source_head_changed",
+        "state": str(state_path),
+        "pr_number": int(error["pr_number"]),
+        "expected_head": error["expected_head"],
+        "actual_head": error["actual_head"],
+        "iteration": task["preflight"]["request"]["iteration"],
+        "allowance_consumed": True,
+        "managed_attempts": state["managed_attempts"],
+        "candidate": candidate,
+        "publication": "not_started",
+        "disposition": "skipped_incomplete",
+        "stage_outcome": "skipped",
+    }
 
 
 def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     output = result_sink or emit
-    require_fresh_invocation(args)
     authorization = getattr(args, "_propagation_request", None)
     if getattr(args, "stack_request", None) or (args.pipeline_run and args.whole_stack):
         authorization = load_stack_request(
@@ -9867,9 +9383,6 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
     iteration_budget = args.pipeline_max_iterations or args.max_iterations
-    replaced_task: dict[str, Any] | None = None
-    replacement_identity: dict[str, str] | None = None
-    malformed_replacement: dict[str, str] | None = None
     if args.expected_state_sha256 is not None:
         if not re.fullmatch(r"[0-9a-f]{64}", args.expected_state_sha256):
             raise WorkflowError("expected state hash must be lowercase SHA-256")
@@ -9877,252 +9390,48 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             raise WorkflowError("expected state does not exist")
         if sha256_file(state_path) != args.expected_state_sha256:
             raise WorkflowError("expected state hash does not match")
-    if args.replace_unidentified_owner is not None:
-        if args.resume:
-            raise WorkflowError(
-                "--replace-unidentified-owner cannot be combined with --resume"
-            )
-        if args.expected_state_sha256 is None:
-            raise WorkflowError(
-                "--replace-unidentified-owner requires --expected-state-sha256"
-            )
+    replaced_task = None
+    if existing is not None:
         active = existing.get("agent_task")
-        error = active.get("error") if isinstance(active, dict) else None
+        replaceable_preflight = (
+            isinstance(active, dict)
+            and active.get("status") in {"failed", "normalization_required"}
+            and active.get("task_id_status") == "not_created"
+        )
         if (
-            not isinstance(active, dict)
-            or active.get("run_id") != args.replace_unidentified_owner
-            or active.get("status") != "interrupted"
-            or active.get("task_id") is not None
-            or active.get("task_id_status") != "unknown"
-            or not isinstance(error, dict)
-            or error.get("code")
-            not in {"managed_task_result_missing", "managed_task_result_unreadable"}
+            isinstance(active, dict)
+            and active.get("status") not in {"completed", "consumed"}
+            and not replaceable_preflight
         ):
             raise WorkflowError(
-                "replacement owner is not an exact unidentified result failure"
+                "an unfinished managed conflict task owns this invocation state"
             )
-        replaced_task = active
-        replacement_identity = {
-            "run_id": args.replace_unidentified_owner,
-            "state_sha256": args.expected_state_sha256,
-            "basis": "operator-verified-no-hosted-task",
-        }
-    malformed_values = (
-        args.replace_malformed_completed_task,
-        args.expected_malformed_result_sha256,
-        args.expected_malformed_task_prompt_sha256,
-        args.expected_malformed_request_id,
-        args.expected_malformed_request_sha256,
+        if replaceable_preflight:
+            replaced_task = active
+    prior_attempts = int(existing.get("attempts", 0)) if existing else 0
+    prior_managed_attempts = managed_attempt_count(existing)
+    pipeline_values = (
+        args.pipeline_run,
+        args.pipeline_iteration,
+        args.pipeline_max_iterations,
     )
-    if any(value is not None for value in malformed_values):
-        if not all(value is not None for value in malformed_values):
-            raise WorkflowError(
-                "malformed completed replacement options must be supplied together"
-            )
-        if args.resume or args.replace_unidentified_owner is not None:
-            raise WorkflowError(
-                "malformed completed replacement cannot be combined with another "
-                "recovery mode"
-            )
-        if args.expected_state_sha256 is None:
-            raise WorkflowError(
-                "malformed completed replacement requires --expected-state-sha256"
-            )
-        for value, description in (
-            (
-                args.expected_malformed_result_sha256,
-                "expected malformed result hash",
-            ),
-            (
-                args.expected_malformed_task_prompt_sha256,
-                "expected malformed task prompt hash",
-            ),
-            (
-                args.expected_malformed_request_sha256,
-                "expected malformed request hash",
-            ),
-        ):
-            if not re.fullmatch(r"[0-9a-f]{64}", value):
-                raise WorkflowError(f"{description} must be lowercase SHA-256")
-        if not re.fullmatch(
-            r"pr-[1-9][0-9]*-[0-9a-f]{16}",
-            args.expected_malformed_request_id,
-        ):
-            raise WorkflowError("expected malformed request ID is invalid")
-        active = existing.get("agent_task") if isinstance(existing, dict) else None
-        error = active.get("error") if isinstance(active, dict) else None
-        result = active.get("result") if isinstance(active, dict) else None
-        result_task = result.get("task") if isinstance(result, dict) else None
-        preflight = active.get("preflight") if isinstance(active, dict) else None
-        request = preflight.get("request") if isinstance(preflight, dict) else None
-        if (
-            not isinstance(active, dict)
-            or active.get("status") != "interrupted"
-            or active.get("task_id")
-            != args.replace_malformed_completed_task
-            or active.get("task_id_status") != "known"
-            or not isinstance(active.get("resume_attempts"), int)
-            or active["resume_attempts"] < 1
-            or not isinstance(error, dict)
-            or error.get("code") != "unexpected_history"
-            or not isinstance(result, dict)
-            or result.get("status") != "error"
-            or result.get("application") != {"status": "not_started"}
-            or result.get("validation") != {"complete": False, "outcomes": []}
-            or not isinstance(result_task, dict)
-            or result_task.get("id")
-            != args.replace_malformed_completed_task
-            or result_task.get("state") != "completed"
-            or not isinstance(request, dict)
-            or request.get("request_id")
-            != args.expected_malformed_request_id
-            or request.get("request_sha256")
-            != args.expected_malformed_request_sha256
-        ):
-            raise WorkflowError(
-                "replacement owner is not an exact malformed completed task"
-            )
-        run_id = active.get("run_id")
-        request_path_value = active.get("request_file")
-        prompt_path_value = active.get("prompt_file")
-        resumed_path_value = active.get("result_file")
-        recovery_files = active.get("recovery_files")
-        if (
-            not isinstance(run_id, str)
-            or not isinstance(request_path_value, str)
-            or not isinstance(prompt_path_value, str)
-            or not isinstance(resumed_path_value, str)
-            or not isinstance(recovery_files, list)
-        ):
-            raise WorkflowError("malformed completed replacement files are incomplete")
-        request_path = Path(request_path_value)
-        prompt_path = Path(prompt_path_value)
-        resumed_path = Path(resumed_path_value)
-        original_path = state_path.with_name(
-            f"{state_path.stem}--{run_id}--result-0.json"
-        )
-        try:
-            retained_request = json.loads(request_path.read_text(encoding="utf-8"))
-            retained_result = json.loads(resumed_path.read_text(encoding="utf-8"))
-            retained_prompt = prompt_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError, json.JSONDecodeError) as artifact_error:
-            raise WorkflowError(
-                "malformed completed replacement artifacts are unreadable: "
-                f"{artifact_error}"
-            ) from artifact_error
-        if (
-            any(
-                not path.is_file()
-                for path in (
-                    request_path,
-                    prompt_path,
-                    original_path,
-                    resumed_path,
-                )
-            )
-            or str(original_path) not in recovery_files
-            or str(resumed_path) not in recovery_files
-            or original_path.read_bytes() != resumed_path.read_bytes()
-            or sha256_file(resumed_path)
-            != args.expected_malformed_result_sha256
-            or retained_request != request
-            or retained_result != result
-            or retained_prompt != build_conflict_prompt(preflight)
-        ):
-            raise WorkflowError(
-                "malformed completed replacement artifact identity changed"
-            )
-        replaced_task = active
-        replacement_identity = {
-            "run_id": run_id,
-            "task_id": args.replace_malformed_completed_task,
-            "state_sha256": args.expected_state_sha256,
-            "request_id": args.expected_malformed_request_id,
-            "request_sha256": args.expected_malformed_request_sha256,
-            "result_sha256": args.expected_malformed_result_sha256,
-            "task_prompt_sha256": args.expected_malformed_task_prompt_sha256,
-            "basis": "completed-task-with-no-generated-commit",
-        }
-        malformed_replacement = {
-            "request_file": str(request_path),
-            "prompt_file": str(prompt_path),
-            "original_result_file": str(original_path),
-            "resumed_result_file": str(resumed_path),
-            "task_prompt_sha256": args.expected_malformed_task_prompt_sha256,
-        }
-    if args.resume:
-        if existing is None or not isinstance(existing.get("agent_task"), dict):
-            raise WorkflowError("recovery state has no managed conflict task")
-        state = existing
-        task = state["agent_task"]
-        if task.get("model") != model:
-            raise WorkflowError("recovery model does not match the pinned task")
-        if task.get("status") == "publishing":
-            output(publish_conflict_result(state_path, state))
-            return
-        if task.get("status") == "completed":
-            raise WorkflowError("managed conflict recovery state was already consumed")
-        preflight = task.get("preflight")
-        prior_path_value = task.get("result_file")
-        if (
-            not isinstance(preflight, dict)
-            or not isinstance(prior_path_value, str)
-            or not Path(prior_path_value).is_file()
-        ):
-            raise WorkflowError("managed conflict recovery files are incomplete")
-        prior_path = Path(prior_path_value)
-        task["resume_attempts"] = int(task.get("resume_attempts", 0)) + 1
-        result_path = state_path.with_name(
-            f"{state_path.stem}--{task['run_id']}--result-"
-            f"{task['resume_attempts']}.json"
-        )
-        input_result_path = prior_path
-        task["status"] = "resuming"
-        task["result_file"] = str(result_path)
-        task.setdefault("recovery_files", []).append(str(result_path))
-        save_state(state_path, state)
-    else:
-        if existing is not None:
-            active = existing.get("agent_task")
-            replaceable_preflight = (
-                isinstance(active, dict)
-                and active.get("status") in {"failed", "normalization_required"}
-                and active.get("task_id_status") == "not_created"
-            )
-            if (
-                isinstance(active, dict)
-                and active.get("status") not in {"completed", "consumed"}
-                and replacement_identity is None
-                and not replaceable_preflight
-            ):
-                raise WorkflowError(
-                    "an unfinished managed conflict task owns this state; use --resume"
-                )
-            if replaceable_preflight:
-                replaced_task = active
-        prior_attempts = int(existing.get("attempts", 0)) if existing else 0
-        prior_managed_attempts = managed_attempt_count(existing)
-        pipeline_values = (
-            args.pipeline_run,
-            args.pipeline_iteration,
-            args.pipeline_max_iterations,
-        )
-        if any(value is not None for value in pipeline_values) and not all(
-            value is not None for value in pipeline_values
-        ):
-            raise WorkflowError("pipeline run, iteration, and maximum must be supplied together")
-        iteration_number = (
-            args.pipeline_iteration
-            if args.pipeline_iteration is not None
-            else prior_managed_attempts + 1
-        )
-        iteration_budget = (
-            args.pipeline_max_iterations
-            if args.pipeline_max_iterations is not None
-            else args.max_iterations
-        )
-        if iteration_number > iteration_budget:
-            payload = {
+    if any(value is not None for value in pipeline_values) and not all(
+        value is not None for value in pipeline_values
+    ):
+        raise WorkflowError("pipeline run, iteration, and maximum must be supplied together")
+    iteration_number = (
+        args.pipeline_iteration
+        if args.pipeline_iteration is not None
+        else prior_managed_attempts + 1
+    )
+    iteration_budget = (
+        args.pipeline_max_iterations
+        if args.pipeline_max_iterations is not None
+        else args.max_iterations
+    )
+    if iteration_number > iteration_budget:
+        output(
+            {
                 "result": "max_iterations_reached",
                 "state": str(state_path),
                 "task_id": None,
@@ -10131,229 +9440,159 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
                 "iteration_budget": iteration_budget,
                 "stage_outcome": "escalated",
             }
-            if malformed_replacement is not None:
-                payload["next_action"] = (
-                    "A new hash-gated malformed-task replacement authorization "
-                    "is required."
-                )
-            output(payload)
-            return
-        run_id = secrets.token_hex(8)
-        iteration_id = (
-            f"{args.pipeline_run}-{iteration_number}"
-            if args.pipeline_run
-            else f"conflict-{run_id}"
         )
-        state = existing or {
-            "version": STATE_VERSION,
-            "created_at": utc_now(),
-            "attempts": prior_attempts,
-            "history": [],
-            "escalation": None,
+        return
+    run_id = secrets.token_hex(8)
+    iteration_id = (
+        f"{args.pipeline_run}-{iteration_number}"
+        if args.pipeline_run
+        else f"conflict-{run_id}"
+    )
+    state = existing or {
+        "version": STATE_VERSION,
+        "created_at": utc_now(),
+        "attempts": prior_attempts,
+        "history": [],
+        "escalation": None,
+    }
+    if replaced_task is not None:
+        state.setdefault("managed_task_history", []).append(replaced_task)
+    state["repo_root"] = str(repo_root)
+    state["pr"] = state.get("pr") or {
+        "number": target["number"],
+        "title": None,
+        "pr_url": target["pr_url"],
+        "repo_name": target["repo_name"],
+        "head_branch": None,
+        "base_branch": None,
+        "head_sha": None,
+    }
+    state["agent_task"] = {
+        "run_id": run_id,
+        "invocation_id": invocation_id,
+        "status": "preparing",
+        "task_id": None,
+        "task_id_status": "not_created",
+        "model": model,
+        "policy": CONFLICT_POLICY,
+        "target": target["pr_url"],
+        "requested_strategy": args.strategy,
+        "whole_stack": args.whole_stack,
+        "iteration": {
+            "id": iteration_id,
+            "number": iteration_number,
+            "budget": iteration_budget,
+        },
+    }
+    save_state(state_path, state)
+    try:
+        preflight = conflict_preflight(
+            repo_root,
+            target,
+            requested_strategy=args.strategy,
+            whole_stack=args.whole_stack,
+            iteration_id=iteration_id,
+            iteration_number=iteration_number,
+            iteration_budget=iteration_budget,
+            model=model,
+            **({"stack_request": authorization} if authorization is not None else {}),
+            **(
+                {"allow_native_stack": args.whole_stack}
+                if getattr(args, "command", None) == "pipeline"
+                else {}
+            ),
+        )
+    except NativeStackNormalizationRequired as error:
+        task = state["agent_task"]
+        task["status"] = "failed"
+        task["error"] = {
+            "code": "conflict_preflight_failed",
+            "message": str(error),
         }
-        if replaced_task is not None:
-            state.setdefault("managed_task_history", []).append(replaced_task)
-        state["repo_root"] = str(repo_root)
-        state["pr"] = state.get("pr") or {
-            "number": target["number"],
-            "title": None,
-            "pr_url": target["pr_url"],
-            "repo_name": target["repo_name"],
-            "head_branch": None,
-            "base_branch": None,
-            "head_sha": None,
-        }
-        state["agent_task"] = {
-            "run_id": run_id,
-            "invocation_id": invocation_id,
-            "status": "preparing",
-            "task_id": None,
-            "task_id_status": "not_created",
-            "model": model,
-            "policy": CONFLICT_POLICY,
-            "target": target["pr_url"],
-            "requested_strategy": args.strategy,
-            "whole_stack": args.whole_stack,
-            "iteration": {
-                "id": iteration_id,
-                "number": iteration_number,
-                "budget": iteration_budget,
-            },
-        }
-        if replacement_identity is not None:
-            replacement_field = (
-                "replaces_malformed_completed_task"
-                if malformed_replacement is not None
-                else "replaces_unidentified_owner"
-            )
-            state["agent_task"][replacement_field] = replacement_identity
         save_state(state_path, state)
-        try:
-            preflight = conflict_preflight(
-                repo_root,
-                target,
-                requested_strategy=args.strategy,
-                whole_stack=args.whole_stack,
-                iteration_id=iteration_id,
-                iteration_number=iteration_number,
-                iteration_budget=iteration_budget,
-                model=model,
-                **({"stack_request": authorization} if authorization is not None else {}),
-                **(
-                    {"allow_native_stack": args.whole_stack}
-                    if getattr(args, "command", None) == "pipeline"
-                    else {}
-                ),
-            )
-        except NativeStackNormalizationRequired as error:
-            task = state["agent_task"]
-            task["status"] = (
-                "replacement_rejected"
-                if malformed_replacement is not None
-                else "normalization_required"
-            )
-            task["normalization"] = error.manifest
-            task["normalization_sha256"] = error.manifest_sha256
-            task["error"] = {
-                "code": "native_stack_normalization_required",
-                "message": str(error),
-            }
-            save_state(state_path, state)
-            payload = {
-                "result": (
-                    "recovery_required"
-                    if malformed_replacement is not None
-                    else "normalization_required"
-                ),
-                "state": str(state_path),
-                "task_id": None,
-                "task_id_status": "not_created",
-                "error": task["error"],
-                "normalization": error.manifest,
-                "normalization_sha256": error.manifest_sha256,
-                "next_action": (
-                    "Use a fresh local owner session to linearize the named "
-                    "stack member without pushing, preserving every linear "
-                    "commit and each recorded merge-resolution intent. "
-                    "A new exact replacement authorization is required afterward."
-                ),
-                "stage_outcome": "escalated",
-            }
-            output(payload)
-            return
-        except (WorkflowError, json.JSONDecodeError, OSError) as error:
-            task = state["agent_task"]
-            task["status"] = (
-                "replacement_rejected"
-                if malformed_replacement is not None
-                else "failed"
-            )
-            task["error"] = {
-                "code": "conflict_preflight_failed",
-                "message": str(error),
-            }
-            save_state(state_path, state)
-            payload = {
-                "result": (
-                    "recovery_required"
-                    if malformed_replacement is not None
-                    else "task_creation_failed"
-                ),
+        output(
+            {
+                "result": "task_creation_failed",
                 "state": str(state_path),
                 "task_id": None,
                 "task_id_status": "not_created",
                 "error": task["error"],
                 "stage_outcome": "escalated",
             }
-            if malformed_replacement is not None:
-                payload["next_action"] = (
-                    "A new hash-gated malformed-task replacement authorization "
-                    "is required."
-                )
-            output(payload)
-            return
-        except BaseException as error:
-            task = state["agent_task"]
-            task["status"] = "interrupted"
-            task["error"] = {
-                "code": "conflict_preflight_interrupted",
-                "message": f"{type(error).__name__}: {error}",
-            }
-            save_state(state_path, state)
-            raise
-        if preflight["already_mergeable"]:
-            if malformed_replacement is not None:
-                task = state["agent_task"]
-                task["status"] = "replacement_rejected"
-                task["error"] = {
-                    "code": "replacement_target_already_satisfied",
-                    "message": (
-                        "malformed completed replacement target no longer "
-                        "requires conflict work"
-                    ),
-                }
-                save_state(state_path, state)
-                output(
-                    {
-                        "result": "recovery_required",
-                        "state": str(state_path),
-                        "task_id": None,
-                        "task_id_status": "not_created",
-                        "error": task["error"],
-                        "next_action": (
-                            "A new hash-gated pipeline authorization is required."
-                        ),
-                        "stage_outcome": "escalated",
-                    }
-                )
-                return
-            record_mergeable_conflict(state_path, state, preflight, prior_managed_attempts)
-            return
-        request_path = state_path.with_name(
-            f"{state_path.stem}--{run_id}--request.json"
         )
-        prompt_path = state_path.with_name(
-            f"{state_path.stem}--{run_id}--prompt.txt"
-        )
-        result_path = state_path.with_name(
-            f"{state_path.stem}--{run_id}--result-0.json"
-        )
-        for path in (request_path, prompt_path, result_path):
-            require_external_path(path, repo_root)
-        atomic_write_text(request_path, canonical_json(preflight["request"]) + "\n")
-        prompt = build_conflict_prompt(preflight)
-        require_no_credentials(prompt, source="conflict worker prompt")
-        atomic_write_text(prompt_path, prompt)
-        state["attempts"] = prior_attempts + 1
-        state["managed_attempts"] = prior_managed_attempts + 1
-        state["repo_root"] = str(repo_root)
-        state["pr"] = preflight["pr"]
-        state["agent_task"] = {
-            "run_id": run_id,
-            "invocation_id": invocation_id,
-            "status": "dispatching",
-            "model": model,
-            "policy": CONFLICT_POLICY,
-            "preflight": preflight,
-            "request_file": str(request_path),
-            "prompt_file": str(prompt_path),
-            "result_file": str(result_path),
-            "resume_attempts": 0,
-            "recovery_files": [
-                str(request_path),
-                str(prompt_path),
-                str(result_path),
-            ],
+        return
+    except (WorkflowError, json.JSONDecodeError, OSError) as error:
+        task = state["agent_task"]
+        task["status"] = "failed"
+        task["error"] = {
+            "code": "conflict_preflight_failed",
+            "message": str(error),
         }
-        if replacement_identity is not None:
-            replacement_field = (
-                "replaces_malformed_completed_task"
-                if malformed_replacement is not None
-                else "replaces_unidentified_owner"
-            )
-            state["agent_task"][replacement_field] = replacement_identity
         save_state(state_path, state)
-        input_result_path = None
+        output(
+            {
+                "result": "task_creation_failed",
+                "state": str(state_path),
+                "task_id": None,
+                "task_id_status": "not_created",
+                "error": task["error"],
+                "stage_outcome": "escalated",
+            }
+        )
+        return
+    except BaseException as error:
+        task = state["agent_task"]
+        task["status"] = "interrupted"
+        task["error"] = {
+            "code": "conflict_preflight_interrupted",
+            "message": f"{type(error).__name__}: {error}",
+        }
+        save_state(state_path, state)
+        raise
+    if preflight["already_mergeable"]:
+        record_mergeable_conflict(
+            state_path,
+            state,
+            preflight,
+            prior_managed_attempts,
+        )
+        return
+    request_path = state_path.with_name(
+        f"{state_path.stem}--{run_id}--request.json"
+    )
+    prompt_path = state_path.with_name(
+        f"{state_path.stem}--{run_id}--prompt.txt"
+    )
+    result_path = state_path.with_name(
+        f"{state_path.stem}--{run_id}--result-0.json"
+    )
+    for path_value in (request_path, prompt_path, result_path):
+        require_external_path(path_value, repo_root)
+    atomic_write_text(request_path, canonical_json(preflight["request"]) + "\n")
+    prompt = build_conflict_prompt(preflight)
+    require_no_credentials(prompt, source="conflict worker prompt")
+    atomic_write_text(prompt_path, prompt)
+    state["attempts"] = prior_attempts + 1
+    state["managed_attempts"] = prior_managed_attempts + 1
+    state["repo_root"] = str(repo_root)
+    state["pr"] = preflight["pr"]
+    state["agent_task"] = {
+        "run_id": run_id,
+        "invocation_id": invocation_id,
+        "status": "dispatching",
+        "model": model,
+        "policy": CONFLICT_POLICY,
+        "preflight": preflight,
+        "request_file": str(request_path),
+        "prompt_file": str(prompt_path),
+        "result_file": str(result_path),
+        "audit_files": [
+            str(request_path),
+            str(prompt_path),
+            str(result_path),
+        ],
+    }
+    save_state(state_path, state)
     task = state["agent_task"]
     preflight = task["preflight"]
     if preflight.get("stack_request") is not None:
@@ -10378,58 +9617,12 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
         "--model",
         args.model,
     ]
-    if input_result_path is not None:
-        command.extend(["--input-result-file", str(input_result_path)])
-    if malformed_replacement is not None:
-        command.extend(
-            [
-                "--replace-malformed-request-file",
-                malformed_replacement["request_file"],
-                "--replace-malformed-prompt-file",
-                malformed_replacement["prompt_file"],
-                "--replace-malformed-original-result-file",
-                malformed_replacement["original_result_file"],
-                "--replace-malformed-resumed-result-file",
-                malformed_replacement["resumed_result_file"],
-                "--expected-malformed-task-prompt-sha256",
-                malformed_replacement["task_prompt_sha256"],
-            ]
-        )
     task["helper_command"] = command
     task["status"] = "running"
     save_state(state_path, state)
     try:
         process = run(command, cwd=repo_root, check=False)
     except OSError as error:
-        if args.resume:
-            prior_result = task.get("result")
-            prior_task = (
-                prior_result.get("task")
-                if isinstance(prior_result, dict)
-                else None
-            )
-            task_id = prior_task.get("id") if isinstance(prior_task, dict) else None
-            task["status"] = "interrupted"
-            task["task_id"] = task_id
-            task["task_id_status"] = "known" if task_id else "unknown"
-            task["error"] = {
-                "code": "managed_task_resume_launch_failed",
-                "message": str(error),
-            }
-            save_state(state_path, state)
-            output(
-                {
-                    "result": "recovery_required",
-                    "state": str(state_path),
-                    "task_id": task_id,
-                    "task_id_status": task["task_id_status"],
-                    "error": task["error"],
-                    "recovery_files": task["recovery_files"],
-                    "next_action": "Retry the retained recovery command.",
-                    "stage_outcome": "escalated",
-                }
-            )
-            return
         task["status"] = "failed"
         task["task_id"] = None
         task["task_id_status"] = "not_created"
@@ -10445,7 +9638,7 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
                 "task_id": None,
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
-                "recovery_files": task["recovery_files"],
+                "audit_files": task["audit_files"],
                 "stage_outcome": "escalated",
             }
         )
@@ -10466,7 +9659,7 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
                 "task_id": None,
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
-                "recovery_files": task["recovery_files"],
+                "audit_files": task["audit_files"],
                 "next_action": "Start a fresh invocation.",
                 "stage_outcome": "escalated",
             }
@@ -10490,7 +9683,7 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
                 "process": task["process"],
-                "recovery_files": task["recovery_files"],
+                "audit_files": task["audit_files"],
                 "next_action": "Start a fresh invocation.",
                 "stage_outcome": "escalated",
             }
@@ -10516,7 +9709,7 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
                 "task_id_status": task["task_id_status"],
                 "error": task["error"],
                 "process": task["process"],
-                "recovery_files": task["recovery_files"],
+                "audit_files": task["audit_files"],
                 "next_action": "Start a fresh invocation.",
                 "stage_outcome": "escalated",
             }
@@ -10524,8 +9717,15 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
         return
     task["result"] = result
     task["result_file"] = str(result_path)
+    error = result.get("error")
+    if (
+        process.returncode != 0
+        and isinstance(error, dict)
+        and error.get("code") == "source_head_changed"
+    ):
+        output(record_source_head_changed(state_path, state, result))
+        return
     if process.returncode != 0 or result.get("status") != "success":
-        error = result.get("error")
         code = error.get("code") if isinstance(error, dict) else "unknown"
         message = error.get("message") if isinstance(error, dict) else "no detail"
         task_id = (
@@ -10533,37 +9733,20 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             if isinstance(result.get("task"), dict)
             else None
         )
-        task["status"] = (
-            "interrupted"
-            if task_id
-            else (
-                "replacement_rejected"
-                if malformed_replacement is not None
-                else "failed"
-            )
-        )
+        task["status"] = "interrupted" if task_id else "failed"
         task["task_id"] = task_id
         task["task_id_status"] = "known" if task_id else "not_created"
         task["error"] = {"code": code, "message": message}
         save_state(state_path, state)
         payload = {
-            "result": (
-                "invocation_abandoned"
-                if task_id or malformed_replacement is not None
-                else "task_creation_failed"
-            ),
+            "result": "invocation_abandoned" if task_id else "task_creation_failed",
             "state": str(state_path),
             "task_id": task_id,
             "task_id_status": task["task_id_status"],
             "error": task["error"],
-            "recovery_files": task["recovery_files"],
+            "audit_files": task["audit_files"],
             "stage_outcome": "escalated",
         }
-        if malformed_replacement is not None:
-            payload["next_action"] = (
-                "A new hash-gated malformed-task replacement authorization "
-                "is required."
-            )
         output(payload)
         return
     code_refs, artifact = validate_conflict_result_identity(
@@ -10832,7 +10015,6 @@ def revalidate_pipeline_conflict(
 
 
 def command_pipeline(args: argparse.Namespace) -> int:
-    require_fresh_invocation(args)
     if not args.state or not args.pipeline_run or not args.repo_root:
         raise WorkflowError("pipeline requires --state, --pipeline-run, and --repo-root")
     state_path = cli_path(args.state)
@@ -10917,7 +10099,7 @@ def command_pipeline(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = CommandPassthroughArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     agent_task = subparsers.add_parser(
@@ -10943,90 +10125,11 @@ def build_parser() -> argparse.ArgumentParser:
     agent_task.add_argument("--pipeline-run")
     agent_task.add_argument("--pipeline-iteration", type=int)
     agent_task.add_argument("--pipeline-max-iterations", type=int)
-    agent_task.add_argument("--resume", action="store_true")
     invocation = agent_task.add_mutually_exclusive_group()
     invocation.add_argument("--new-invocation", action="store_true")
     invocation.add_argument("--invocation-run")
-    agent_task.add_argument("--replace-unidentified-owner")
-    agent_task.add_argument("--replace-malformed-completed-task")
-    agent_task.add_argument("--expected-malformed-result-sha256")
-    agent_task.add_argument("--expected-malformed-task-prompt-sha256")
-    agent_task.add_argument("--expected-malformed-request-id")
-    agent_task.add_argument("--expected-malformed-request-sha256")
     agent_task.add_argument("--expected-state-sha256")
     agent_task.set_defaults(function=command_agent_task)
-
-    preflight = subparsers.add_parser(
-        "preflight",
-        help="resolve and check out a PR, read live mergeability, and pick a strategy",
-    )
-    preflight.add_argument(
-        "target",
-        nargs="?",
-        help=(
-            "PR URL or owner/repo#number; omit only from a worktree attached to "
-            "the PR's branch"
-        ),
-    )
-    preflight.add_argument("--repo-root")
-    preflight.add_argument("--state")
-    preflight.add_argument("--strategy", choices=list(STRATEGIES), default="auto")
-    preflight.add_argument(
-        "--whole-stack",
-        action="store_true",
-        help=(
-            "inspect every native-stack member even when the invoked pull request "
-            "is already mergeable"
-        ),
-    )
-    preflight.set_defaults(function=command_preflight)
-
-    attempt = subparsers.add_parser(
-        "attempt", help="start the integration and report every conflicted file"
-    )
-    attempt.add_argument("--state", required=True)
-    attempt.set_defaults(function=command_attempt)
-
-    resolved = subparsers.add_parser(
-        "resolved", help="record conflicted files this run resolved and stage them"
-    )
-    resolved.add_argument("--state", required=True)
-    resolved.add_argument("--paths", nargs="+", required=True)
-    resolved.add_argument(
-        "--companion-paths",
-        nargs="+",
-        help=(
-            "non-conflicted files that the commit being replayed also touches and "
-            "that must change to preserve both sides"
-        ),
-    )
-    rationale = resolved.add_mutually_exclusive_group(required=True)
-    rationale.add_argument("--rationale")
-    rationale.add_argument(
-        "--rationale-file", help="UTF-8 rationale file, or - for standard input"
-    )
-    resolved.add_argument(
-        "--accept-one-side",
-        action="store_true",
-        help="allow a resolution that is byte-for-byte one side of the conflict",
-    )
-    resolved.add_argument(
-        "--accept-line-endings",
-        action="store_true",
-        help="allow a resolution that changes the file's line endings",
-    )
-    resolved.add_argument(
-        "--accept-deletion",
-        action="store_true",
-        help="allow a resolution that leaves the file deleted",
-    )
-    resolved.set_defaults(function=command_resolved)
-
-    continue_parser = subparsers.add_parser(
-        "continue", help="finish the merge commit or replay the next rebased commit"
-    )
-    continue_parser.add_argument("--state", required=True)
-    continue_parser.set_defaults(function=command_continue)
 
     abort = subparsers.add_parser(
         "abort", help="undo the in-progress merge or rebase and end the attempt"
@@ -11046,90 +10149,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     escalate.add_argument("--recommended-action")
     escalate.set_defaults(function=command_escalate)
-
-    publish = subparsers.add_parser(
-        "publish", help="push the resolved head branch and verify what moved"
-    )
-    publish.add_argument("--state", required=True)
-    publish.set_defaults(function=command_publish)
-
-    stack_rebase = subparsers.add_parser(
-        "stack-rebase",
-        help="cascade a rebase through the trunk for a native GitHub stack",
-    )
-    stack_rebase.add_argument("--state", required=True)
-    stack_rebase.set_defaults(function=command_stack_rebase)
-
-    stack_continue = subparsers.add_parser(
-        "stack-continue",
-        help="continue a cascading rebase after resolving its conflicted files",
-    )
-    stack_continue.add_argument("--state", required=True)
-    stack_continue.set_defaults(function=command_stack_continue)
-
-    stack_format = subparsers.add_parser(
-        "stack-format",
-        help="run the repository formatter and record the current stack member",
-    )
-    stack_format.add_argument("--state", required=True)
-    format_choice = stack_format.add_mutually_exclusive_group(required=True)
-    format_choice.add_argument(
-        "--format-command",
-        nargs="+",
-        help=(
-            "formatter executable and arguments, run in the cascade workspace; "
-            "this must be the last helper option because all remaining arguments "
-            "are passed through"
-        ),
-    )
-    format_choice.add_argument(
-        "--no-format",
-        action="store_true",
-        help="record that this repository has no formatting step for this layer",
-    )
-    stack_format.set_defaults(function=command_stack_format)
-
-    stack_abort = subparsers.add_parser(
-        "stack-abort",
-        help="abort a cascading rebase and remove its scratch clone",
-    )
-    stack_abort.add_argument("--state", required=True)
-    stack_abort.set_defaults(function=command_stack_abort)
-
-    stack_validation_fix = subparsers.add_parser(
-        "stack-validation-fix",
-        help=(
-            "atomically record an explicit validation repair on the final stack "
-            "member"
-        ),
-    )
-    stack_validation_fix.add_argument("--state", required=True)
-    stack_validation_fix.add_argument("--paths", nargs="+", required=True)
-    validation_rationale = stack_validation_fix.add_mutually_exclusive_group(
-        required=True
-    )
-    validation_rationale.add_argument("--rationale")
-    validation_rationale.add_argument(
-        "--rationale-file", help="UTF-8 rationale file, or - for standard input"
-    )
-    stack_validation_fix.add_argument(
-        "--fix-command",
-        nargs="+",
-        required=True,
-        help=(
-            "executable and arguments that make the declared fixes in the cascade "
-            "workspace; this must be the last helper option because all remaining "
-            "arguments are passed through"
-        ),
-    )
-    stack_validation_fix.set_defaults(function=command_stack_validation_fix)
-
-    stack_publish = subparsers.add_parser(
-        "stack-publish",
-        help="push every stack member and verify each landed on its rebased tip",
-    )
-    stack_publish.add_argument("--state", required=True)
-    stack_publish.set_defaults(function=command_stack_publish)
 
     propagate = subparsers.add_parser(
         "descendant-propagate",
@@ -11193,6 +10212,7 @@ _EXECUTION = None
 EXECUTION_TERMINAL_RESULTS = frozenset({
     "published",
     "mergeable",
+    "head_changed",
     "no_descendants",
 })
 EXECUTION_SHA256 = "bcca8dfa65d156b33081c2edf841b375a0620d4c1bdbc3cec3fd6501dc5cf53c"

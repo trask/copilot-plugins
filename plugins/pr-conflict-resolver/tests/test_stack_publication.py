@@ -113,13 +113,22 @@ class StackPublicationTest(unittest.TestCase):
         self.assertFalse(self.workspace.exists())
 
     def test_cli_rejects_unbound_and_other_legacy_commands(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["resolver", "descendant-propagate", "owner/repo#11"],
+        ):
+            self.assertEqual(1, MODULE.main())
         for command in (
-            ["descendant-propagate", "owner/repo#11"],
             ["stack-format", "--state", "old.json", "--no-format"],
             ["stack-continue", "--state", "old.json"],
         ):
-            with self.subTest(command=command), mock.patch.object(sys, "argv", ["resolver", *command]):
-                self.assertEqual(1, MODULE.main())
+            with (
+                self.subTest(command=command),
+                mock.patch.object(sys, "argv", ["resolver", *command]),
+                self.assertRaises(SystemExit),
+            ):
+                MODULE.main()
         self.calls["create_stack_workspace"].assert_not_called()
         self.calls["command_agent_task"].assert_not_called()
 

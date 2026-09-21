@@ -113,7 +113,7 @@ class ReplayMessageProofTest(unittest.TestCase):
 
     def test_controller_rechecks_task_session_and_account(self):
         request = existing.ManagedTaskPromptTest().minimal_request()
-        request.update(policy=CLOUD.SEQUENTIAL_POLICY, strategy="rebase")
+        request.update(policy=CLOUD.POLICY, strategy="rebase")
         task = existing.MinimalConflictContractTest().task(request)
         task["id"] = task["sessions"][0]["task_id"] = "task-1"
         task["creator"] = {"id": 218610}

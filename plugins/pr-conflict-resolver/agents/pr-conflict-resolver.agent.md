@@ -19,7 +19,7 @@ It never posts a comment, review, reply, label, or pull request update. Its only
 
 ## Controller execution
 
-Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Append it to the workflow command below. The installed `agent-tasks-runtime@trask-plugins` supplies the pinned execution library; it is not another agent.
+Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Append it to the workflow command below. The installed `agent-tasks-runtime@trask-plugins` version 1.0.22 supplies the pinned execution library; it is not another agent.
 
 Launch the controller once through the official execution tool. Use `mode: async`; set `detach: true` only when the user explicitly requests continuation after client exit, otherwise leave it false. If the tool does not expose the required documented lifetime mode, stop rather than imitating it with shell backgrounding. The Python controller stays in the foreground and owns its children. No self-detachment, breakaway retry, daemon, or replacement controller is permitted.
 
@@ -87,7 +87,7 @@ The helper performs a trusted local preflight without executing repository code.
 
 A pipeline-owned isolated worktree may stay detached only at the exact frozen pull request head. An attached worktree must hold the pull request branch. Any other branch or commit fails preflight.
 
-The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 2 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `d22684f684af52a3a0a6caa6afd4b25f5733260e2127db81763b2b13946c323a`, and invokes it once with:
+The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 2 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `c72c8a0836d790128ce3f1e93ed7d1da3c01fbf465f96da3dbe0aa03dae14d04`, and invokes it once with:
 
 ```text
 --conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@10 --pr <canonical-url> --model <alias>
@@ -100,7 +100,7 @@ The current base comes from the advertised branch ref, not the pull request's la
 An upper native-stack member may contain a merge that only synchronized its direct base. The coordinator omits that topology marker from the linear replay only when it has exactly two parents, its second parent is in the current direct-base ancestry, and `git show --remerge-diff` is empty. The request retains the exact merge position, parents, tree, subject, trailers, and empty-diff digest. Any merge with manual resolution content, unrelated ancestry, more than two parents, or no later linear tip stops before task creation. Its retained manifest is audit evidence; a later authorized action starts a fresh invocation.
 
 Policy `marketplace-conflict-worker@10` has SHA-256 `7d934b95e5e0b8ef83228e95464a5c4f70d8de9114a50c98811e55b4825a0435`.
-The bundled worker helper has SHA-256 `d22684f684af52a3a0a6caa6afd4b25f5733260e2127db81763b2b13946c323a`.
+The bundled worker helper has SHA-256 `c72c8a0836d790128ce3f1e93ed7d1da3c01fbf465f96da3dbe0aa03dae14d04`.
 
 The full immutable request remains retained outside the repository and is not a worker-accessible file. The hosted problem statement carries execution identity, ordered source commits and `resolution_context_paths` with its count and digest. These paths locate the conflict; they are not a filename permission list. Necessary scoped companion changes and test relocations are allowed. The hosted worker preserves both sides' intent, test execution and coverage, validates behavior and corrects its candidate internally. It must not change unselected members or escape its semantic assignment.
 
@@ -120,11 +120,11 @@ The worker may add one final single-parent commit that changes only `.github/age
 
 The worker does not return summary, validation, commit annotations, conflict paths, companion paths, or rationale as acceptance evidence. The helper derives every SHA, parent, ordered old/new mapping, subject, trailer, path set, patch digest, patch difference, receipt, and result envelope from Git and the frozen request. `github.copilot.agent-task-conflict-receipt` version 3 and `github.copilot.agent-task-conflict-result` version 5 contain no hosted validation schema. Native-stack results retain controller-owned per-member task, request, and artifact identity. A completed task with matching task, session, repository, model, base, and generated-ref identity, no platform error, and valid generated topology is a collected candidate, not publication approval. The caller independently verifies the whole candidate and frozen live guards before publishing. Builds and tests stay on the hosted worker; normal GitHub checks validate behavior after publication.
 
-The coordinator rejects malformed or ambiguous refs, output/code overlap, unsafe or reserved paths, stale targets, reversed or extra merge parents, dropped, squashed, reordered or nonlinear replay commits, missing or extra members, bad ordering, stale leases, changed outside dependents, and source or base drift. Policies through `marketplace-conflict-worker@9` remain immutable audit evidence. Older artifacts are never repaired, normalized, or promoted into a current invocation.
+The coordinator rejects malformed or ambiguous refs, output/code overlap, unsafe or reserved paths, stale targets, reversed or extra merge parents, dropped, squashed, reordered or nonlinear replay commits, missing or extra members, bad ordering, stale leases, changed outside dependents, and base or topology drift. A source-head-only change discovered after a task completes preserves the quarantined candidate as audit evidence, consumes the started allowance, and returns `head_changed` without adoption, rebase, or publication. Previously recorded result schema 5 artifacts remain readable only by live status and audit paths; they never seed execution.
 
 For merge, publication preserves the explicit refspec, requires parents `[frozen head, frozen base]`, checks code-path safety and uses an exact lease on the frozen head. Rebase publication also uses exact `--force-with-lease`. For a native stack, one atomic push carries every selected member and one exact lease per branch. Artifact commits never reach user branches. Structural acceptance is not proof of semantic correctness or green CI.
 
-Every top-level call receives invocation-local state and creates at most one fresh hosted task per frozen member. Existing PR-level state, prior results, task IDs, and malformed legacy artifacts are immutable audit evidence and never seed execution. Resume and owner-replacement arguments fail before tool discovery, state writes, task creation, checkout, or GitHub mutation.
+Every top-level call receives invocation-local state and creates at most one fresh hosted task per frozen member. Existing PR-level state, prior results, task IDs, and malformed legacy artifacts are immutable audit evidence and never seed execution. There is no resume, prepared-task adoption, owner replacement, or malformed-result replacement route.
 
 A lost publication response never invokes cloud. It succeeds only when every remote head already equals the exact intended new value. Old, mixed, or unexpected heads stop the invocation.
 
@@ -134,12 +134,13 @@ Follow the JSON result exactly:
 
 - `published`: stop. Report the strategy, old head, new head, mergeability, and every native-stack head when present.
 - `mergeable`: stop with `Outcome: already mergeable.`
+- `head_changed`: stop with `Outcome: source head changed; incomplete.` Report the expected and observed heads, iteration, consumed allowance, preserved task and candidate evidence, and `publication: not_started`. Never adopt, rebase, or publish the stale candidate.
 - `invocation_abandoned`: stop with `Outcome: invocation abandoned.` Include the task ID status, error, and retained audit files. Never resume it.
 - `task_creation_failed`: stop with `Outcome: managed task creation failed.` Include the structured error and invocation-local state path. A later user action starts a fresh invocation after the prerequisite is fixed.
 - `max_iterations_reached`: stop with `Outcome: escalated.` Report that no Agent Task started, the completed invocation-local iteration count, the refused iteration, and the budget.
 - `error`: stop and report the exact error. Never work around a failed guard.
 
-One run dispatches one managed conflict task for merge or rebase, or one per frozen native-stack member. Do not run the legacy `attempt`, `resolved`, `continue`, `stack-rebase`, `stack-continue`, `stack-format`, `stack-validation-fix`, or `stack-publish` commands.
+One run dispatches one managed conflict task for merge or rebase, or one per frozen native-stack member. Only the current `agent-task`, `pipeline`, `status`, `abort`, `escalate`, `cleanup`, and controller-owned descendant propagation routes are available.
 
 ## Session name and final response
 
@@ -149,6 +150,7 @@ Lead with one outcome:
 
 - `Outcome: published.`
 - `Outcome: already mergeable.`
+- `Outcome: source head changed; incomplete.`
 - `Outcome: invocation abandoned.`
 - `Outcome: managed task creation failed.`
 - `Outcome: escalated.`

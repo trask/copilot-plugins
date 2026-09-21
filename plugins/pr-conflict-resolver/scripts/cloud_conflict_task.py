@@ -33,40 +33,16 @@ TASK_PROMPT_MAX_UTF8_BYTES = (
 )
 MODE = "conflict_with_report"
 REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 2}
-RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 3}
-MINIMAL_RESULT_SCHEMA = {
-    "id": "github.copilot.agent-task-conflict-result",
-    "version": 4,
-}
-REPLAY_RESULT_SCHEMA = {
+RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
     "version": 5,
 }
-LEGACY_RESULT_SCHEMA = {"id": "github.copilot.agent-task-conflict-result", "version": 1}
-RECEIPT_SCHEMA = {"id": "github.copilot.agent-task-conflict-receipt", "version": 2}
-MINIMAL_RECEIPT_SCHEMA = {
+RECEIPT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-receipt",
     "version": 3,
 }
-LEGACY_RECEIPT_SCHEMA = {
-    "id": "github.copilot.agent-task-conflict-receipt",
-    "version": 1,
-}
-SEMANTIC_SCHEMA = {
-    "id": "github.copilot.agent-task-conflict-semantic-output",
-    "version": 2,
-}
 POLICY_ID = "marketplace-conflict-worker"
-LEGACY_POLICY_VERSION = 1
-LEGACY_POLICY_SHA256 = (
-    "30c96b070bed7b652ffd9181fd4f74b052f670226dab9693d595338aaf0a9d6a"
-)
-LEGACY_POLICY = {
-    "id": POLICY_ID,
-    "version": LEGACY_POLICY_VERSION,
-    "sha256": LEGACY_POLICY_SHA256,
-}
-POLICY_VERSION = 5
+POLICY_VERSION = 10
 POLICY_SPEC = {
     "id": POLICY_ID,
     "version": POLICY_VERSION,
@@ -74,39 +50,8 @@ POLICY_SPEC = {
     "authentication": "local-gh-api",
     "custom_agent": False,
     "local_fallback": False,
-    "single_role_code_tip": "verified-task-artifact-parent",
-    "multi_role_code_refs": "dispatcher-assigned-request-scoped",
-    "user_branch_publication": False,
-    "quarantined_refs_only": True,
-    "worker_identity_fields": False,
-    "semantic_artifact": "minimal-payload-json",
-    "semantic_wrapper_owner": "dispatcher",
-    "merge_commit_annotations": "dispatcher-derived",
-    "semantic_validation_evidence": "command-result",
-    "dispatcher_generated_report_receipt": True,
-    "require_exact_request_identity": True,
-    "require_exact_target_identity": True,
-    "require_mechanical_history_proof": True,
-    "safe_direct_base_sync_merge_omission": True,
-    "require_separate_artifact_commit": True,
-    "require_complete_successful_validation": True,
-}
-POLICY_SHA256 = hashlib.sha256(
-    json.dumps(POLICY_SPEC, sort_keys=True, separators=(",", ":")).encode("ascii")
-).hexdigest()
-POLICY_SELECTOR = f"{POLICY_ID}@{POLICY_VERSION}"
-LEGACY_POLICY_SELECTOR = f"{POLICY_ID}@{LEGACY_POLICY_VERSION}"
-POLICY = {"id": POLICY_ID, "version": POLICY_VERSION, "sha256": POLICY_SHA256}
-MINIMAL_POLICY_VERSION = 6
-MINIMAL_POLICY_SPEC = {
-    "id": POLICY_ID,
-    "version": MINIMAL_POLICY_VERSION,
-    "execution_backend": "github-agent-tasks-rest",
-    "authentication": "local-gh-api",
-    "custom_agent": False,
-    "local_fallback": False,
     "single_role_code_tip": "authoritative-generated-ref",
-    "multi_role_code_refs": "dispatcher-assigned-request-scoped",
+    "multi_role_code_refs": "one-authoritative-generated-branch-per-member-task",
     "user_branch_publication": False,
     "quarantined_refs_only": True,
     "worker_identity_fields": False,
@@ -120,41 +65,17 @@ MINIMAL_POLICY_SPEC = {
     "require_mechanical_history_proof": True,
     "safe_direct_base_sync_merge_omission": True,
     "terminal_completion_signal": "completed-without-platform-error",
-}
-MINIMAL_POLICY_SHA256 = hashlib.sha256(
-    json.dumps(
-        MINIMAL_POLICY_SPEC,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("ascii")
-).hexdigest()
-MINIMAL_POLICY_SELECTOR = f"{POLICY_ID}@{MINIMAL_POLICY_VERSION}"
-MINIMAL_POLICY = {
-    "id": POLICY_ID,
-    "version": MINIMAL_POLICY_VERSION,
-    "sha256": MINIMAL_POLICY_SHA256,
-}
-SEQUENTIAL_POLICY_SPEC = {
-    **MINIMAL_POLICY_SPEC,
-    "version": 10,
-    "multi_role_code_refs": "one-authoritative-generated-branch-per-member-task",
     "native_stack_execution": "controller-sequenced-frozen-member-replay",
     "member_fix_commits": "linear-scoped-companion-suffix-after-complete-replay",
     "resolution_context_paths": "informational-not-a-permission-set",
     "replay_task_base": "pinned-destination-sha",
     "replay_message": "exact-source-bytes-with-one-verified-creator-appendix",
 }
-SEQUENTIAL_POLICY_SHA256 = hashlib.sha256(
-    json.dumps(
-        SEQUENTIAL_POLICY_SPEC, sort_keys=True, separators=(",", ":")
-    ).encode("ascii")
+POLICY_SHA256 = hashlib.sha256(
+    json.dumps(POLICY_SPEC, sort_keys=True, separators=(",", ":")).encode("ascii")
 ).hexdigest()
-SEQUENTIAL_POLICY_SELECTOR = f"{POLICY_ID}@10"
-SEQUENTIAL_POLICY = {
-    "id": POLICY_ID,
-    "version": 10,
-    "sha256": SEQUENTIAL_POLICY_SHA256,
-}
+POLICY_SELECTOR = f"{POLICY_ID}@{POLICY_VERSION}"
+POLICY = {"id": POLICY_ID, "version": POLICY_VERSION, "sha256": POLICY_SHA256}
 MODEL_IDS = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
@@ -166,18 +87,6 @@ ACTIVE_STATES = {"queued", "in_progress"}
 SUCCESS_STATES = {"completed"}
 TERMINAL_STATES = {"failed", "timed_out", "cancelled", "waiting_for_user", "idle"}
 KNOWN_STATES = ACTIVE_STATES | SUCCESS_STATES | TERMINAL_STATES
-ERROR_CODES = {
-    "task_failed",
-    "interrupted",
-    "policy_rejected",
-    "credentials_rejected",
-    "malformed_result",
-    "unexpected_history",
-    "validation_failed",
-    "stale_target",
-    "unsupported_strategy",
-    "prompt_too_large",
-}
 SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -185,7 +94,6 @@ TASK_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
 REPO_RE = re.compile(r"\A[^/\s]+/[^/\s]+\Z")
 REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
-SEMANTIC_DIRECTORY = ".github/agent-task-conflict-semantic"
 OUTPUT_REPORT_PATH = ".github/agent-task-output/report.md"
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -198,16 +106,18 @@ class ConflictError(RuntimeError):
         self.code = code
 
 
-@dataclass(frozen=True)
-class MalformedCompletedReplacement:
-    request_file: Path
-    prompt_file: Path
-    original_result_file: Path
-    resumed_result_file: Path
-    request: Mapping[str, object]
-    prompt: str
-    result: Mapping[str, object]
-    task_prompt_sha256: str
+class SourceHeadChanged(ConflictError):
+    def __init__(
+        self,
+        *,
+        pr_number: int,
+        expected_head: str,
+        actual_head: str,
+    ):
+        super().__init__("pull request source head changed", "source_head_changed")
+        self.pr_number = pr_number
+        self.expected_head = expected_head
+        self.actual_head = actual_head
 
 
 @dataclass(frozen=True)
@@ -218,11 +128,8 @@ class Options:
     request_file: Path
     prompt_file: Path
     result_file: Path
-    input_result_file: Path | None
     request: Mapping[str, object]
     prompt: str
-    prior_result: Mapping[str, object] | None
-    replacement: MalformedCompletedReplacement | None = None
 
 
 @dataclass(frozen=True)
@@ -319,8 +226,7 @@ class Result:
                 "outcomes": self.validations,
             },
         }
-        if self.schema in (MINIMAL_RESULT_SCHEMA, REPLAY_RESULT_SCHEMA):
-            payload.pop("validation")
+        payload.pop("validation")
         return payload
 
 
@@ -787,10 +693,7 @@ def validate_request(
         raise ConflictError("resolution_context_paths is not ordered and unique", "policy_rejected")
     for path in allowed_paths:
         require_path(path, "allowed path")
-    if (
-        request["policy"] in (MINIMAL_POLICY, SEQUENTIAL_POLICY)
-        and OUTPUT_REPORT_PATH in allowed_paths
-    ):
+    if OUTPUT_REPORT_PATH in allowed_paths:
         raise ConflictError(
             "the advisory output path cannot be a publishable source path",
             "policy_rejected",
@@ -909,12 +812,6 @@ def parse_args(args: Sequence[str]) -> Options:
         "--request-file",
         "--prompt-file",
         "--result-file",
-        "--input-result-file",
-        "--replace-malformed-request-file",
-        "--replace-malformed-prompt-file",
-        "--replace-malformed-original-result-file",
-        "--replace-malformed-resumed-result-file",
-        "--expected-malformed-task-prompt-sha256",
         "--policy",
     }
     while index < len(args):
@@ -931,32 +828,14 @@ def parse_args(args: Sequence[str]) -> Options:
             raise ConflictError(f"{token} requires one value", "policy_rejected")
         values[token] = args[index + 1]
         index += 2
-    replacement_options = {
-        "--replace-malformed-request-file",
-        "--replace-malformed-prompt-file",
-        "--replace-malformed-original-result-file",
-        "--replace-malformed-resumed-result-file",
-        "--expected-malformed-task-prompt-sha256",
-    }
-    required = flags | (options - {"--input-result-file"} - replacement_options)
+    required = flags | options
     missing = sorted(required - values.keys())
     if missing:
         raise ConflictError(
             f"missing required options: {', '.join(missing)}",
             "policy_rejected",
         )
-    if "--input-result-file" in values or replacement_options & values.keys():
-        raise ConflictError(
-            "resume and malformed-task replacement are disabled; start a fresh "
-            "invocation",
-            "recovery_disabled",
-        )
-    if values["--policy"] not in {
-        SEQUENTIAL_POLICY_SELECTOR,
-        MINIMAL_POLICY_SELECTOR,
-        POLICY_SELECTOR,
-        LEGACY_POLICY_SELECTOR,
-    }:
+    if values["--policy"] != POLICY_SELECTOR:
         raise ConflictError("unsupported conflict worker policy", "policy_rejected")
     strategy = str(values["--strategy"])
     if strategy not in STRATEGIES:
@@ -975,11 +854,6 @@ def parse_args(args: Sequence[str]) -> Options:
         "--request-file",
         "--prompt-file",
         "--result-file",
-        "--input-result-file",
-        "--replace-malformed-request-file",
-        "--replace-malformed-prompt-file",
-        "--replace-malformed-original-result-file",
-        "--replace-malformed-resumed-result-file",
     ):
         raw = values.get(name)
         path = Path(str(raw)) if raw is not None else None
@@ -998,108 +872,9 @@ def parse_args(args: Sequence[str]) -> Options:
         expected_strategy=strategy,
         expected_model=MODEL_IDS[alias],
         expected_pr_url=pr_url,
-        expected_policy=(
-            SEQUENTIAL_POLICY
-            if values["--policy"] == SEQUENTIAL_POLICY_SELECTOR
-            else MINIMAL_POLICY
-            if values["--policy"] == MINIMAL_POLICY_SELECTOR
-            else POLICY
-            if values["--policy"] == POLICY_SELECTOR
-            else LEGACY_POLICY
-        ),
+        expected_policy=POLICY,
     )
     prompt = read_external_text(paths["--prompt-file"], "prompt file")
-    prior = (
-        validate_prior_result(
-            read_json_file(paths["--input-result-file"], "input result file"),
-            request,
-        )
-        if paths["--input-result-file"] is not None
-        else None
-    )
-    supplied_replacement = replacement_options & values.keys()
-    if supplied_replacement and supplied_replacement != replacement_options:
-        raise ConflictError(
-            "malformed completed replacement options must be supplied together",
-            "policy_rejected",
-        )
-    if supplied_replacement and prior is not None:
-        raise ConflictError(
-            "malformed completed replacement cannot resume a prior result",
-            "policy_rejected",
-        )
-    replacement = None
-    if supplied_replacement:
-        expected_prompt_sha256 = str(
-            values["--expected-malformed-task-prompt-sha256"]
-        )
-        if not SHA256_RE.fullmatch(expected_prompt_sha256):
-            raise ConflictError(
-                "expected malformed task prompt hash is invalid",
-                "policy_rejected",
-            )
-        replacement_request_data = read_json_file(
-            paths["--replace-malformed-request-file"],
-            "replacement request file",
-        )
-        replacement_request = validate_request(
-            replacement_request_data,
-            expected_strategy=strategy,
-            expected_model=MODEL_IDS[alias],
-            expected_pr_url=pr_url,
-        )
-        replacement_prompt = read_external_text(
-            paths["--replace-malformed-prompt-file"],
-            "replacement prompt file",
-        )
-        original_path = paths["--replace-malformed-original-result-file"]
-        resumed_path = paths["--replace-malformed-resumed-result-file"]
-        if original_path.read_bytes() != resumed_path.read_bytes():
-            raise ConflictError(
-                "malformed task resume results are not byte-identical",
-                "malformed_result",
-            )
-        replacement_result = validate_prior_result(
-            read_json_file(resumed_path, "replacement resumed result file"),
-            replacement_request,
-        )
-        validate_prior_result(
-            read_json_file(original_path, "replacement original result file"),
-            replacement_request,
-        )
-        comparable_keys = set(request) - {
-            "request_id",
-            "request_sha256",
-            "iteration",
-        }
-        if any(
-            request[key] != replacement_request[key]
-            for key in comparable_keys
-        ):
-            raise ConflictError(
-                "malformed completed replacement request identity changed",
-                "policy_rejected",
-            )
-        old_iteration = replacement_request["iteration"]
-        new_iteration = request["iteration"]
-        if (
-            new_iteration["number"] != old_iteration["number"] + 1
-            or new_iteration["budget"] != old_iteration["budget"]
-        ):
-            raise ConflictError(
-                "malformed completed replacement iteration is invalid",
-                "policy_rejected",
-            )
-        replacement = MalformedCompletedReplacement(
-            paths["--replace-malformed-request-file"],
-            paths["--replace-malformed-prompt-file"],
-            original_path,
-            resumed_path,
-            replacement_request,
-            replacement_prompt,
-            replacement_result,
-            expected_prompt_sha256,
-        )
     return Options(
         strategy,
         MODEL_IDS[alias],
@@ -1107,268 +882,17 @@ def parse_args(args: Sequence[str]) -> Options:
         paths["--request-file"],
         paths["--prompt-file"],
         paths["--result-file"],
-        paths["--input-result-file"],
         request,
         prompt,
-        prior,
-        replacement,
     )
 
 
-def validate_prior_result(
-    data: object, request: Mapping[str, object]
-) -> Mapping[str, object]:
-    try:
-        return _validate_prior_result(data, request)
-    except ConflictError:
-        raise ConflictError("prior result is malformed", "malformed_result") from None
 
 
-def _validate_prior_result(
-    data: object, request: Mapping[str, object]
-) -> Mapping[str, object]:
-    result = require_exact_keys(
-        data,
-        {
-            "schema",
-            "status",
-            "error",
-            "model",
-            "policy",
-            "repository",
-            "task",
-            "mode",
-            "strategy",
-            "request",
-            "pull_request",
-            "generated",
-            "application",
-            "validation",
-        },
-        "prior conflict result",
-    )
-    if (
-        result["schema"] != RESULT_SCHEMA
-        or result["status"] not in {"success", "error", "interrupted"}
-        or result["model"] != request["model"]
-        or result["policy"] != POLICY
-        or result["repository"] != request["repository"]
-        or result["mode"] != MODE
-        or result["strategy"] != request["strategy"]
-        or result["request"]
-        != {"id": request["request_id"], "sha256": request["request_sha256"]}
-        or result["pull_request"] != request["pull_request"]
-    ):
-        raise ConflictError("prior result identity mismatch", "malformed_result")
-    task = require_exact_keys(
-        result["task"], {"id", "url", "state", "base_ref", "base_sha"}, "prior task"
-    )
-    if not isinstance(task["id"], str) or not TASK_ID_RE.fullmatch(task["id"]):
-        raise ConflictError(
-            "resume has no reusable Agent Task identity",
-            "malformed_result",
-        )
-    if (
-        task["state"] not in KNOWN_STATES
-        or (
-            task["url"] is not None
-            and (
-                not isinstance(task["url"], str)
-                or not task["url"].strip()
-                or not re.fullmatch(
-                    r"https://(?:api\.)?github\.com/\S+", task["url"]
-                )
-                or contains_credentials(task["url"])
-            )
-        )
-    ):
-        raise ConflictError("prior task identity is malformed", "malformed_result")
-    if task["base_ref"] != request["pull_request"]["head_sha"] or task[
-        "base_sha"
-    ] != request["pull_request"]["head_sha"]:
-        raise ConflictError("prior task base mismatch", "malformed_result")
-    generated = require_exact_keys(
-        result["generated"], {"artifact", "code_refs"}, "prior generated result"
-    )
-    if not isinstance(generated["code_refs"], list):
-        raise ConflictError("prior code refs are malformed", "malformed_result")
-    expected_role_order = [role for role, _, _ in expected_roles(request)]
-    if [
-        code_ref.get("role") if isinstance(code_ref, dict) else None
-        for code_ref in generated["code_refs"]
-    ] != expected_role_order and generated["code_refs"]:
-        raise ConflictError("prior code refs are malformed", "malformed_result")
-    try:
-        if generated["code_refs"]:
-            code_refs_from_receipt(
-                {
-                    "generated_refs": [
-                        {"ref": code_ref, "sha256": object_digest(code_ref)}
-                        for code_ref in generated["code_refs"]
-                    ]
-                },
-                request,
-            )
-            for code_ref in generated["code_refs"]:
-                validate_prior_code_ref(code_ref, request)
-        elif result["status"] == "success":
-            raise ConflictError("prior code refs are missing", "malformed_result")
-        validate_prior_artifact(generated["artifact"], request, result["status"])
-    except (ConflictError, TypeError, ValueError):
-        raise ConflictError("prior generated identity is malformed", "malformed_result") from None
-    application = require_exact_keys(
-        result["application"], {"status"}, "prior application"
-    )
-    if application["status"] not in {
-        "not_started",
-        "quarantined_refs",
-        "no_changes",
-    }:
-        raise ConflictError("prior application is malformed", "malformed_result")
-    validation = require_exact_keys(
-        result["validation"], {"complete", "outcomes"}, "prior validation"
-    )
-    if not isinstance(validation["complete"], bool) or not isinstance(
-        validation["outcomes"], list
-    ):
-        raise ConflictError("prior validation is malformed", "malformed_result")
-    if result["status"] == "success":
-        if (
-            result["error"] is not None
-            or application["status"] not in {"quarantined_refs", "no_changes"}
-            or validation["complete"] is not True
-        ):
-            raise ConflictError("prior success is malformed", "malformed_result")
-        try:
-            if result["schema"] == RESULT_SCHEMA and result["policy"] == POLICY:
-                validate_semantic_validations(validation["outcomes"])
-            else:
-                validate_validations(validation["outcomes"])
-        except ConflictError:
-            raise ConflictError(
-                "prior validation is malformed", "malformed_result"
-            ) from None
-    else:
-        error = require_exact_keys(
-            result["error"], {"code", "message"}, "prior error"
-        )
-        if (
-            error["code"] not in ERROR_CODES
-            or not isinstance(error["message"], str)
-            or not error["message"].strip()
-            or (result["status"] == "interrupted" and error["code"] != "interrupted")
-            or application["status"] != "not_started"
-            or validation != {"complete": False, "outcomes": []}
-        ):
-            raise ConflictError("prior error is malformed", "malformed_result")
-    return result
 
 
-def validate_prior_code_ref(
-    code_ref: Mapping[str, object], request: Mapping[str, object]
-) -> None:
-    commits = code_ref["commits"]
-    if request["strategy"] == "merge":
-        if not commits or any(
-            not isinstance(commit, str) or not SHA_RE.fullmatch(commit)
-            for commit in commits
-        ):
-            raise ConflictError("prior merge commits are malformed", "malformed_result")
-        return
-    if not commits:
-        raise ConflictError("prior commit mappings are missing", "malformed_result")
-    for item in commits:
-        mapping = require_exact_keys(
-            item,
-            {
-                "old_sha",
-                "new_sha",
-                "subject",
-                "trailers",
-                "patch_sha256",
-                "conflict_paths",
-                "companion_paths",
-                "unaffected_path_digests",
-                "rationale",
-            },
-            "prior commit mapping",
-        )
-        require_sha(mapping["old_sha"], "prior mapping old SHA")
-        require_sha(mapping["new_sha"], "prior mapping new SHA")
-        require_sha256(mapping["patch_sha256"], "prior mapping patch digest")
-        if (
-            not isinstance(mapping["subject"], str)
-            or not mapping["subject"]
-            or not isinstance(mapping["trailers"], list)
-            or any(not isinstance(trailer, str) for trailer in mapping["trailers"])
-            or not isinstance(mapping["conflict_paths"], list)
-            or not isinstance(mapping["companion_paths"], list)
-            or any(
-                not isinstance(path, str)
-                for path in [
-                    *mapping["conflict_paths"],
-                    *mapping["companion_paths"],
-                ]
-            )
-            or not isinstance(mapping["unaffected_path_digests"], dict)
-            or any(
-                not isinstance(path, str)
-                or not isinstance(digest, str)
-                or not SHA256_RE.fullmatch(digest)
-                for path, digest in mapping["unaffected_path_digests"].items()
-            )
-            or not isinstance(mapping["rationale"], str)
-        ):
-            raise ConflictError("prior commit mapping is malformed", "malformed_result")
 
 
-def validate_prior_artifact(
-    artifact: object,
-    request: Mapping[str, object],
-    status: object,
-) -> None:
-    if artifact is None:
-        if status == "success":
-            raise ConflictError("prior artifact is missing", "malformed_result")
-        return
-    value = require_exact_keys(
-        artifact, {"branch", "head_sha", "report", "receipt"}, "prior artifact"
-    )
-    if not isinstance(value["branch"], str) or not value["branch"].strip():
-        raise ConflictError("prior artifact branch is malformed", "malformed_result")
-    head_sha = require_sha(value["head_sha"], "prior artifact head")
-    expected_paths = artifact_paths(request["request_id"])
-    for name, identity, expected_path in zip(
-        ("report", "receipt"),
-        (value["report"], value["receipt"]),
-        expected_paths,
-    ):
-        expected_keys = (
-            {"path", "commit", "sha256"}
-            if name == "report"
-            else {"path", "commit"}
-        )
-        item = require_exact_keys(
-            identity, expected_keys, "prior artifact file"
-        )
-        if (
-            item["path"] != expected_path
-            or item["commit"] != head_sha
-            or (
-                name == "report"
-                and item["sha256"] is not None
-                and (
-                    not isinstance(item["sha256"], str)
-                    or not SHA256_RE.fullmatch(item["sha256"])
-                )
-            )
-            or (
-                name == "report"
-                and status == "success"
-                and item["sha256"] is None
-            )
-        ):
-            raise ConflictError("prior artifact file is malformed", "malformed_result")
 
 
 def _creation_flags() -> int:
@@ -1833,6 +1357,15 @@ def require_target_fresh(
     current = resolve_pr(
         runner, snapshot.control_root, expected.repository, expected.number
     )
+    if (
+        current.head_sha != expected.head_sha
+        and replace(current, head_sha=expected.head_sha) == expected
+    ):
+        raise SourceHeadChanged(
+            pr_number=expected.number,
+            expected_head=expected.head_sha,
+            actual_head=current.head_sha,
+        )
     if current != expected:
         raise ConflictError("pull request target changed", "stale_target")
     repository_data = parse_json_output(
@@ -1914,6 +1447,21 @@ def require_target_fresh(
             expected_head_sha = item["head_sha"]
             expected_base_ref = item.get("direct_base_ref", item.get("base_ref"))
             expected_base_sha = item.get("direct_base_sha", item.get("base_sha"))
+            if (
+                live.head_sha != expected_head_sha
+                and live.state == "OPEN"
+                and live.repository == item["repository"]
+                and live.head_repository == item["repository"]
+                and live.head_ref == expected_head_ref
+                and live.base_repository == request["repository"]
+                and live.base_ref == expected_base_ref
+                and live.base_sha == expected_base_sha
+            ):
+                raise SourceHeadChanged(
+                    pr_number=item["pr_number"],
+                    expected_head=expected_head_sha,
+                    actual_head=live.head_sha,
+                )
             if (
                 live.head_ref != expected_head_ref
                 or live.head_sha != expected_head_sha
@@ -2107,8 +1655,6 @@ def compact_commit_evidence(
     return evidence
 
 
-def semantic_path(request_id: str) -> str:
-    return f"{SEMANTIC_DIRECTORY}/{request_id}.json"
 
 
 def assigned_code_ref(request_id: str, role: str) -> str:
@@ -2194,170 +1740,18 @@ def compact_request_contract(
     }
 
 
-def compact_receipt_contract(
-    request: Mapping[str, object],
-) -> Mapping[str, object]:
-    generated_refs = []
-    for role, pr_number, repository in expected_roles(request):
-        old_sha, base_sha, base_ref, lease_sha, old_commits = code_ref_base(
-            request, role
-        )
-        generated_refs.append(
-            {
-                "role": role,
-                "pr_number": pr_number,
-                "repository": repository,
-                "old_sha": old_sha,
-                "base_ref": base_ref,
-                "base_sha": base_sha,
-                "lease_sha": lease_sha,
-                "old_commit_count": len(old_commits),
-                "commits_contract": (
-                    {
-                        "kind": "ordered_publishable_commit_shas",
-                    }
-                    if request["strategy"] == "merge"
-                    else {
-                        "kind": "ordered_old_to_new_mappings",
-                        "count": len(old_commits),
-                    }
-                ),
-            }
-        )
-    return {
-        "top_level_keys": [
-            "schema",
-            "request",
-            "policy",
-            "model",
-            "mode",
-            "strategy",
-            "repository",
-            "pull_request",
-            "generated_refs",
-            "validation_complete",
-            "validation",
-        ],
-        "schema": LEGACY_RECEIPT_SCHEMA,
-        "request": {
-            "id": request["request_id"],
-            "sha256": request["request_sha256"],
-        },
-        "policy": LEGACY_POLICY,
-        "model": request["model"],
-        "mode": MODE,
-        "strategy": request["strategy"],
-        "repository": request["repository"],
-        "pull_request": request["pull_request"],
-        "generated_refs": generated_refs,
-        "generated_ref_wrapper_keys": ["ref", "sha256"],
-        "generated_ref_keys": [
-            "role",
-            "pr_number",
-            "repository",
-            "ref",
-            "old_sha",
-            "new_sha",
-            "base_ref",
-            "base_sha",
-            "lease_sha",
-            "commits",
-        ],
-        "commit_mapping_keys": [
-            "old_sha",
-            "new_sha",
-            "subject",
-            "trailers",
-            "patch_sha256",
-            "conflict_paths",
-            "companion_paths",
-            "unaffected_path_digests",
-            "rationale",
-        ],
-        "validation_complete": True,
-        "validation_item_keys": ["command", "status", "detail"],
-        "validation_required_status": "passed",
-    }
 
 
-def receipt_contract_template(
-    request: Mapping[str, object],
-) -> Mapping[str, object]:
-    generated_refs: list[Mapping[str, object]] = []
-    for role, pr_number, repository in expected_roles(request):
-        old_sha, base_sha, base_ref, lease_sha, old_commits = code_ref_base(
-            request, role
-        )
-        if request["strategy"] == "merge":
-            commits: list[object] = ["<oldest-to-newest publishable commit SHA>"]
-        else:
-            commits = [
-                {
-                    "old_sha": old["sha"],
-                    "new_sha": "<rewritten commit SHA>",
-                    "subject": old["subject"],
-                    "trailers": old["trailers"],
-                    "patch_sha256": "<helper-compatible whitespace-preserving digest>",
-                    "conflict_paths": [],
-                    "companion_paths": [],
-                    "unaffected_path_digests": {},
-                    "rationale": "",
-                }
-                for old in old_commits
-            ]
-        generated_refs.append(
-            {
-                "ref": {
-                    "role": role,
-                    "pr_number": pr_number,
-                    "repository": repository,
-                    "ref": "<generated branch>",
-                    "old_sha": old_sha,
-                    "new_sha": "<generated tip SHA>",
-                    "base_ref": base_ref,
-                    "base_sha": (
-                        base_sha
-                        if request["strategy"] != "native-stack"
-                        else "<actual preceding generated tip, or pinned trunk SHA>"
-                    ),
-                    "lease_sha": lease_sha,
-                    "commits": commits,
-                },
-                "sha256": "<SHA-256 of canonical compact sorted ref object>",
-            }
-        )
-    return {
-        "schema": LEGACY_RECEIPT_SCHEMA,
-        "request": {
-            "id": request["request_id"],
-            "sha256": request["request_sha256"],
-        },
-        "policy": LEGACY_POLICY,
-        "model": request["model"],
-        "mode": MODE,
-        "strategy": request["strategy"],
-        "repository": request["repository"],
-        "pull_request": request["pull_request"],
-        "generated_refs": generated_refs,
-        "validation_complete": True,
-        "validation": [
-            {
-                "command": "<exact command or deterministic proof>",
-                "status": "passed",
-                "detail": "<concise result>",
-            }
-        ],
-    }
 
 
 def task_base_sha(request: Mapping[str, object]) -> str:
-    if request["policy"] == SEQUENTIAL_POLICY and request["strategy"] == "rebase":
+    if request["strategy"] == "rebase":
         return request["pull_request"]["base_sha"]
     return request["pull_request"]["head_sha"]
 
 
 def replay_task_instructions(request: Mapping[str, object]) -> str:
-    if request["policy"] != SEQUENTIAL_POLICY or request["strategy"] != "rebase":
+    if request["strategy"] != "rebase":
         return ""
     pr = request["pull_request"]
     return (
@@ -2409,11 +1803,8 @@ def policy_prompt(
         "outputs separate from code history. The retained local request is dispatcher "
         "evidence, not a file available to this worker.\n"
     )
-    if options.request["policy"] in (MINIMAL_POLICY, SEQUENTIAL_POLICY):
-        if (
-            options.request["policy"] == SEQUENTIAL_POLICY
-            and options.request["strategy"] == "native-stack"
-        ):
+    if options.request["policy"] == POLICY:
+        if options.request["strategy"] == "native-stack":
             raise ConflictError(
                 "native stack work must be dispatched one member at a time",
                 "policy_rejected",
@@ -2489,152 +1880,6 @@ def policy_prompt(
             "threads, or choose another strategy.\n"
             "----- marketplace conflict worker policy -----"
         )
-    if options.request["policy"] == POLICY:
-        path = semantic_path(options.request["request_id"])
-        compact_request = compact_request_contract(
-            options.request,
-            include_per_commit_paths=include_per_commit_paths,
-        )
-        refs = (
-            [
-                {
-                    "role_index": index,
-                    "role": remote.role,
-                    "branch": remote.ref,
-                    "annotation_count": len(
-                        code_ref_base(options.request, remote.role)[4]
-                    ),
-                }
-                for index, remote in enumerate(
-                    assigned_code_refs(options.request),
-                    start=1,
-                )
-            ]
-            if options.request["strategy"] == "native-stack"
-            else []
-        )
-        code_locator_policy = (
-            "Publish each resolved member tip to the exact request-scoped branch "
-            "assigned below, in role order. These branch names are locators only; "
-            "the dispatcher fetches them into quarantine and derives every SHA and "
-            "ordered mapping from Git history. Do not publish any other code branch.\n"
-            f"{json.dumps(refs, ensure_ascii=False, sort_keys=True)}\n"
-            if refs
-            else (
-                "Do not publish a duplicate code branch. Commit the resolved "
-                "single-role history directly before the final semantic artifact "
-                "commit on the Agent Task branch. The dispatcher derives the code "
-                "tip only from that final commit's verified sole parent and derives "
-                "every SHA and ordered mapping from Git history.\n"
-            )
-        )
-        shape = {
-            "summary": "<nonempty explanation of the resolution>",
-            "validation": [
-                {
-                    "command": "<exact command or deterministic proof>",
-                    "result": "passed",
-                }
-            ],
-        }
-        if options.strategy != "merge":
-            shape["commit_annotations"] = [
-                [
-                    {
-                        "conflict_paths": [],
-                        "companion_paths": [],
-                        "rationale": "",
-                    }
-                ]
-            ]
-        return (
-            f"{options.prompt.rstrip()}\n\n"
-            "----- marketplace conflict worker policy -----\n"
-            f"Policy: {POLICY_SELECTOR}\n"
-            f"Policy SHA-256: {POLICY_SHA256}\n"
-            f"Mode: {MODE}\n"
-            f"Strategy: {options.strategy}\n"
-            "The dispatcher owns and binds every request, repository, pull request, "
-            "frozen head/base, model, policy, task, session, generated-ref, commit, "
-            "report, receipt, and completion identity. Do not author or echo those "
-            "fields in the semantic artifact.\n"
-            f"{path_scope}"
-            "Compact immutable task contract (input evidence only): "
-            f"{canonical_json(compact_request).decode('utf-8')}\n"
-            f"{code_locator_policy}"
-            "Create one final single-parent task artifact commit on the Agent Task "
-            f"branch. Its only changed path must be `{path}` and its parent must be "
-            "the final mechanically verified code tip. Write exactly the minimal "
-            "JSON payload below. The dispatcher adds the semantic schema and kind; "
-            "do not author them. For merge, omit `commit_annotations`; the dispatcher "
-            "derives the empty positional annotation from verified history. For "
-            "rebase/native-stack, `commit_annotations` is positional: one array per "
-            "assigned role and one entry per frozen old commit. An unchanged rewritten commit uses empty "
-            "path arrays and an empty rationale; a conflict-touched commit must name "
-            "its conflict paths, any companion paths, and a concrete rationale. Do "
-            "not include SHAs, refs, roles, request identity, validation completion, "
-            "or any report/receipt/envelope fields. Missing or malformed semantic "
-            "output fails closed. Validation entries are untrusted evidence and must "
-            "contain only the exact command and explicit `result: passed`; the "
-            "dispatcher never invents validation status or detail.\n"
-            f"{json.dumps(shape, ensure_ascii=False, sort_keys=True)}\n"
-            "----- marketplace conflict worker policy -----"
-        )
-    if options.request["policy"] != LEGACY_POLICY:
-        raise ConflictError("unsupported conflict worker policy", "policy_rejected")
-    report_path, receipt_path = artifact_paths(options.request["request_id"])
-    compact_request = compact_request_contract(
-        options.request,
-        include_per_commit_paths=include_per_commit_paths,
-    )
-    compact_receipt = compact_receipt_contract(options.request)
-    return (
-        f"{options.prompt.rstrip()}\n\n"
-        "----- marketplace conflict worker policy -----\n"
-        f"Policy: {POLICY_SELECTOR}\n"
-        f"Policy SHA-256: {POLICY_SHA256}\n"
-        f"Mode: {MODE}\n"
-        f"Strategy: {options.strategy}\n"
-        "The full retained local request is immutable evidence identified by "
-        f"request SHA-256 {options.request['request_sha256']}. The compact contract "
-        "below contains every execution identity, the complete allowed path set, "
-        "and digest representations of retained commit evidence. Never infer a "
-        "replacement identity or treat a digest summary as omitted permission.\n"
-        "Canonical evidence digests use SHA-256 over UTF-8 JSON with sorted keys, "
-        "comma and colon separators, and non-ASCII values preserved.\n"
-        f"{path_scope}"
-        "Compact immutable task contract: "
-        f"{canonical_json(compact_request).decode('utf-8')}\n"
-        "Compact required receipt contract: "
-        f"{canonical_json(compact_receipt).decode('utf-8')}\n"
-        "Reconstruct retained commit subjects, trailers, parents, paths, and patches "
-        "from the exact pinned SHAs with git show, git rev-list, git diff-tree, git "
-        "diff --binary --full-index, and git merge-tree as applicable. Verify their "
-        "compact evidence hashes before resolving. The dispatcher validates the "
-        "complete retained request, generated history, report, receipt, paths, and "
-        "patch identities after the task; compact prompt evidence never weakens that "
-        "validation.\n"
-        "A native-stack member may list direct-base synchronization merges. The "
-        "dispatcher proved each has exactly two parents, its second parent belongs "
-        "to the current direct-base ancestry, and its remerge diff is empty. These "
-        "merges are topology-only base updates: omit their merge commits while "
-        "rebasing, map every listed old linear commit one-to-one and in order, and "
-        "never omit or flatten any other merge.\n"
-        "Do not read, request, print, persist, or transmit credentials, local "
-        "environment values, cookies, tokens, keys, or authorization headers. "
-        "Do not invoke a custom_agent or local fallback. Do not update any user "
-        "branch or pull request, reply to reviews, resolve threads, or choose a "
-        "strategy. Publish only the receipt-declared generated code refs and the "
-        "distinct task artifact ref.\n"
-        f"Commit the complete report at {report_path} and the exact v1 receipt "
-        f"at {receipt_path} in the sole final artifact commit. The artifact "
-        "commit must be a single-parent child of the final requested code tip "
-        "and change exactly those two paths. Do not add commits afterward.\n"
-        "Every validation outcome must be complete, ordered, and passed. "
-        "Account for every old and new commit in the report and receipt.\n"
-        "----- marketplace conflict worker policy -----"
-    )
-
 
 def validated_task_prompt(options: Options) -> str:
     prompt = policy_prompt(options)
@@ -2657,151 +1902,6 @@ def validated_task_prompt(options: Options) -> str:
     return prompt
 
 
-def validate_malformed_completed_replacement(
-    runner: Runner,
-    snapshot: LocalSnapshot,
-    replacement: MalformedCompletedReplacement,
-) -> None:
-    request = replacement.request
-    result = replacement.result
-    task_result = result["task"]
-    report_path, receipt_path = artifact_paths(request["request_id"])
-    recorded_artifact = result["generated"]["artifact"]
-    expected_artifact = {
-        "branch": recorded_artifact["branch"],
-        "head_sha": request["pull_request"]["head_sha"],
-        "report": {
-            "path": report_path,
-            "commit": request["pull_request"]["head_sha"],
-            "sha256": None,
-        },
-        "receipt": {
-            "path": receipt_path,
-            "commit": request["pull_request"]["head_sha"],
-        },
-    }
-    error = result["error"]
-    if (
-        result["status"] != "error"
-        or error["code"] != "unexpected_history"
-        or receipt_path not in error["message"]
-        or "does not exist" not in error["message"]
-        or result["generated"]
-        != {"artifact": expected_artifact, "code_refs": []}
-        or result["application"] != {"status": "not_started"}
-        or result["validation"] != {"complete": False, "outcomes": []}
-        or task_result["state"] != "completed"
-    ):
-        raise ConflictError(
-            "replacement result is not an exact malformed completed task",
-            "policy_rejected",
-        )
-    prompt_options = Options(
-        request["strategy"],
-        request["model"],
-        request["pull_request"]["url"],
-        replacement.request_file,
-        replacement.prompt_file,
-        replacement.resumed_result_file,
-        None,
-        request,
-        replacement.prompt,
-        None,
-    )
-    current_prompt = policy_prompt(prompt_options)
-    legacy_prompt = policy_prompt(
-        prompt_options,
-        include_per_commit_paths=True,
-    )
-    expected_prompt = next(
-        (
-            prompt
-            for prompt in (current_prompt, legacy_prompt)
-            if hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-            == replacement.task_prompt_sha256
-        ),
-        None,
-    )
-    if expected_prompt is None:
-        raise ConflictError(
-            "replacement task prompt hash does not match",
-            "policy_rejected",
-        )
-    task = get_task(runner, snapshot, task_result["id"])
-    sessions = task.get("sessions")
-    if (
-        task["state"] != "completed"
-        or not isinstance(sessions, list)
-        or len(sessions) != 1
-        or not isinstance(sessions[0], dict)
-    ):
-        raise ConflictError(
-            "replacement Agent Task is not exactly completed",
-            "task_failed",
-        )
-    session = sessions[0]
-    if (
-        session.get("task_id") != task_result["id"]
-        or session.get("state") != "completed"
-        or session.get("model") != f"sweagent-capi:{request['model']}"
-        or session.get("base_ref") != request["pull_request"]["head_sha"]
-        or session.get("prompt") != expected_prompt
-    ):
-        raise ConflictError(
-            "replacement Agent Task session identity changed",
-            "task_failed",
-        )
-    remote_artifact = discover_artifact_ref(task, request)
-    expected_task_artifacts = [
-        {
-            "provider": "github",
-            "type": "branch",
-            "data": {
-                "base_ref": request["pull_request"]["head_sha"],
-                "head_ref": remote_artifact.ref,
-            },
-        }
-    ]
-    if (
-        remote_artifact.ref != recorded_artifact["branch"]
-        or task.get("artifacts") != expected_task_artifacts
-        or session.get("head_ref") != remote_artifact.ref
-    ):
-        raise ConflictError(
-            "replacement Agent Task artifact identity changed",
-            "task_failed",
-        )
-    _, artifact_sha = fetch_quarantined(
-        runner,
-        snapshot,
-        remote_artifact,
-        request["request_id"],
-    )
-    if artifact_sha != request["pull_request"]["head_sha"]:
-        raise ConflictError(
-            "replacement Agent Task generated repository changes",
-            "unexpected_history",
-        )
-    artifact_paths_present = [
-        value
-        for value in git(
-            runner,
-            snapshot.root,
-            "ls-tree",
-            "-r",
-            "--name-only",
-            artifact_sha,
-            "--",
-            report_path,
-            receipt_path,
-        ).splitlines()
-        if value
-    ]
-    if artifact_paths_present:
-        raise ConflictError(
-            "replacement Agent Task artifact paths exist",
-            "unexpected_history",
-        )
 
 
 def start_task(
@@ -2878,43 +1978,7 @@ def expected_roles(request: Mapping[str, object]) -> list[tuple[str, int | None,
     return [("code", request["pull_request"]["number"], request["repository"])]
 
 
-def discover_artifact_ref(
-    task: Mapping[str, object], request: Mapping[str, object]
-) -> RemoteRef:
-    heads: set[str] = set()
-    for artifact in task.get("artifacts") or []:
-        if (
-            not isinstance(artifact, dict)
-            or artifact.get("provider") != "github"
-            or artifact.get("type") != "branch"
-            or not isinstance(artifact.get("data"), dict)
-        ):
-            continue
-        data = artifact["data"]
-        ref = data.get("head_ref")
-        if not isinstance(ref, str) or not ref:
-            raise ConflictError("artifact branch identity is malformed", "unexpected_history")
-        heads.add(ref.removeprefix("refs/heads/"))
-    for session in task.get("sessions") or []:
-        if not isinstance(session, dict):
-            raise ConflictError("task session is malformed", "unexpected_history")
-        ref = session.get("head_ref")
-        if isinstance(ref, str) and ref:
-            heads.add(ref.removeprefix("refs/heads/"))
-    if len(heads) != 1:
-        raise ConflictError(
-            "task did not return one exact artifact branch",
-            "unexpected_history",
-        )
-    return RemoteRef(
-        "artifact",
-        None,
-        request["repository"],
-        next(iter(heads)),
-    )
-
-
-def discover_semantic_artifact_ref(
+def discover_task_artifact_ref(
     task: Mapping[str, object], request: Mapping[str, object]
 ) -> RemoteRef:
     artifacts = task.get("artifacts")
@@ -3008,7 +2072,7 @@ def discover_minimal_artifact_ref(
             raise AssertionError("validated session copy changed shape")
         normalized_sessions[0]["model"] = f"sweagent-capi:{request['model']}"
         normalized_task = normalized
-    remote = discover_semantic_artifact_ref(normalized_task, request)
+    remote = discover_task_artifact_ref(normalized_task, request)
     task_repository = task.get("repository")
     task_owner = task.get("owner")
     session = sessions[0]
@@ -3074,81 +2138,6 @@ def discover_minimal_artifact_ref(
     return remote
 
 
-def code_refs_from_receipt(
-    receipt: Mapping[str, object],
-    request: Mapping[str, object],
-) -> tuple[list[RemoteRef], dict[str, Mapping[str, object]]]:
-    entries = receipt.get("generated_refs")
-    if not isinstance(entries, list):
-        raise ConflictError("receipt generated refs are malformed", "validation_failed")
-    by_role: dict[str, Mapping[str, object]] = {}
-    for entry in entries:
-        if (
-            not isinstance(entry, dict)
-            or set(entry) != {"ref", "sha256"}
-            or not isinstance(entry["ref"], dict)
-            or entry["sha256"] != object_digest(entry["ref"])
-        ):
-            raise ConflictError(
-                "receipt generated ref or digest is malformed",
-                "validation_failed",
-            )
-        ref = require_exact_keys(
-            entry["ref"],
-            {
-                "role",
-                "pr_number",
-                "repository",
-                "ref",
-                "old_sha",
-                "new_sha",
-                "base_ref",
-                "base_sha",
-                "lease_sha",
-                "commits",
-            },
-            "receipt generated code ref",
-        )
-        role = ref["role"]
-        if not isinstance(role, str) or role in by_role:
-            raise ConflictError(
-                "receipt generated ref role is invalid",
-                "validation_failed",
-            )
-        if (
-            not isinstance(ref["pr_number"], int)
-            or isinstance(ref["pr_number"], bool)
-            or ref["pr_number"] < 1
-            or not isinstance(ref["ref"], str)
-            or not ref["ref"]
-            or not isinstance(ref["commits"], list)
-        ):
-            raise ConflictError(
-                "receipt generated ref identity is malformed",
-                "validation_failed",
-            )
-        require_repo(ref["repository"], "receipt generated repository")
-        require_sha(ref["old_sha"], "receipt generated old SHA")
-        require_sha(ref["new_sha"], "receipt generated new SHA")
-        require_ref(ref["base_ref"], "receipt generated base ref")
-        require_sha(ref["base_sha"], "receipt generated base SHA")
-        require_sha(ref["lease_sha"], "receipt generated lease SHA")
-        by_role[role] = ref
-    expected = expected_roles(request)
-    if set(by_role) != {role for role, _, _ in expected}:
-        raise ConflictError(
-            "receipt generated refs are missing or contain extras",
-            "unexpected_history",
-        )
-    code_refs: list[RemoteRef] = []
-    for role, pr_number, repository in expected:
-        ref = by_role[role]
-        if ref["pr_number"] != pr_number or ref["repository"] != repository:
-            raise ConflictError("generated code ref identity mismatch", "unexpected_history")
-        code_refs.append(
-            RemoteRef(role, pr_number, repository, str(ref["ref"]))
-        )
-    return code_refs, by_role
 
 
 def quarantine_ref(request_id: str, role: str) -> str:
@@ -3645,66 +2634,6 @@ def validate_mapping(
     return value
 
 
-def mapping_from_annotation(
-    annotation: object,
-    old: Mapping[str, object],
-    new_sha: str,
-    runner: Runner,
-    root: Path,
-    parent: str,
-    allowed_paths: set[str],
-) -> Mapping[str, object]:
-    value = require_exact_keys(
-        annotation,
-        {"conflict_paths", "companion_paths", "rationale"},
-        "semantic commit annotation",
-    )
-    conflict_paths = value["conflict_paths"]
-    companion_paths = value["companion_paths"]
-    rationale = value["rationale"]
-    if (
-        not isinstance(conflict_paths, list)
-        or not isinstance(companion_paths, list)
-        or any(not isinstance(path, str) for path in [*conflict_paths, *companion_paths])
-        or not isinstance(rationale, str)
-    ):
-        raise ConflictError(
-            "semantic commit annotation is malformed",
-            "validation_failed",
-        )
-    old_parent = parents(runner, root, old["sha"])
-    if len(old_parent) != 1:
-        raise ConflictError("old commit is not linear", "unexpected_history")
-    unaffected_paths = set(old["paths"]) - set(conflict_paths)
-    mapping = {
-        "old_sha": old["sha"],
-        "new_sha": new_sha,
-        "subject": commit_subject(runner, root, new_sha),
-        "trailers": commit_trailers(runner, root, new_sha),
-        "patch_sha256": patch_sha256(runner, root, parent, new_sha),
-        "conflict_paths": conflict_paths,
-        "companion_paths": companion_paths,
-        "unaffected_path_digests": {
-            path: path_patch_sha256(
-                runner,
-                root,
-                old_parent[0],
-                old["sha"],
-                path,
-            )
-            for path in sorted(unaffected_paths)
-        },
-        "rationale": rationale,
-    }
-    return validate_mapping(
-        mapping,
-        old,
-        new_sha,
-        runner,
-        root,
-        parent,
-        allowed_paths,
-    )
 
 
 def mechanical_mapping(
@@ -3803,66 +2732,8 @@ def prove_rebase_range_mechanically(
     return commits, mappings
 
 
-def prove_rebase_range(
-    runner: Runner,
-    root: Path,
-    base_sha: str,
-    tip: str,
-    old_commits: Sequence[Mapping[str, object]],
-    mappings: Sequence[object],
-    allowed_paths: set[str],
-) -> list[str]:
-    commits = ordered_commits(runner, root, base_sha, tip)
-    if len(commits) != len(old_commits) or len(mappings) != len(old_commits):
-        raise ConflictError(
-            "rewritten range dropped, squashed, reordered, or added commits",
-            "unexpected_history",
-        )
-    parent = base_sha
-    for old, new_sha, mapping in zip(old_commits, commits, mappings):
-        if parents(runner, root, new_sha) != [parent]:
-            raise ConflictError("rewritten range is not linear", "unexpected_history")
-        validate_mapping(
-            mapping, old, new_sha, runner, root, parent, allowed_paths
-        )
-        parent = new_sha
-    return commits
 
 
-def prove_rebase_range_from_annotations(
-    runner: Runner,
-    root: Path,
-    base_sha: str,
-    tip: str,
-    old_commits: Sequence[Mapping[str, object]],
-    annotations: Sequence[object],
-    allowed_paths: set[str],
-) -> tuple[list[str], list[Mapping[str, object]]]:
-    commits = ordered_commits(runner, root, base_sha, tip)
-    if len(commits) != len(old_commits) or len(annotations) != len(old_commits):
-        raise ConflictError(
-            "rewritten range dropped, squashed, reordered, added, or omitted "
-            "semantic annotations",
-            "unexpected_history",
-        )
-    mappings: list[Mapping[str, object]] = []
-    parent = base_sha
-    for old, new_sha, annotation in zip(old_commits, commits, annotations):
-        if parents(runner, root, new_sha) != [parent]:
-            raise ConflictError("rewritten range is not linear", "unexpected_history")
-        mappings.append(
-            mapping_from_annotation(
-                annotation,
-                old,
-                new_sha,
-                runner,
-                root,
-                parent,
-                allowed_paths,
-            )
-        )
-        parent = new_sha
-    return commits, mappings
 
 
 def code_ref_base(
@@ -3924,451 +2795,18 @@ def build_code_ref(
     }
 
 
-def validate_validations(value: object) -> list[Mapping[str, str]]:
-    if not isinstance(value, list) or not value:
-        raise ConflictError("validation is incomplete", "validation_failed")
-    outcomes: list[Mapping[str, str]] = []
-    for item in value:
-        outcome = require_exact_keys(
-            item, {"command", "status", "detail"}, "validation outcome"
-        )
-        if (
-            not isinstance(outcome["command"], str)
-            or not outcome["command"].strip()
-            or outcome["status"] != "passed"
-            or not isinstance(outcome["detail"], str)
-            or not outcome["detail"].strip()
-            or contains_credentials(canonical_json(outcome).decode("utf-8"))
-        ):
-            raise ConflictError("validation did not pass", "validation_failed")
-        outcomes.append(outcome)
-    return outcomes
 
 
-def validate_semantic_validations(value: object) -> list[Mapping[str, str]]:
-    if not isinstance(value, list) or not value:
-        raise ConflictError("validation is incomplete", "validation_failed")
-    outcomes: list[Mapping[str, str]] = []
-    for item in value:
-        outcome = require_exact_keys(
-            item, {"command", "result"}, "semantic validation outcome"
-        )
-        if (
-            not isinstance(outcome["command"], str)
-            or not outcome["command"].strip()
-            or outcome["result"] != "passed"
-            or contains_credentials(canonical_json(outcome).decode("utf-8"))
-        ):
-            raise ConflictError("validation did not pass", "validation_failed")
-        outcomes.append(outcome)
-    return outcomes
 
 
-def git_show_file(
-    runner: Runner, root: Path, commit: str, path: str
-) -> str:
-    return git(runner, root, "show", f"{commit}:{path}")
 
 
-def validate_artifact(
-    runner: Runner,
-    snapshot: LocalSnapshot,
-    request: Mapping[str, object],
-    artifact_remote: RemoteRef,
-    artifact_ref: str,
-    artifact_head: str,
-    code_refs: Sequence[Mapping[str, object]],
-) -> tuple[Mapping[str, object], list[Mapping[str, str]]]:
-    report_path, receipt_path = artifact_paths(request["request_id"])
-    if artifact_head in {ref["new_sha"] for ref in code_refs}:
-        raise ConflictError("artifact head equals a code head", "unexpected_history")
-    final_code_head = code_refs[-1]["new_sha"]
-    if parents(runner, snapshot.root, artifact_head) != [final_code_head]:
-        raise ConflictError(
-            "artifact commit is not the sole single-parent child of code head",
-            "unexpected_history",
-        )
-    if changed_paths(runner, snapshot.root, artifact_head) != sorted(
-        [report_path, receipt_path]
-    ):
-        raise ConflictError(
-            "artifact commit changed unexpected paths",
-            "unexpected_history",
-        )
-    report = git_show_file(runner, snapshot.root, artifact_head, report_path)
-    receipt_text = git_show_file(runner, snapshot.root, artifact_head, receipt_path)
-    if not report.strip():
-        raise ConflictError("conflict report is empty", "validation_failed")
-    if (
-        request["request_id"] not in report
-        or request["request_sha256"] not in report
-    ):
-        raise ConflictError(
-            "conflict report request identity mismatch",
-            "validation_failed",
-        )
-    try:
-        receipt = json.loads(receipt_text)
-    except json.JSONDecodeError:
-        raise ConflictError("conflict receipt is malformed", "validation_failed") from None
-    value = require_exact_keys(
-        receipt,
-        {
-            "schema",
-            "request",
-            "policy",
-            "model",
-            "mode",
-            "strategy",
-            "repository",
-            "pull_request",
-            "generated_refs",
-            "validation_complete",
-            "validation",
-        },
-        "conflict receipt",
-    )
-    expected_refs = [
-        {"ref": ref, "sha256": object_digest(ref)}
-        for ref in code_refs
-    ]
-    if (
-        value["schema"] != LEGACY_RECEIPT_SCHEMA
-        or value["request"]
-        != {"id": request["request_id"], "sha256": request["request_sha256"]}
-        or value["policy"] != LEGACY_POLICY
-        or value["model"] != request["model"]
-        or value["mode"] != MODE
-        or value["strategy"] != request["strategy"]
-        or value["repository"] != request["repository"]
-        or value["pull_request"] != request["pull_request"]
-        or value["generated_refs"] != expected_refs
-        or value["validation_complete"] is not True
-    ):
-        raise ConflictError("conflict receipt identity mismatch", "validation_failed")
-    validations = validate_validations(value["validation"])
-    for code_ref in code_refs:
-        for mapping in code_ref["commits"]:
-            if isinstance(mapping, dict) and mapping.get("old_sha"):
-                if (
-                    mapping["old_sha"] not in report
-                    or mapping["new_sha"] not in report
-                ):
-                    raise ConflictError(
-                        "report does not account for every old/new commit",
-                        "validation_failed",
-                    )
-    artifact = {
-        "branch": artifact_remote.ref,
-        "head_sha": artifact_head,
-        "report": {
-            "path": report_path,
-            "commit": artifact_head,
-            "sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
-        },
-        "receipt": {
-            "path": receipt_path,
-            "commit": artifact_head,
-        },
-    }
-    return artifact, validations
 
 
-def validate_semantic_artifact(
-    runner: Runner,
-    snapshot: LocalSnapshot,
-    request: Mapping[str, object],
-    artifact_remote: RemoteRef,
-    artifact_head: str,
-    final_code_head: str,
-) -> tuple[str, Sequence[Sequence[object]], list[Mapping[str, str]], str]:
-    path = semantic_path(str(request["request_id"]))
-    if parents(runner, snapshot.root, artifact_head) != [final_code_head]:
-        raise ConflictError(
-            "semantic artifact is not the sole child of the final code head",
-            "unexpected_history",
-        )
-    if changed_paths(runner, snapshot.root, artifact_head) != [path]:
-        raise ConflictError(
-            "semantic artifact commit changed unexpected paths",
-            "unexpected_history",
-        )
-    content = git_show_file(runner, snapshot.root, artifact_head, path)
-    try:
-        value = json.loads(content)
-    except json.JSONDecodeError:
-        raise ConflictError(
-            "conflict semantic output is malformed",
-            "validation_failed",
-        ) from None
-    expected_keys = (
-        {"summary", "validation"}
-        if request["strategy"] == "merge"
-        else {"summary", "commit_annotations", "validation"}
-    )
-    if (
-        not isinstance(value, dict)
-        or set(value) != expected_keys
-        or not isinstance(value.get("summary"), str)
-        or not value["summary"].strip()
-        or contains_credentials(value["summary"])
-        or (
-            request["strategy"] != "merge"
-            and not isinstance(value.get("commit_annotations"), list)
-        )
-    ):
-        raise ConflictError(
-            "conflict semantic output has an unsupported shape",
-            "validation_failed",
-        )
-    annotations = (
-        [[]] if request["strategy"] == "merge" else value["commit_annotations"]
-    )
-    expected_role_count = len(expected_roles(request))
-    if (
-        len(annotations) != expected_role_count
-        or any(not isinstance(items, list) for items in annotations)
-    ):
-        raise ConflictError(
-            "conflict semantic annotations do not match assigned roles",
-            "validation_failed",
-        )
-    validations = validate_semantic_validations(value["validation"])
-    return (
-        value["summary"],
-        annotations,
-        validations,
-        hashlib.sha256(content.encode("utf-8")).hexdigest(),
-    )
 
 
-def canonical_conflict_artifacts(
-    request: Mapping[str, object],
-    code_refs: Sequence[Mapping[str, object]],
-    validations: Sequence[Mapping[str, str]],
-    summary: str,
-) -> tuple[str, Mapping[str, object]]:
-    lines = [
-        "# Conflict resolution",
-        "",
-        f"Request: `{request['request_id']}`",
-        f"Request SHA-256: `{request['request_sha256']}`",
-        "",
-        summary.strip(),
-        "",
-        "## Generated history",
-        "",
-    ]
-    for code_ref in code_refs:
-        lines.append(
-            f"- `{code_ref['role']}`: `{code_ref['old_sha']}` -> "
-            f"`{code_ref['new_sha']}`"
-        )
-        for mapping in code_ref["commits"]:
-            if isinstance(mapping, dict):
-                lines.append(
-                    f"  - `{mapping['old_sha']}` -> `{mapping['new_sha']}`"
-                )
-    report = "\n".join(lines).rstrip() + "\n"
-    receipt = {
-        "schema": RECEIPT_SCHEMA,
-        "request": {
-            "id": request["request_id"],
-            "sha256": request["request_sha256"],
-        },
-        "policy": request["policy"],
-        "model": request["model"],
-        "mode": MODE,
-        "strategy": request["strategy"],
-        "repository": request["repository"],
-        "pull_request": request["pull_request"],
-        "generated_refs": [
-            {"ref": ref, "sha256": object_digest(ref)}
-            for ref in code_refs
-        ],
-        "validation_complete": True,
-        "validation": list(validations),
-    }
-    return report, receipt
 
 
-def prove_generated_semantic(
-    runner: Runner,
-    snapshot: LocalSnapshot,
-    request: Mapping[str, object],
-    task: Mapping[str, object],
-    recovery_result: Result | None = None,
-) -> tuple[list[Mapping[str, object]], Mapping[str, object], list[Mapping[str, str]]]:
-    artifact_remote = discover_semantic_artifact_ref(task, request)
-    request_id = str(request["request_id"])
-    quarantine: list[str] = []
-    artifact_ref, artifact_head = fetch_quarantined(
-        runner,
-        snapshot,
-        artifact_remote,
-        request_id,
-    )
-    quarantine.append(artifact_ref)
-    fetched_code: list[tuple[RemoteRef, str, str]] = []
-    if request["strategy"] == "native-stack":
-        for remote in assigned_code_refs(request):
-            target, tip = fetch_quarantined(
-                runner,
-                snapshot,
-                remote,
-                request_id,
-            )
-            quarantine.append(target)
-            fetched_code.append((remote, target, tip))
-        final_code_head = fetched_code[-1][2]
-    else:
-        artifact_parents = parents(
-            runner,
-            snapshot.root,
-            artifact_head,
-        )
-        if len(artifact_parents) != 1:
-            raise ConflictError(
-                "semantic artifact commit must have exactly one parent",
-                "unexpected_history",
-            )
-        final_code_head = artifact_parents[0]
-    summary, annotations, validations, semantic_sha256 = validate_semantic_artifact(
-        runner,
-        snapshot,
-        request,
-        artifact_remote,
-        artifact_head,
-        final_code_head,
-    )
-    if request["strategy"] != "native-stack":
-        target = quarantine_ref(request_id, "code")
-        git(
-            runner,
-            snapshot.root,
-            "update-ref",
-            target,
-            final_code_head,
-        )
-        quarantine.append(target)
-        fetched_code.append(
-            (
-                RemoteRef(
-                    "code",
-                    request["pull_request"]["number"],
-                    request["repository"],
-                    artifact_remote.ref,
-                ),
-                target,
-                final_code_head,
-            )
-        )
-    require_local_unchanged(runner, snapshot, quarantine)
-    allowed_paths = set(request["resolution_context_paths"])
-    code_refs: list[Mapping[str, object]] = []
-    if request["strategy"] == "merge":
-        if annotations != [[]]:
-            raise ConflictError(
-                "merge semantic annotations must be one empty array",
-                "validation_failed",
-            )
-        remote, _, tip = fetched_code[0]
-        commits = first_parent_chain(
-            runner,
-            snapshot.root,
-            request["pull_request"]["head_sha"],
-            tip,
-        )
-        if not commits or parents(runner, snapshot.root, commits[0]) != [
-            request["pull_request"]["head_sha"],
-            request["pull_request"]["base_sha"],
-        ]:
-            raise ConflictError(
-                "merge integration parents are not [head, base]",
-                "unexpected_history",
-            )
-        parent = commits[0]
-        for commit in commits[1:]:
-            if parents(runner, snapshot.root, commit) != [parent]:
-                raise ConflictError("merge fixes are not linear", "unexpected_history")
-            parent = commit
-        code_ref = build_code_ref(request, remote, tip, commits, [])
-        code_ref["base_ref"] = request["pull_request"]["base_ref"]
-        code_ref["base_sha"] = request["pull_request"]["base_sha"]
-        code_refs.append(code_ref)
-    elif request["strategy"] == "rebase":
-        remote, _, tip = fetched_code[0]
-        commits, mappings = prove_rebase_range_from_annotations(
-            runner,
-            snapshot.root,
-            request["pull_request"]["base_sha"],
-            tip,
-            request["head_commits"],
-            annotations[0],
-            allowed_paths,
-        )
-        code_refs.append(build_code_ref(request, remote, tip, commits, mappings))
-    else:
-        previous_tip = request["native_stack"]["trunk"]["sha"]
-        for index, (remote, _, tip) in enumerate(fetched_code):
-            member = request["native_stack"]["members"][index]
-            prove_native_stack_member_input(runner, snapshot.root, member)
-            commits, mappings = prove_rebase_range_from_annotations(
-                runner,
-                snapshot.root,
-                previous_tip,
-                tip,
-                member["old_commits"],
-                annotations[index],
-                allowed_paths,
-            )
-            code_ref = build_code_ref(
-                request,
-                remote,
-                tip,
-                commits,
-                mappings,
-                generated_base_sha=previous_tip,
-            )
-            if (
-                code_ref["old_sha"] != member["head_sha"]
-                or code_ref["lease_sha"] != member["lease_sha"]
-            ):
-                raise ConflictError(
-                    "native stack lease identity mismatch",
-                    "stale_target",
-                )
-            code_refs.append(code_ref)
-            previous_tip = tip
-    report, receipt = canonical_conflict_artifacts(
-        request,
-        code_refs,
-        validations,
-        summary,
-    )
-    artifact = {
-        "branch": artifact_remote.ref,
-        "head_sha": artifact_head,
-        "semantic": {
-            "schema": SEMANTIC_SCHEMA,
-            "kind": "conflict-resolution",
-            "path": semantic_path(request_id),
-            "commit": artifact_head,
-            "sha256": semantic_sha256,
-        },
-        "report": {
-            "sha256": hashlib.sha256(report.encode("utf-8")).hexdigest(),
-            "content": report,
-        },
-        "receipt": {
-            "sha256": object_digest(receipt),
-            "value": receipt,
-        },
-    }
-    if recovery_result is not None:
-        recovery_result.code_refs = list(code_refs)
-        recovery_result.artifact = artifact
-    return code_refs, artifact, validations
 
 
 def separate_optional_report(
@@ -4413,7 +2851,7 @@ def canonical_minimal_receipt(
     code_refs: Sequence[Mapping[str, object]],
 ) -> Mapping[str, object]:
     return {
-        "schema": MINIMAL_RECEIPT_SCHEMA,
+        "schema": RECEIPT_SCHEMA,
         "request": {
             "id": request["request_id"],
             "sha256": request["request_sha256"],
@@ -4438,10 +2876,7 @@ def prove_generated_minimal(
     task: Mapping[str, object],
     recovery_result: Result | None = None,
 ) -> tuple[list[Mapping[str, object]], Mapping[str, object], list[Mapping[str, str]]]:
-    if (
-        request["policy"] == SEQUENTIAL_POLICY
-        and request["strategy"] == "native-stack"
-    ):
+    if request["strategy"] == "native-stack":
         raise ConflictError(
             "one task cannot identify a complete native stack",
             "unexpected_history",
@@ -4449,7 +2884,7 @@ def prove_generated_minimal(
     artifact_remote = discover_minimal_artifact_ref(task, request)
     attribution = (
         task_attribution(runner, snapshot, task)
-        if request["policy"] == SEQUENTIAL_POLICY and request["strategy"] == "rebase"
+        if request["strategy"] == "rebase"
         else None
     )
     request_id = str(request["request_id"])
@@ -4623,273 +3058,19 @@ def prove_generated(
     task: Mapping[str, object],
     recovery_result: Result | None = None,
 ) -> tuple[list[Mapping[str, object]], Mapping[str, object], list[Mapping[str, str]]]:
-    if request["policy"] in (MINIMAL_POLICY, SEQUENTIAL_POLICY):
-        return prove_generated_minimal(
-            runner,
-            snapshot,
-            request,
-            task,
-            recovery_result,
-        )
-    if request["policy"] == POLICY:
-        return prove_generated_semantic(
-            runner,
-            snapshot,
-            request,
-            task,
-            recovery_result,
-        )
-    remote_artifact = discover_artifact_ref(task, request)
-    request_id = request["request_id"]
-    quarantine: list[str] = []
-    artifact_ref, artifact_sha = fetch_quarantined(
-        runner, snapshot, remote_artifact, request_id
-    )
-    quarantine.append(artifact_ref)
-    if recovery_result is not None:
-        report_path, receipt_path = artifact_paths(request_id)
-        recovery_result.artifact = {
-            "branch": remote_artifact.ref,
-            "head_sha": artifact_sha,
-            "report": {
-                "path": report_path,
-                "commit": artifact_sha,
-                "sha256": None,
-            },
-            "receipt": {
-                "path": receipt_path,
-                "commit": artifact_sha,
-            },
-        }
-    receipt_path = artifact_paths(request_id)[1]
-    receipt_text = git_show_file(runner, snapshot.root, artifact_sha, receipt_path)
-    try:
-        receipt_preview = json.loads(receipt_text)
-    except json.JSONDecodeError:
-        raise ConflictError("conflict receipt is malformed", "validation_failed") from None
-    if not isinstance(receipt_preview, dict):
-        raise ConflictError("conflict receipt is malformed", "validation_failed")
-    remote_code, receipt_refs = code_refs_from_receipt(
-        receipt_preview,
-        request,
-    )
-    if (
-        len({remote.ref for remote in remote_code}) != len(remote_code)
-        or len({ref["new_sha"] for ref in receipt_refs.values()})
-        != len(receipt_refs)
-    ):
-        raise ConflictError(
-            "generated code refs and heads are not distinct",
-            "unexpected_history",
-        )
-    if recovery_result is not None:
-        recovery_result.code_refs = [
-            receipt_refs[role]
-            for role, _, _ in expected_roles(request)
-        ]
-    if remote_artifact.ref in {ref.ref for ref in remote_code}:
-        raise ConflictError("artifact and code refs are not distinct", "unexpected_history")
-    fetched_code: list[tuple[RemoteRef, str]] = []
-    for remote in remote_code:
-        target, sha = fetch_quarantined(
-            runner,
-            snapshot,
-            remote,
-            request_id,
-            allow_commit_sha=True,
-        )
-        quarantine.append(target)
-        fetched_code.append((remote, sha))
-    require_local_unchanged(runner, snapshot, quarantine)
-    mappings_by_role: dict[str, Sequence[object]] = {}
-    for role, ref in receipt_refs.items():
-        mappings_by_role[role] = ref["commits"]
-    allowed_paths = set(request["resolution_context_paths"])
-    code_refs: list[Mapping[str, object]] = []
-    if request["strategy"] == "merge":
-        remote, tip = fetched_code[0]
-        commits = first_parent_chain(
-            runner, snapshot.root, request["pull_request"]["head_sha"], tip
-        )
-        if not commits or parents(runner, snapshot.root, commits[0]) != [
-            request["pull_request"]["head_sha"],
-            request["pull_request"]["base_sha"],
-        ]:
-            raise ConflictError(
-                "merge integration parents are not [head, base]",
-                "unexpected_history",
-            )
-        parent = commits[0]
-        for commit in commits[1:]:
-            if parents(runner, snapshot.root, commit) != [parent]:
-                raise ConflictError(
-                    "merge fixes are not a linear chain",
-                    "unexpected_history",
-                )
-            parent = commit
-        mappings = mappings_by_role.get(remote.role, [])
-        if list(mappings) != commits:
-            raise ConflictError(
-                "merge receipt commit list does not match history",
-                "unexpected_history",
-            )
-        code_ref = build_code_ref(request, remote, tip, commits, [])
-        if code_ref != receipt_refs[remote.role]:
-            raise ConflictError(
-                "merge receipt code ref does not match history",
-                "unexpected_history",
-            )
-        code_refs.append(code_ref)
-    elif request["strategy"] == "rebase":
-        remote, tip = fetched_code[0]
-        mappings = mappings_by_role.get(remote.role, [])
-        commits = prove_rebase_range(
-            runner,
-            snapshot.root,
-            request["pull_request"]["base_sha"],
-            tip,
-            request["head_commits"],
-            mappings,
-            allowed_paths,
-        )
-        code_ref = build_code_ref(request, remote, tip, commits, mappings)
-        if code_ref != receipt_refs[remote.role]:
-            raise ConflictError(
-                "rebase receipt code ref does not match history",
-                "unexpected_history",
-            )
-        code_refs.append(code_ref)
-    else:
-        previous_tip = request["native_stack"]["trunk"]["sha"]
-        member_by_number = {
-            member["pr_number"]: member for member in request["native_stack"]["members"]
-        }
-        represented = {remote.pr_number for remote, _ in fetched_code}
-        outside = {
-            item["pr_number"] for item in request["native_stack"]["outside_dependents"]
-        }
-        if represented & outside:
-            raise ConflictError("outside dependent was represented", "unexpected_history")
-        for remote, tip in fetched_code:
-            member = member_by_number[remote.pr_number]
-            prove_native_stack_member_input(
-                runner,
-                snapshot.root,
-                member,
-            )
-            expected_parent = member["expected_new_parent"]
-            expected_role = (
-                "trunk"
-                if not code_refs
-                else f"member:{code_refs[-1]['pr_number']}"
-            )
-            expected_old_sha = (
-                request["native_stack"]["trunk"]["sha"]
-                if not code_refs
-                else member_by_number[code_refs[-1]["pr_number"]]["head_sha"]
-            )
-            if (
-                expected_parent["role"] != expected_role
-                or expected_parent["old_sha"] != expected_old_sha
-            ):
-                raise ConflictError(
-                    "native stack expected parent chain is inconsistent",
-                    "stale_target",
-                )
-            mappings = mappings_by_role.get(remote.role, [])
-            commits = prove_rebase_range(
-                runner,
-                snapshot.root,
-                previous_tip,
-                tip,
-                member["old_commits"],
-                mappings,
-                allowed_paths,
-            )
-            code_ref = build_code_ref(
-                request,
-                remote,
-                tip,
-                commits,
-                mappings,
-                generated_base_sha=previous_tip,
-            )
-            if (
-                code_ref["old_sha"] != member["head_sha"]
-                or code_ref["lease_sha"] != member["lease_sha"]
-            ):
-                raise ConflictError("native stack lease identity mismatch", "stale_target")
-            if code_ref != receipt_refs[remote.role]:
-                raise ConflictError(
-                    "native stack receipt ref does not match history",
-                    "unexpected_history",
-                )
-            code_refs.append(code_ref)
-            previous_tip = tip
-    artifact, validations = validate_artifact(
+    return prove_generated_minimal(
         runner,
         snapshot,
         request,
-        remote_artifact,
-        artifact_ref,
-        artifact_sha,
-        code_refs,
+        task,
+        recovery_result,
     )
-    return code_refs, artifact, validations
 
 
-def validate_prior_generated(
-    prior: Mapping[str, object],
-    code_refs: Sequence[Mapping[str, object]],
-    artifact: Mapping[str, object],
-    validations: Sequence[Mapping[str, str]],
-) -> None:
-    generated = prior["generated"]
-    validation = prior["validation"]
-    if prior["status"] == "success":
-        if (
-            generated["code_refs"] != list(code_refs)
-            or generated["artifact"] != artifact
-            or prior["application"] != {"status": "quarantined_refs"}
-            or validation
-            != {"complete": True, "outcomes": list(validations)}
-        ):
-            raise ConflictError(
-                "prior success does not match rediscovered generated result",
-                "malformed_result",
-            )
-        return
-    if generated["code_refs"] and generated["code_refs"] != list(code_refs):
-        raise ConflictError("prior generated code refs changed", "malformed_result")
-    if generated["artifact"] is not None and not prior_artifact_matches(
-        generated["artifact"], artifact
-    ):
-        raise ConflictError("prior artifact identity changed", "malformed_result")
-    if validation["complete"] and validation["outcomes"] != list(validations):
-        raise ConflictError("prior validation identity changed", "malformed_result")
 
 
-def prior_artifact_matches(
-    prior: Mapping[str, object], current: Mapping[str, object]
-) -> bool:
-    if (
-        prior.get("branch") != current.get("branch")
-        or prior.get("head_sha") != current.get("head_sha")
-        or prior.get("receipt") != current.get("receipt")
-    ):
-        return False
-    prior_report = prior.get("report")
-    current_report = current.get("report")
-    if not isinstance(prior_report, dict) or not isinstance(current_report, dict):
-        return False
-    return (
-        prior_report.get("path") == current_report.get("path")
-        and prior_report.get("commit") == current_report.get("commit")
-        and (
-            prior_report.get("sha256") is None
-            or prior_report.get("sha256") == current_report.get("sha256")
-        )
-    )
+
+
 
 
 def pull_request_result(request: Mapping[str, object]) -> Mapping[str, object]:
@@ -5003,7 +3184,11 @@ def execute_native_stack(
         final = monitor_task(runner, snapshot, initial, progress, sleep)
         result.task_state = str(final["state"])
         result.task_url = task_link(final) or result.task_url
-        require_target_fresh(runner, snapshot, request)
+        source_drift = None
+        try:
+            require_target_fresh(runner, snapshot, request)
+        except SourceHeadChanged as error:
+            source_drift = error
         remote = discover_minimal_artifact_ref(final, member_request)
         attribution = task_attribution(runner, snapshot, final)
         if (
@@ -5075,6 +3260,8 @@ def execute_native_stack(
         result.artifact = {"members": list(artifacts)}
         atomic_write_json(options.result_file, result.as_dict())
         base_sha = tip
+        if source_drift is not None:
+            raise source_drift
     for artifact in artifacts:
         _, current_head = fetch_quarantined(
             runner,
@@ -5119,7 +3306,6 @@ def execute(
 ) -> int:
     progress = progress or Progress()
     request = options.request
-    replacement = getattr(options, "replacement", None)
     control_root = options.result_file.parent.resolve()
     if not control_root.is_dir():
         raise ConflictError(
@@ -5141,39 +3327,6 @@ def execute(
         (options.request_file, "--request-file"),
         (options.prompt_file, "--prompt-file"),
         (options.result_file, "--result-file"),
-        (options.input_result_file, "--input-result-file"),
-        (
-            (
-                replacement.request_file
-                if replacement is not None
-                else None
-            ),
-            "--replace-malformed-request-file",
-        ),
-        (
-            (
-                replacement.prompt_file
-                if replacement is not None
-                else None
-            ),
-            "--replace-malformed-prompt-file",
-        ),
-        (
-            (
-                replacement.original_result_file
-                if replacement is not None
-                else None
-            ),
-            "--replace-malformed-original-result-file",
-        ),
-        (
-            (
-                replacement.resumed_result_file
-                if replacement is not None
-                else None
-            ),
-            "--replace-malformed-resumed-result-file",
-        ),
     ):
         if path is None:
             continue
@@ -5189,17 +3342,8 @@ def execute(
     require_target_fresh(runner, snapshot, request)
     require_local_unchanged(runner, snapshot)
     if result is not None:
-        request_policy = request.get("policy", MINIMAL_POLICY)
-        result.schema = (
-            LEGACY_RESULT_SCHEMA
-            if request_policy == LEGACY_POLICY
-            else REPLAY_RESULT_SCHEMA
-            if request_policy == SEQUENTIAL_POLICY
-            else MINIMAL_RESULT_SCHEMA
-            if request_policy in (MINIMAL_POLICY, SEQUENTIAL_POLICY)
-            else RESULT_SCHEMA
-        )
-        result.policy = request_policy
+        result.schema = RESULT_SCHEMA
+        result.policy = POLICY
         result.model = options.model
         result.repository = snapshot.repository
         result.strategy = options.strategy
@@ -5212,49 +3356,19 @@ def execute(
         if result is not None:
             result.status = "success"
             result.application_status = "no_changes"
-            result.validations = (
-                [
-                    {
-                        "command": "local-history-proof",
-                        "status": "passed",
-                        "detail": (
-                            "all requested heads already have their exact expected "
-                            "parent"
-                        ),
-                    }
-                ]
-                if request.get("policy", MINIMAL_POLICY) == LEGACY_POLICY
-                else [{"command": "local-history-proof", "result": "passed"}]
-                if request.get("policy", MINIMAL_POLICY) == POLICY
-                else []
-            )
+            result.validations = []
         return 0
     fetch_pinned_inputs(runner, snapshot, request)
     verify_frozen_ranges(runner, snapshot, request)
     require_target_fresh(runner, snapshot, request)
     require_local_unchanged(runner, snapshot)
-    if (
-        request.get("policy") == SEQUENTIAL_POLICY
-        and request.get("strategy") == "native-stack"
-    ):
+    if request.get("strategy") == "native-stack":
         execute_native_stack(
             options, snapshot, runner, sleep, progress,
             result if result is not None else Result(),
         )
         return 0
-    if replacement is not None:
-        validate_malformed_completed_replacement(
-            runner,
-            snapshot,
-            replacement,
-        )
-        require_target_fresh(runner, snapshot, request)
-        require_local_unchanged(runner, snapshot)
-    if options.prior_result is not None:
-        task_id = options.prior_result["task"]["id"]
-        initial = get_task(runner, snapshot, task_id)
-    else:
-        initial = start_task(runner, snapshot, options)
+    initial = start_task(runner, snapshot, options)
     progress.task_id = str(initial["id"])
     progress.task_state = str(initial["state"])
     if result is not None:
@@ -5266,7 +3380,11 @@ def execute(
     if result is not None:
         result.task_state = str(final["state"])
         result.task_url = task_link(final) or result.task_url
-    require_target_fresh(runner, snapshot, request)
+    source_drift = None
+    try:
+        require_target_fresh(runner, snapshot, request)
+    except SourceHeadChanged as error:
+        source_drift = error
     require_local_unchanged(runner, snapshot)
     code_refs, artifact, validations = prove_generated(
         runner,
@@ -5275,16 +3393,15 @@ def execute(
         final,
         result,
     )
-    if options.prior_result is not None:
-        validate_prior_generated(
-            options.prior_result, code_refs, artifact, validations
-        )
-    require_target_fresh(runner, snapshot, request)
-    require_local_unchanged(runner, snapshot)
     if result is not None:
         result.code_refs = list(code_refs)
         result.artifact = artifact
         result.validations = list(validations)
+    if source_drift is not None:
+        raise source_drift
+    require_target_fresh(runner, snapshot, request)
+    require_local_unchanged(runner, snapshot)
+    if result is not None:
         result.application_status = "quarantined_refs"
         result.status = "success"
     return 0
@@ -5336,28 +3453,7 @@ def main(
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     result_path = result_path_from_args(args)
-    selected_policy = next(
-        (
-            args[index + 1]
-            for index in range(len(args) - 1)
-            if args[index] == "--policy"
-        ),
-        None,
-    )
-    active_policy_requested = selected_policy in (
-        MINIMAL_POLICY_SELECTOR, SEQUENTIAL_POLICY_SELECTOR
-    )
-    result = Result(
-        schema=(
-            REPLAY_RESULT_SCHEMA if selected_policy == SEQUENTIAL_POLICY_SELECTOR
-            else MINIMAL_RESULT_SCHEMA if active_policy_requested else RESULT_SCHEMA
-        ),
-        policy=(
-            SEQUENTIAL_POLICY
-            if selected_policy == SEQUENTIAL_POLICY_SELECTOR
-            else MINIMAL_POLICY if active_policy_requested else POLICY
-        ),
-    )
+    result = Result()
     progress = Progress()
     try:
         options = parse_args(args)
@@ -5391,6 +3487,14 @@ def main(
             "code": error.code,
             "message": safe_error_message(str(error)),
         }
+        if isinstance(error, SourceHeadChanged):
+            result.error.update(
+                {
+                    "pr_number": str(error.pr_number),
+                    "expected_head": error.expected_head,
+                    "actual_head": error.actual_head,
+                }
+            )
         print(f"error: {safe_error_message(str(error))}", file=stderr)
         exit_code = 2
     except Exception as error:
