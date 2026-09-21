@@ -189,7 +189,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "21338db268e9e0d73418b3b35e97fdf8e3409a963782a94de8d4fbb170bb4e71"
+    "5f941bbf0443659d6b91e1259841025c0e98c5fad03b735318f90816baa0e08b"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -9426,7 +9426,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "source_changed",
     "review_comments_pending_preparation",
 })
-EXECUTION_SHA256 = "ce1ed0beed8d3daed64a31c453b8f010190cbe5648342f44b6a26a0a94c6ffb6"
+EXECUTION_SHA256 = "1abed8d051205ea4bcd8d630c7b06a97ad7ca753fc5400fa4a03dbd2a3ea18ae"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

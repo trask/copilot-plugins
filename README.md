@@ -84,9 +84,11 @@ available. The verified owned job is the completion unit, so a job member may
 briefly outlive the direct process while normal completion remains pending.
 Success still requires complete verified membership and a zero active-job count
 within the original deadline. Unverified or forced drainage is an operation
-failure even when cleanup later proves that the job reached zero. A foreground
-timeout covers communication and owned-job drainage, and cancellation remains
-observable while drainage is pending.
+failure even when cleanup later proves that the job reached zero. An open
+failure for an enumerated member is retried only when a second Job Object
+snapshot proves that membership changed; a stable denial remains a failure. A
+foreground timeout covers communication and owned-job drainage, and
+cancellation remains observable while drainage is pending.
 Linux uses procfs generations and owned process groups; unresolved
 descendant drainage is reported rather than assumed.
 Other process-generation providers are unsupported.

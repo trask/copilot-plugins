@@ -20,8 +20,11 @@ owned job is the completion unit, so members may briefly outlive the direct
 process while completion remains pending. Success requires complete verified
 membership and a zero active-job count within the original deadline. Forced or
 unverified drainage remains a failed operation even when cleanup later reaches
-zero. A foreground timeout covers communication and owned-job drainage, and
-cancellation remains observable while drainage is pending.
+zero. If opening an enumerated member races with its exit, Runtime retries only
+after a second Job Object snapshot proves that membership changed; a stable
+denial remains a failed operation. A foreground timeout covers communication
+and owned-job drainage, and cancellation remains observable while drainage is
+pending.
 
 Controllers remain foreground processes. Only the official execution tool may
 detach a root when the user explicitly requests survival beyond client exit.

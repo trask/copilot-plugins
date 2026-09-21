@@ -461,7 +461,11 @@ class WindowsOwner:
                 for pid in pids:
                     binding = retained.get(pid)
                     if binding is None:
-                        handle = self.open_process(pid)
+                        try:
+                            handle = self.open_process(pid)
+                        except OSError as inspection:
+                            failure = inspection
+                            break
                         if handle is None:
                             failure = ExecutionError(
                                 "owned Windows job process identity is unavailable"

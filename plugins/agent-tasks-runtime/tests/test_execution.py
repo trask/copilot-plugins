@@ -847,6 +847,30 @@ class ExecutionTest(unittest.TestCase):
         ):
             owner.processes(EXECUTION.time.monotonic() + 1.0, {})
 
+    def test_windows_process_observation_retries_transient_open_denial(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.process_ids = mock.Mock(side_effect=[(456,), (), (), ()])
+        owner.open_process = mock.Mock(
+            side_effect=PermissionError(5, "Access is denied")
+        )
+        owner.kernel = types.SimpleNamespace(CloseHandle=mock.Mock(return_value=True))
+
+        self.assertEqual(
+            [],
+            owner.processes(EXECUTION.time.monotonic() + 1.0, {}),
+        )
+
+    def test_windows_process_observation_rejects_stable_open_denial(self):
+        owner = object.__new__(EXECUTION.WindowsOwner)
+        owner.process_ids = mock.Mock(side_effect=[(456,), (456,)])
+        owner.open_process = mock.Mock(
+            side_effect=PermissionError(5, "Access is denied")
+        )
+        owner.kernel = types.SimpleNamespace(CloseHandle=mock.Mock(return_value=True))
+
+        with self.assertRaisesRegex(PermissionError, "Access is denied"):
+            owner.processes(EXECUTION.time.monotonic() + 1.0, {})
+
     def test_windows_process_observation_rejects_stable_nonmember_generation(self):
         owner = object.__new__(EXECUTION.WindowsOwner)
         owner.process_ids = mock.Mock(side_effect=[(456,), (456,)])
@@ -1970,6 +1994,140 @@ class ExecutionTest(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "Windows process ownership regression")
 class WindowsRealProcessTest(unittest.TestCase):
+    def test_nested_execution_tree_completes_and_cancels_without_access_denied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            script = root / "nested_execution.py"
+            script.write_text(
+                "import importlib.util\n"
+                "import json\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "\n"
+                "runtime_path, role, mode, ready = sys.argv[1:]\n"
+                "spec = importlib.util.spec_from_file_location(f'nested_{role}', runtime_path)\n"
+                "execution = importlib.util.module_from_spec(spec)\n"
+                "sys.modules[spec.name] = execution\n"
+                "spec.loader.exec_module(execution)\n"
+                "command = [sys.executable, __file__, *sys.argv[1:]]\n"
+                "parent = Path(os.environ[execution.PARENT_ENV])\n"
+                "request = execution.read(parent)\n"
+                "context = execution.Execution(\n"
+                "    Path(request['handle']),\n"
+                "    command=command,\n"
+                "    parent=parent,\n"
+                "    terminal_results=frozenset({'complete'}),\n"
+                ")\n"
+                "context.ready()\n"
+                "try:\n"
+                "    if role == 'pipeline':\n"
+                "        context.run(\n"
+                "            [sys.executable, __file__, runtime_path, 'conflict', mode, ready],\n"
+                "            require_execution=True,\n"
+                "            check=True,\n"
+                "        )\n"
+                "    elif mode == 'normal':\n"
+                "        for _ in range(16):\n"
+                "            context.run(['git', '--version'], check=True, capture_output=True)\n"
+                "        Path(ready).write_text(\n"
+                "            json.dumps({\n"
+                "                'pipeline': context.parent['owner']['pid'],\n"
+                "                'conflict': os.getpid(),\n"
+                "            }),\n"
+                "            encoding='utf-8',\n"
+                "        )\n"
+                "    else:\n"
+                "        leaf = context.start(\n"
+                "            [sys.executable, '-c', 'import time; time.sleep(60)']\n"
+                "        )\n"
+                "        Path(ready).write_text(\n"
+                "            json.dumps({\n"
+                "                'pipeline': context.parent['owner']['pid'],\n"
+                "                'conflict': os.getpid(),\n"
+                "                'leaf': leaf.pid,\n"
+                "            }),\n"
+                "            encoding='utf-8',\n"
+                "        )\n"
+                "        leaf.wait()\n"
+                "    context.emit({'result': 'complete'})\n"
+                "    terminal = context.finish(0)\n"
+                "except execution.Cancelled:\n"
+                "    terminal = context.finish(130, cancelled=True)\n"
+                "except BaseException as failure:\n"
+                "    terminal = context.finish(\n"
+                "        1, error=f'{type(failure).__name__}: {failure}'\n"
+                "    )\n"
+                "raise SystemExit(terminal['exit_code'])\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            runtime = str(SCRIPT.resolve())
+
+            normal_context = EXECUTION.Execution(
+                root / "normal-execution.json",
+                command=[sys.executable, str(script)],
+                terminal_results=frozenset({"complete"}),
+            )
+            normal_command = [
+                sys.executable, str(script), runtime, "pipeline", "normal",
+                str(root / "normal-ready.json"),
+            ]
+            normal = normal_context.run(
+                normal_command, require_execution=True, timeout=60, check=True
+            )
+            self.assertEqual(0, normal.returncode)
+            normal_context.emit({"result": "complete"})
+            normal_terminal = normal_context.finish(0)
+            self.assertEqual("finished", normal_terminal["local_status"])
+            self.assertTrue(normal_terminal["local_children_drained"])
+
+            cancel_context = EXECUTION.Execution(
+                root / "cancel-execution.json",
+                command=[sys.executable, str(script)],
+                terminal_results=frozenset({"complete"}),
+            )
+            cancel_ready = root / "cancel-ready.json"
+            cancel_command = [
+                sys.executable, str(script), runtime, "pipeline", "cancel",
+                str(cancel_ready),
+            ]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                cancelled = pool.submit(
+                    cancel_context.run,
+                    cancel_command,
+                    require_execution=True,
+                    timeout=60,
+                    check=True,
+                )
+                deadline = time.monotonic() + 20
+                while not cancel_ready.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(cancel_ready.is_file())
+                processes = json.loads(cancel_ready.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    "cancel_requested",
+                    EXECUTION.cancel(cancel_context.handle)["result"],
+                )
+                with self.assertRaises(EXECUTION.Cancelled):
+                    cancelled.result(timeout=20)
+
+            for pid in processes.values():
+                identity = EXECUTION.process_identity(pid)
+                self.assertTrue(identity is None or not identity["running"])
+            cancel_context.emit({"result": "complete"})
+            cancel_terminal = cancel_context.finish(130, cancelled=True)
+            self.assertEqual("failed", cancel_terminal["local_status"])
+            self.assertTrue(cancel_terminal["local_children_drained"])
+            evidence = "\n".join(
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in root.rglob("*")
+                if path.is_file()
+            )
+            self.assertNotIn("Access is denied", evidence)
+
     def test_real_process_tree_is_owned_drained_and_cancelled_without_console_windows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
