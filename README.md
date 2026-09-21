@@ -63,14 +63,15 @@ status reads verify process generation and the canonical terminal-result hash;
 they do not drive the workflow. The handle's `.d` directory holds stdout,
 stderr, progress, child evidence and results. An unsealed root observed only
 after its executable image becomes unavailable remains abandoned and remotely
-unconfirmed; that observation does not release writer ownership.
+unconfirmed.
 
 Client or observer disconnection is not cancellation. Explicit plugin cancellation
 fences new launches and publication, but cannot undo an admitted remote request
 or promise hosted-task cancellation. Failed and cancelled runs retain unknown
-or active task identities, spent budgets, artifacts and branch-writer ownership.
-There is no automatic takeover or recovery. A new authorization does not make an
-unresolved old owner safe to replace.
+or active task identities, spent budgets and artifacts. Branch admission is based
+on current execution evidence rather than persistent writer reservations. There
+is no automatic takeover or recovery, and a fresh invocation never adopts an
+unresolved historical task.
 
 The execution record distinguishes finished, failed, locally cancelled and
 abandoned runs. A finished controller may still report pending review, exhaustion,
@@ -105,8 +106,6 @@ immediately forced job drainage. That evidence does not explain why those
 members existed or how long they would have remained naturally. None of these
 failures qualifies cases that did not run, and mocked coverage is not native
 qualification.
-The legacy Pipeline `start` path retains its separate breakaway contract and
-fails before fallback when breakaway is denied.
 
 ## Plugins
 
@@ -116,6 +115,12 @@ Provides the shared, hash-verified `cloud_task.py` used by six Agent Tasks
 agents. The plugin exposes no custom agent; consumer coordinators locate its
 internal skill through Copilot's skill inventory and fail closed when the
 runtime is missing, disabled, or incompatible.
+
+The executable cloud-task surface supports only the current version-5
+code-candidate and report-recommendation contracts. Retired apply/report,
+resume, monitor-only, prepared-result and task-reuse options fail before
+dispatch or mutation; historical artifacts remain evidence and cannot be used
+to resume a fresh invocation.
 
 ### PR Reviewer
 
@@ -175,8 +180,10 @@ Agent Tasks through local `gh api`; there is no Cloud Sandbox, custom agent, or
 local-analysis fallback.
 
 Description deliberately invalidates same-head clearance when metadata or the
-actual base tip changes. It does not create a replacement task for that head.
-A source-only replacement proposal remains excluded, not cleared.
+actual base tip changes. A title or body change at the same head can be
+reevaluated only in a strictly later authorized Pipeline iteration after the
+earlier task completed. A source-only replacement proposal remains excluded,
+not cleared.
 
 ### PR Pipeline
 

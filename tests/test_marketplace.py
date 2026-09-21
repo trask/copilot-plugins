@@ -33,15 +33,15 @@ CONFLICT_HELPER_SHA256 = (
     "d22684f684af52a3a0a6caa6afd4b25f5733260e2127db81763b2b13946c323a"
 )
 EXPECTED_PACKAGE_VERSIONS = {
-    "agent-tasks-runtime": "1.0.21",
-    "ci-fix-loop": "1.6.61",
-    "copilot-review-loop": "1.1.71",
-    "historical-pr-audit": "1.1.25",
-    "pr-conflict-resolver": "1.1.40",
-    "pr-description": "1.0.70",
-    "pr-pipeline": "1.5.41",
-    "pr-reviewer": "1.8.14",
-    "self-review-loop": "1.3.47",
+    "agent-tasks-runtime": "1.0.22",
+    "ci-fix-loop": "1.6.62",
+    "copilot-review-loop": "1.1.72",
+    "historical-pr-audit": "1.1.26",
+    "pr-conflict-resolver": "1.1.41",
+    "pr-description": "1.0.71",
+    "pr-pipeline": "1.5.42",
+    "pr-reviewer": "1.8.15",
+    "self-review-loop": "1.3.48",
 }
 
 
