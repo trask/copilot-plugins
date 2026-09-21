@@ -1956,7 +1956,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.48")
+        self.assertEqual(plugin["version"], "1.3.49")
         self.assertNotIn("custom_agent", plugin)
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
