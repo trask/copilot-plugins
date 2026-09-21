@@ -3535,7 +3535,6 @@ def command_status(args: argparse.Namespace) -> None:
             },
             "local_validation": state.get("local_validation") or [],
             **stage_outcome_fields(state),
-            **malformed_owner_fields,
             "iterations": int(state.get("iterations", 0)),
             "last_helper_activity": last_helper_activity(state),
         }

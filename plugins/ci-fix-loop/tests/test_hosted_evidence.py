@@ -55,7 +55,10 @@ class HostedEvidenceTest(unittest.TestCase):
                 )
                 rendered = MODULE.controller_ci_evidence(self.preflight(text))
                 record = json.loads(rendered)["logs"][0]
-                self.assertLessEqual(len(rendered.encode("utf-8")), MODULE.MAX_TRIAGE_SUMMARY_BYTES)
+                self.assertLessEqual(
+                    len(rendered.encode("utf-8")),
+                    MODULE.MAX_INLINE_CI_EVIDENCE_BYTES,
+                )
                 self.assertTrue(record["retrieve_full_log"])
                 self.assertNotIn("text", record)
                 self.assertEqual(len(text.encode("utf-8")), record["omitted_utf8_bytes"])
@@ -64,7 +67,7 @@ class HostedEvidenceTest(unittest.TestCase):
                 self.assertEqual(MODULE.sha256_text(text), record["log_sha256"])
 
     def test_missing_attempt_or_job_never_silently_truncates(self):
-        source = self.preflight("x" * (MODULE.MAX_TRIAGE_SUMMARY_BYTES + 1))
+        source = self.preflight("x" * (MODULE.MAX_INLINE_CI_EVIDENCE_BYTES + 1))
         for field in ("job", "attempt"):
             with self.subTest(field=field):
                 preflight = copy.deepcopy(source)

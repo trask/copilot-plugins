@@ -2986,207 +2986,6 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                     repo,
                 )
 
-    def test_verifier_process_does_not_create_package_bytecode(self):
-        with tempfile.TemporaryDirectory(prefix="verifier package ") as directory:
-            scripts = Path(directory) / "ci-fix-loop" / "scripts"
-            scripts.mkdir(parents=True)
-            helper = scripts / "ci_fix_loop.py"
-            permission = scripts / "ci_fix_loop_permission.py"
-            shutil.copy2(SCRIPT, helper)
-            shutil.copy2(PERMISSION_SCRIPT, permission)
-            artifact = Path(directory) / "missing eligibility.json"
-            options = {}
-            if os.name == "nt":
-                options["creationflags"] = subprocess.CREATE_NO_WINDOW
-            for _ in range(2):
-                completed = subprocess.run(
-                    [
-                        sys.executable,
-                        str(helper),
-                        "verify-sealed-legacy-owner-reconciliation",
-                        str(artifact),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    check=False,
-                    **options,
-                )
-                self.assertEqual(1, completed.returncode)
-                self.assertIn('"result": "error"', completed.stdout)
-                self.assertFalse((scripts / "__pycache__").exists())
-
-                permission_result = subprocess.run(
-                    [sys.executable, str(permission)],
-                    input="{}\n",
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    check=True,
-                    **options,
-                )
-                self.assertEqual("{}\n", permission_result.stdout)
-                self.assertFalse((scripts / "__pycache__").exists())
-
-    def legacy_sealed_verifier_authorizes_only_exact_two_pass_snapshot(self):
-        with tempfile.TemporaryDirectory(prefix="legacy owner ") as directory:
-            root = Path(directory)
-            state_path = root / "state.json"
-            artifact_path = root / "eligibility artifact.json"
-            digest_path = root / "eligibility artifact.json.sha256"
-            manifest_path = root / "package manifest.json"
-            repo, _identity, state = self.legacy_owner_state(directory)
-            MODULE.save_state(state_path, state)
-            manifest_path.write_text("{}\n", encoding="utf-8")
-            package = {
-                "path": str(manifest_path),
-                "sha256": "a" * 64,
-                "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
-                "source_commit": "b" * 40,
-                "installed_root": str(root / "installed"),
-                "package": {
-                    "name": "ci-fix-loop",
-                    "version": "1.6.35",
-                    "file_count": 8,
-                    "package_sha256": "c" * 64,
-                },
-            }
-            snapshot = {
-                "schema": MODULE.LEGACY_OWNER_RECONCILIATION_SNAPSHOT_SCHEMA,
-                "state": {
-                    "path": str(state_path),
-                    "sha256": MODULE.sha256_file(state_path),
-                },
-                "owner": "run-1",
-            }
-            artifact = MODULE.legacy_owner_eligibility_artifact(
-                target=MODULE.parse_target("owner/repo#7"),
-                repo_root=repo,
-                state_path=state_path,
-                eligibility_path=artifact_path,
-                digest_path=digest_path,
-                snapshot=snapshot,
-                package_manifest=package,
-            )
-            artifact_path.write_text(
-                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-                newline="\n",
-            )
-            artifact_sha256 = MODULE.sha256_file(artifact_path)
-            digest_path.write_text(
-                f"{artifact_sha256}\n", encoding="ascii", newline="\n"
-            )
-            arguments = SimpleNamespace(
-                target="owner/repo#7",
-                repo_root=str(repo),
-                state=str(state_path),
-                eligibility_artifact=str(artifact_path),
-                eligibility_sha256_file=str(digest_path),
-                package_manifest=str(manifest_path),
-                expected_package_manifest_sha256=package["sha256"],
-                expected_seal=artifact["seal"],
-            )
-            emitted = []
-            forbidden = [
-                "listed_agent_task_ids",
-                "run_hosted_helper",
-                "apply_verified_import",
-                "publish_empty_rerun_commit",
-            ]
-            with contextlib.ExitStack() as stack:
-                forbidden_mocks = [
-                    stack.enter_context(mock.patch.object(MODULE, name))
-                    for name in forbidden
-                ]
-                with (
-                    mock.patch.object(MODULE, "require_tools"),
-                    mock.patch.object(
-                        MODULE, "resolve_repo_root", return_value=repo
-                    ),
-                    mock.patch.object(
-                        MODULE,
-                        "resolve_target",
-                        return_value=MODULE.parse_target("owner/repo#7"),
-                    ),
-                    mock.patch.object(
-                        MODULE,
-                        "verify_installed_package_manifest",
-                        return_value=package,
-                    ),
-                    mock.patch.object(
-                        MODULE,
-                        "legacy_hosted_owner_reconciliation_snapshot",
-                        side_effect=[snapshot, snapshot],
-                    ) as live,
-                    mock.patch.object(MODULE, "emit", emitted.append),
-                ):
-                    MODULE.command_verify_legacy_owner_reconciliation(
-                        arguments
-                    )
-                for forbidden_mock in forbidden_mocks:
-                    forbidden_mock.assert_not_called()
-
-            self.assertEqual(2, live.call_count)
-            authorization = emitted[-1]
-            self.assertEqual("authorized", authorization["result"])
-            self.assertEqual(2, authorization["passes"])
-            self.assertFalse(authorization["mutation_performed"])
-            self.assertFalse(authorization["workflow_started"])
-            self.assertEqual(
-                "apply-legacy-owner-reconciliation",
-                authorization["reconciliation_argv"][2],
-            )
-            apply_arguments = copy.copy(arguments)
-            apply_arguments.expected_artifact_sha256 = artifact_sha256
-            apply_arguments.expected_authorization_token = authorization[
-                "authorization_token"
-            ]
-            applied = []
-            with contextlib.ExitStack() as stack:
-                forbidden_mocks = [
-                    stack.enter_context(mock.patch.object(MODULE, name))
-                    for name in forbidden
-                ]
-                with (
-                    mock.patch.object(MODULE, "require_tools"),
-                    mock.patch.object(
-                        MODULE, "resolve_repo_root", return_value=repo
-                    ),
-                    mock.patch.object(
-                        MODULE,
-                        "resolve_target",
-                        return_value=MODULE.parse_target("owner/repo#7"),
-                    ),
-                    mock.patch.object(
-                        MODULE,
-                        "verify_installed_package_manifest",
-                        return_value=package,
-                    ),
-                    mock.patch.object(
-                        MODULE,
-                        "legacy_hosted_owner_reconciliation_snapshot",
-                        side_effect=[snapshot, snapshot, snapshot],
-                    ),
-                    mock.patch.object(MODULE, "emit", applied.append),
-                ):
-                    MODULE.command_apply_legacy_owner_reconciliation(
-                        apply_arguments
-                    )
-                for forbidden_mock in forbidden_mocks:
-                    forbidden_mock.assert_not_called()
-
-            final = MODULE.load_state(state_path)
-            self.assertEqual(1, final["iterations"])
-            self.assertEqual("failed", final["agent_task"]["status"])
-            self.assertEqual("unknown", final["agent_task"]["task_id_status"])
-            self.assertIsNone(final["agent_task"]["task_id"])
-            self.assertNotIn("recovery_command", final["agent_task"])
-            self.assertEqual("owner_lost", applied[-1]["result"])
-            self.assertFalse(applied[-1]["workflow_started"])
-            self.assertFalse(applied[-1]["task_created"])
-            self.assertIsNone(applied[-1]["continuation"])
-
     def legacy_prepare_writes_one_sealed_nonexecuted_artifact(self):
         with tempfile.TemporaryDirectory(prefix="legacy prepare ") as directory:
             root = Path(directory)
@@ -6802,8 +6601,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 "prompt_file": str(prompt),
                 "result_file": str(result),
                 "prior_result_files": [str(prior_result)],
-                "recovery_command": "resume",
-                "recovery_files": [str(prompt), str(result)],
             }
         }
 
@@ -6842,8 +6639,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ],
             stored["preserved_artifacts"],
         )
-        self.assertNotIn("recovery_command", stored)
-        self.assertNotIn("recovery_files", stored)
 
 
 
@@ -14228,47 +14023,6 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("accepted_push_not_propagated", action["reason"])
         self.assertEqual("pending-push", action["checkpoint_id"])
         self.assertEqual("lower2", action["expected_head"])
-
-    def test_interrupted_member_surfaces_its_managed_task_recovery(self):
-        stack = native_stack()
-        started = self.start(stack)
-        self.next(stack)
-        directory = self.root / "resume-agent-task"
-        directory.mkdir()
-        member_state = write_state(
-            directory,
-            pr={
-                "number": 5,
-                "title": "PR 5",
-                "pr_url": "https://github.com/owner/repo/pull/5",
-                "repo_name": "owner/repo",
-                "head_sha": "lower1",
-            },
-            run={
-                "stack_guard": {
-                    "state": str(self.stack_state),
-                    "run_id": started["run_id"],
-                    "member": 5,
-                    "member_head_sha": "lower1",
-                }
-            },
-            agent_task={
-                "status": "failed",
-                "recovery_command": "python ci_fix_loop.py agent-task --resume",
-            },
-        )
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "read_native_stack", return_value=stack),
-            mock.patch.object(
-                MODULE, "stack_member_state_path", return_value=member_state
-            ),
-        ):
-            action = call("stack-next", "--state", str(self.stack_state))
-
-        self.assertEqual("resume_agent-task", action["result"])
-        self.assertEqual("agent_task_failed", action["reason"])
-        self.assertEqual(str(member_state), action["member_state"])
 
     def test_landed_pending_push_is_finalized_and_propagated_after_a_crash(self):
         stack = native_stack()

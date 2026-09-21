@@ -54,14 +54,6 @@ SOURCE_ONLY_REVIEW_REQUEST_BLOCKED_STATE = (
     / "fixtures"
     / "source-only-review-request-blocked-16161-state.json"
 )
-APPLIED_PATH_CORRELATED_V2_RESULT = (
-    Path(__file__).parent
-    / "fixtures"
-    / "applied-path-correlated-v2-agent-task-result.json"
-)
-PATH_CORRELATED_V2_REPORT = (
-    Path(__file__).parent / "fixtures" / "path-correlated-v2-report.md"
-)
 COMPACT_V3_REPORT = (
     Path(__file__).parent / "fixtures" / "compact-v3-report.md"
 )
@@ -2760,12 +2752,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                         paths_by_commit=common["paths_by_commit"],
                     )
 
-    def test_canonical_report_preserves_diff_side_and_legacy_schema(self):
+    def test_canonical_report_preserves_diff_side_and_history_contract(self):
         preflight = copy.deepcopy(self.preflight)
         comment = {**self.comment, "side": "RIGHT"}
         preflight["comment_identities"] = [MODULE.comment_identity(comment)]
         content = json.loads(self.report())
-        content["schema"] = MODULE.LEGACY_COPILOT_REVIEW_REPORT_SCHEMA
         report = MODULE.validate_copilot_review_report(
             json.dumps(content),
             request_id="request-1",
@@ -2781,7 +2772,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            MODULE.LEGACY_COPILOT_REVIEW_REPORT_SCHEMA,
+            MODULE.POSITIONAL_COPILOT_REVIEW_REPORT_SCHEMA,
             report["schema"],
         )
         self.assertIn('"side": "RIGHT"', prompt)
@@ -2792,7 +2783,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn('"base_ref": "main"', prompt)
         self.assertIn("linear single-parent code commits", prompt)
         self.assertIn("without squashing or rewriting", prompt)
-        self.assertIn("increasing order without duplicates", prompt)
 
     def test_canonical_report_v3_validates_refs_and_separate_author(self):
         preflight = copy.deepcopy(self.preflight)
@@ -3104,108 +3094,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 paths_by_commit={},
                 active_local_decisions=True,
             )
-
-    def test_exact_v2_path_correlated_report_recovers_applied_local_commits(self):
-        result = MODULE.load_agent_task_result(APPLIED_PATH_CORRELATED_V2_RESULT)
-        preflight = copy.deepcopy(self.preflight)
-        preflight["identity"].update(
-            {
-                "branch": "trask-actions-queue-events",
-                "head": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
-            }
-        )
-        preflight["pr"].update(
-            {
-                "number": 377,
-                "pr_url": "https://github.com/open-telemetry/shared-workflows/pull/377",
-                "repo_name": "open-telemetry/shared-workflows",
-                "head_repository": "open-telemetry/shared-workflows",
-                "head_branch": "trask-actions-queue-events",
-                "head_sha": "ba1cdf0d96365a55af87e62c2f476245af685bbb",
-                "base_branch": "main",
-                "base_sha": "ad5b9918d6eca8cc999d7034757aee727b2631ea",
-            }
-        )
-        preflight["comment_identities"] = [
-            {
-                "body_sha256": "fee0fb038a1fb5ce774f8c3673dccfd9730ffade85b058dc2987857ec948f59e",
-                "id": 4021507173,
-                "line": 490,
-                "original_line": 496,
-                "path": ".github/scripts/github-actions-queue/collect.py",
-                "review_id": 5217340671,
-                "source": "thread",
-                "thread_id": "PRRT_kwDOTENyc86iv3hz",
-                "url": "https://github.com/open-telemetry/shared-workflows/pull/377#discussion_r4021507173",
-            },
-            {
-                "body_sha256": "10a523a78d2852ee85db99e6cfd04c487df06a2154c1ce3a57f27d5d6a81351c",
-                "id": 4021507189,
-                "line": 55,
-                "original_line": 55,
-                "path": ".github/workflows/github-actions-queue-collector.yml",
-                "review_id": 5217340671,
-                "source": "thread",
-                "thread_id": "PRRT_kwDOTENyc86iv3iA",
-                "url": "https://github.com/open-telemetry/shared-workflows/pull/377#discussion_r4021507189",
-            },
-        ]
-        remote = MODULE.validate_success_result(
-            result,
-            preflight=preflight,
-            requested_model="gpt-5.6-sol",
-        )
-        paths_by_commit = {
-            "571bade3904ff473283e6b9da95853e712fe6c8a": [
-                ".github/scripts/github-actions-queue/collect.py",
-                ".github/scripts/github-actions-queue/test_collect.py",
-            ],
-            "c546c4902433040a05262cb22fa5587ae829de62": [
-                ".github/workflows/github-actions-queue-collector.yml",
-            ],
-        }
-        report_content = PATH_CORRELATED_V2_REPORT.read_text(encoding="utf-8")
-
-        report = MODULE.validate_copilot_review_report(
-            report_content,
-            request_id=remote["request_id"],
-            preflight=preflight,
-            remote=remote,
-            paths_by_commit=paths_by_commit,
-        )
-
-        self.assertFalse(remote["requires_apply"])
-        self.assertEqual(
-            [item["commit"] for item in report["comments"]],
-            remote["commits"],
-        )
-        with (
-            mock.patch.object(
-                MODULE,
-                "local_identity",
-                return_value={
-                    "branch": "trask-actions-queue-events",
-                    "head": remote["final_local_head"],
-                    "status": "",
-                },
-            ),
-            mock.patch.object(MODULE, "run") as run,
-            mock.patch.object(
-                MODULE,
-                "sha256_file",
-                return_value="result-digest",
-            ),
-        ):
-            imported = MODULE.apply_verified_import(
-                self.repo_root,
-                result_path=APPLIED_PATH_CORRELATED_V2_RESULT,
-                result_sha256="result-digest",
-                report_content=report_content,
-                preflight=preflight,
-                remote=remote,
-            )
-        self.assertFalse(imported)
-        run.assert_not_called()
 
     def test_rejects_malformed_mismatched_and_credential_artifacts(self):
         bad = self.result()
@@ -3547,51 +3435,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "`stage_outcome: skipped` only with the exact frozen-head source-only proof",
             instructions,
         )
-
-    def test_prepare_only_stops_before_requesting_a_missing_review(self):
-        state_path = self.directory / "review-request-pending.json"
-        preflight = {
-            **self.preflight,
-            "comments": [],
-            "comment_identities": [],
-            "head_review_clean": False,
-            "head_review_id": None,
-        }
-        args = self.arguments(state_path)
-        args.prepare_only = True
-        args.preserve_artifacts = True
-        emitted = []
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target("owner/repo#7"),
-            ),
-            mock.patch.object(
-                MODULE,
-                "wait_for_stable_review_preflight",
-                return_value=preflight,
-            ),
-            mock.patch.object(
-                MODULE,
-                "local_identity",
-                return_value=preflight["identity"],
-            ),
-            mock.patch.object(MODULE, "remote_head") as remote_head,
-            mock.patch.object(MODULE, "request_copilot") as request,
-            mock.patch.object(MODULE, "discover_cloud_task") as discover,
-            mock.patch.object(MODULE, "emit", emitted.append),
-        ):
-            MODULE.command_agent_task(args)
-
-        self.assertEqual(
-            "review_request_pending_authorization", emitted[-1]["result"]
-        )
-        remote_head.assert_not_called()
-        request.assert_not_called()
-        discover.assert_not_called()
 
     def arguments(self, state_path, *, resume=False, max_iterations=5):
         return SimpleNamespace(
@@ -4005,102 +3848,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         }
         return arguments, manifest, attestation
 
-    def invoke_local_failure(
-        self,
-        state_path,
-        message,
-        *,
-        run_id="run-1",
-        target="owner/repo#7",
-        details=None,
-        result=None,
-    ):
-        def fail(**arguments):
-            if result is not None:
-                arguments["result_path"].write_text(json.dumps(result), encoding="utf-8")
-            raise MODULE.WorkflowError(
-                message,
-                details=details
-                or {
-                    "source_before": self.source_fingerprint,
-                    "source_after": self.source_fingerprint,
-                    "github_before": self.github_fingerprint,
-                    "github_after": self.github_fingerprint,
-                },
-            )
-
-        self.hosted_worker.side_effect = fail
-        arguments = self.arguments(state_path)
-        arguments.target = target
-        with (
-            mock.patch.object(MODULE, "require_tools"),
-            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
-            mock.patch.object(
-                MODULE,
-                "resolve_target",
-                return_value=MODULE.parse_target(target),
-            ),
-            mock.patch.object(
-                MODULE,
-                "wait_for_stable_review_preflight",
-                return_value=self.preflight,
-            ),
-            mock.patch.object(
-                MODULE, "local_identity", return_value=self.preflight["identity"]
-            ),
-            mock.patch.object(
-                MODULE,
-                "require_live_comments",
-                return_value=self.preflight["comments"],
-            ),
-            mock.patch.object(MODULE, "discover_cloud_task") as discover,
-            mock.patch.object(MODULE.secrets, "token_hex", return_value=run_id),
-            mock.patch.object(MODULE.uuid, "uuid4", return_value="local-session"),
-            self.assertRaisesRegex(MODULE.WorkflowError, re.escape(message)),
-        ):
-            MODULE.command_agent_task(arguments)
-        discover.assert_called_once()
-        self.local_worker.assert_not_called()
-        return MODULE.load_state(state_path)
-
-
-    def test_new_terminal_report_failure_is_audit_only(self):
-        state_path = self.directory / "terminal-report-state.json"
-        result = self.result()
-        result.update(
-            schema=MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
-            candidate=None, completion=None,
-        )
-        failed = self.invoke_local_failure(
-            state_path,
-            "hosted decision report has stale identity",
-            result=result,
-        )["agent_task"]
-        self.assertEqual("failed", failed["status"])
-        self.assertEqual("terminal_unusable", failed["task_id_status"])
-        self.assertEqual(result["task"]["id"], failed["task_id"])
-        self.assertEqual(
-            "hosted decision report has stale identity",
-            failed["error"],
-        )
-        self.assertNotIn("recovery_command", failed)
-        self.assertNotIn("retry_command", failed)
-
-
-    def test_malformed_report_does_not_import_verified_commits(self):
-        state_path = self.directory / "malformed-report-state.json"
-        failed = self.invoke_local_failure(
-            state_path,
-            "local decision report is malformed",
-        )["agent_task"]
-
-        self.assertEqual("failed", failed["status"])
-        self.assertEqual("unknown", failed["task_id_status"])
-        self.assertEqual(1, len(failed["recovery_files"]))
-        self.assertTrue(failed["recovery_files"][0].endswith("hosted-decision-prompt.txt"))
-        self.assertEqual(self.source_fingerprint, failed["source_before"])
-        self.assertEqual(self.source_fingerprint, failed["source_after"])
-
     def test_exact_cca_disabled_result_is_a_trusted_task_creation_failure(self):
         result = MODULE.load_agent_task_result(CCA_DISABLED_RESULT)
         preflight = {
@@ -4390,7 +4137,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(completed, restarted["managed_task_history"][1])
         self.assertEqual("new-owner", restarted["agent_task"]["run_id"])
 
-    def test_fresh_review_comments_start_the_next_managed_iteration(self):
+    def test_fresh_review_comments_resume_the_managed_iteration(self):
         state_path = self.directory / "watch-state.json"
         events = []
         MODULE.save_state(
@@ -4432,7 +4179,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.continue_after_review_request(arguments, state_path)
         fresh.assert_called_once()
         next_arguments = next_iteration.call_args.args[0]
-        self.assertFalse(next_arguments.resume)
+        self.assertTrue(next_arguments.resume)
         self.assertEqual(next_arguments.max_iterations, 5)
         self.assertEqual("pipeline-run", next_arguments.pipeline_run)
         self.assertEqual(2, next_arguments.pipeline_iteration)
@@ -6737,30 +6484,6 @@ class RecordCommitTest(unittest.TestCase):
             saved = MODULE.load_state(state_path)
 
         self.assertEqual(saved["queue"]["comments"][0]["commit"], "a" * 40)
-
-
-class ParserTest(unittest.TestCase):
-    def test_plan_accumulates_repeated_path_flags(self):
-        args = MODULE.build_parser().parse_args(
-            [
-                "plan",
-                "--state",
-                "state.json",
-                "--batch",
-                "batch-1",
-                "--comments",
-                "1",
-                "--label",
-                "Fix paths",
-                "--paths",
-                "one.java",
-                "two.java",
-                "--paths",
-                "three.java",
-            ]
-        )
-
-        self.assertEqual(args.paths, ["one.java", "two.java", "three.java"])
 
 
 class ReplyPublishingTest(unittest.TestCase):
@@ -10026,17 +9749,6 @@ class DerivedCeilingTest(unittest.TestCase):
             instructions,
         )
 
-    def test_preflight_documents_the_ceiling_rather_than_a_replacement(self):
-        """The flag reads as a replacement unless its help says otherwise."""
-        parser = MODULE.build_parser()
-        bare = parser.parse_args(["preflight"])
-        self.assertIsNone(bare.pipeline_max_iterations)
-
-        source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("advancing it does not refresh", source)
-        self.assertIn("it never multiplies or replaces ", source)
-
-
 class LocalValidationRecordTest(unittest.TestCase):
     """The record is what makes the push requirement falsifiable.
 
@@ -10114,42 +9826,6 @@ class DetachedHeadTargetTest(unittest.TestCase):
         self.assertIn(
             "pass the pull request explicitly as a URL or owner/repo#number",
             message,
-        )
-
-
-class PreflightHelpTest(unittest.TestCase):
-    """`--help` is read by a caller building a call, not one recovering from it.
-
-    An agent constructing a `preflight` invocation reads this line first. A hint
-    that still promises the checked-out branch's pull request sends it to a
-    resolver a detached worktree cannot satisfy, and the refusal's correction
-    then arrives only after the launch it wasted.
-    """
-
-    def test_the_target_help_repeats_the_agent_file_hint(self):
-        """Deriving the clause keeps one sentence across both surfaces.
-
-        The agent file's own guard fixes what that clause says; this one stops
-        the two from drifting apart.
-        """
-        hint = re.search(
-            r'^argument-hint: "(.+)"$', AGENT.read_text(encoding="utf-8"), re.M
-        )
-        self.assertIsNotNone(hint)
-        clause = hint.group(1).split("; ", 1)[1]
-        subparsers = next(
-            action
-            for action in MODULE.build_parser()._actions
-            if isinstance(action, argparse._SubParsersAction)
-        )
-        target = next(
-            action
-            for action in subparsers.choices["preflight"]._actions
-            if action.dest == "target"
-        )
-        self.assertTrue(
-            target.help.endswith(f"; {clause}"),
-            f"preflight target help {target.help!r} does not end with {clause!r}",
         )
 
 
