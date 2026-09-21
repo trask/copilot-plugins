@@ -41,7 +41,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "b88a6edaeeb4358d84bb1143489244d7f181ff694fb6d2c3abde735de7c719f3"
+    "4912c63d9841cf3439a91ac90db9f9eff86140c68a74a353e9228e5ec41c76b1"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -107,7 +107,7 @@ def run(
     check: bool = True,
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.run(
+    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         command,
         input=input_text,
         text=True,
@@ -125,7 +125,9 @@ def run(
     return process
 
 
-def emit(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:
+def emit(payload: dict[str, Any], *, stream: Any=None) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.emit(payload)
     print(json.dumps(payload, indent=2, sort_keys=True), file=stream, flush=True)
 
 
@@ -1538,6 +1540,11 @@ def state_path_for(pr: dict[str, Any], run_id: str) -> Path:
 
 
 def save_run_state(path: Path, state: dict[str, Any]) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.record_state(path, state)
+        pr = state.get("pr")
+        if isinstance(pr, dict) and pr:
+            _EXECUTION.claim_writers([(pr["head"]["repository"], pr["head"]["ref"])])
     atomic_write_text(
         path,
         json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -2305,10 +2312,12 @@ def run_hosted_review_phase(
     return payload
 
 
-def command_check(args: argparse.Namespace) -> None:
+def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
+    if result_sink is None:
+        result_sink = emit
     pr, viewer, anchors, pending_url, _, _, _, _ = preflight(args.target)
     if pending_url:
-        emit({"result": "existing_pending_review", "review_url": pending_url})
+        result_sink({"result": "existing_pending_review", "review_url": pending_url})
         return
     if args.model != "sol":
         raise WorkflowError("PR Reviewer discovery requires Sol; independent critique requires Astra")
@@ -2372,7 +2381,7 @@ def command_check(args: argparse.Namespace) -> None:
         remove_transient_artifacts([
             Path(phase[key]) for phase in state["phases"] for key in ("prompt_file", "result_file")
         ])
-        emit({
+        result_sink({
             "result": "ready" if comments else "no_findings", "state": str(state_path),
             "run_id": run_id, "pr_url": pr["pr_url"], "pr_number": pr["number"],
             "pr_title": pr["title"], "head_sha": pr["head_sha"],
@@ -2401,7 +2410,9 @@ def command_check(args: argparse.Namespace) -> None:
         raise
 
 
-def command_post(args: argparse.Namespace) -> None:
+def command_post(args: argparse.Namespace, *, result_sink=None) -> None:
+    if result_sink is None:
+        result_sink = emit
     state_path, state = load_run_state(args.state)
     require_outside_repository(state_path, Path.cwd().resolve())
     if args.comments != "-":
@@ -2435,7 +2446,7 @@ def command_post(args: argparse.Namespace) -> None:
     if pending_url:
         if viewer.casefold() != str(state["viewer"]["login"]).casefold():
             raise WorkflowError("authenticated viewer changed since check")
-        emit({"result": "existing_pending_review", "review_url": pending_url})
+        result_sink({"result": "existing_pending_review", "review_url": pending_url})
         return
     if mutation["status"] != "not_attempted":
         raise WorkflowError(
@@ -2512,7 +2523,7 @@ def command_post(args: argparse.Namespace) -> None:
         "review_url": review_url(pr, verified),
     }
     save_run_state(state_path, state)
-    emit(
+    result_sink(
         {
             "result": "created_pending_review",
             "review_id": review_id,
@@ -2521,9 +2532,36 @@ def command_post(args: argparse.Namespace) -> None:
     )
 
 
+def command_run(args: argparse.Namespace) -> None:
+    checked: dict[str, Any] = {}
+    command_check(args, result_sink=checked.update)
+    if not checked:
+        raise WorkflowError("review check returned no structured result")
+    if checked["result"] != "ready" or not args.post_pending_review:
+        emit(checked)
+        return
+    if _EXECUTION is not None:
+        _EXECUTION.check_cancel()
+    posted: dict[str, Any] = {}
+    command_post(argparse.Namespace(
+        target=args.target, expected_head=checked["head_sha"], state=checked["state"],
+        run_id=checked["run_id"], comments=checked["comments_file"],
+    ), result_sink=posted.update)
+    if not posted:
+        raise WorkflowError("review post returned no structured result")
+    emit({**checked, **posted})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    foreground = subparsers.add_parser("run", help="run hosted review with explicit pending-review authority")
+    foreground.add_argument("target")
+    foreground.add_argument("--model", choices=sorted(MODEL_ALIASES), default="sol")
+    foreground.add_argument("--repo-root")
+    foreground.add_argument("--post-pending-review", action="store_true",
+                            help="authorize the existing guarded pending-review creation, never submission")
+    foreground.set_defaults(function=command_run)
     check = subparsers.add_parser(
         "check",
         help="run authoritative local preflight and one managed Agent Task review",
@@ -2569,5 +2607,57 @@ def main() -> int:
         return 1
 
 
+_EXECUTION = None
+EXECUTION_TERMINAL_RESULTS = frozenset({
+    "ready",
+    "no_findings",
+    "existing_pending_review",
+    "created_pending_review",
+})
+EXECUTION_SHA256 = "790bd73a95b92c636a06964e116d023ed1bec714c68f63488f9a31220fd0bbb4"
+
+
+def _load_execution():
+    """Load only the pinned shared foreground execution source."""
+    import types
+    inventory = subprocess.run(
+        ["copilot", "skill", "list", "--json"], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+           if os.name == "nt" else {}),
+    )
+    matches = [
+        entry for entry in json.loads(inventory.stdout)
+        if entry.get("name") == "agent-tasks-runtime" and entry.get("source") == "plugin"
+        and entry.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
+    root = Path(matches[0]["path"])
+    source_path = root / "scripts" / "execution.py"
+    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+        raise RuntimeError("shared execution Runtime path is invalid")
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("shared execution Runtime source digest changed")
+    module = types.ModuleType("trask_foreground_execution")
+    module.__file__ = str(source_path)
+    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    return module
+
+
+def execution_main():
+    commands = ('run',)
+    arguments = sys.argv[1:]
+    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    enabled = (
+        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments and arguments[0] in {"execution-status", "execution-cancel"}
+    )
+    if not selected or not enabled:
+        return main()
+    return _load_execution().entrypoint(main, globals(), commands=commands)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(execution_main())

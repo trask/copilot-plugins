@@ -98,6 +98,37 @@ def reconciled_forward_head_task(root):
 
 
 class AgentCommandAdmissionTest(unittest.TestCase):
+    def test_execution_controls_bind_original_artifact_owner_and_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cwd = root / "repo"
+            cwd.mkdir()
+            artifact_path, artifact = self.write_sealed_ci_fix_artifact(root, cwd)
+            handle = Path(artifact["request"]["execution_handle"])
+            identity = {
+                "schema": "github.copilot.foreground-execution.v1",
+                "run_id": artifact["invocation_id"], "handle": str(handle),
+                "root": str(handle),
+            }
+            for operation in ("execution-status", "execution-cancel"):
+                command = self.powershell_command(f'{operation} "{artifact_path}"')
+                payload = self.payload(command, cwd=str(cwd))
+                payload["toolInput"].update(mode="sync", detach=False)
+                self.assertFalse(PERMISSION_MODULE.admission_allowed(payload))
+                handle.write_text(json.dumps(identity) + "\n", encoding="utf-8", newline="\n")
+                Path(artifact["outputs"]["state"]).write_text("{}", encoding="utf-8")
+                self.assertTrue(PERMISSION_MODULE.admission_allowed(payload))
+                payload["toolInput"]["mode"] = "async"
+                self.assertFalse(PERMISSION_MODULE.admission_allowed(payload))
+                payload["toolInput"]["mode"] = "sync"
+                payload["sessionId"] = "11111111-1111-1111-1111-111111111111"
+                self.assertFalse(PERMISSION_MODULE.admission_allowed(payload))
+                payload["sessionId"] = artifact["request"]["owner_session_id"]
+                for key in ("root", "run_id"):
+                    handle.write_text(json.dumps({**identity, key: "foreign"}) + "\n", encoding="utf-8", newline="\n")
+                    self.assertFalse(PERMISSION_MODULE.admission_allowed(payload))
+                handle.unlink()
+
     def payload(
         self,
         command,
@@ -112,7 +143,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
             "cwd": cwd or str(Path.cwd()),
             "hookName": "permissionRequest",
             "toolName": tool_name,
-            "toolInput": {"command": command},
+            "toolInput": {"command": command, "mode": "async", "detach": True},
             "permissionSuggestions": [],
         }
 
@@ -304,6 +335,19 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                     self.payload(command, cwd=str(cwd))
                 )
             )
+            for metadata in (
+                {"command": command},
+                {"command": command, "mode": "sync", "detach": True},
+                {"command": command, "mode": "async", "detach": False},
+                {"command": command, "mode": "async", "detach": "true"},
+                {"command": command, "mode": "async", "detach": True, "isBackground": True},
+                {"command": command, "mode": "async", "detach": True, "shellId": "../foreign"},
+                {"command": command, "mode": "async", "detach": True, "description": "x" * 101},
+            ):
+                with self.subTest(metadata=metadata):
+                    rejected = self.payload(command, cwd=str(cwd))
+                    rejected["toolInput"] = metadata
+                    self.assertFalse(PERMISSION_MODULE.admission_allowed(rejected))
             process_options = {}
             if os.name == "nt":
                 process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -4619,7 +4663,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         )
         self.assertIn("model: gpt-5.6-sol", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual("1.6.60", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.61", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_sealed_artifact(self):
         instructions = AGENT.read_text(encoding="utf-8")

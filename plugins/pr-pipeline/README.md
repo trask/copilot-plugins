@@ -5,7 +5,7 @@ Ask Copilot: **Show the PR Pipeline execution topology.**
 ```mermaid
 flowchart LR
     agent["PR Pipeline agent<br/>local session"]
-    scheduler["PR Pipeline scheduler<br/>detached local process"]
+    scheduler["PR Pipeline scheduler<br/>foreground controller"]
     agent --> scheduler
 
     subgraph pipeline["Five-stage pipeline"]
@@ -42,6 +42,32 @@ Description status reads pass `--verify-clearance-snapshot`. Successful KEEP and
 
 On a later native pass, an unchanged member reuses Description only when this run already collected its accepted exit-zero completion and its recorded snapshot is still current. The invocation, model, mutation policy, and earlier pass must match. Other members whose heads advanced still run Description normally. Invalid same-head clearance blocks without another semantic evaluation; Description's once-per-head guard remains in force. Phase and terminal results list reused members separately from dispatched workers and accepted completions, including when all members reuse clearance. A failed worker exit always blocks even if its state retains an older clear marker.
 
+## Foreground ownership
+
+The agent entrypoints use `run --execution-handle <fresh-absolute-path>` with the
+shared, source-pinned Runtime execution library. One official execution-tool
+launch owns the foreground scheduler. Optional `execution-status --handle` reads
+the generation-bound handle and verifies the terminal result hash.
+`execution-cancel --handle` requests local cancellation only. Neither observer
+disconnection nor tool-shell exit establishes cancellation or completion.
+
+Stage sequencing remains in these schedulers. Children inherit the root run
+identity, bind their own process generations and write their own readiness.
+Root branch-writer leases cover the selected branches. Foreground stack locks
+never reclaim a stale or ambiguous owner. Output and results are file-backed;
+an unfinished or unverified child blocks completion. Cancelled or failed runs
+retain task identities, spent budgets and ownership rather than starting a
+replacement. Hosted tasks may continue after local cancellation.
+
+Both Pipeline and Conflict require the shared Runtime execution library;
+Conflict retains its dedicated hosted backend. No app-native Stop integration,
+automatic recovery, app-shutdown survival or remote cancellation is promised.
+The agent does not need to stay active or run watch calls.
+Foreground roots create their own run ID. They reject `--run-id` so a fresh
+execution handle cannot point the scheduler at old stage paths.
+
+## Legacy monitoring
+
 `start` creates a random run ID and a versioned monitor handle. The handle binds the canonical target, launch record, and progress log. Each unfinished `watch` response returns the complete arguments for the next call. Callers pass those arguments unchanged. The helpers do not scan for a latest run or reconstruct a target from shared state.
 
 On Windows, scheduler launch requests suspended, no-window breakaway and records the flags, result, PID, creation identity and available job membership. Denied breakaway fails before any fallback scheduler starts. No-window and a new process group do not prove lifetime independence. Workers have a separate scheduler-owned kill job. Watch compares the recorded process generation; missing, changed or unreadable identity is a monitoring failure, not workflow completion. A racing final journal event still wins. The inert lifetime tests qualify only the host where they run; a denied test-parent breakaway leaves that qualification unavailable.
@@ -54,7 +80,9 @@ When the stopping stage retains an `agent_task.error`, both summaries expose it 
 
 `artifacts.progress` on the watch envelope names the progress journal. `updates_omitted` and per-update `details_truncated` identify bounded progress previews. The cursor still covers all journaled records, and unfinished responses preserve `next_watch.arguments`. A compact terminal event may also appear in the last update when both copies fit, but consumers must use top-level `final_event`. No reporting omission changes stage execution or authorizes a relaunch.
 
-Stack Pipeline uses the same rules. Each run has its own scheduler state, monitor handle, stage state files, worker records, and worktrees. A stack-wide lock permits one active owner for the selected suffix, but no new run resumes or imports a sealed run. Each worker request binds one run ID, nonce, head, base, and role. Native-stack Conflict Resolver runs one task per member in order, collecting committed code only from each task's authoritative generated branch.
+## Stack controller
+
+Stack Pipeline uses the same clearance rules. Each run has its own scheduler state, monitor handle, stage state files, worker records, and worktrees. A stack-wide lock permits one active owner for the selected suffix, but no new run resumes or imports a sealed run. Each worker request binds one run ID, nonce, head, base, and role. Native-stack Conflict Resolver runs one task per member in order, collecting committed code only from each task's authoritative generated branch.
 
 Stack worker cleanup removes only clean, owned worktrees through ordinary `git worktree remove`. Dirty worktrees, unreadable status, and removal failures retain the workspace and ownership record. The full `result.json` lists retained paths and reasons under `pipeline_result.cleanup`; it also preserves each worker's stage-result evidence under `pipeline_result.pull_requests`. Retention does not authorize replay, publication, or a replacement worker.
 

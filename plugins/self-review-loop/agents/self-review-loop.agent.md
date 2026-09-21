@@ -19,6 +19,18 @@ The primary session must use exactly `gpt-5.6-sol`. When the runtime exposes rea
 
 The managed worker model is separate. Pass the user's explicit `luna`, `terra`, `sol`, or `astra` selection to `agent-task`; otherwise use `sol`.
 
+## Controller execution
+
+Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Append it to the workflow command below. The installed `agent-tasks-runtime@trask-plugins` supplies the pinned execution library; it is not another agent.
+
+Launch the controller once through the official execution tool. Use `mode: async`; set `detach: true` only when the user explicitly requests continuation after client exit, otherwise leave it false. If the tool does not expose the required documented lifetime mode, stop rather than imitating it with shell backgrounding. The Python controller stays in the foreground and owns its children. No self-detachment, breakaway retry, daemon, or replacement controller is permitted.
+
+Tool acknowledgement is not readiness. The run-bound handle must report `ready`, or a verified terminal result, before claiming startup. Optional synchronous `execution-status --handle <path>` reads only execution files and process generation. It does not inspect the PR, spend budget, or keep execution alive. Never run a required watch loop. Ending the conversation or disconnecting an observer is not cancellation.
+
+Only the hash-verified terminal execution result establishes local completion. Preserve its `workflow_result`, including blocked, pending, warning, exhaustion and failure outcomes; a zero tool-shell exit or a model's prose cannot establish clearance. Output, progress, child records and results remain in the handle's adjacent `.d` directory. Missing, abandoned, unsealed or unreadable evidence is unknown, never success. Do not relaunch or adopt an old task.
+
+On an explicit stop request, run `execution-cancel --handle <path>` once. This requests local cancellation, fences subsequent owned launches and publication, and retains state, spent budgets and known or unknown remote task identities. An already admitted remote mutation may still complete. Report cancellation only after a terminal result confirms the local outcome. It does not promise remote task cancellation, rollback, app-native Stop integration, app-shutdown survival, automatic recovery or post-exit notifications. Failed or cancelled ownership is retained rather than taken over.
+
 ## Required path
 
 1. Find this installed plugin's bundled coordinator:
@@ -26,7 +38,7 @@ The managed worker model is separate. Pass the user's explicit `luna`, `terra`, 
    - Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; helper="$copilot_home/installed-plugins/trask-plugins/self-review-loop/scripts/self_review_loop.py"`
    - POSIX: `helper="${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/self-review-loop/scripts/self_review_loop.py"`
 2. Run the coordinator once with the active Python interpreter:
-   - `python "$helper" agent-task <target>`
+   - `python "$helper" agent-task <target> --execution-handle <fresh-absolute-path>`
    - Use `python3` on POSIX when needed.
    - Pass a supplied PR URL or `owner/repo#number` exactly. Omit the target only from a worktree attached to the pull request branch.
    - Pass supplied `--pipeline-run`, `--pipeline-iteration`, and `--pipeline-max-iterations` values together and exactly. Never mint any pipeline position yourself.
@@ -36,7 +48,7 @@ The managed worker model is separate. Pass the user's explicit `luna`, `terra`, 
 
 When a pipeline position includes `github-mutation-policy: source-only`, pass `--github-mutation-policy source-only` unchanged to every `agent-task` command for that run. Never omit, replace, or relax it. Stop if the helper rejects it. This policy forbids title/body updates, draft changes, comments, thread operations, review requests, and other GitHub metadata mutations. Source publication is the only permitted mutation.
 
-The bundled coordinator is the sole authoritative local entry point. It discovers the separately installed `agent-tasks-runtime@trask-plugins` skill and verifies Runtime 1.0.20 by pinned SHA-256 before execution. The coordinator captures immutable repository, pull request, viewer, publication, and budget identity and dispatches `marketplace-agent-code-candidate-worker@1`. Runtime returns `github.copilot.agent-task-result` version 5 and candidate manifest version 1. The coordinator accepts a terminal completed task with a valid dispatcher-owned candidate and no platform error. It re-derives every commit parent, tree, patch digest, and changed path from fetched Git history before guarded import. The optional final output commit stays outside the code tip.
+The bundled coordinator is the sole authoritative local entry point. It discovers the separately installed `agent-tasks-runtime@trask-plugins` skill and verifies Runtime 1.0.21 by pinned SHA-256 before execution. The coordinator captures immutable repository, pull request, viewer, publication, and budget identity and dispatches `marketplace-agent-code-candidate-worker@1`. Runtime returns `github.copilot.agent-task-result` version 5 and candidate manifest version 1. The coordinator accepts a terminal completed task with a valid dispatcher-owned candidate and no platform error. It re-derives every commit parent, tree, patch digest, and changed path from fetched Git history before guarded import. The optional final output commit stays outside the code tip.
 
 The worker may make zero or more code commits and must add one final output-only commit containing `.github/agent-task-output/self-review-result.json`. Its only fields are `outcome`, one of `clean`, `exhausted`, or `incomplete`, and integer `iterations_used`. Optional `report.md` is free-form advice; missing or malformed prose cannot reject valid code. The outcome is a hosted semantic claim, not something Git history proves. Zero code commits alone does not establish clean. Existing policy and report parsers remain available only for retained audit evidence.
 

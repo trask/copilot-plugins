@@ -2530,7 +2530,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("result schema version 5", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.70")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.71")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -4315,14 +4315,15 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(emitted[-1]["result"], "max_iterations_reached")
         discover.assert_not_called()
 
-    def test_agent_runs_the_coordinator_synchronously_without_a_tool_timeout(self):
+    def test_agent_uses_foreground_execution_without_a_required_watch_loop(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("Run the shell tool synchronously with `mode: sync`", instructions)
-        self.assertIn("Leave out `timeout` and `isBackground`", instructions)
+        self.assertIn("Use `mode: async`", instructions)
+        self.assertIn("only when the user explicitly requests continuation after client exit", instructions)
+        self.assertIn("Never run a required watch loop", instructions)
+        self.assertIn("hash-verified terminal execution result", instructions)
         self.assertIn(
-            "accept `stage_outcome: skipped` only when a `source-only` run returns "
-            "its exact frozen-head `policy_skip` proof",
+            "`stage_outcome: skipped` only with the exact frozen-head source-only proof",
             instructions,
         )
 

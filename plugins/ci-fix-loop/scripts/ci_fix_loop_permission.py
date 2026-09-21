@@ -52,6 +52,7 @@ SEALED_RECONCILIATION_COMMANDS = {
     "apply-sealed-legacy-owner-reconciliation",
 }
 SEALED_CI_FIX_COMMANDS = {"run-sealed-ci-fix"}
+EXECUTION_CONTROL_COMMANDS = {"execution-status", "execution-cancel"}
 LEGACY_OWNER_ELIGIBILITY_SCHEMA = (
     "github.copilot.ci-fix-loop-legacy-owner-eligibility.v3"
 )
@@ -59,7 +60,7 @@ LEGACY_OWNER_AUTHORIZATION_FILE_SCHEMA = (
     "github.copilot.ci-fix-loop-legacy-owner-authorization-file.v1"
 )
 SEALED_CI_FIX_INVOCATION_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-invocation.v2"
+    "github.copilot.ci-fix-loop-sealed-invocation.v3"
 )
 SEALED_CI_FIX_MUTATION_POLICY = {
     "id": "allow",
@@ -200,6 +201,7 @@ def command_tokens(tool_name: str, command: str) -> list[str] | None:
             set(RECONCILIATION_COMMANDS)
             | SEALED_RECONCILIATION_COMMANDS
             | SEALED_CI_FIX_COMMANDS
+            | EXECUTION_CONTROL_COMMANDS
         )
     ):
         return None
@@ -443,6 +445,7 @@ def sealed_ci_fix_admission(
     *,
     cwd: str,
     session_id: str,
+    fresh: bool = True,
 ) -> bool:
     if len(tokens) != 2:
         return False
@@ -508,7 +511,10 @@ def sealed_ci_fix_admission(
         or request.get("repo_root") is None
         or normalized_path(str(request["repo_root"])) != normalized_path(cwd)
         or request.get("owner_session_id") != session_id
-        or request.get("execution_mode") != "direct_owner_session"
+        or request.get("execution_mode") != "foreground_controller"
+        or request.get("execution_handle") != str(artifact_path.with_name(
+            f"ci-fix-loop-sealed-{payload['invocation_id']}-execution.json"
+        ))
         or TARGET_PATTERN.fullmatch(str(request.get("target") or "")) is None
         or request.get("model_alias") != "sol"
         or request.get("model") != "gpt-5.6-sol"
@@ -576,13 +582,25 @@ def sealed_ci_fix_admission(
         or set(outputs) != set(expected_outputs)
         or any(
             outputs[name] != str(path)
-            or path.exists()
+            or fresh and path.exists()
             or path.is_symlink()
             for name, path in expected_outputs.items()
         )
         or state["path"] != outputs["state"]
     ):
         return False
+    handle = Path(request["execution_handle"])
+    if handle.is_symlink() or fresh and (handle.exists() or handle.with_name(handle.name + ".d").exists()):
+        return False
+    if not fresh:
+        execution = read_small_json(handle)
+        if (
+            execution is None or execution.get("schema") != "github.copilot.foreground-execution.v1"
+            or execution.get("run_id") != invocation_id
+            or execution.get("handle") != str(handle)
+            or execution.get("root") != str(handle)
+        ):
+            return False
     return True
 
 
@@ -599,18 +617,35 @@ def admission_allowed(payload: Any) -> bool:
         or not isinstance(cwd, str)
         or not isinstance(session_id, str)
         or not isinstance(tool_input, dict)
-        or set(tool_input) != {"command"}
-        or not isinstance(tool_input["command"], str)
+        or not set(tool_input) <= {"command", "mode", "detach", "shellId", "description"}
+        or not isinstance(tool_input.get("command"), str)
     ):
         return False
     tokens = command_tokens(tool_name, tool_input["command"])
+    fresh = bool(tokens and tokens[0] == "run-sealed-ci-fix")
+    if fresh:
+        if tool_input.get("mode") != "async" or tool_input.get("detach") is not True:
+            return False
+    elif tool_input.get("mode", "sync") != "sync" or tool_input.get("detach", False) is not False:
+        return False
+    if (
+        "shellId" in tool_input and (
+            not isinstance(tool_input["shellId"], str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", tool_input["shellId"]) is None
+        )
+        or "description" in tool_input and (
+            not isinstance(tool_input["description"], str) or len(tool_input["description"]) > 100
+        )
+    ):
+        return False
     return bool(
         tokens
-        and tokens[0] in SEALED_CI_FIX_COMMANDS
+        and tokens[0] in SEALED_CI_FIX_COMMANDS | EXECUTION_CONTROL_COMMANDS
         and sealed_ci_fix_admission(
             tokens,
             cwd=cwd,
             session_id=session_id,
+            fresh=fresh,
         )
     )
 

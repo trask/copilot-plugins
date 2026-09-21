@@ -1394,6 +1394,8 @@ def run_process(
     cwd: Path | None = None,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if _EXECUTION is not None:
+        runner = _EXECUTION.run
     process_command = list(command)
     process_cwd = cwd
     if process_command and process_command[0] == "git" and cwd is not None:
@@ -2792,7 +2794,9 @@ def start_task(
         "create_pull_request": False,
         "base_ref": task_base_sha(options.request),
     }
-    return validate_task(
+    if _EXECUTION is not None:
+        _EXECUTION.record_dispatch(options.result_file, options.request["request_id"], snapshot.repository)
+    task = validate_task(
         api_json(
             runner,
             snapshot.control_root,
@@ -2801,6 +2805,11 @@ def start_task(
             payload,
         )
     )
+    if _EXECUTION is not None:
+        _EXECUTION.record_dispatch(options.result_file, options.request["request_id"], snapshot.repository, {
+            "id": task["id"], "state": task["state"], "url": task_link(task),
+        })
+    return task
 
 
 def get_task(
@@ -5384,5 +5393,47 @@ def main(
     return exit_code
 
 
+_EXECUTION = None
+EXECUTION_SHA256 = "790bd73a95b92c636a06964e116d023ed1bec714c68f63488f9a31220fd0bbb4"
+
+
+def _load_execution():
+    """Load only the pinned shared foreground execution source."""
+    import types
+    inventory = subprocess.run(
+        ["copilot", "skill", "list", "--json"], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+           if os.name == "nt" else {}),
+    )
+    matches = [
+        entry for entry in json.loads(inventory.stdout)
+        if entry.get("name") == "agent-tasks-runtime" and entry.get("source") == "plugin"
+        and entry.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
+    root = Path(matches[0]["path"])
+    source_path = root / "scripts" / "execution.py"
+    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+        raise RuntimeError("shared execution Runtime path is invalid")
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("shared execution Runtime source digest changed")
+    module = types.ModuleType("trask_foreground_execution")
+    module.__file__ = str(source_path)
+    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    return module
+
+
+
+def execution_main():
+    if not os.environ.get("TRASK_EXECUTION_PARENT"):
+        return main()
+    return _load_execution().controller_main(
+        lambda: main(stdout=sys.stdout, stderr=sys.stderr), globals(),
+    )
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(execution_main())

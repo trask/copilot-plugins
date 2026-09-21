@@ -27,11 +27,64 @@ copilot plugin install historical-pr-audit@trask-plugins
 Restart Copilot after you install or update a plugin.
 
 `pr-reviewer`, `copilot-review-loop`, `self-review-loop`, `pr-description`,
-`ci-fix-loop`, and `historical-pr-audit` require
+`ci-fix-loop`, `historical-pr-audit`, `pr-pipeline`, and `pr-conflict-resolver` require
 `agent-tasks-runtime@trask-plugins`. The runtime contains no custom agents and
 does not add anything to the agent list. PR Conflict Resolver keeps its
-specialized conflict runtime inside its own plugin and does not require the
-shared runtime.
+specialized hosted conflict backend inside its own plugin. It uses the shared
+runtime only for local execution ownership.
+
+## Controller execution
+
+All nine agent entrypoints launch their existing foreground Python controller
+once. The shared Runtime execution library owns process generations, child
+launches, durable output and explicit local cancellation. Controllers keep their
+workflow-specific stages, permissions, candidate checks and budgets. Hosted
+agents still diagnose, edit and validate.
+
+Except for sealed CI, pass a fresh absolute path outside the checkout:
+
+```text
+python <installed-helper> <workflow-command> <target> --execution-handle <absolute-path>
+python <installed-helper> execution-status --handle <same-absolute-path>
+python <installed-helper> execution-cancel --handle <same-absolute-path>
+```
+
+Pipeline and Stack use `run`, Reviewer uses `run` with explicit
+`--post-pending-review` authority, and other standalone workflows use
+`agent-task`. Sealed CI derives its handle from its v3 artifact. Its controls
+accept that exact artifact instead of `--handle` and retain original-session
+admission. Runtime remains an internal dependency, not a standalone workflow.
+
+Use the official execution tool's documented asynchronous mode. Tool-level
+detachment requires the user's explicit request to continue after client exit.
+Do not add another detach layer. The tool acknowledgement does not prove
+readiness, and tool-shell exit does not prove workflow completion. Optional
+status reads verify process generation and the canonical terminal-result hash;
+they do not drive the workflow. The handle's `.d` directory holds stdout,
+stderr, progress, child evidence and results.
+
+Client or observer disconnection is not cancellation. Explicit plugin cancellation
+fences new launches and publication, but cannot undo an admitted remote request
+or promise hosted-task cancellation. Failed and cancelled runs retain unknown
+or active task identities, spent budgets, artifacts and branch-writer ownership.
+There is no automatic takeover or recovery. A new authorization does not make an
+unresolved old owner safe to replace.
+
+The execution record distinguishes finished, failed, locally cancelled and
+abandoned runs. A finished controller may still report pending review, exhaustion,
+blocked stages or CI warnings. No candidate or process exit means CI green.
+Windows children use no-window launch and native generation/job accounting;
+unverified drainage is an error. Linux uses procfs generations and owned process
+groups; unresolved descendant drainage is reported rather than assumed.
+Other process-generation providers are unsupported.
+
+This is not an app task manager. It promises no app-native Stop integration,
+graceful app-shutdown survival, automatic recovery or notifications after exit.
+Only one inert direct foreground process has been qualified across controlled
+client termination on the tested Windows host. Production trees, graceful
+cleanup, app exit, post-exit streams and remote cancellation remain unqualified.
+The legacy Pipeline `start` path retains its separate breakaway contract and
+fails before fallback when breakaway is denied.
 
 ## Plugins
 
@@ -116,10 +169,9 @@ Each stage waits for its children and owns its configured iteration budget.
 Another Pipeline pass does not replenish that budget. An interrupted run
 fails; a later invocation starts from the beginning.
 
-Both parent agents launch their scheduler once and use a durable monitor
-protocol to report every stage transition and one coalesced heartbeat per five
-minutes of unchanged waiting in their own session conversation. Progress does
-not depend on opening a terminal card or PR Flight.
+Both parent agents launch their foreground scheduler once. Durable progress and
+terminal files do not depend on a local agent keeping a watch loop alive.
+Observers are optional and read-only.
 
 PR Flight starts the stack agent with one JSON object:
 

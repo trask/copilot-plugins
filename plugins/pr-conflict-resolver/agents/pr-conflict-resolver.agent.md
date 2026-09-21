@@ -17,6 +17,18 @@ This agent is a thin control-plane coordinator. It never reads repository files,
 
 It never posts a comment, review, reply, label, or pull request update. Its only GitHub change is pushing verified conflict-resolution commits to the pull request head branch or atomically pushing every member of its native stack.
 
+## Controller execution
+
+Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Append it to the workflow command below. The installed `agent-tasks-runtime@trask-plugins` supplies the pinned execution library; it is not another agent.
+
+Launch the controller once through the official execution tool. Use `mode: async`; set `detach: true` only when the user explicitly requests continuation after client exit, otherwise leave it false. If the tool does not expose the required documented lifetime mode, stop rather than imitating it with shell backgrounding. The Python controller stays in the foreground and owns its children. No self-detachment, breakaway retry, daemon, or replacement controller is permitted.
+
+Tool acknowledgement is not readiness. The run-bound handle must report `ready`, or a verified terminal result, before claiming startup. Optional synchronous `execution-status --handle <path>` reads only execution files and process generation. It does not inspect the PR, spend budget, or keep execution alive. Never run a required watch loop. Ending the conversation or disconnecting an observer is not cancellation.
+
+Only the hash-verified terminal execution result establishes local completion. Preserve its `workflow_result`, including blocked, pending, warning, exhaustion and failure outcomes; a zero tool-shell exit or a model's prose cannot establish clearance. Output, progress, child records and results remain in the handle's adjacent `.d` directory. Missing, abandoned, unsealed or unreadable evidence is unknown, never success. Do not relaunch or adopt an old task.
+
+On an explicit stop request, run `execution-cancel --handle <path>` once. This requests local cancellation, fences subsequent owned launches and publication, and retains state, spent budgets and known or unknown remote task identities. An already admitted remote mutation may still complete. Report cancellation only after a terminal result confirms the local outcome. It does not promise remote task cancellation, rollback, app-native Stop integration, app-shutdown survival, automatic recovery or post-exit notifications. Failed or cancelled ownership is retained rather than taken over.
+
 ## Invocation
 
 Find the installed helper once:
@@ -28,7 +40,7 @@ Find the installed helper once:
 Invoke it with the active Python interpreter:
 
 ```text
-agent-task <target> --repo-root <workspace> --strategy auto --model sol
+agent-task <target> --execution-handle <fresh-absolute-path> --repo-root <workspace> --strategy auto --model sol
 ```
 
 Use a URL or `owner/repo#number` exactly as supplied. For a bare number, combine it with the current workspace repository first. Omit the target only when the worktree is attached to the pull request branch.
@@ -75,7 +87,7 @@ The helper performs a trusted local preflight without executing repository code.
 
 A pipeline-owned isolated worktree may stay detached only at the exact frozen pull request head. An attached worktree must hold the pull request branch. Any other branch or commit fails preflight.
 
-The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 2 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `3412b829b54819e50bdbc8d6983d8d8a9c3f8f9d4398059e40c8712bccf043fc`, and invokes it once with:
+The helper records `preparing` ownership at the explicit state path before conflict preflight. A preflight error records failed or interrupted ownership with a null task ID and `not_created` status, so a wrapper exit cannot erase the attempted run. The Agent Tasks runtime is bundled with this plugin. The helper writes the closed `github.copilot.agent-task-conflict-request` version 2 file and a trusted prompt outside the repository. It loads only the adjacent `cloud_conflict_task.py`, verifies SHA-256 `e59c3ce51ec5de977926e0085a0d1961886611ca1c0fcb17bd7f7016abdbfc60`, and invokes it once with:
 
 ```text
 --conflict-with-report --strategy <merge|rebase|native-stack> --request-file <absolute-path> --prompt-file <absolute-path> --result-file <absolute-path> --policy marketplace-conflict-worker@10 --pr <canonical-url> --model <alias>
@@ -88,7 +100,7 @@ The current base comes from the advertised branch ref, not the pull request's la
 An upper native-stack member may contain a merge that only synchronized its direct base. The coordinator omits that topology marker from the linear replay only when it has exactly two parents, its second parent is in the current direct-base ancestry, and `git show --remerge-diff` is empty. The request retains the exact merge position, parents, tree, subject, trailers, and empty-diff digest. Any merge with manual resolution content, unrelated ancestry, more than two parents, or no later linear tip stops before task creation. Its retained manifest is audit evidence; a later authorized action starts a fresh invocation.
 
 Policy `marketplace-conflict-worker@10` has SHA-256 `7d934b95e5e0b8ef83228e95464a5c4f70d8de9114a50c98811e55b4825a0435`.
-The bundled worker helper has SHA-256 `3412b829b54819e50bdbc8d6983d8d8a9c3f8f9d4398059e40c8712bccf043fc`.
+The bundled worker helper has SHA-256 `e59c3ce51ec5de977926e0085a0d1961886611ca1c0fcb17bd7f7016abdbfc60`.
 
 The full immutable request remains retained outside the repository and is not a worker-accessible file. The hosted problem statement carries execution identity, ordered source commits and `resolution_context_paths` with its count and digest. These paths locate the conflict; they are not a filename permission list. Necessary scoped companion changes and test relocations are allowed. The hosted worker preserves both sides' intent, test execution and coverage, validates behavior and corrects its candidate internally. It must not change unselected members or escape its semantic assignment.
 

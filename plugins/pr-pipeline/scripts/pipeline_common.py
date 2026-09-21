@@ -43,6 +43,7 @@ SOURCE_ONLY_POLICY_SKIP_DETAIL = (
     "Copilot review exists at the frozen head and requesting one is forbidden"
 )
 IS_WINDOWS = os.name == "nt"
+_EXECUTION = None
 
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
@@ -371,6 +372,8 @@ class OwnedProcess:
 
 
 def terminate_process_tree(process: Any, *, timeout: float = 10.0) -> int:
+    if _EXECUTION is not None and hasattr(process, "terminate_tree"):
+        return process.terminate_tree(timeout=timeout)
     if isinstance(process, OwnedProcess):
         return process.terminate_tree(timeout=timeout)
     if process.poll() is None:
@@ -398,7 +401,7 @@ def run(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        process = subprocess.run(
+        process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
             command,
             cwd=str(cwd) if cwd else None,
             text=True,
@@ -443,6 +446,8 @@ def git_succeeds(repo_root: Path, *arguments: str) -> bool:
 
 
 def emit(payload: dict[str, Any]) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.emit(payload)
     print(json.dumps(payload, sort_keys=True), flush=True)
 
 
@@ -463,7 +468,8 @@ def report_safely(
     try:
         report_event(report, event, **fields)
     except (OSError, TypeError, ValueError):
-        pass
+        if _EXECUTION is not None:
+            raise
 
 
 class ConversationProgressReporter:
@@ -487,7 +493,8 @@ class ConversationProgressReporter:
         try:
             self.output(payload)
         except (OSError, TypeError, ValueError):
-            pass
+            if _EXECUTION is not None:
+                raise
         if self.event_log is None:
             return
         update = self.transition(payload)
@@ -509,7 +516,8 @@ class ConversationProgressReporter:
                 stream.flush()
                 os.fsync(stream.fileno())
         except (OSError, TypeError, ValueError):
-            pass
+            if _EXECUTION is not None:
+                raise
 
 
 def validate_run_id(run_id: str) -> str:
@@ -1016,7 +1024,8 @@ def read_pull_request(
             "--repo",
             target["repo_name"],
             "--json",
-            "number,title,url,state,isDraft,headRefName,baseRefName,headRefOid",
+            "number,title,url,state,isDraft,headRefName,baseRefName,headRefOid"
+            + (",headRepository,headRepositoryOwner" if _EXECUTION is not None else ""),
         ]
     )
     if not isinstance(payload, dict):
@@ -1037,6 +1046,9 @@ def read_pull_request(
         "base_branch": base_branch,
         "base_sha": base_tip(target["repo_name"], base_branch),
         "head_sha": payload.get("headRefOid"),
+        **({"head_repository": (
+            payload["headRepositoryOwner"]["login"] + "/" + payload["headRepository"]["name"]
+        )} if _EXECUTION is not None else {}),
     }
 
 
@@ -2165,8 +2177,9 @@ def run_foreground(
     started_at = utc_now()
     try:
         with open(log_path, "w", encoding="utf-8", newline="\n") as log:
-            process = subprocess.run(
-                command, check=False, **launch_options(log, cwd)
+            process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
+                command, check=False, **launch_options(log, cwd),
+                **({"require_execution": True} if _EXECUTION is not None else {}),
             )
         return {
             "returncode": process.returncode,
@@ -2188,6 +2201,13 @@ def start_background(
     command: list[str], *, cwd: Path, log_path: Path
 ) -> OwnedProcess:
     """Start one stage process that keeps running after this call returns."""
+    if _EXECUTION is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("wb") as log:
+            return _EXECUTION.start(
+                command, cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT,
+                require_execution=True,
+            )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log = open(log_path, "w", encoding="utf-8", newline="\n")
     options = launch_options(log, cwd)
@@ -2267,6 +2287,8 @@ def run_monitored(
     try:
         progress()
         while process.poll() is None:
+            if _EXECUTION is not None:
+                _EXECUTION.check_cancel()
             sleep(interval)
             progress()
     except BaseException:
@@ -2378,6 +2400,8 @@ def process_is_alive(pid: int) -> bool:
 
 def write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
     """Replace a state file in one step so a crash never leaves a half file."""
+    if _EXECUTION is not None and payload.get("run_id") == _EXECUTION.run_id:
+        _EXECUTION.record_state(path, payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     temporary.write_text(

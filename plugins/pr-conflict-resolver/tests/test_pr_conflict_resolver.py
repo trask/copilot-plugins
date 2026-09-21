@@ -902,7 +902,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "3412b829b54819e50bdbc8d6983d8d8a9c3f8f9d4398059e40c8712bccf043fc",
+            "e59c3ce51ec5de977926e0085a0d1961886611ca1c0fcb17bd7f7016abdbfc60",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -2568,7 +2568,9 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
 
     def test_every_production_subprocess_path_uses_windows_no_window(self):
         script = SCRIPT.read_text(encoding="utf-8")
-        self.assertEqual(script.count("subprocess.run("), 2)
+        self.assertEqual(script.count("subprocess.run("), 1)
+        self.assertEqual(script.count("_EXECUTION.run if _EXECUTION else subprocess.run"), 2)
+        self.assertIn('getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)', script)
         self.assertIn("**windows_no_window_options()", script)
         self.assertIn("hashlib.sha256(report_bytes).hexdigest()", script)
 

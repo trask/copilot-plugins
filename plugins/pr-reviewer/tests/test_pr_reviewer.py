@@ -87,7 +87,7 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
         self.assertIn("tools: [execute, rename_session]", instructions)
         self.assertIn("disable-model-invocation: true", instructions)
         self.assertIn("`PR Review: <PR number> - <PR title>`", instructions)
-        self.assertIn("`python \"$helper\" check <target> --model sol`", instructions)
+        self.assertIn('run <target> --model sol --post-pending-review --execution-handle', instructions)
         self.assertIn("separate fresh Astra task", instructions)
         self.assertIn("verifies each task's actual model", instructions)
         self.assertIn("no hosted max-effort attestation", instructions)
@@ -107,10 +107,10 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
     def test_preserves_pending_review_and_recovery_contract(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("--state <state> --run-id <run_id>", instructions)
+        self.assertIn("only its verified check result", instructions)
         self.assertIn("creates and verifies one viewer-owned pending review", instructions)
         self.assertIn("never submits it", instructions)
-        self.assertIn("Run `post` exactly once", instructions)
+        self.assertIn("A `ready` result alone grants no posting permission", instructions)
         self.assertIn("Never retry or use direct `gh api` as a fallback", instructions)
         self.assertIn("no findings with no mutation", instructions)
 
@@ -123,6 +123,75 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
         )
         self.assertIn("no review mutation is needed", instructions)
         self.assertIn("comments_file` unchanged", instructions)
+
+
+class ForegroundDriverTest(unittest.TestCase):
+    def run_driver(self, result, *, authorize=False, failure=None):
+        arguments = SimpleNamespace(target="owner/repo#42", model="sol",
+                                    repo_root=None, post_pending_review=authorize)
+        calls = []
+
+        def checked(args, *, result_sink):
+            result_sink(result)
+
+        def posted(args, *, result_sink):
+            calls.append(args)
+            if failure:
+                raise failure
+            result_sink({"result": "created_pending_review", "review_url": "https://example/review"})
+
+        with (
+            mock.patch.object(MODULE, "command_check", side_effect=checked),
+            mock.patch.object(MODULE, "command_post", side_effect=posted),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_run(arguments)
+        return calls, emit.call_args.args[0]
+
+    def test_ready_does_not_grant_posting_permission(self):
+        calls, output = self.run_driver({"result": "ready"})
+        self.assertEqual([], calls)
+        self.assertEqual("ready", output["result"])
+
+    def test_empty_or_existing_pending_never_posts_even_with_permission(self):
+        for result in ("no_findings", "existing_pending_review"):
+            with self.subTest(result=result):
+                calls, output = self.run_driver({"result": result}, authorize=True)
+                self.assertEqual([], calls)
+                self.assertEqual(result, output["result"])
+
+    def test_authorized_post_uses_only_exact_check_identity(self):
+        checked = {"result": "ready", "head_sha": "abc", "state": "state.json",
+                   "run_id": "run", "comments_file": "comments.json", "pr_number": 42}
+        calls, output = self.run_driver(checked, authorize=True)
+        self.assertEqual(1, len(calls))
+        self.assertEqual({"target": "owner/repo#42", "expected_head": "abc",
+                          "state": "state.json", "run_id": "run",
+                          "comments": "comments.json"}, vars(calls[0]))
+        self.assertEqual("created_pending_review", output["result"])
+        self.assertEqual("state.json", output["state"])
+        self.assertEqual(42, output["pr_number"])
+
+    def test_post_verification_failure_has_no_retry(self):
+        checked = {"result": "ready", "head_sha": "abc", "state": "state.json",
+                   "run_id": "run", "comments_file": "comments.json"}
+        with self.assertRaisesRegex(MODULE.WorkflowError, "created but unverified"):
+            self.run_driver(checked, authorize=True,
+                            failure=MODULE.WorkflowError("created but unverified"))
+
+    def test_cancel_fences_pending_review_creation(self):
+        checked = {"result": "ready"}
+        context = mock.Mock()
+        context.check_cancel.side_effect = MODULE.WorkflowError("local stop")
+        with (
+            mock.patch.object(MODULE, "_EXECUTION", context),
+            mock.patch.object(MODULE, "command_check",
+                              side_effect=lambda args, result_sink: result_sink(checked)),
+            mock.patch.object(MODULE, "command_post") as post,
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "local stop"):
+                MODULE.command_run(SimpleNamespace(post_pending_review=True))
+            post.assert_not_called()
 
 
 class ParseTargetTest(unittest.TestCase):

@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "3412b829b54819e50bdbc8d6983d8d8a9c3f8f9d4398059e40c8712bccf043fc"
+    "e59c3ce51ec5de977926e0085a0d1961886611ca1c0fcb17bd7f7016abdbfc60"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 V5_CONFLICT_POLICY = "marketplace-conflict-worker@5"
@@ -195,7 +195,7 @@ def run(
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.run(
+    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         command,
         cwd=str(cwd) if cwd else None,
         input=input_text,
@@ -223,7 +223,7 @@ def git_try(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[str
 
 
 def git_bytes(repo_root: Path, *arguments: str) -> bytes | None:
-    process = subprocess.run(
+    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         ["git", "-C", str(repo_root), *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -247,6 +247,8 @@ def is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
 
 
 def emit(payload: dict[str, Any]) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.emit(payload)
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
 
 
@@ -875,6 +877,17 @@ def last_helper_activity(state: dict[str, Any]) -> str | None:
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.record_state(path, state)
+        pr = state.get("pr")
+        if isinstance(pr, dict) and pr.get("head_branch"):
+            _EXECUTION.claim_writers([(pr.get("head_repository") or f"{pr['head_owner']}/{pr['head_repo']}", pr["head_branch"])])
+        request = ((state.get("agent_task") or {}).get("preflight") or {}).get("request") or {}
+        native = request.get("native_stack")
+        if isinstance(native, dict):
+            _EXECUTION.claim_writers([
+                (member["repository"], member["head_ref"]) for member in native["members"]
+            ])
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     handle, temporary_name = tempfile.mkstemp(
@@ -6789,6 +6802,10 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
     stack = stack_membership(pr).get("stack")
     require_authorized_stack(request, pr, stack)
     partial = propagation_stack(stack, request["fixed_pr"], request["fixed_head"], request["selected"])
+    if _EXECUTION is not None:
+        _EXECUTION.claim_writers([
+            (request["repository"], member["head_branch"]) for member in partial["members"]
+        ])
     if external_stack_dependents(pr, partial):
         raise WorkflowError("external dependents prevent authorized descendant publication")
     if not partial["members"]:
@@ -11172,5 +11189,56 @@ def main() -> int:
         return 1
 
 
+_EXECUTION = None
+EXECUTION_TERMINAL_RESULTS = frozenset({
+    "published",
+    "mergeable",
+    "no_descendants",
+})
+EXECUTION_SHA256 = "790bd73a95b92c636a06964e116d023ed1bec714c68f63488f9a31220fd0bbb4"
+
+
+def _load_execution():
+    """Load only the pinned shared foreground execution source."""
+    import types
+    inventory = subprocess.run(
+        ["copilot", "skill", "list", "--json"], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+           if os.name == "nt" else {}),
+    )
+    matches = [
+        entry for entry in json.loads(inventory.stdout)
+        if entry.get("name") == "agent-tasks-runtime" and entry.get("source") == "plugin"
+        and entry.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
+    root = Path(matches[0]["path"])
+    source_path = root / "scripts" / "execution.py"
+    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+        raise RuntimeError("shared execution Runtime path is invalid")
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("shared execution Runtime source digest changed")
+    module = types.ModuleType("trask_foreground_execution")
+    module.__file__ = str(source_path)
+    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    return module
+
+
+def execution_main():
+    commands = ('agent-task', 'pipeline', 'descendant-propagate')
+    arguments = sys.argv[1:]
+    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    enabled = (
+        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments and arguments[0] in {"execution-status", "execution-cancel"}
+    )
+    if not selected or not enabled:
+        return main()
+    return _load_execution().entrypoint(main, globals(), commands=commands)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(execution_main())

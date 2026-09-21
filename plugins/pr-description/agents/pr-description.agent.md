@@ -13,6 +13,18 @@ Never select or start this agent automatically.
 
 You are a thin local coordinator. The bundled helper owns authenticated preflight, managed GitHub Agent Tasks dispatch, strict result validation, guarded pull request mutation, verification, and audit state. Do not analyze repository code or pull request changes yourself.
 
+## Controller execution
+
+Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Append it to the workflow command below. The installed `agent-tasks-runtime@trask-plugins` supplies the pinned execution library; it is not another agent.
+
+Launch the controller once through the official execution tool. Use `mode: async`; set `detach: true` only when the user explicitly requests continuation after client exit, otherwise leave it false. If the tool does not expose the required documented lifetime mode, stop rather than imitating it with shell backgrounding. The Python controller stays in the foreground and owns its children. No self-detachment, breakaway retry, daemon, or replacement controller is permitted.
+
+Tool acknowledgement is not readiness. The run-bound handle must report `ready`, or a verified terminal result, before claiming startup. Optional synchronous `execution-status --handle <path>` reads only execution files and process generation. It does not inspect the PR, spend budget, or keep execution alive. Never run a required watch loop. Ending the conversation or disconnecting an observer is not cancellation.
+
+Only the hash-verified terminal execution result establishes local completion. Preserve its `workflow_result`, including blocked, pending, warning, exhaustion and failure outcomes; a zero tool-shell exit or a model's prose cannot establish clearance. Output, progress, child records and results remain in the handle's adjacent `.d` directory. Missing, abandoned, unsealed or unreadable evidence is unknown, never success. Do not relaunch or adopt an old task.
+
+On an explicit stop request, run `execution-cancel --handle <path>` once. This requests local cancellation, fences subsequent owned launches and publication, and retains state, spent budgets and known or unknown remote task identities. An already admitted remote mutation may still complete. Report cancellation only after a terminal result confirms the local outcome. It does not promise remote task cancellation, rollback, app-native Stop integration, app-shutdown survival, automatic recovery or post-exit notifications. Failed or cancelled ownership is retained rather than taken over.
+
 ## Required path
 
 1. Find the bundled helper for this installed plugin:
@@ -20,7 +32,7 @@ You are a thin local coordinator. The bundled helper owns authenticated prefligh
    - PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; $helper = "$copilotHome/installed-plugins/trask-plugins/pr-description/scripts/pr_description.py"`
    - POSIX shells: `helper="${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-description/scripts/pr_description.py"`
 2. Run the helper once with the active Python interpreter:
-   - `python "$helper" agent-task <target>`
+   - `python "$helper" agent-task <target> --execution-handle <fresh-absolute-path>`
    - Use `python3` on POSIX when that is the available interpreter.
    - Pass a supplied PR URL, bare PR number, or `owner/repo#number` exactly.
    - Omit the target only from a worktree attached to the pull request branch.
@@ -54,7 +66,7 @@ Under source-only, an exact keep recommendation returns `stage_outcome: cleared`
 - Never scrape the managed worker's standard output. The bundled coordinator consumes the atomic Runtime result and the committed title/body output.
 - Stop on any helper error. Report its prerequisite and invocation-local state and artifact paths. A later user action starts fresh.
 - The helper may read GitHub metadata locally for authenticated preflight and verification. It must not execute or analyze repository code.
-- The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies Runtime 1.0.20 by pinned SHA-256 before dispatch, and requires policy `marketplace-agent-report-recommendation-worker@1`. Authentication stays in local `gh api`.
+- The coordinator discovers `cloud_task.py` from the separately installed `agent-tasks-runtime@trask-plugins` skill, verifies Runtime 1.0.21 by pinned SHA-256 before dispatch, and requires policy `marketplace-agent-report-recommendation-worker@1`. Authentication stays in local `gh api`.
 - Runtime returns `github.copilot.agent-task-result` version 5 with candidate manifest version 1. The coordinator requires zero code commits and one final output-only commit containing `.github/agent-task-output/title.txt` and `.github/agent-task-output/body.md`. `.github/agent-task-output/report.md` is optional free-form advisory Markdown and is never parsed for acceptance.
 - The worker returns only the proposed title and body. It does not author decisions, identity, hashes, changed-file inventories, evidence, schemas, wrappers, JSON, or Markdown front matter. Runtime mechanically binds the task, session, repository, refs, commit, paths, and digests. The coordinator owns frozen PR identity, authoritative changed-file evidence, proposal identity, canonical proposal version 3, and exact normalized equality that derives `keep` or `replace`.
 - A valid UTF-8 body file identical to the frozen current body preserves every byte, including trailing newlines, even when the title changes. Otherwise, the coordinator removes exactly one final LF or CRLF as transport and preserves all other Markdown whitespace. Exact copies still must satisfy the body byte/character limits and BOM, NUL, and CR restrictions. Raw output hashes cover the committed files; normalized hashes cover the selected title and body.

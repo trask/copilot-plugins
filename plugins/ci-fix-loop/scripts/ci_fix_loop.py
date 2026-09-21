@@ -88,7 +88,7 @@ SEALED_CI_FIX_SNAPSHOT_SCHEMA = (
     "github.copilot.ci-fix-loop-sealed-invocation-snapshot.v2"
 )
 SEALED_CI_FIX_INVOCATION_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-invocation.v2"
+    "github.copilot.ci-fix-loop-sealed-invocation.v3"
 )
 SEALED_CI_FIX_RESULT_SCHEMA = (
     "github.copilot.ci-fix-loop-sealed-result.v2"
@@ -219,7 +219,7 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "b88a6edaeeb4358d84bb1143489244d7f181ff694fb6d2c3abde735de7c719f3"
+    "4912c63d9841cf3439a91ac90db9f9eff86140c68a74a353e9228e5ec41c76b1"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -829,6 +829,13 @@ def popen_owned_process(
     env: dict[str, str] | None = None,
     text: bool = True,
 ) -> tuple[subprocess.Popen[Any], WindowsKillJob | None]:
+    if _EXECUTION is not None:
+        owned = _EXECUTION.start(
+            command, cwd=str(cwd), stdout=stdout, stderr=stderr,
+            env=subprocess_environment() if env is None else env,
+            text=text, **({"encoding": "utf-8"} if text else {}),
+        )
+        return owned, None
     options: dict[str, Any] = {
         "cwd": str(cwd),
         "stdin": subprocess.DEVNULL,
@@ -1034,7 +1041,7 @@ def run(
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.run(
+    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         command,
         cwd=str(cwd) if cwd else None,
         input=input_text,
@@ -1062,7 +1069,7 @@ def run_bytes(
     check: bool = True,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    process = subprocess.run(
+    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         command,
         cwd=str(cwd) if cwd else None,
         input=input_bytes,
@@ -1100,6 +1107,8 @@ _EMIT_CAPTURE_STACK: list[list[dict[str, Any]]] = []
 
 
 def emit(payload: dict[str, Any]) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.emit(payload)
     if _EMIT_CAPTURE_STACK:
         _EMIT_CAPTURE_STACK[-1].append(payload)
         return
@@ -2543,6 +2552,11 @@ def last_helper_activity(state: dict[str, Any]) -> str | None:
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.record_state(path, state)
+        pr = state.get("pr")
+        if isinstance(pr, dict) and pr:
+            _EXECUTION.claim_writers([(pr.get("head_repository") or f"{pr['head_owner']}/{pr['head_repo']}", pr["head_branch"])])
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     handle, temporary_name = tempfile.mkstemp(
@@ -10291,11 +10305,13 @@ def run_hosted_helper(
         run_id=run_id,
         monitor=monitor,
     )
-    stdout_file = tempfile.TemporaryFile(
-        mode="w+", encoding="utf-8", newline="\n"
+    stdout_file = (
+        (_EXECUTION.directory / f"hosted-{run_id}-stdout.log").open("x+", encoding="utf-8", newline="\n")
+        if _EXECUTION is not None else tempfile.TemporaryFile(mode="w+", encoding="utf-8", newline="\n")
     )
-    stderr_file = tempfile.TemporaryFile(
-        mode="w+", encoding="utf-8", newline="\n"
+    stderr_file = (
+        (_EXECUTION.directory / f"hosted-{run_id}-stderr.log").open("x+", encoding="utf-8", newline="\n")
+        if _EXECUTION is not None else tempfile.TemporaryFile(mode="w+", encoding="utf-8", newline="\n")
     )
     try:
         process, owner = popen_owned_process(
@@ -10319,6 +10335,8 @@ def run_hosted_helper(
         deadline = time.monotonic() + timeout
         identity = None
         while True:
+            if _EXECUTION is not None:
+                _EXECUTION.check_cancel()
             if identity is None:
                 identity = discover_hosted_dispatch(
                     repository=repository,
@@ -10387,7 +10405,7 @@ def run_hosted_helper(
     finally:
         if owner is not None:
             owner.close()
-        elif not IS_WINDOWS:
+        elif not IS_WINDOWS and _EXECUTION is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -11745,7 +11763,10 @@ def sealed_ci_fix_artifact(
             "repo_root": str(repo_root),
             "state": str(state_path),
             "owner_session_id": owner_session_id,
-            "execution_mode": "direct_owner_session",
+            "execution_mode": "foreground_controller",
+            "execution_handle": str(artifact_path.with_name(
+                f"ci-fix-loop-sealed-{invocation_id}-execution.json"
+            )),
             "model_alias": "sol",
             "model": "gpt-5.6-sol",
             "fresh_invocation": True,
@@ -11830,6 +11851,7 @@ def load_sealed_ci_fix_artifact(
         "state",
         "owner_session_id",
         "execution_mode",
+        "execution_handle",
         "model_alias",
         "model",
         "fresh_invocation",
@@ -11858,7 +11880,10 @@ def load_sealed_ci_fix_artifact(
         or set(request) != request_keys
         or request.get("model_alias") != "sol"
         or request.get("model") != "gpt-5.6-sol"
-        or request.get("execution_mode") != "direct_owner_session"
+        or request.get("execution_mode") != "foreground_controller"
+        or request.get("execution_handle") != str(artifact_path.with_name(
+            f"ci-fix-loop-sealed-{artifact['invocation_id']}-execution.json"
+        ))
         or re.fullmatch(
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
             str(request.get("owner_session_id") or ""),
@@ -17621,5 +17646,69 @@ def main() -> int:
         return 1
 
 
+_EXECUTION = None
+EXECUTION_TERMINAL_RESULTS = frozenset({
+    "sealed_ci_fix_completed",
+    "complete",
+})
+EXECUTION_SHA256 = "790bd73a95b92c636a06964e116d023ed1bec714c68f63488f9a31220fd0bbb4"
+
+
+def _load_execution():
+    """Load only the pinned shared foreground execution source."""
+    import types
+    inventory = subprocess.run(
+        ["copilot", "skill", "list", "--json"], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+           if os.name == "nt" else {}),
+    )
+    matches = [
+        entry for entry in json.loads(inventory.stdout)
+        if entry.get("name") == "agent-tasks-runtime" and entry.get("source") == "plugin"
+        and entry.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
+    root = Path(matches[0]["path"])
+    source_path = root / "scripts" / "execution.py"
+    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+        raise RuntimeError("shared execution Runtime path is invalid")
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("shared execution Runtime source digest changed")
+    module = types.ModuleType("trask_foreground_execution")
+    module.__file__ = str(source_path)
+    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    return module
+
+
+def execution_main():
+    commands = ('pipeline', 'run-sealed-ci-fix')
+    arguments = sys.argv[1:]
+    if arguments and arguments[0] in {"run-sealed-ci-fix", "execution-status", "execution-cancel"}:
+        if len(arguments) != 2:
+            raise WorkflowError("sealed execution requires exactly one invocation artifact")
+        _, artifact = load_sealed_ci_fix_artifact(cli_path(arguments[1]))
+        helper = _load_execution()
+        handle = Path(artifact["request"]["execution_handle"])
+        if arguments[0] != "run-sealed-ci-fix":
+            operation = helper.status if arguments[0] == "execution-status" else helper.cancel
+            emit(operation(handle))
+            return 0
+        return helper.entrypoint(
+            main, globals(), commands=commands, sealed_handle=handle,
+            run_id=artifact["invocation_id"],
+        )
+    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    enabled = (
+        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments and arguments[0] in {"execution-status", "execution-cancel"}
+    )
+    if not selected or not enabled:
+        return main()
+    return _load_execution().entrypoint(main, globals(), commands=commands)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(execution_main())

@@ -34,9 +34,17 @@ ci_fix_loop="$copilot_home/installed-plugins/trask-plugins/ci-fix-loop/scripts/c
 python3 "$ci_fix_loop" run-sealed-ci-fix "<exact absolute invocation artifact path>"
 ```
 
-Replace only the artifact path. Do not add flags, reconstruct internal argv, read the artifact first, or invoke another helper. The permission hook admits only this operation when the artifact binds the current repository root and owner session.
+Replace only the artifact path. Do not add flags, reconstruct internal argv, read the artifact first, or invoke another helper. The permission hook admits only the exact sealed operation bound to this repository, package and owner session.
 
-Run it once. A permission denial, missing or blank execution output, nonzero exit, timeout, interruption, or tool error is terminal. Do not repeat the command, choose another artifact, inspect result files, or issue a follow-up probe. Stdout is not workflow evidence.
+Use the official execution tool once with exactly `mode: async` and `detach: true`, only with explicit authorization to continue after client exit. The Python controller stays in the foreground. Do not self-detach, add shell backgrounding or retry a denied launch. Tool acknowledgement is not controller readiness and shell exit is not workflow completion.
+
+Run it once. A launch denial or tool error is terminal for launch admission. Do not repeat the command. A lost observation does not prove that the controller stopped; use only the sealed controls below.
+
+The sealed v3 artifact binds the fresh execution handle and its adjacent file-backed output, progress and result directory. Stdout is not workflow evidence. The only optional follow-up commands are `execution-status "<same exact artifact path>"` and, on an explicit stop request, `execution-cancel "<same exact artifact path>"`. Use the same installed helper prefix and synchronous, non-detached execution. These controls require the original owner session. They cannot accept an arbitrary handle or target.
+
+Status is read-only and never keeps the workflow alive. Only its hash-verified terminal result can establish the local outcome. No watch loop is required; observer or client disconnection is not cancellation. Missing, abandoned, unsealed or unreadable evidence stays unknown. Never repeat the launch, choose another artifact, reset allowance, or adopt a prior task.
+
+Cancellation fences new owned launches and publication and drains owned local children when the host can verify drainage. Retain spent budgets, known task identities and unknown creation outcomes. Already admitted remote requests may finish, and hosted work may continue. No remote-cancellation, rollback, app-native Stop, app-shutdown survival, automatic recovery or post-exit notification is promised.
 
 ## Coordinator contract
 
@@ -54,7 +62,7 @@ The artifact also binds:
 
 The coordinator checks the package and live identities twice before the loop. It starts no work if either pass differs. Within the invocation, its private state may retain the current iteration and budget. A crash or lost invocation is abandoned. No later invocation may resume, recover, import, or supersede it.
 
-Every hosted worker uses `gpt-5.6-sol` and `marketplace-agent-code-candidate-worker@1`. It may create zero or more linear code commits, then one optional path-only output commit under `.github/agent-task-output/`. Runtime 1.0.20 returns `github.copilot.agent-task-result` version 5 and candidate manifest version 1. The coordinator re-derives every commit parent, tree, patch digest, and changed path from fetched Git history. It imports only the manifest's code tip, never the output commit.
+Every hosted worker uses `gpt-5.6-sol` and `marketplace-agent-code-candidate-worker@1`. It may create zero or more linear code commits, then one optional path-only output commit under `.github/agent-task-output/`. Runtime 1.0.21 returns `github.copilot.agent-task-result` version 5 and candidate manifest version 1. The coordinator re-derives every commit parent, tree, patch digest, and changed path from fetched Git history. It imports only the manifest's code tip, never the output commit.
 
 The worker may write free-form advisory prose to `.github/agent-task-output/report.md`. Missing, malformed, or arbitrary report content is not mechanical evidence and cannot invalidate a valid candidate. The coordinator does not accept worker-authored commit provenance, command results, or green claims. It never runs Gradle, Maven, tests, builds, formatters, or candidate validation commands locally.
 

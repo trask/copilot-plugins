@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "e06214907cb138784c00c1cef30f678f61abe095ca9ccc3ef2e796c681c2462b"
+COMMON_SHA256 = "d1a383ea78a750b0e438da04d0b2417cda9dc5a135d3cb7f40dcce7cad4b6bb3"
 
 
 def load_common() -> Any:
@@ -1090,9 +1090,14 @@ def acquire_lock(
     alive: Callable[[int], bool] = common.process_is_alive,
 ) -> dict[str, Any]:
     holder = {"run_id": run_id, "pid": os.getpid(), "created_at": utc_now()}
+    if common._EXECUTION is not None:
+        holder["execution_root"] = str(common._EXECUTION.root)
+        holder["owner"] = common._EXECUTION.owner
     path.parent.mkdir(parents=True, exist_ok=True)
     with lock_guard(path):
         existing = common.read_json(path)
+        if common._EXECUTION is not None and path.exists():
+            return {"result": "held", "holder": existing}
         if isinstance(existing, dict) and lock_holder_is_live(
             existing, alive=alive
         ):
@@ -1113,6 +1118,17 @@ def acquire_lock(
 def release_lock(path: Path, run_id: str) -> None:
     with lock_guard(path):
         existing = common.read_json(path)
+        if common._EXECUTION is not None:
+            if existing is None and not path.exists():
+                return
+            if (
+                not isinstance(existing, dict) or existing.get("run_id") != run_id
+                or existing.get("owner") != common._EXECUTION.owner
+                or existing.get("execution_root") != str(common._EXECUTION.root)
+            ):
+                raise WorkflowError("stack lock ownership changed before release")
+            path.unlink()
+            return
         if isinstance(existing, dict) and existing.get("run_id") != run_id:
             return
         try:
@@ -1400,6 +1416,25 @@ class WorkerLauncher:
             if should_cancel is not None and should_cancel():
                 return {"result": "cancelled"}
             exited = handle.poll()
+            if common._EXECUTION is not None:
+                child_handle = Path(handle.launch_receipt["handle"])
+                if child_handle.is_file():
+                    execution = common._EXECUTION.child_status(child_handle)
+                    if execution.get("terminal") is True:
+                        if execution.get("exit_code") != 0:
+                            return {"result": "failed", "reason": "worker_execution_failed",
+                                    "detail": json.dumps(execution, sort_keys=True)}
+                        return {"result": "active", "evidence": execution}
+                    if execution.get("status") == "ready":
+                        return {"result": "active", "evidence": execution}
+                if exited is not None:
+                    return {"result": "failed", "reason": "worker_exited_before_readiness",
+                            "detail": "worker exited without its own readiness or terminal evidence"}
+                if self.monotonic() >= deadline:
+                    return {"result": "failed", "reason": "worker_readiness_timeout",
+                            "detail": "worker did not write run-bound readiness"}
+                self.sleep(self.poll_interval)
+                continue
             log_size = log_path.stat().st_size if log_path.exists() else 0
             if record_path.is_file() and exited in {None, 0}:
                 return {
@@ -1887,6 +1922,8 @@ class StackPipeline:
         self.save()
 
     def cancellation_requested(self) -> bool:
+        if common._EXECUTION is not None:
+            common._EXECUTION.check_cancel()
         request = common.read_json(self.cancellation_path)
         return (
             isinstance(request, dict)
@@ -3742,6 +3779,10 @@ class StackPipeline:
                 detail=opening.get("detail"),
             )
         fingerprint = opening["fingerprint"]
+        if common._EXECUTION is not None:
+            common._EXECUTION.claim_writers([
+                (self.repository, member["head_branch"]) for member in opening["selected"]
+            ])
         if self.state_path.exists():
             self.state = new_state(self.kickoff, self.run_id, fingerprint)
             result = {
@@ -4519,6 +4560,10 @@ def command_cancel(args: argparse.Namespace) -> None:
 
 def command_run(args: argparse.Namespace) -> None:
     common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
+    if common._EXECUTION is not None and args.run_id is not None:
+        args.run_id = common._EXECUTION.run_id
+        args.event_log = None
+        raise WorkflowError("foreground execution owns its fresh run identity; omit --run-id")
     common.require_tools()
     kickoff = load_kickoff(args)
     repo_root = Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
@@ -4531,7 +4576,9 @@ def command_run(args: argparse.Namespace) -> None:
         effort=args.effort,
         conflict_strategy=args.conflict_strategy,
         github_mutation_policy=args.github_mutation_policy,
-        run_id=validate_run_id(args.run_id) if args.run_id else None,
+        run_id=validate_run_id(args.run_id) if args.run_id else (
+            common._EXECUTION.run_id if common._EXECUTION is not None else None
+        ),
         report=reporter,
     )
     result = pipeline.execute()
@@ -4726,5 +4773,55 @@ def main() -> int:
         return 130
 
 
+_EXECUTION = None
+EXECUTION_TERMINAL_RESULTS = frozenset({
+    "complete",
+    "partial",
+})
+EXECUTION_SHA256 = "790bd73a95b92c636a06964e116d023ed1bec714c68f63488f9a31220fd0bbb4"
+
+
+def _load_execution():
+    """Load only the pinned shared foreground execution source."""
+    import types
+    inventory = subprocess.run(
+        ["copilot", "skill", "list", "--json"], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+           if os.name == "nt" else {}),
+    )
+    matches = [
+        entry for entry in json.loads(inventory.stdout)
+        if entry.get("name") == "agent-tasks-runtime" and entry.get("source") == "plugin"
+        and entry.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
+    root = Path(matches[0]["path"])
+    source_path = root / "scripts" / "execution.py"
+    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+        raise RuntimeError("shared execution Runtime path is invalid")
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("shared execution Runtime source digest changed")
+    module = types.ModuleType("trask_foreground_execution")
+    module.__file__ = str(source_path)
+    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    return module
+
+
+def execution_main():
+    commands = ('run',)
+    arguments = sys.argv[1:]
+    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    enabled = (
+        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments and arguments[0] in {"execution-status", "execution-cancel"}
+    )
+    if not selected or not enabled:
+        return main()
+    return _load_execution().entrypoint(main, globals(), commands=commands)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(execution_main())

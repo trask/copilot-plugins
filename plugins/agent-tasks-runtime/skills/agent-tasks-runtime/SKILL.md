@@ -7,6 +7,31 @@ description: Internal GitHub Agent Tasks runtime dependency for Trask pull reque
 
 This is the shared runtime dependency for Trask PR agents, not a user workflow. Consumer coordinators discover it through `copilot skill list --json`, verify the exact source digest, and invoke the helper. Do not invoke its scripts manually during an agent workflow.
 
+`scripts/execution.py` is the shared foreground execution library. All nine
+user-facing entrypoints pin its source bytes. Pipeline and Conflict use this
+library for local ownership without changing Conflict's dedicated hosted
+backend. It supplies fresh generation-bound root and child identities,
+file-backed output and canonical terminal results, optional read-only status,
+explicit local cancellation and conservative branch-writer leases.
+
+Controllers remain foreground processes. Only the official execution tool may
+detach a root when the user explicitly requests survival beyond client exit.
+There is no fallback from denied legacy breakaway, self-detach layer, daemon,
+automatic recovery or app-native Stop integration. Readiness comes from the
+controller, not the tool acknowledgement. Completion comes from a verified
+terminal file, not shell exit or model prose.
+
+Cancellation fences later owned subprocess launches and publication. It does
+not retract an admitted remote mutation or prove remote task cancellation.
+Dispatch observations retain creation uncertainty and known task identities.
+Domain state retains its original budgets and pending outcomes. Failed,
+cancelled or abandoned ownership cannot be adopted by a new invocation.
+Writer releases take effect only with the owner's exact sealed terminal
+result. A missing or unsealed result keeps the branch unavailable even when
+the controller has exited.
+No production lifetime or graceful app-shutdown guarantee follows from the
+single inert Windows controlled-client-exit qualification.
+
 ## Current contracts
 
 `marketplace-agent-code-candidate-worker@1` permits zero or more linear single-parent code commits and an optional final output-only commit under `.github/agent-task-output/`. Review, Self Review, CI Fix and Historical Audit use it.

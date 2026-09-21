@@ -13,7 +13,7 @@ Run only after the user explicitly invokes this agent by name or `/pr-stack-pipe
 
 Run this primary session only when its model is exactly `gpt-5.6-sol`. Before you invoke the helper or read pull request data, determine the model and inspect the reasoning effort when the runtime exposes it. Continue when the model matches and the effort is either exactly `high` or unavailable. The app does not always expose the primary session's effort to the agent, so an unavailable effort does not fail the gate. Otherwise stop, report the active model and any exposed effort, and ask the user to run PR Stack Pipeline again with `gpt-5.6-sol` and reasoning effort `high`. If you cannot determine the model, the gate has failed. The user cannot override this gate.
 
-Launch and monitor the bundled stack helper with its durable progress protocol, then report its final JSON event. The helper owns all control flow. Do not launch stages yourself, create worktrees or sessions, retry a stage, inspect stage prose, rebase anything, or modify a worktree.
+Launch the bundled stack helper with its durable progress protocol, then report its final JSON event. The helper owns all control flow. Do not launch stages yourself, create worktrees or sessions, retry a stage, inspect stage prose, rebase anything, or modify a worktree.
 
 ## Kickoff
 
@@ -25,45 +25,35 @@ The prompt is exactly one JSON object and nothing else:
 
 `pullRequests` is the ordered selected suffix of the stack and starts at `startPullRequest`. Draft and non-draft members are both included. Pass the object to the helper exactly as received. Never edit it, reorder it, add a member, or drop a member. If it is missing, malformed, or not version 1, say so and stop.
 
+## Controller execution
+
+Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Pass that handle once with the workflow command below. The installed `agent-tasks-runtime@trask-plugins` supplies the pinned execution library; it is not another agent.
+
+Launch the controller once through the official execution tool. Use `mode: async`; set `detach: true` only when the user explicitly requests continuation after client exit, otherwise leave it false. If the tool does not expose the required documented lifetime mode, stop rather than imitating it with shell backgrounding. The Python controller stays in the foreground and owns its children. No self-detachment, breakaway retry, daemon, or replacement controller is permitted.
+
+Tool acknowledgement is not readiness. The run-bound handle must report `ready`, or a verified terminal result, before claiming startup. Optional synchronous `execution-status --handle <path>` reads only execution files and process generation. It does not inspect the PR, spend budget, or keep execution alive. Never run a required watch loop. Ending the conversation or disconnecting an observer is not cancellation.
+
+Only the hash-verified terminal execution result establishes local completion. Preserve its `workflow_result`, including blocked, pending, warning, exhaustion and failure outcomes; a zero tool-shell exit or a model's prose cannot establish clearance. Output, progress, child records and results remain in the handle's adjacent `.d` directory. Missing, abandoned, unsealed or unreadable evidence is unknown, never success. Do not relaunch or adopt an old task.
+
+On an explicit stop request, run `execution-cancel --handle <path>` once. This requests local cancellation, fences subsequent owned launches and publication, and retains state, spent budgets and known or unknown remote task identities. An already admitted remote mutation may still complete. Report cancellation only after a terminal result confirms the local outcome. It does not promise remote task cancellation, rollback, app-native Stop integration, app-shutdown survival, automatic recovery or post-exit notifications. Failed or cancelled ownership is retained rather than taken over.
+
 ## Launching the helper
 
 Choose the command for the active shell, and pass the kickoff JSON as the single `--kickoff` value:
 
-- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" start --kickoff '<json>'`
-- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" start --kickoff '<json>'`
-- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" start --kickoff '<json>'`
+- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run --execution-handle <fresh-absolute-path> --kickoff '<json>'`
+- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run --execution-handle <fresh-absolute-path> --kickoff '<json>'`
+- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run --execution-handle <fresh-absolute-path> --kickoff '<json>'`
 
-Run `start` synchronously exactly once. It returns `stack_pipeline_launched` with a `run_id`, cursor, and `next_watch.arguments`. The scheduler is a detached process; never launch it again, even if progress monitoring fails.
-
-Windows launch requires breakaway and fails before fallback if denied. The receipt records flags and process generation. Watch checks that generation; missing, unreadable or reused identity is a monitoring failure, not workflow completion. Workers remain separately owned by the scheduler.
-
-When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `start`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
+When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `run`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
 
 Normal execution uses `--github-mutation-policy allow`, the helper's default. Explicitly invoking PR Stack Pipeline for a selected suffix authorizes its standard stage-owned actions: verified source publication, bounded guarded CI failed-job reruns, Copilot review requests, replies to and resolution of bot-authored review threads, and title/body updates. Draft and ready-for-review pull requests are eligible; preserve their draft states and the exact selected suffix. This authorization does not extend to merging, approving, unsolicited comments, or replies to human-authored threads, which require a separate explicit request.
 
-Choose one GitHub mutation policy before `start` and never change it for that run. Use `--github-mutation-policy source-only` only when the caller explicitly requests source-only execution or forbids the normal stage-owned review or metadata updates. Do not infer source-only from draft status or the separate prohibitions on merging, approval, unsolicited comments, and human-thread replies. The helper freezes and forwards the policy to Copilot Review, Self Review, CI Fix, and PR Description. Under `source-only`, CI reruns are forbidden and PR Description may preserve a replacement proposal but must not apply its title or body. Neither policy permits empty commits as a rerun workaround.
+Choose one GitHub mutation policy before `run` and never change it for that run. Use `--github-mutation-policy source-only` only when the caller explicitly requests source-only execution or forbids the normal stage-owned review or metadata updates. Do not infer source-only from draft status or the separate prohibitions on merging, approval, unsolicited comments, and human-thread replies. The helper freezes and forwards the policy to Copilot Review, Self Review, CI Fix, and PR Description. Under `source-only`, CI reruns are forbidden and PR Description may preserve a replacement proposal but must not apply its title or body. Neither policy permits empty commits as a rerun workaround.
 
-`watch` only observes the detached scheduler. Interrupting `watch` does not cancel the run. When the user explicitly asks to stop the run, invoke the matching `cancel` command once with the exact kickoff and run ID:
+Read the verified terminal `workflow_result` as the `stack_pipeline_finished` summary. Retrieve required omitted details from its exact full-result artifact after verifying its hash and run identity. Legacy `start`/`watch`/`cancel` remains a distinct self-detached contract. Its denied-breakaway failure must never trigger a foreground fallback; foreground runs use only the execution controls above.
 
-- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" cancel --kickoff '<json>' --run-id '<run_id>'`
-- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" cancel --kickoff '<json>' --run-id '<run_id>'`
-- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" cancel --kickoff '<json>' --run-id '<run_id>'`
-
-Cancellation is durable and idempotent. Report the command's exact result; never substitute process-name killing or infer cancellation from an interrupted observer.
-
-## Monitoring progress
-
-After `start`, repeatedly run `watch` synchronously with the returned `next_watch.arguments`, exactly as returned. The versioned monitor handle binds the kickoff and run paths. Never reconstruct the kickoff, cursor, wait, or target:
-
-- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" watch --run-id '<run_id>' --cursor <cursor> --wait-seconds 300`
-- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" watch --run-id '<run_id>' --cursor <cursor> --wait-seconds 300`
-- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" watch --run-id '<run_id>' --cursor <cursor> --wait-seconds 300`
-
-Each call returns one `pipeline_update` and, while unfinished, the complete next `next_watch.arguments`. For every item in `updates`, immediately write one visible assistant line in this session conversation before the next tool call: start with `message`, then append `Waiting: <wait_reason>.` and `Next: <next_action>.` when those fields are present. Do not send these updates to the PR Flight canvas, hide them in a tool-call label, or print the raw JSON. Transition updates report pass, pull request, stage, outcome, wait reason, and next action when applicable. Heartbeat updates are already coalesced to no more than one per five minutes for an unchanged active wait and include elapsed time. If `updates` is empty, invoke the returned `next_watch.arguments` again without adding a message.
-
-Never end your turn or leave the session idle while `finished` is false. Stop only when `finished` is true. On a normal terminal update, use its `final_event` as the bounded `stack_pipeline_finished` summary. Read `artifacts.result` when an omission count is nonzero or when the final response needs detail that the bounded event references but does not contain. If `monitor_failure` is present, report it without guessing the pipeline outcome; progress reporting is deliberately separate from scheduler execution.
-
-After monitoring finishes, rename the session to the final event's `session_title` when that field is present and the current name does not already begin with `PR Stack Pipeline: #<startPullRequest> - `. The helper builds the name as `PR Stack Pipeline: #<startPullRequest> - <PR title>` from the starting pull request's live metadata. If `session_title` is absent because the helper could not read that metadata, continue without renaming.
+After verified terminal completion, rename the session to the final event's `session_title` when that field is present and the current name does not already begin with `PR Stack Pipeline: #<startPullRequest> - `. The helper builds the name as `PR Stack Pipeline: #<startPullRequest> - <PR title>` from the starting pull request's live metadata. If `session_title` is absent because the helper could not read that metadata, continue without renaming.
 
 ## What the helper does
 

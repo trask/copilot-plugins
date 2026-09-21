@@ -1,0 +1,1061 @@
+"""Controller-owned foreground execution and optional file-based controls."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Callable
+import uuid
+
+
+SCHEMA = "github.copilot.foreground-execution.v1"
+PARENT_ENV = "TRASK_EXECUTION_PARENT"
+IS_WINDOWS = os.name == "nt"
+
+
+class ExecutionError(RuntimeError):
+    pass
+
+
+class Cancelled(BaseException):
+    pass
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def read(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ExecutionError(f"execution artifact is a symlink: {path}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ExecutionError(f"execution artifact is not an object: {path}")
+    return value
+
+
+def write(path: Path, value: dict[str, Any], *, exclusive: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if exclusive:
+        with path.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return
+    if path.is_symlink():
+        raise ExecutionError(f"execution artifact is a symlink: {path}")
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def guard(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        if IS_WINDOWS:
+            import msvcrt
+
+            if stream.seek(0, os.SEEK_END) == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def process_identity(pid: int) -> dict[str, Any] | None:
+    if pid <= 0:
+        return None
+    if not IS_WINDOWS:
+        # Linux procfs supplies a generation without invoking a console utility.
+        root = Path("/proc") / str(pid)
+        try:
+            fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
+            return {
+                "pid": pid, "creation_time": fields[19],
+                "image": str((root / "exe").resolve(strict=True)),
+                "running": fields[0] != "Z",
+            }
+        except FileNotFoundError:
+            if Path("/proc").is_dir():
+                return None
+            raise ExecutionError("this host has no supported process-generation provider")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x00101000, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:
+            return None
+        raise ctypes.WinError(error)
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        image = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(image))
+        if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        state = kernel.WaitForSingleObject(handle, 0)
+        if state not in (0, 258):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return {
+            "pid": pid,
+            "creation_time": str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime),
+            "image": os.path.normcase(image.value),
+            "running": state == 258,
+        }
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def same_process(expected: dict[str, Any], observed: dict[str, Any] | None) -> bool:
+    return observed is not None and all(
+        expected.get(key) == observed.get(key) for key in ("pid", "creation_time", "image")
+    )
+
+
+def require_owner(expected: dict[str, Any]) -> None:
+    observed = process_identity(expected["pid"])
+    if not same_process(expected, observed) or not observed["running"]:
+        raise ExecutionError("execution owner generation is absent or changed")
+
+
+class WindowsOwner:
+    """Assign a suspended child to a kill-on-close job, without breakaway."""
+
+    def __init__(self, process: subprocess.Popen[Any]) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class Limits(ctypes.Structure):
+            _fields_ = [
+                ("per_process", ctypes.c_int64), ("per_job", ctypes.c_int64),
+                ("flags", wintypes.DWORD), ("minimum", ctypes.c_size_t),
+                ("maximum", ctypes.c_size_t), ("active", wintypes.DWORD),
+                ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+                ("scheduling", wintypes.DWORD),
+            ]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [
+                ("basic", Limits), ("io", ctypes.c_uint64 * 6),
+                ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                ("peak_process", ctypes.c_size_t), ("peak_job", ctypes.c_size_t),
+            ]
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        kernel.SetInformationJobObject.restype = wintypes.BOOL
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.TerminateJobObject.restype = wintypes.BOOL
+        kernel.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+        ]
+        kernel.QueryInformationJobObject.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        self.kernel = kernel
+        self.handle = kernel.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            limits = Extended()
+            limits.basic.flags = 0x2000
+            if not kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel.AssignProcessToJobObject(self.handle, int(process._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except BaseException:
+            self.close()
+            raise
+
+    def terminate(self) -> None:
+        if not self.kernel.TerminateJobObject(self.handle, 1):
+            import ctypes
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self.handle:
+            if not self.kernel.CloseHandle(self.handle):
+                import ctypes
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.handle = None
+
+    def active_count(self) -> int:
+        import ctypes
+        from ctypes import wintypes
+
+        class Accounting(ctypes.Structure):
+            _fields_ = [
+                ("user", ctypes.c_int64), ("kernel", ctypes.c_int64),
+                ("period_user", ctypes.c_int64), ("period_kernel", ctypes.c_int64),
+                ("page_faults", wintypes.DWORD), ("total", wintypes.DWORD),
+                ("active", wintypes.DWORD), ("terminated", wintypes.DWORD),
+            ]
+
+        accounting = Accounting()
+        if not self.kernel.QueryInformationJobObject(
+            self.handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return accounting.active
+
+    def drain(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while self.active_count():
+            if time.monotonic() >= deadline:
+                raise ExecutionError("owned Windows job still has active processes")
+            time.sleep(0.02)
+
+
+def resume_process(pid: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class Thread(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD), ("usage", wintypes.DWORD),
+            ("id", wintypes.DWORD), ("pid", wintypes.DWORD),
+            ("base", wintypes.LONG), ("delta", wintypes.LONG), ("flags", wintypes.DWORD),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    for name in ("Thread32First", "Thread32Next"):
+        function = getattr(kernel, name)
+        function.argtypes = [wintypes.HANDLE, ctypes.POINTER(Thread)]
+        function.restype = wintypes.BOOL
+    kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenThread.restype = wintypes.HANDLE
+    kernel.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel.ResumeThread.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel.CreateToolhelp32Snapshot(4, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    count = 0
+    try:
+        thread = Thread()
+        thread.size = ctypes.sizeof(thread)
+        more = kernel.Thread32First(snapshot, ctypes.byref(thread))
+        while more:
+            if thread.pid == pid:
+                handle = kernel.OpenThread(2, False, thread.id)
+                if not handle:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                try:
+                    if kernel.ResumeThread(handle) == 0xFFFFFFFF:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    count += 1
+                finally:
+                    kernel.CloseHandle(handle)
+            more = kernel.Thread32Next(snapshot, ctypes.byref(thread))
+    finally:
+        kernel.CloseHandle(snapshot)
+    if not count:
+        raise ExecutionError("suspended child has no verifiable initial thread")
+
+
+class OwnedProcess:
+    def __init__(self, process: subprocess.Popen[Any], owner: WindowsOwner | None,
+                 record: Path, streams: list[Any]) -> None:
+        self.process, self.owner, self.record, self.streams = process, owner, record, streams
+        self.pid = process.pid
+        self.launch_receipt = read(record)
+        self.drained = False
+        self.drainage_error: str | None = None
+        self.stopping = False
+
+    @property
+    def returncode(self):
+        return self.process.returncode
+
+    def poll(self):
+        code = self.process.poll()
+        return None if code is None else self.wait()
+
+    def terminate(self):
+        return self.terminate_tree()
+
+    def kill(self):
+        return self.terminate_tree()
+
+    def verify_execution(self, code: int) -> None:
+        if code == 0 and self.launch_receipt.get("requires_execution_result"):
+            result = status(Path(self.launch_receipt["handle"]))
+            if (
+                result.get("terminal") is not True or result.get("exit_code") != code
+                or result.get("local_status") != "finished"
+                or result.get("local_children_drained") is not True
+                or result.get("run_id") != self.launch_receipt["run_id"]
+                or not same_process(result.get("owner", {}), self.launch_receipt["process_identity"])
+            ):
+                raise ExecutionError("child exit lacks a matching sealed execution result")
+
+    def wait(self, timeout=None):
+        code = self.process.wait(timeout=timeout)
+        if self.drainage_error is not None:
+            raise ExecutionError(self.drainage_error)
+        if self.drained:
+            self.verify_execution(code)
+            return code
+        unexpected = False
+        try:
+            if self.owner:
+                unexpected = bool(self.owner.active_count()) and not self.stopping
+                if unexpected:
+                    self.owner.terminate()
+                self.owner.drain(timeout if timeout is not None else 10.0)
+            elif not IS_WINDOWS:
+                try:
+                    os.killpg(self.pid, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise ExecutionError("owned process group still has active descendants")
+            self.drained = True
+            write(self.record, {**read(self.record), "exit_code": code, "local_drained": True})
+        except (OSError, subprocess.SubprocessError, ExecutionError) as failure:
+            self.drained = False
+            self.drainage_error = str(failure)
+            raise
+        finally:
+            if self.owner:
+                self.owner.close()
+                self.owner = None
+            for stream in self.streams:
+                stream.close()
+            self.streams.clear()
+        if unexpected:
+            raise ExecutionError("child exited before its descendants; the owned job was drained")
+        self.verify_execution(code)
+        return code
+
+    def terminate_tree(self, timeout=10.0):
+        if self.drained:
+            return self.process.returncode
+        self.stopping = True
+        if self.owner:
+            self.owner.terminate()
+        elif not IS_WINDOWS:
+            require_owner(self.launch_receipt["process_identity"])
+            try:
+                os.killpg(self.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        elif self.poll() is None:
+            self.process.terminate()
+        try:
+            return self.wait(timeout)
+        except subprocess.TimeoutExpired:
+            if not IS_WINDOWS:
+                try:
+                    os.killpg(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                self.process.kill()
+            return self.wait(timeout)
+
+
+class Execution:
+    def __init__(self, handle: Path, *, command: list[str], parent: Path | None = None,
+                 run_id: str | None = None, terminal_results: frozenset[str] = frozenset()) -> None:
+        if not handle.is_absolute() or handle.is_symlink():
+            raise ExecutionError("execution handle must be a fresh absolute regular path")
+        for index, argument in enumerate(command):
+            target = None
+            if argument == "--repo-root" and index + 1 < len(command):
+                target = command[index + 1]
+            elif argument.startswith("--repo-root="):
+                target = argument.partition("=")[2]
+            if target and handle.resolve().is_relative_to(Path(target).expanduser().resolve()):
+                raise ExecutionError("execution artifacts must be outside the target repository")
+        for directory in (Path.cwd(), *Path.cwd().parents):
+            if (directory / ".git").exists() and handle.resolve().is_relative_to(directory.resolve()):
+                raise ExecutionError("execution artifacts must be outside the target repository")
+        self.handle = handle.resolve()
+        self.directory = self.handle.with_name(self.handle.name + ".d")
+        self.directory.mkdir(parents=True, exist_ok=False)
+        self.children: list[OwnedProcess] = []
+        self.launch_failures: list[dict[str, Any]] = []
+        self.last_result: dict[str, Any] | None = None
+        self.run_id = run_id or uuid.uuid4().hex
+        self.terminal_results = terminal_results
+        self.root = self.handle
+        self.parent = None
+        self.owner = process_identity(os.getpid())
+        if self.owner is None:
+            raise ExecutionError("controller generation could not be read")
+        if parent is not None:
+            request = read(parent)
+            if request.get("schema") != SCHEMA or request.get("handle") != str(self.handle):
+                raise ExecutionError("parent request does not bind this child handle")
+            root = load_handle(Path(request["root"]))
+            require_owner(root["owner"])
+            self.parent = load_handle(Path(request["parent"]))
+            if self.parent["root"] != str(request["root"]) or self.parent["run_id"] != root["run_id"]:
+                raise ExecutionError("parent execution identity changed")
+            require_owner(self.parent["owner"])
+            if request["command_sha256"] != digest(command):
+                raise ExecutionError("child command does not match its parent request")
+            child_record = Path(request["child_record"])
+            deadline = time.monotonic() + 10
+            while not child_record.exists():
+                require_owner(root["owner"])
+                if time.monotonic() >= deadline:
+                    raise ExecutionError("parent did not bind child generation")
+                time.sleep(0.02)
+            child = read(child_record)
+            if (
+                child.get("schema") != SCHEMA or child.get("root") != request["root"]
+                or child.get("run_id") != root["run_id"] or child.get("handle") != str(self.handle)
+                or child.get("command_sha256") != request["command_sha256"]
+            ):
+                raise ExecutionError("parent child record identity changed")
+            expected = child["process_identity"]
+            if not same_process(expected, self.owner):
+                raise ExecutionError("child process generation does not match its parent request")
+            self.root = Path(request["root"])
+            self.run_id = root["run_id"]
+        self.record = {
+            "schema": SCHEMA, "run_id": self.run_id, "handle": str(self.handle),
+            "root": str(self.root), "parent_request": str(parent) if parent else None,
+            "owner": self.owner, "mode": "foreground", "command_sha256": digest(command),
+            "status": "starting", "started_at": time.time(),
+            "result": str(self.directory / "result.json"),
+            "stdout": str(self.directory / "stdout.log"),
+            "stderr": str(self.directory / "stderr.log"),
+            "progress": str(self.directory / "progress.jsonl"),
+            "cancel": str(self.directory / "cancel.json"),
+        }
+        write(self.handle, self.record, exclusive=True)
+
+    def check_cancel(self) -> None:
+        root = load_handle(self.root)
+        if self.root != self.handle:
+            require_owner(root["owner"])
+        if self.parent is not None:
+            require_owner(self.parent["owner"])
+        cancel = Path(root["cancel"])
+        if cancel.exists():
+            request = read(cancel)
+            if request.get("run_id") != self.run_id or request.get("owner") != root["owner"]:
+                raise ExecutionError("cancellation identity does not match the owner")
+            raise Cancelled("explicit local cancellation")
+
+    def ready(self) -> None:
+        self.check_cancel()
+        self.record["status"] = "ready"
+        write(self.handle, self.record)
+
+    def emit(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            raise ExecutionError("controller event must be a JSON object")
+        with Path(self.record["progress"]).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self.last_result = payload
+
+    def child_status(self, path: Path) -> dict[str, Any]:
+        value = load_handle(path)
+        if value["root"] != str(self.root) or value["run_id"] != self.run_id:
+            raise ExecutionError("child readiness belongs to another execution")
+        return status(path)
+
+    def claim_writers(self, writers: list[tuple[str, str]]) -> None:
+        root = load_handle(self.root)
+        home = Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot")
+        directory = home / "run" / "foreground-execution" / "writers"
+        ledger_path = self.root.with_name(self.root.name + ".d") / "writers.json"
+        with guard(ledger_path.with_suffix(".guard")):
+            ledger = read(ledger_path) if ledger_path.exists() else {"leases": []}
+            for repository, branch in sorted(set(writers)):
+                if not repository or "/" not in repository or not branch:
+                    raise ExecutionError("writer lease requires exact repository and branch")
+                key = [repository.casefold(), branch]
+                path = directory / f"{digest(key)}.json"
+                expected = {"schema": SCHEMA, "key": key, "run_id": self.run_id,
+                            "root": str(self.root), "owner": root["owner"]}
+                with guard(path.with_suffix(".guard")):
+                    if path.exists():
+                        lease = read(path)
+                        if lease != expected:
+                            released = False
+                            if lease.get("schema") == SCHEMA and lease.get("key") == key and lease.get("release"):
+                                prior = status(Path(lease["root"]))
+                                released = (
+                                    prior.get("terminal") is True
+                                    and prior.get("run_id") == lease.get("run_id")
+                                    and prior.get("owner") == lease.get("owner")
+                                    and prior.get("exit_code") == 0
+                                    and prior.get("local_status") == "finished"
+                                    and prior.get("local_children_drained") is True
+                                    and prior.get("writer_ownership") == "released"
+                                    and prior.get("remote_work_may_continue") is False
+                                    and digest(read(Path(prior["result_file"]))) == lease["release"]
+                                )
+                            if not released:
+                                raise ExecutionError(
+                                    f"branch has another or unresolved execution owner: {repository}:{branch}"
+                                )
+                            write(path, expected)
+                    else:
+                        write(path, expected, exclusive=True)
+                if str(path) not in ledger["leases"]:
+                    ledger["leases"].append(str(path))
+                    write(ledger_path, ledger)
+
+    def record_state(self, path: Path, state: dict[str, Any]) -> None:
+        paths = self.record.setdefault("domain_states", [])
+        if str(path.resolve()) not in paths:
+            paths.append(str(path.resolve()))
+            write(self.handle, self.record)
+
+    def record_dispatch(self, result_path: Path, request_id: str, repository: str,
+                        task: dict[str, Any] | None = None) -> None:
+        path = result_path.with_name(result_path.name + ".dispatch.json")
+        self.record_state(path, {})
+        write(path, {
+            "schema": "github.copilot.dispatch-observation.v1",
+            "request_id": request_id, "repository": repository,
+            "status": "creating" if task is None else "observing",
+            "task": task, "remote_status": "unknown" if task is None else "unconfirmed",
+        })
+
+    def release_writers(self, result: dict[str, Any]) -> None:
+        if self.root != self.handle:
+            return
+        ledger_path = self.directory / "writers.json"
+        if not ledger_path.exists():
+            return
+        with guard(ledger_path.with_suffix(".guard")):
+            for value in read(ledger_path)["leases"]:
+                path = Path(value)
+                with guard(path.with_suffix(".guard")):
+                    lease = read(path)
+                    if (
+                        lease.get("schema") != SCHEMA or lease.get("run_id") != self.run_id
+                        or lease["root"] != str(self.root) or lease["owner"] != self.owner
+                    ):
+                        raise ExecutionError("writer ownership changed before release")
+                    # A release becomes effective only when this exact terminal result is sealed.
+                    write(path, {**lease, "release": digest(result)})
+
+    def start(self, command: list[str], *, require_execution: bool = False, **options: Any) -> OwnedProcess:
+        self.check_cancel()
+        sequence = uuid.uuid4().hex
+        record = self.directory / f"child-{sequence}.json"
+        request = self.directory / f"request-{sequence}.json"
+        child_handle = self.directory / f"handle-{sequence}.json"
+        supplied_environment = options.pop("env", None)
+        env = dict(os.environ if supplied_environment is None else supplied_environment)
+        env[PARENT_ENV] = str(request)
+        write(request, {
+            "schema": SCHEMA, "root": str(self.root), "parent": str(self.handle),
+            "child_record": str(record), "handle": str(child_handle),
+            "command_sha256": digest(command),
+        }, exclusive=True)
+        streams = []
+        try:
+            for name in ("stdout", "stderr"):
+                if name not in options:
+                    stream = (self.directory / f"child-{sequence}-{name}.log").open("wb")
+                    streams.append(stream)
+                    options[name] = stream
+        except BaseException:
+            for stream in streams:
+                stream.close()
+            raise
+        options.setdefault("stdin", subprocess.DEVNULL)
+        options["env"] = env
+        if IS_WINDOWS:
+            options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | 4
+        else:
+            options["start_new_session"] = True
+        root = load_handle(self.root)
+        owner = None
+        process = None
+        try:
+            with guard(Path(root["cancel"]).with_suffix(".guard")):
+                self.check_cancel()
+                process = subprocess.Popen(command, **options)
+                if IS_WINDOWS:
+                    owner = WindowsOwner(process)
+                identity = process_identity(process.pid)
+                if identity is None:
+                    raise ExecutionError("child generation is unavailable")
+                write(record, {
+                    "schema": SCHEMA, "run_id": self.run_id,
+                    "process_identity": identity, "handle": str(child_handle),
+                    "root": str(self.root), "command_sha256": digest(command),
+                    "exit_code": None, "local_drained": False,
+                    "requires_execution_result": require_execution,
+                    "breakaway_requested": False,
+                    "result_file": (
+                        command[command.index("--result-file") + 1]
+                        if "--result-file" in command and command.index("--result-file") + 1 < len(command)
+                        else None
+                    ),
+                }, exclusive=True)
+                if IS_WINDOWS:
+                    resume_process(process.pid)
+            owned = OwnedProcess(process, owner, record, streams)
+            self.children.append(owned)
+            return owned
+        except BaseException as failure:
+            cleanup_errors = []
+            if owner:
+                try:
+                    owner.terminate()
+                    owner.drain(10.0)
+                except (OSError, ExecutionError) as cleanup:
+                    cleanup_errors.append(str(cleanup))
+                try:
+                    owner.close()
+                except OSError as cleanup:
+                    cleanup_errors.append(str(cleanup))
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        if IS_WINDOWS:
+                            process.kill()
+                        else:
+                            os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=10)
+                    if not IS_WINDOWS:
+                        try:
+                            os.killpg(process.pid, 0)
+                        except ProcessLookupError:
+                            pass
+                        else:
+                            cleanup_errors.append("failed launch has unconfirmed process-group drainage")
+                except (OSError, subprocess.SubprocessError) as cleanup:
+                    cleanup_errors.append(str(cleanup))
+            for stream in streams:
+                stream.close()
+            self.launch_failures.append({
+                "error": f"{type(failure).__name__}: {failure}",
+                "pid": process.pid if process is not None else None,
+                "local_drained": not cleanup_errors, "cleanup_errors": cleanup_errors,
+                "request": str(request),
+            })
+            if cleanup_errors:
+                raise ExecutionError(
+                    f"{type(failure).__name__}: {failure}; failed-launch drainage: {cleanup_errors}"
+                ) from failure
+            raise
+
+    def run(self, command: list[str], **options: Any) -> subprocess.CompletedProcess[Any]:
+        check = options.pop("check", False)
+        timeout = options.pop("timeout", None)
+        input_value = options.pop("input", None)
+        if options.pop("capture_output", False):
+            if "stdout" in options or "stderr" in options:
+                raise ValueError("capture_output cannot be combined with stdout or stderr")
+            options["stdout"] = options["stderr"] = subprocess.PIPE
+        captured = {}
+        for name in ("stdout", "stderr"):
+            if options.get(name) == subprocess.PIPE:
+                path = self.directory / f"capture-{uuid.uuid4().hex}-{name}.log"
+                stream = path.open("wb")
+                captured[name] = (path, stream)
+                options[name] = stream
+        if input_value is not None:
+            options["stdin"] = subprocess.PIPE
+        try:
+            process = self.start(command, **options)
+        except BaseException:
+            for _, stream in captured.values():
+                stream.close()
+            raise
+        write(process.record, {**read(process.record), "captured_output": {
+            name: str(path) for name, (path, _) in captured.items()
+        }})
+        deadline = None if timeout is None else time.monotonic() + timeout
+        sent = False
+        try:
+            while True:
+                self.check_cancel()
+                wait = 0.2
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    wait = min(wait, remaining)
+                try:
+                    stdout, stderr = process.process.communicate(
+                        input=None if sent else input_value, timeout=wait,
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    sent = True
+            code = process.wait()
+            values = {}
+            for name, (path, stream) in captured.items():
+                stream.flush()
+                values[name] = (
+                    path.read_text(encoding=process.process.encoding, errors=process.process.errors)
+                    if process.process.text_mode else path.read_bytes()
+                )
+            stdout, stderr = values.get("stdout", stdout), values.get("stderr", stderr)
+            result = subprocess.CompletedProcess(command, code, stdout, stderr)
+            if check:
+                result.check_returncode()
+            return result
+        except BaseException as failure:
+            try:
+                process.terminate_tree()
+            except (OSError, subprocess.SubprocessError, ExecutionError) as cleanup:
+                raise ExecutionError(f"{type(failure).__name__}: {failure}; local drainage: {cleanup}") from failure
+            raise
+        finally:
+            for _, stream in captured.values():
+                stream.close()
+
+    def finish(self, code: int, error: str | None = None, *, cancelled=False) -> dict[str, Any]:
+        if error and code == 0:
+            code = 1
+        drainage_errors = [
+            str(failure) for failure in self.launch_failures if not failure["local_drained"]
+        ]
+        for child in self.children:
+            try:
+                if child.poll() is None:
+                    child.terminate_tree()
+                    if not cancelled:
+                        drainage_errors.append("controller returned with a running child")
+                else:
+                    child.wait()
+            except (OSError, subprocess.SubprocessError, ExecutionError) as failure:
+                drainage_errors.append(str(failure))
+        if not error and not cancelled and not (
+            isinstance(self.last_result, dict)
+            and (
+                isinstance(self.last_result.get("result"), str)
+                or self.root != self.handle and isinstance(self.last_result.get("status"), str)
+            )
+        ):
+            error, code = "controller returned without a structured result", 1
+        if drainage_errors:
+            code = 1
+        if not IS_WINDOWS:
+            for source in self.directory.rglob("child-*.json"):
+                child = read(source)
+                if child.get("root") == str(self.root) and not child.get("local_drained"):
+                    drainage_errors.append(f"descendant drainage is unconfirmed: {source}")
+                    code = 1
+        retained = []
+        remote_tasks = []
+        evidence_errors = []
+        records = [self.record]
+        for handle in self.directory.rglob("handle-*.json"):
+            try:
+                child = load_handle(handle)
+                if child["root"] != str(self.root) or child["run_id"] != self.run_id:
+                    raise ExecutionError("retained child evidence belongs to a different execution")
+                records.append(child)
+            except (OSError, ValueError, KeyError, ExecutionError) as failure:
+                evidence_errors.append(f"{handle}: {failure}")
+        state_paths = sorted({path for record in records for path in record.get("domain_states", [])})
+        for path in state_paths:
+            source = Path(path)
+            if source.is_file():
+                try:
+                    retained.append({"path": path, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+                    value = read(source)
+                    if value.get("schema") == "github.copilot.dispatch-observation.v1":
+                        remote_tasks.append({"evidence": path, **value})
+                except (OSError, ValueError, ExecutionError) as failure:
+                    evidence_errors.append(f"{path}: {failure}")
+            else:
+                retained.append({"path": path, "missing": True})
+                evidence_errors.append(f"recorded state is missing: {path}")
+        for child in self.children:
+            try:
+                record = read(child.record)
+                result_file = record.get("result_file")
+                if isinstance(result_file, str):
+                    source = Path(result_file + ".dispatch.json")
+                    if source.is_file():
+                        observation = read(source)
+                        retained.append({"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()})
+                        remote_tasks.append({"evidence": str(source), **observation})
+            except (OSError, ValueError, ExecutionError) as failure:
+                evidence_errors.append(f"{child.record}: {failure}")
+        if evidence_errors:
+            code = 1
+        outcome = (self.last_result or {}).get("result")
+        confirmed = (
+            not code and not error and not drainage_errors and not cancelled
+            and (self.root != self.handle or outcome in self.terminal_results)
+        )
+        payload = {
+            "schema": SCHEMA, "run_id": self.run_id, "owner": self.owner,
+            "terminal": True, "exit_code": code, "error": error,
+            "local_status": "cancelled_local" if cancelled and not drainage_errors else (
+                "failed" if code or error or drainage_errors else "finished"
+            ),
+            "local_children_drained": not drainage_errors,
+            "drainage_errors": drainage_errors,
+            "finalization_errors": evidence_errors,
+            "remote_status": "see_workflow_result" if confirmed else "unconfirmed",
+            "remote_work_may_continue": not confirmed,
+            "writer_ownership": "root_owned" if self.root != self.handle else "retained",
+            "workflow_result": self.last_result,
+            "domain_states": state_paths,
+            "child_records": [str(child.record) for child in self.children],
+            "launch_failures": self.launch_failures,
+            "retained_evidence": retained,
+            "remote_tasks": remote_tasks,
+            "finished_at": time.time(),
+            "artifacts": {"progress": self.record["progress"], "stdout": self.record["stdout"],
+                          "stderr": self.record["stderr"]},
+        }
+        root = load_handle(self.root)
+        with guard(Path(root["cancel"]).with_suffix(".guard")):
+            cancellation = Path(root["cancel"])
+            if cancellation.exists():
+                request = read(cancellation)
+                if request.get("run_id") != self.run_id or request.get("owner") != root["owner"]:
+                    raise ExecutionError("cancellation identity changed before terminal sealing")
+                payload.update(
+                    exit_code=130 if not drainage_errors and not evidence_errors else 1,
+                    local_status="cancelled_local" if not drainage_errors and not evidence_errors else "failed",
+                    remote_status="unconfirmed", remote_work_may_continue=True,
+                )
+                confirmed = False
+            if confirmed:
+                try:
+                    if self.root == self.handle:
+                        payload["writer_ownership"] = "released"
+                    self.release_writers(payload)
+                except (OSError, ExecutionError) as failure:
+                    payload.update(exit_code=1, local_status="failed", remote_status="unconfirmed",
+                                   remote_work_may_continue=True, writer_ownership="retained")
+                    payload["finalization_errors"].append(str(failure))
+            write(Path(self.record["result"]), payload, exclusive=True)
+            self.record.update(
+                status=payload["local_status"],
+                result_sha256=hashlib.sha256(Path(self.record["result"]).read_bytes()).hexdigest(),
+            )
+            write(self.handle, self.record)
+        return payload
+
+
+def load_handle(path: Path) -> dict[str, Any]:
+    if not path.is_absolute():
+        raise ExecutionError("execution handle must be absolute")
+    value = read(path)
+    if value.get("schema") != SCHEMA or value.get("handle") != str(path.resolve()):
+        raise ExecutionError("execution handle identity is invalid")
+    return value
+
+
+def status(path: Path) -> dict[str, Any]:
+    value = load_handle(path)
+    result = Path(value["result"])
+    if result.exists():
+        if "result_sha256" not in value:
+            return {"schema": SCHEMA, "run_id": value["run_id"], "terminal": False,
+                    "status": "terminal_unsealed", "remote_status": "unconfirmed"}
+        terminal = read(result)
+        if (
+            terminal.get("schema") != SCHEMA or terminal.get("run_id") != value["run_id"]
+            or terminal.get("owner") != value["owner"] or terminal.get("terminal") is not True
+            or hashlib.sha256(result.read_bytes()).hexdigest() != value.get("result_sha256")
+        ):
+            raise ExecutionError("terminal result identity or digest is invalid")
+        return {**terminal, "result_file": str(result), "result_sha256": value["result_sha256"]}
+    observed = process_identity(value["owner"]["pid"])
+    root = load_handle(Path(value["root"]))
+    cancellation = Path(root["cancel"])
+    cancel_requested = cancellation.exists()
+    if cancel_requested:
+        request = read(cancellation)
+        if request.get("run_id") != value["run_id"] or request.get("owner") != root["owner"]:
+            raise ExecutionError("cancellation identity is invalid")
+    records = [value]
+    for child_path in path.with_name(path.name + ".d").rglob("handle-*.json"):
+        child = load_handle(child_path)
+        if child["root"] != value["root"] or child["run_id"] != value["run_id"]:
+            raise ExecutionError("child evidence belongs to a different execution")
+        records.append(child)
+    state_paths = sorted({source for record in records for source in record.get("domain_states", [])})
+    remote_tasks = []
+    for source in state_paths:
+        if source.endswith(".dispatch.json"):
+            file = Path(source)
+            remote_tasks.append({"evidence": source, **(
+                read(file) if file.exists() else {"task": None, "remote_status": "unknown"}
+            )})
+    return {
+        "schema": SCHEMA, "run_id": value["run_id"], "terminal": False,
+        "status": (
+            "cancel_requested" if cancel_requested else value["status"]
+        ) if same_process(value["owner"], observed) and observed["running"] else "abandoned",
+        "handle": str(path), "remote_status": "unconfirmed",
+        "owner": value["owner"], "cancel_requested": cancel_requested,
+        "domain_states": state_paths, "remote_tasks": remote_tasks,
+        "artifacts": {name: value[name] for name in ("result", "stdout", "stderr", "progress")},
+    }
+
+
+def cancel(path: Path) -> dict[str, Any]:
+    value = load_handle(path)
+    if value["root"] != str(path.resolve()):
+        raise ExecutionError("cancel requires the root execution handle")
+    with guard(Path(value["cancel"]).with_suffix(".guard")):
+        current = status(path)
+        if current.get("terminal"):
+            return {"result": "already_finished", "execution": current}
+        require_owner(value["owner"])
+        request = {"run_id": value["run_id"], "owner": value["owner"], "requested_at": time.time()}
+        destination = Path(value["cancel"])
+        if destination.exists():
+            prior = read(destination)
+            if prior.get("run_id") != value["run_id"] or prior.get("owner") != value["owner"]:
+                raise ExecutionError("existing cancellation request is malformed")
+        else:
+            write(destination, request, exclusive=True)
+        return {"result": "cancel_requested", "run_id": value["run_id"],
+                "remote_status": "unconfirmed"}
+
+
+def controller_main(main: Callable[[], int], namespace: dict[str, Any], *,
+                    handle: Path | None = None, run_id: str | None = None) -> int:
+    arguments = list(sys.argv[1:])
+    if arguments and arguments[0] in {"execution-status", "execution-cancel"}:
+        if len(arguments) != 3 or arguments[1] != "--handle":
+            raise ExecutionError("execution control requires exactly --handle <absolute-path>")
+        operation = status if arguments[0] == "execution-status" else cancel
+        print(json.dumps(operation(Path(arguments[2])), sort_keys=True))
+        return 0
+    parent_text = os.environ.get(PARENT_ENV)
+    parent = Path(parent_text) if parent_text else None
+    if parent is not None:
+        if handle is not None:
+            raise ExecutionError("child execution cannot choose a root handle")
+        handle = Path(read(parent)["handle"])
+    if handle is None:
+        return main()
+    context = Execution(handle, command=[sys.executable, str(Path(sys.argv[0]).resolve()), *arguments],
+                        parent=parent, run_id=run_id,
+                        terminal_results=frozenset(namespace.get("EXECUTION_TERMINAL_RESULTS", ())))
+    namespace["_EXECUTION"] = context
+    common = namespace.get("common")
+    if common is not None:
+        common._EXECUTION = context
+    code, error, cancelled = 1, None, False
+    try:
+        with (
+            Path(context.record["stdout"]).open("x", encoding="utf-8") as output,
+            Path(context.record["stderr"]).open("x", encoding="utf-8") as errors,
+            redirect_stdout(output), redirect_stderr(errors),
+        ):
+            context.ready()
+            code = main()
+            if context.last_result is None and "--result-file" in arguments:
+                index = arguments.index("--result-file")
+                if index + 1 < len(arguments):
+                    result_path = Path(arguments[index + 1])
+                    if result_path.is_file():
+                        context.emit(read(result_path))
+            context.check_cancel()
+    except Cancelled as failure:
+        code, error, cancelled = 130, str(failure), True
+    except BaseException as failure:
+        code, error = 1, f"{type(failure).__name__}: {failure}"
+    finally:
+        namespace["_EXECUTION"] = None
+        if common is not None:
+            common._EXECUTION = None
+    try:
+        return context.finish(code, error, cancelled=cancelled)["exit_code"]
+    except (OSError, ValueError, KeyError, TypeError, ExecutionError) as failure:
+        message = (
+            f"controller exit {code}, error {error!r}; "
+            f"terminal sealing failed: {type(failure).__name__}: {failure}"
+        )
+        try:
+            with Path(context.record["stderr"]).open("a", encoding="utf-8") as stream:
+                stream.write(message + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as sink_error:
+            message += f"; stderr sink failed: {sink_error}"
+        raise ExecutionError(message) from failure
+
+
+def entrypoint(main: Callable[[], int], namespace: dict[str, Any], *,
+               commands: tuple[str, ...], sealed_handle: Path | None = None,
+               run_id: str | None = None) -> int:
+    arguments = sys.argv[1:]
+    controls = {"execution-status", "execution-cancel"}
+    if not arguments or arguments[0] not in {*commands, *controls}:
+        return main()
+    handle = sealed_handle
+    if "--execution-handle" in arguments:
+        if arguments.count("--execution-handle") != 1 or sealed_handle is not None:
+            raise ExecutionError("choose exactly one execution handle")
+        index = sys.argv.index("--execution-handle")
+        if index + 1 >= len(sys.argv):
+            raise ExecutionError("--execution-handle requires an absolute path")
+        handle = Path(sys.argv[index + 1])
+        del sys.argv[index:index + 2]
+    return controller_main(main, namespace, handle=handle, run_id=run_id)

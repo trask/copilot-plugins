@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import subprocess
 import time
 import uuid
 from typing import Any, Callable
@@ -18,7 +19,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "e06214907cb138784c00c1cef30f678f61abe095ca9ccc3ef2e796c681c2462b"
+COMMON_SHA256 = "d1a383ea78a750b0e438da04d0b2417cda9dc5a135d3cb7f40dcce7cad4b6bb3"
 
 
 def load_common() -> Any:
@@ -1090,6 +1091,8 @@ def run_pipeline(
 
     for sweep in range(1, MAX_SWEEPS + 1):
         pr = read_pull_request(target)
+        if common._EXECUTION is not None:
+            common._EXECUTION.claim_writers([(pr["head_repository"], pr["head_branch"])])
         if pr["state"] != "OPEN":
             return blocked_result(
                 pr=pr,
@@ -1597,7 +1600,13 @@ def command_watch(args: argparse.Namespace) -> None:
 
 def command_run(args: argparse.Namespace) -> None:
     common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
-    args.run_id = common.validate_run_id(args.run_id) if args.run_id else uuid.uuid4().hex
+    if common._EXECUTION is not None and args.run_id is not None:
+        args.run_id = common._EXECUTION.run_id
+        args.event_log = None
+        raise WorkflowError("foreground execution owns its fresh run identity; omit --run-id")
+    args.run_id = common.validate_run_id(args.run_id) if args.run_id else (
+        common._EXECUTION.run_id if common._EXECUTION is not None else uuid.uuid4().hex
+    )
     require_tools()
     repo_root = resolve_repo_root()
     target = resolve_target(args.target, repo_root)
@@ -1763,5 +1772,55 @@ def main() -> int:
         return 130
 
 
+_EXECUTION = None
+EXECUTION_TERMINAL_RESULTS = frozenset({
+    "complete",
+    "incomplete",
+})
+EXECUTION_SHA256 = "790bd73a95b92c636a06964e116d023ed1bec714c68f63488f9a31220fd0bbb4"
+
+
+def _load_execution():
+    """Load only the pinned shared foreground execution source."""
+    import types
+    inventory = subprocess.run(
+        ["copilot", "skill", "list", "--json"], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+           if os.name == "nt" else {}),
+    )
+    matches = [
+        entry for entry in json.loads(inventory.stdout)
+        if entry.get("name") == "agent-tasks-runtime" and entry.get("source") == "plugin"
+        and entry.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
+    root = Path(matches[0]["path"])
+    source_path = root / "scripts" / "execution.py"
+    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+        raise RuntimeError("shared execution Runtime path is invalid")
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("shared execution Runtime source digest changed")
+    module = types.ModuleType("trask_foreground_execution")
+    module.__file__ = str(source_path)
+    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    return module
+
+
+def execution_main():
+    commands = ('run',)
+    arguments = sys.argv[1:]
+    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    enabled = (
+        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments and arguments[0] in {"execution-status", "execution-cancel"}
+    )
+    if not selected or not enabled:
+        return main()
+    return _load_execution().entrypoint(main, globals(), commands=commands)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(execution_main())

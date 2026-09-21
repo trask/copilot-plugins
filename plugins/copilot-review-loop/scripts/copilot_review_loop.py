@@ -189,7 +189,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "b88a6edaeeb4358d84bb1143489244d7f181ff694fb6d2c3abde735de7c719f3"
+    "4912c63d9841cf3439a91ac90db9f9eff86140c68a74a353e9228e5ec41c76b1"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -401,7 +401,7 @@ def run(
     input_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    process = subprocess.run(
+    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         command,
         cwd=str(cwd) if cwd else None,
         input=input_text,
@@ -686,6 +686,12 @@ def run_owned_local_worker(
     environment: dict[str, str] | None = None,
     description: str = "local Copilot decision process",
 ) -> subprocess.CompletedProcess[str]:
+    if _EXECUTION is not None:
+        return _EXECUTION.run(
+            command, cwd=str(cwd), input=input_text, timeout=timeout,
+            env=environment, text=True, encoding="utf-8",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
     options = {} if environment is None else {"environment": environment}
     process, owner = popen_owned_local_worker(command, cwd=cwd, **options)
     try:
@@ -737,7 +743,7 @@ def run_bytes(
     input_bytes: bytes | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
-    process = subprocess.run(
+    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         command,
         cwd=str(cwd) if cwd else None,
         input=input_bytes,
@@ -846,6 +852,8 @@ def parse_timestamp(value: str) -> dt.datetime:
 
 
 def emit(payload: Any) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.emit(payload)
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
 
 
@@ -921,6 +929,11 @@ def last_helper_activity(state: dict[str, Any]) -> str | None:
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
+    if _EXECUTION is not None:
+        _EXECUTION.record_state(path, state)
+        pr = state.get("pr")
+        if isinstance(pr, dict) and pr:
+            _EXECUTION.claim_writers([(pr.get("head_repository") or f"{pr['head_owner']}/{pr['head_repo']}", pr["head_branch"])])
     path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = utc_now()
     handle, temporary_name = tempfile.mkstemp(
@@ -12762,5 +12775,60 @@ def main() -> int:
         return 1
 
 
+_EXECUTION = None
+EXECUTION_TERMINAL_RESULTS = frozenset({
+    "published",
+    "nothing_to_publish",
+    "no_unresolved_comments",
+    "skipped",
+    "published_source_only",
+    "watcher_completed",
+    "review_comments_pending_preparation",
+})
+EXECUTION_SHA256 = "790bd73a95b92c636a06964e116d023ed1bec714c68f63488f9a31220fd0bbb4"
+
+
+def _load_execution():
+    """Load only the pinned shared foreground execution source."""
+    import types
+    inventory = subprocess.run(
+        ["copilot", "skill", "list", "--json"], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+           if os.name == "nt" else {}),
+    )
+    matches = [
+        entry for entry in json.loads(inventory.stdout)
+        if entry.get("name") == "agent-tasks-runtime" and entry.get("source") == "plugin"
+        and entry.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("shared execution Runtime is not uniquely installed and enabled")
+    root = Path(matches[0]["path"])
+    source_path = root / "scripts" / "execution.py"
+    if not root.is_absolute() or any(path.is_symlink() for path in (root, source_path.parent, source_path)):
+        raise RuntimeError("shared execution Runtime path is invalid")
+    source = source_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != EXECUTION_SHA256:
+        raise RuntimeError("shared execution Runtime source digest changed")
+    module = types.ModuleType("trask_foreground_execution")
+    module.__file__ = str(source_path)
+    exec(compile(source, str(source_path), "exec", dont_inherit=True), module.__dict__)
+    return module
+
+
+def execution_main():
+    commands = ('agent-task', 'pipeline')
+    arguments = sys.argv[1:]
+    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    enabled = (
+        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments and arguments[0] in {"execution-status", "execution-cancel"}
+    )
+    if not selected or not enabled:
+        return main()
+    return _load_execution().entrypoint(main, globals(), commands=commands)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(execution_main())

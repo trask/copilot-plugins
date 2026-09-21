@@ -3575,43 +3575,32 @@ class AgentInstructionTest(unittest.TestCase):
             self.text.index("Write a concise final response"),
         )
 
-    def test_the_agent_only_runs_and_reports_the_helper(self):
-        self.assertIn('pr_stack_pipeline.py" start --kickoff', self.text)
-        self.assertIn('pr_stack_pipeline.py" watch --run-id', self.text)
-        self.assertIn('pr_stack_pipeline.py" cancel --kickoff', self.text)
-        self.assertIn("Interrupting `watch` does not cancel", self.text)
+    def test_the_agent_only_runs_and_reports_the_foreground_helper(self):
+        self.assertIn('pr_stack_pipeline.py" run --execution-handle', self.text)
+        self.assertIn("--kickoff '<json>'", self.text)
+        self.assertNotIn('pr_stack_pipeline.py" watch', self.text)
+        self.assertIn("execution-status --handle", self.text)
+        self.assertIn("execution-cancel --handle", self.text)
         self.assertIn("The helper owns all control flow", self.text)
-        self.assertIn("Run `start` synchronously exactly once", self.text)
-        self.assertIn("exactly as returned", self.text)
-        self.assertIn("Never reconstruct", self.text)
-        self.assertIn("--wait-seconds 300", self.text)
-        self.assertIn("no more than one per five minutes", self.text)
-        self.assertIn("Never end your turn", self.text)
-        self.assertIn("`final_event`", self.text)
-        watch_lines = [
-            line
-            for line in self.text.splitlines()
-            if "pr_stack_pipeline.py" in line and " watch " in line
-        ]
-        self.assertTrue(any("copilot_home=" in line for line in watch_lines))
-        self.assertTrue(any("$copilotHome =" in line for line in watch_lines))
+        self.assertIn("Launch the controller once", self.text)
+        self.assertIn("Tool acknowledgement is not readiness", self.text)
+        self.assertIn("hash-verified terminal execution result", self.text)
+        self.assertIn("spent budgets", self.text)
+        self.assertIn("does not promise remote task cancellation", self.text)
 
-    def test_progress_belongs_in_the_session_conversation(self):
-        self.assertIn("visible assistant line in this session conversation", self.text)
-        self.assertIn("Waiting: <wait_reason>.", self.text)
-        self.assertIn("Next: <next_action>.", self.text)
-        self.assertIn("Do not send these updates to the PR Flight canvas", self.text)
-        self.assertIn(
-            "If `updates` is empty, invoke the returned `next_watch.arguments`",
-            self.text,
-        )
+    def test_observers_are_optional_and_disconnect_is_not_cancellation(self):
+        self.assertIn("Never run a required watch loop", self.text)
+        self.assertIn("disconnecting an observer is not cancellation", self.text)
+        self.assertIn("Output, progress, child records and results remain", self.text)
+        self.assertNotIn("Never end your turn", self.text)
+        self.assertNotIn("invoke the returned `next_watch.arguments`", self.text)
 
     def test_the_agent_states_the_session_title(self):
         self.assertIn(
             "PR Stack Pipeline: #<startPullRequest> - <PR title>",
             self.text,
         )
-        self.assertIn("After monitoring finishes, rename the session", self.text)
+        self.assertIn("After verified terminal completion, rename the session", self.text)
 
     def test_the_agent_documents_the_kickoff_schema(self):
         self.assertIn('"version":1', self.text)

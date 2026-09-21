@@ -3272,41 +3272,23 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("Omit this section when the run encountered no friction", text)
         self.assertGreater(text.index("## Retrospective"), text.index("Write a concise final response"))
 
-    def test_agent_uses_the_durable_start_and_watch_protocol(self):
+    def test_agent_uses_foreground_controller_and_optional_observers(self):
         text = AGENT.read_text(encoding="utf-8")
-        self.assertIn("pr_pipeline.py\" start", text)
-        self.assertIn("pr_pipeline.py\" watch", text)
+        self.assertIn('pr_pipeline.py" run --execution-handle', text)
+        self.assertNotIn('pr_pipeline.py" watch', text)
         self.assertIn("at most two foreground sweeps", text)
         self.assertIn("A nonzero stage exit", text)
         self.assertIn("Sweeps never reset or multiply it", text)
         self.assertIn("an active child after its coordinator returns blocks", text)
-        self.assertIn("Run `start` synchronously exactly once", text)
-        self.assertIn("`next_watch.arguments`", text)
-        self.assertIn("never add or reconstruct a positional target", text)
-        self.assertIn("--wait-seconds 300", text)
-        self.assertIn("no more than one per five minutes", text)
-        self.assertIn("Never end your turn", text)
-        self.assertIn("visible assistant line in this session conversation", text)
-        self.assertIn("Waiting: <wait_reason>.", text)
-        self.assertIn("Next: <next_action>.", text)
-        self.assertIn("Do not send these updates to the PR Flight canvas", text)
-        self.assertIn(
-            "If `updates` is empty and `finished` is false, invoke the returned `next_watch.arguments` again",
-            text,
-        )
-        self.assertIn("top-level `final_event`", text)
-        self.assertIn("`final_event.artifacts.result`", text)
-        self.assertIn("`artifacts.result_sha256`", text)
-        self.assertIn("`*_details_truncated`", text)
-        self.assertIn("Extract the needed JSON fields in bounded chunks", text)
+        self.assertIn("Launch the controller once", text)
+        self.assertIn("Tool acknowledgement is not readiness", text)
+        self.assertIn("execution-status --handle", text)
+        self.assertIn("execution-cancel --handle", text)
+        self.assertIn("Never run a required watch loop", text)
+        self.assertNotIn("Never end your turn", text)
+        self.assertIn("Only the hash-verified terminal execution result", text)
+        self.assertIn("Verify every referenced result hash and run ID", text)
         self.assertIn("only top-level `ci_warnings`", text)
-        self.assertIn("`final_event`", text)
-        watch_lines = [
-            line for line in text.splitlines() if "pr_pipeline.py" in line and " watch " in line
-        ]
-        self.assertTrue(any("copilot_home=" in line for line in watch_lines))
-        self.assertTrue(any("$copilotHome =" in line for line in watch_lines))
-        self.assertTrue(all("<owner/repo#number>" not in line for line in watch_lines))
         self.assertIn("A clean run that pushed no commits", text)
         self.assertIn("Do not organize the response by sweep", text)
         self.assertNotIn("### Sweep 1", text)
