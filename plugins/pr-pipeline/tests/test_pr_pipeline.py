@@ -1852,31 +1852,100 @@ class RunStageStateIsolationTest(unittest.TestCase):
             )
         self.assertEqual(1, result["returncode"])
 
-    def test_ci_progress_reads_the_current_pipeline_state(self):
-        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
-        seen = []
+    def test_every_stage_progress_reads_its_current_pipeline_state(self):
+        for entry in MODULE.STAGES:
+            with self.subTest(stage=entry["stage"]):
+                seen = []
 
-        def progress(_entry, selected, *, state_for):
-            seen.append(state_for(entry, selected))
-            return None
+                def progress(_entry, selected, *, state_for):
+                    seen.append(state_for(entry, selected))
+                    return None
+
+                def monitored(_command, *, cwd, log_path, progress):
+                    del cwd, log_path
+                    progress()
+                    return {
+                        "returncode": 0,
+                        "log_path": "stage.log",
+                        "started_at": "start",
+                        "ended_at": "end",
+                    }
+
+                with (
+                    mock.patch.object(
+                        MODULE, "stage_command", return_value=["copilot"]
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "stage_log_path",
+                        return_value=Path("stage.log"),
+                    ),
+                    mock.patch.object(
+                        MODULE.common,
+                        "stage_live_progress",
+                        side_effect=progress,
+                    ),
+                    mock.patch.object(
+                        MODULE.common,
+                        "run_monitored",
+                        side_effect=monitored,
+                    ),
+                ):
+                    MODULE.run_stage(
+                        entry,
+                        target(),
+                        Path("C:/repo"),
+                        model="gpt-5.6-sol",
+                        effort="high",
+                        run_id=InvocationStateIsolationTest.RUN_ID,
+                        sweep=1,
+                    )
+
+                self.assertEqual(
+                    [
+                        MODULE.stage_state_path(
+                            entry,
+                            target(),
+                            InvocationStateIsolationTest.RUN_ID,
+                        )
+                    ],
+                    seen,
+                )
+
+    def test_unchanged_stage_progress_emits_one_minute_heartbeats(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_COPILOT_REVIEW]
+        events = []
 
         def monitored(_command, *, cwd, log_path, progress):
             del cwd, log_path
             progress()
+            progress()
+            progress()
             return {
                 "returncode": 0,
-                "log_path": "ci.log",
+                "log_path": "stage.log",
                 "started_at": "start",
                 "ended_at": "end",
             }
 
         with (
             mock.patch.object(MODULE, "stage_command", return_value=["copilot"]),
-            mock.patch.object(MODULE, "stage_log_path", return_value=Path("ci.log")),
             mock.patch.object(
-                MODULE.common, "stage_live_progress", side_effect=progress
+                MODULE, "stage_log_path", return_value=Path("stage.log")
             ),
-            mock.patch.object(MODULE.common, "run_monitored", side_effect=monitored),
+            mock.patch.object(
+                MODULE.common,
+                "stage_live_progress",
+                return_value={"phase": "addressing_comments"},
+            ),
+            mock.patch.object(
+                MODULE.common, "run_monitored", side_effect=monitored
+            ),
+            mock.patch.object(
+                MODULE.time,
+                "monotonic",
+                side_effect=[100.0, 100.0, 110.0, 161.0],
+            ),
         ):
             MODULE.run_stage(
                 entry,
@@ -1886,18 +1955,17 @@ class RunStageStateIsolationTest(unittest.TestCase):
                 effort="high",
                 run_id=InvocationStateIsolationTest.RUN_ID,
                 sweep=1,
+                report=events.append,
             )
 
         self.assertEqual(
-            [
-                MODULE.stage_state_path(
-                    entry,
-                    target(),
-                    InvocationStateIsolationTest.RUN_ID,
-                )
-            ],
-            seen,
+            ["stage_progress", "stage_heartbeat"],
+            [event["event"] for event in events],
         )
+        self.assertEqual(61, events[-1]["elapsed_seconds"])
+        transition = MODULE.progress_transition(events[-1])
+        self.assertIn("Copilot review addressing comments", transition["message"])
+        self.assertIn("1m 1s elapsed", transition["message"])
 
 
 class SweepTest(unittest.TestCase):

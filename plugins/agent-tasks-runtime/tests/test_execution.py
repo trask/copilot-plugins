@@ -121,6 +121,77 @@ class ExecutionTest(unittest.TestCase):
             self.context()
         self.assertEqual(before, self.handle.read_bytes())
 
+    def test_owned_root_mirrors_deduplicated_progress_to_caller_stderr(self):
+        helper, files, environment = self.owned_environment()
+        live_progress = io.StringIO()
+        namespace = {
+            "EXECUTION_TERMINAL_RESULTS": frozenset({"complete"}),
+            "progress_transition": lambda payload: {
+                "message": f"Result: {payload['result']}"
+            },
+        }
+
+        def main():
+            namespace["_EXECUTION"].emit({"result": "complete"})
+            namespace["_EXECUTION"].emit({"result": "complete"})
+            return 0
+
+        with (
+            mock.patch.dict(EXECUTION.os.environ, environment, clear=True),
+            mock.patch.object(Path, "home", return_value=self.root),
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+            mock.patch.object(sys, "stderr", live_progress),
+        ):
+            self.assertEqual(
+                0,
+                EXECUTION.entrypoint(main, namespace, commands=("run",)),
+            )
+
+        self.assertEqual(
+            "[progress] Result: complete\n",
+            live_progress.getvalue(),
+        )
+        handle = next(files.glob("execution-*.json"))
+        progress = (
+            handle.with_name(handle.name + ".d") / "progress.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            [{"result": "complete"}, {"result": "complete"}],
+            [json.loads(line) for line in progress],
+        )
+
+    def test_live_progress_write_failure_is_retained_without_failing_execution(self):
+        live_progress = io.StringIO()
+        live_progress.close()
+        context = EXECUTION.Execution(
+            self.handle,
+            command=["python", "controller.py"],
+            terminal_results=frozenset({"complete"}),
+            live_progress=live_progress,
+            progress_transition=lambda _payload: {"message": "Starting"},
+        )
+
+        context.emit({"event": "stage_started"})
+
+        record = EXECUTION.read(self.handle)
+        self.assertIn("I/O operation on closed file", record["live_progress_error"])
+        self.assertIsNone(context.live_progress)
+
+    def test_live_progress_transition_must_return_a_message_object(self):
+        context = EXECUTION.Execution(
+            self.handle,
+            command=["python", "controller.py"],
+            terminal_results=frozenset({"complete"}),
+            live_progress=io.StringIO(),
+            progress_transition=lambda _payload: "Starting",
+        )
+
+        with self.assertRaisesRegex(
+            EXECUTION.ExecutionError,
+            "live progress transition must be an object or null",
+        ):
+            context.emit({"event": "stage_started"})
+
     def test_installed_agent_derives_a_fresh_session_owned_root_each_time(self):
         helper, files, environment = self.owned_environment()
         namespace = {"EXECUTION_TERMINAL_RESULTS": frozenset({"complete"})}

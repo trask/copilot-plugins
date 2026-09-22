@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 import uuid
 
 
@@ -1024,7 +1024,11 @@ class OwnedProcess:
 class Execution:
     def __init__(self, handle: Path, *, command: list[str], parent: Path | None = None,
                  run_id: str | None = None, terminal_results: frozenset[str] = frozenset(),
-                 route: dict[str, Any] | None = None) -> None:
+                 route: dict[str, Any] | None = None,
+                 live_progress: TextIO | None = None,
+                 progress_transition: (
+                     Callable[[dict[str, Any]], dict[str, Any] | None] | None
+                 ) = None) -> None:
         if not handle.is_absolute() or handle.is_symlink():
             raise ExecutionError("execution handle must be a fresh absolute regular path")
         if route is not None:
@@ -1046,6 +1050,9 @@ class Execution:
         self.children: list[OwnedProcess] = []
         self.launch_failures: list[dict[str, Any]] = []
         self.last_result: dict[str, Any] | None = None
+        self.live_progress = live_progress
+        self.progress_transition = progress_transition
+        self.last_live_progress: str | None = None
         self.run_id = run_id or uuid.uuid4().hex
         self.terminal_results = terminal_results
         self.root = self.handle
@@ -1134,6 +1141,28 @@ class Execution:
             stream.write(json.dumps(payload, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if self.live_progress is not None and self.progress_transition is not None:
+            transition = self.progress_transition(payload)
+            if transition is not None:
+                if not isinstance(transition, dict):
+                    raise ExecutionError(
+                        "live progress transition must be an object or null"
+                    )
+                message = transition.get("message")
+                if not isinstance(message, str) or not message.strip():
+                    raise ExecutionError(
+                        "live progress transition must contain a non-empty message"
+                    )
+                if message != self.last_live_progress:
+                    try:
+                        self.live_progress.write(f"[progress] {message}\n")
+                        self.live_progress.flush()
+                    except (OSError, ValueError) as error:
+                        self.record["live_progress_error"] = str(error)
+                        write(self.handle, self.record)
+                        self.live_progress = None
+                    else:
+                        self.last_live_progress = message
         self.last_result = payload
 
     def child_status(self, path: Path) -> dict[str, Any]:
@@ -2004,8 +2033,19 @@ def controller_main(main: Callable[[], int], namespace: dict[str, Any], *,
         run_id = None
     if handle is None:
         return main()
-    context = Execution(handle, command=command, parent=parent, run_id=run_id, route=route,
-                        terminal_results=frozenset(namespace.get("EXECUTION_TERMINAL_RESULTS", ())))
+    progress_transition = namespace.get("progress_transition")
+    if progress_transition is not None and not callable(progress_transition):
+        raise ExecutionError("progress_transition must be callable")
+    context = Execution(
+        handle,
+        command=command,
+        parent=parent,
+        run_id=run_id,
+        route=route,
+        terminal_results=frozenset(namespace.get("EXECUTION_TERMINAL_RESULTS", ())),
+        live_progress=sys.stderr if parent is None else None,
+        progress_transition=progress_transition,
+    )
     namespace["_EXECUTION"] = context
     common = namespace.get("common")
     if common is not None:

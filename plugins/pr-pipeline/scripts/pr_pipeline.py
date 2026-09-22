@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import sys
 import subprocess
+import time
 import uuid
 from types import ModuleType
 from typing import Any, Callable
@@ -54,6 +55,7 @@ common = load_common()
 WorkflowError = common.WorkflowError
 
 MAX_SWEEPS = 2
+STAGE_HEARTBEAT_SECONDS = 60.0
 CI_SNAPSHOT_CHANGED_REASONS = {
     "clearance_verification": "ci_snapshot_changed",
     "warning_verification": "ci_warning_snapshot_changed",
@@ -346,30 +348,67 @@ def progress_transition(payload: dict[str, Any]) -> dict[str, Any] | None:
             "waiting": True,
             "wait_reason": f"waiting for {label}",
         }
-    elif event == "stage_progress":
+    elif event in {"stage_progress", "stage_heartbeat"}:
         phase = payload.get("phase")
         action_checks = payload.get("action_checks") or []
         pending_checks = payload.get("pending_checks") or []
-        if phase == "diagnosing":
-            message = f"{prefix}{label} diagnosing {len(action_checks)} known failure(s){scope}."
-            next_action = "Attribute the known failure from its logs and the pinned diff."
-        elif phase == "fixing":
-            message = f"{prefix}{label} fixing {len(action_checks)} attributed failure(s){scope}."
+        if stage == STAGE_CI and phase == "diagnosing":
+            message = (
+                f"{prefix}{label} diagnosing {len(action_checks)} "
+                f"known failure(s){scope}."
+            )
+            next_action = (
+                "Attribute the known failure from its logs and the pinned diff."
+            )
+        elif stage == STAGE_CI and phase == "fixing":
+            message = (
+                f"{prefix}{label} fixing {len(action_checks)} "
+                f"attributed failure(s){scope}."
+            )
             next_action = "Validate, commit, and publish the fix."
-        elif phase == "rerunning":
-            message = f"{prefix}{label} retrying {len(action_checks)} suspected flake(s){scope}."
+        elif stage == STAGE_CI and phase == "rerunning":
+            message = (
+                f"{prefix}{label} retrying {len(action_checks)} "
+                f"suspected flake(s){scope}."
+            )
             next_action = "Request one safe retry, then inspect its result."
+        elif stage == STAGE_CI:
+            message = (
+                f"{prefix}{label} monitoring {len(pending_checks)} "
+                f"pending check(s){scope}."
+            )
+            next_action = (
+                "Inspect the next concrete failure as soon as it completes."
+            )
         else:
-            message = f"{prefix}{label} monitoring {len(pending_checks)} pending check(s){scope}."
-            next_action = "Inspect the next concrete failure as soon as it completes."
+            phase_label = (
+                str(phase).replace("_", " ")
+                if isinstance(phase, str) and phase
+                else "running"
+            )
+            message = f"{prefix}{label} {phase_label}{scope}."
+            next_action = "Wait for the stage agent result."
+        elapsed = payload.get("elapsed_seconds")
+        if event == "stage_heartbeat" and isinstance(elapsed, int):
+            minutes, seconds = divmod(max(0, elapsed), 60)
+            duration = (
+                f"{minutes}m {seconds}s"
+                if minutes
+                else f"{seconds}s"
+            )
+            message = f"{message[:-1]} ({duration} elapsed)."
         update = {
             "message": message,
             "next_action": next_action,
             "waiting": True,
             "wait_reason": (
-                f"{phase} a known CI failure"
-                if phase != "waiting"
-                else "waiting for remaining CI checks"
+                (
+                    f"{phase} a known CI failure"
+                    if phase != "waiting"
+                    else "waiting for remaining CI checks"
+                )
+                if stage == STAGE_CI
+                else f"waiting for {label}"
             ),
         }
     elif event == "stage_finished":
@@ -704,13 +743,13 @@ def run_stage(
         repo_root=repo_root,
     )
     log_path = stage_log_path(target, run_id, sweep, entry)
-    if entry["stage"] != STAGE_CI:
-        return common.run_foreground(command, cwd=repo_root, log_path=log_path)
-
     last_signature: str | None = None
+    last_reported_at = time.monotonic()
+    started_at = last_reported_at
 
     def progress() -> None:
-        nonlocal last_signature
+        nonlocal last_reported_at, last_signature
+        now = time.monotonic()
         current = common.stage_live_progress(
             entry,
             target,
@@ -718,20 +757,29 @@ def run_stage(
                 selected, current_target, run_id
             ),
         )
-        if current is None:
+        signature = (
+            json.dumps(current, sort_keys=True)
+            if current is not None
+            else None
+        )
+        heartbeat = now - last_reported_at >= STAGE_HEARTBEAT_SECONDS
+        if signature == last_signature and not heartbeat:
             return
-        signature = json.dumps(current, sort_keys=True)
-        if signature == last_signature:
-            return
-        last_signature = signature
+        if signature != last_signature:
+            event = "stage_progress"
+            last_signature = signature
+        else:
+            event = "stage_heartbeat"
+        last_reported_at = now
         report_event(
             report,
-            "stage_progress",
+            event,
             run_id=run_id,
             stage=entry["stage"],
             sweep=sweep,
             number=target["number"],
-            **current,
+            elapsed_seconds=int(now - started_at),
+            **(current or {"phase": "running"}),
         )
 
     return common.run_monitored(
@@ -1377,7 +1425,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "complete",
     "incomplete",
 })
-EXECUTION_SHA256 = "f1155a19cb14481a933df741121753e30489deee1b0eaf07a3592ea418dc3256"
+EXECUTION_SHA256 = "29e311216bde1db84a1017c4d2e2dd5d0e97b595f766cc91d5b2743fc89625cd"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

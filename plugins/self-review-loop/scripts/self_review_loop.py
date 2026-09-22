@@ -78,7 +78,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "1307b4c754ed4e3bf32339020a28ef81bded8ff4be7c77e07240e1793f43cb4b"
+    "d1f2816ae4b222159079202b877f88117c379b678e0bff7a06c8fa2563917474"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -3670,7 +3670,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "published",
     "nothing_to_publish",
 })
-EXECUTION_SHA256 = "f1155a19cb14481a933df741121753e30489deee1b0eaf07a3592ea418dc3256"
+EXECUTION_SHA256 = "29e311216bde1db84a1017c4d2e2dd5d0e97b595f766cc91d5b2743fc89625cd"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 
