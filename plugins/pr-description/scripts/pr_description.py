@@ -56,7 +56,7 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "8aaf7ab3324d91037c0709c712db90bb41efaf1b90810f713c932f66c8431d95"
+    "68fca6f6561d2b18e43ad9e101c4ee23876f29ac5f6d33c93b241c5996c30b11"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -3041,7 +3041,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "validated",
     "source_only_no_mutation",
 })
-EXECUTION_SHA256 = "2972a39513197ad0ffbaed94e608f3084d297d3ede86bbe6283df8c711a510c3"
+EXECUTION_SHA256 = "f1155a19cb14481a933df741121753e30489deee1b0eaf07a3592ea418dc3256"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 
@@ -3105,7 +3105,8 @@ def execution_main():
         "--state",
     }
     if (
-        arguments
+        not os.environ.get("TRASK_EXECUTION_PARENT")
+        and arguments
         and arguments[0] in {"agent-task", "pipeline"}
         and any(flag in arguments for flag in standalone_internal)
     ):

@@ -548,7 +548,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.77")
+        self.assertEqual(plugin["version"], "1.0.78")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1522,7 +1522,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "8aaf7ab3324d91037c0709c712db90bb41efaf1b90810f713c932f66c8431d95",
+            "68fca6f6561d2b18e43ad9e101c4ee23876f29ac5f6d33c93b241c5996c30b11",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(
@@ -2917,6 +2917,25 @@ class ParserShapeTest(unittest.TestCase):
         ):
             self.assertEqual(23, MODULE.execution_main())
         load_execution.assert_not_called()
+
+        runtime.reset_mock()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["helper", "pipeline", "7", "--repo-root", "repo"],
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"TRASK_EXECUTION_PARENT": "request.json"},
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("agent-task", "pipeline")
+        )
 
     def test_requires_exactly_one_status_source(self):
         with self.assertRaises(SystemExit):

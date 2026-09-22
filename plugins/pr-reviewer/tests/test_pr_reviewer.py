@@ -180,6 +180,25 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
             self.assertEqual(23, MODULE.execution_main())
         load_execution.assert_not_called()
 
+        runtime.reset_mock()
+        with (
+            mock.patch.object(
+                MODULE.sys,
+                "argv",
+                ["helper", "run", "7", "--model", "sol"],
+            ),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"TRASK_EXECUTION_PARENT": "request.json"},
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("run",)
+        )
+
 
 class ForegroundDriverTest(unittest.TestCase):
     def run_driver(self, result, *, authorize=False, failure=None):

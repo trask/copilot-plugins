@@ -292,25 +292,28 @@ class ExecutionTest(unittest.TestCase):
             "handle": str(handle),
             "requires_execution_result": False,
         })
-        with (
-            mock.patch.dict(
-                EXECUTION.os.environ,
-                {EXECUTION.PARENT_ENV: str(request)},
-                clear=True,
-            ),
-            mock.patch.object(
-                sys, "argv", ["controller.py", "status", "--state", "state.json"]
-            ),
-            mock.patch.object(EXECUTION, "controller_main") as controller,
+        for arguments in (
+            ["controller.py", "status", "--state", "state.json"],
+            ["controller.py", "run", "--state", "state.json"],
         ):
-            self.assertEqual(
-                17,
-                EXECUTION.entrypoint(
-                    lambda: 17, {}, commands=("run",)
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch.dict(
+                    EXECUTION.os.environ,
+                    {EXECUTION.PARENT_ENV: str(request)},
+                    clear=True,
                 ),
-            )
+                mock.patch.object(sys, "argv", arguments),
+                mock.patch.object(EXECUTION, "controller_main") as controller,
+            ):
+                self.assertEqual(
+                    17,
+                    EXECUTION.entrypoint(
+                        lambda: 17, {}, commands=("run",)
+                    ),
+                )
 
-        controller.assert_not_called()
+            controller.assert_not_called()
 
     def test_execution_artifacts_cannot_enter_an_explicit_target_checkout(self):
         target = self.root / "target"

@@ -1762,7 +1762,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.78")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.79")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -1911,6 +1911,25 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             self.assertEqual(23, MODULE.execution_main())
         load_execution.assert_not_called()
+
+        runtime.reset_mock()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["helper", "pipeline", "7", "--pipeline-run", "run"],
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"TRASK_EXECUTION_PARENT": "request.json"},
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("agent-task", "pipeline")
+        )
 
     def test_local_coordinator_waits_for_stable_actionable_feedback(self):
         state_path = self.directory / "stable-state.json"

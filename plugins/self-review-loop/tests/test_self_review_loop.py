@@ -1957,7 +1957,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.55")
+        self.assertEqual(plugin["version"], "1.3.56")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2001,6 +2001,25 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             self.assertEqual(23, MODULE.execution_main())
         load_execution.assert_not_called()
+
+        runtime.reset_mock()
+        with (
+            mock.patch.object(
+                MODULE.sys,
+                "argv",
+                ["helper", "pipeline", "7", "--state", "state.json"],
+            ),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"TRASK_EXECUTION_PARENT": "request.json"},
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("agent-task", "pipeline")
+        )
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"

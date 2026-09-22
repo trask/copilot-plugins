@@ -2078,10 +2078,10 @@ def entrypoint(main: Callable[[], int], namespace: dict[str, Any], *,
         parent_requires_execution = (
             receipt.get("requires_execution_result") is True
         )
-    if (
-        not parent_requires_execution
-        and (not arguments or arguments[0] not in {*commands, *controls})
-    ):
+    if parent_text:
+        if not parent_requires_execution:
+            return main()
+    elif not arguments or arguments[0] not in {*commands, *controls}:
         return main()
     return controller_main(
         main, namespace, handle=sealed_handle, run_id=run_id, commands=commands

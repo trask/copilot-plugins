@@ -257,10 +257,29 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual(23, MODULE.execution_main())
         load_execution.assert_not_called()
 
+        runtime.reset_mock()
+        with (
+            mock.patch.object(
+                MODULE.sys,
+                "argv",
+                ["helper", "agent-task", "7", "--pipeline-run", "run"],
+            ),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"TRASK_EXECUTION_PARENT": "request.json"},
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("agent-task", "pipeline")
+        )
+
     def test_pins_shared_helper_and_current_policy(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "8aaf7ab3324d91037c0709c712db90bb41efaf1b90810f713c932f66c8431d95",
+            "68fca6f6561d2b18e43ad9e101c4ee23876f29ac5f6d33c93b241c5996c30b11",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY,
