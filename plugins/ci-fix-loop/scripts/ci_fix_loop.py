@@ -12,11 +12,9 @@ import datetime as dt
 import errno
 import fnmatch
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
-import py_compile
 import random
 import re
 import secrets
@@ -76,10 +74,10 @@ SEALED_CI_FIX_SNAPSHOT_SCHEMA = (
     "github.copilot.ci-fix-loop-sealed-invocation-snapshot.v2"
 )
 SEALED_CI_FIX_INVOCATION_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-invocation.v4"
+    "github.copilot.ci-fix-loop-sealed-invocation.v5"
 )
 SEALED_CI_FIX_RESULT_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-result.v2"
+    "github.copilot.ci-fix-loop-sealed-result.v3"
 )
 SEALED_CI_FIX_RESULT_KEYS = {
     "schema",
@@ -97,7 +95,6 @@ SEALED_CI_FIX_RESULT_KEYS = {
     "stage",
     "owner",
     "request",
-    "package_manifest",
     "steps",
     "outcome",
     "outcome_sha256",
@@ -173,31 +170,6 @@ COMMAND_RESULT_FILE_PATTERNS = {
     "loop": re.compile(
         r"^(?:ci-fix-loop-loop-result-[1-9][0-9]*|"
         r"ci-fix-loop-sealed-[0-9a-f]{32}-loop-result)\.json$"
-    ),
-}
-PLUGIN_PACKAGE_MANIFEST_SCHEMA = {
-    "id": "github.copilot.plugin-package-manifest",
-    "version": 1,
-}
-PLUGIN_PACKAGE_MANIFEST_ALGORITHM = {
-    "aggregate": "sha256",
-    "digest_encoding": "lowercase hexadecimal ASCII",
-    "file_set": (
-        "Every regular Git blob recursively tracked below plugins/<name> at "
-        "source_commit, with no missing or extra installed regular files and "
-        "no symlinks."
-    ),
-    "ordering": (
-        "Ascending lexicographic order of normalized UTF-8 path bytes."
-    ),
-    "path_normalization": (
-        "Plugin-relative Unicode NFC path with forward-slash separators; "
-        "absolute paths, empty components, dot components, backslashes, NUL, "
-        "CR, LF, and normalization collisions are rejected."
-    ),
-    "record_framing": (
-        "path_utf8 + NUL + decimal_byte_size_ascii + NUL + "
-        "file_sha256_lowercase_hex_ascii + LF"
     ),
 }
 MAX_RERUNS_PER_CHECK = 1
@@ -1709,288 +1681,6 @@ def strict_json_file(path: Path, description: str) -> tuple[bytes, Any]:
     return content, parse_strict_json(text, description=description)
 
 
-def canonical_package_path(value: str) -> str:
-    if (
-        not value
-        or value.startswith("/")
-        or "\\" in value
-        or any(part in {"", ".", ".."} for part in value.split("/"))
-        or any(character in value for character in "\0\r\n")
-        or not value.isascii()
-    ):
-        raise WorkflowError("canonical package path is malformed")
-    return value
-
-
-def canonical_package_digest(files: list[dict[str, Any]]) -> str:
-    if not isinstance(files, list) or not files:
-        raise WorkflowError("canonical package file list is empty")
-    records = []
-    paths = []
-    for item in files:
-        if (
-            not isinstance(item, dict)
-            or set(item) != {"path", "size", "sha256"}
-            or not isinstance(item.get("path"), str)
-            or not isinstance(item.get("size"), int)
-            or isinstance(item["size"], bool)
-            or item["size"] < 0
-            or not isinstance(item.get("sha256"), str)
-            or SHA256_PATTERN.fullmatch(item["sha256"]) is None
-        ):
-            raise WorkflowError("canonical package file record is malformed")
-        path = canonical_package_path(item["path"])
-        paths.append(path)
-        records.append(
-            path.encode("utf-8")
-            + b"\0"
-            + str(item["size"]).encode("ascii")
-            + b"\0"
-            + item["sha256"].encode("ascii")
-            + b"\n"
-        )
-    if paths != sorted(paths) or len(paths) != len(set(paths)):
-        raise WorkflowError("canonical package files are not unique and ordered")
-    return hashlib.sha256(b"".join(records)).hexdigest()
-
-
-def installed_package_files(package_root: Path) -> dict[str, Path]:
-    if not package_root.is_dir() or package_root.is_symlink():
-        raise WorkflowError("installed CI Fix package directory is invalid")
-    files: dict[str, Path] = {}
-    for current, directories, names in os.walk(package_root, followlinks=False):
-        current_path = Path(current)
-        for name in directories:
-            path = current_path / name
-            if path.is_symlink() or (
-                hasattr(path, "is_junction") and path.is_junction()
-            ):
-                raise WorkflowError("installed CI Fix package contains a link")
-        for name in names:
-            path = current_path / name
-            if path.is_symlink() or not path.is_file():
-                raise WorkflowError(
-                    "installed CI Fix package contains a non-regular file"
-                )
-            relative = canonical_package_path(
-                "/".join(path.relative_to(package_root).parts)
-            )
-            if relative in files:
-                raise WorkflowError(
-                    "installed CI Fix package paths collide after normalization"
-                )
-            files[relative] = path
-    return files
-
-
-def verified_runtime_cache_paths(
-    expected_files: dict[str, dict[str, Any]],
-    actual_files: dict[str, Path],
-) -> set[str]:
-    verified = set()
-    for relative in sorted(set(actual_files) - set(expected_files)):
-        parts = relative.split("/")
-        if (
-            len(parts) < 3
-            or parts[-2] != "__pycache__"
-            or not parts[-1].endswith(".pyc")
-        ):
-            continue
-        source_name = parts[-1].split(".", 1)[0] + ".py"
-        source_relative = "/".join([*parts[:-2], source_name])
-        source_path = actual_files.get(source_relative)
-        if (
-            source_relative not in expected_files
-            or source_path is None
-            or source_path.suffix != ".py"
-            or source_path.is_symlink()
-            or not source_path.is_file()
-        ):
-            continue
-        expected_cache = Path(
-            importlib.util.cache_from_source(str(source_path))
-        ).name
-        if parts[-1] != expected_cache:
-            continue
-        with tempfile.TemporaryDirectory(
-            prefix="ci-fix-runtime-cache-"
-        ) as directory:
-            compiled = Path(directory) / expected_cache
-            try:
-                py_compile.compile(
-                    str(source_path),
-                    cfile=str(compiled),
-                    dfile=str(source_path),
-                    doraise=True,
-                    optimize=-1,
-                )
-            except py_compile.PyCompileError as error:
-                raise WorkflowError(
-                    f"could not verify installed runtime cache {relative}: {error}"
-                ) from error
-            if compiled.read_bytes() != actual_files[relative].read_bytes():
-                continue
-        verified.add(relative)
-    return verified
-
-
-def verify_installed_package_manifest(
-    manifest_path: Path,
-    expected_sha256: str,
-    repo_root: Path,
-) -> dict[str, Any]:
-    require_outside_repository(manifest_path, repo_root)
-    if SHA256_PATTERN.fullmatch(expected_sha256) is None:
-        raise WorkflowError("expected package manifest SHA-256 is malformed")
-    manifest_bytes, manifest = strict_json_file(
-        manifest_path, "canonical package manifest"
-    )
-    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    if manifest_sha256 != expected_sha256:
-        raise WorkflowError("canonical package manifest SHA-256 drifted")
-    if (
-        not isinstance(manifest, dict)
-        or set(manifest)
-        != {
-            "schema",
-            "generator",
-            "generated_at",
-            "source_commit",
-            "installed_root",
-            "algorithm",
-            "packages",
-        }
-        or manifest.get("schema") != PLUGIN_PACKAGE_MANIFEST_SCHEMA
-        or manifest.get("algorithm") != PLUGIN_PACKAGE_MANIFEST_ALGORITHM
-        or not isinstance(manifest.get("generator"), dict)
-        or set(manifest["generator"])
-        != {"name", "version", "sha256", "command_argv"}
-        or manifest["generator"].get("name")
-        != "trask/copilot-plugins plugin_package_manifest"
-        or manifest["generator"].get("version") != "1.0.0"
-        or SHA256_PATTERN.fullmatch(
-            str(manifest["generator"].get("sha256", ""))
-        )
-        is None
-        or not isinstance(manifest["generator"].get("command_argv"), list)
-        or not all(
-            isinstance(value, str)
-            for value in manifest["generator"]["command_argv"]
-        )
-        or not isinstance(manifest.get("generated_at"), str)
-        or not manifest["generated_at"]
-        or re.fullmatch(
-            r"[0-9a-f]{40}|[0-9a-f]{64}",
-            str(manifest.get("source_commit", "")),
-        )
-        is None
-        or not isinstance(manifest.get("installed_root"), str)
-        or not isinstance(manifest.get("packages"), list)
-        or len(manifest["packages"]) != 1
-    ):
-        raise WorkflowError("canonical package manifest schema or fields are invalid")
-    installed_root = Path(manifest["installed_root"])
-    if (
-        not installed_root.is_absolute()
-        or os.path.normcase(str(installed_root.resolve()))
-        != os.path.normcase(manifest["installed_root"])
-        or not installed_root.is_dir()
-        or installed_root.is_symlink()
-    ):
-        raise WorkflowError("canonical package installed root is invalid")
-    package = manifest["packages"][0]
-    if (
-        not isinstance(package, dict)
-        or set(package)
-        != {
-            "name",
-            "version",
-            "file_count",
-            "byte_count",
-            "package_sha256",
-            "published_git_tree_oid",
-            "files",
-        }
-        or package.get("name") != "ci-fix-loop"
-        or not isinstance(package.get("version"), str)
-        or not package["version"]
-        or not isinstance(package.get("file_count"), int)
-        or isinstance(package["file_count"], bool)
-        or not isinstance(package.get("byte_count"), int)
-        or isinstance(package["byte_count"], bool)
-        or not isinstance(package.get("files"), list)
-        or package["file_count"] != len(package["files"])
-        or package["byte_count"]
-        != sum(
-            item.get("size", -1)
-            for item in package["files"]
-            if isinstance(item, dict)
-        )
-        or SHA256_PATTERN.fullmatch(
-            str(package.get("package_sha256", ""))
-        )
-        is None
-        or re.fullmatch(
-            r"[0-9a-f]{40}|[0-9a-f]{64}",
-            str(package.get("published_git_tree_oid", "")),
-        )
-        is None
-        or canonical_package_digest(package["files"])
-        != package["package_sha256"]
-    ):
-        raise WorkflowError("canonical CI Fix package manifest entry is invalid")
-    expected_files = {item["path"]: item for item in package["files"]}
-    package_root = installed_root / "ci-fix-loop"
-    actual_files = installed_package_files(package_root)
-    runtime_cache = verified_runtime_cache_paths(
-        expected_files,
-        actual_files,
-    )
-    comparable_files = set(actual_files) - runtime_cache
-    if comparable_files != set(expected_files):
-        missing = sorted(set(expected_files) - comparable_files)
-        extra = sorted(comparable_files - set(expected_files))
-        raise WorkflowError(
-            "installed CI Fix package file set drifted: "
-            f"missing={missing}, extra={extra}"
-        )
-    for relative, expected in expected_files.items():
-        content = actual_files[relative].read_bytes()
-        if (
-            len(content) != expected["size"]
-            or hashlib.sha256(content).hexdigest() != expected["sha256"]
-        ):
-            raise WorkflowError(
-                f"installed CI Fix package bytes drifted: {relative}"
-            )
-    helper_record = expected_files.get("scripts/ci_fix_loop.py")
-    expected_helper = (
-        installed_root / "ci-fix-loop" / "scripts" / "ci_fix_loop.py"
-    ).resolve()
-    if (
-        os.path.normcase(str(Path(__file__).resolve()))
-        != os.path.normcase(str(expected_helper))
-        or helper_record is None
-        or helper_record["sha256"] != sha256_file(Path(__file__).resolve())
-    ):
-        raise WorkflowError(
-            "canonical package manifest does not identify this installed helper"
-        )
-    return {
-        "path": str(manifest_path),
-        "sha256": manifest_sha256,
-        "schema": PLUGIN_PACKAGE_MANIFEST_SCHEMA,
-        "source_commit": manifest["source_commit"],
-        "installed_root": manifest["installed_root"],
-        "package": {
-            "name": package["name"],
-            "version": package["version"],
-            "file_count": package["file_count"],
-            "package_sha256": package["package_sha256"],
-        },
-    }
-
-
 def parse_target(target: str) -> dict[str, Any]:
     match = PR_URL_PATTERN.fullmatch(target) or SHORT_TARGET_PATTERN.fullmatch(target)
     if not match:
@@ -2751,6 +2441,35 @@ def current_pr_target(repo_root: Path) -> dict[str, Any]:
 
 def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
     return parse_target(value) if value else current_pr_target(repo_root)
+
+
+def resolve_ci_fix_target(value: str, repo_root: Path) -> dict[str, Any]:
+    repository = run(
+        ["gh", "repo", "view", "--json", "nameWithOwner"],
+        cwd=repo_root,
+    ).stdout
+    try:
+        payload = json.loads(repository)
+    except json.JSONDecodeError as error:
+        raise WorkflowError(
+            f"gh returned invalid repository identity: {error}"
+        ) from error
+    name = payload.get("nameWithOwner") if isinstance(payload, dict) else None
+    if not isinstance(name, str) or re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+        name,
+    ) is None:
+        raise WorkflowError("current repository identity is malformed")
+    target = (
+        parse_target(f"{name}#{value}")
+        if re.fullmatch(r"[1-9][0-9]*", value)
+        else parse_target(value)
+    )
+    if target["repo_name"].lower() != name.lower():
+        raise WorkflowError(
+            "pull request target does not belong to the current repository"
+        )
+    return target
 
 
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
@@ -9666,6 +9385,37 @@ def sealed_ci_fix_session_path(
     return path
 
 
+def current_agent_session_id() -> str:
+    session_id = os.environ.get("COPILOT_AGENT_SESSION_ID", "")
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        session_id,
+    ) is None:
+        raise WorkflowError("COPILOT_AGENT_SESSION_ID is missing or malformed")
+    return session_id
+
+
+def sealed_ci_fix_invocation_path(
+    invocation_id: str,
+    owner_session_id: str,
+) -> Path:
+    copilot_home = Path(
+        os.environ.get("COPILOT_HOME") or Path.home() / ".copilot"
+    )
+    path = (
+        copilot_home
+        / "session-state"
+        / owner_session_id
+        / "files"
+        / f"ci-fix-loop-sealed-{invocation_id}-invocation.json"
+    )
+    return sealed_ci_fix_session_path(
+        path,
+        description="sealed CI Fix invocation artifact",
+        must_exist=False,
+    )
+
+
 def sealed_ci_fix_output_paths(
     artifact_path: Path,
     invocation_id: str,
@@ -9906,15 +9656,6 @@ def sealed_ci_fix_inner_argv(
     }
 
 
-def sealed_ci_fix_run_command_argv(artifact_path: Path) -> list[str]:
-    return [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "run-sealed-ci-fix",
-        str(artifact_path),
-    ]
-
-
 def sealed_ci_fix_invocation_seal(artifact: dict[str, Any]) -> str:
     identity = copy.deepcopy(artifact)
     identity.pop("seal", None)
@@ -9924,7 +9665,6 @@ def sealed_ci_fix_invocation_seal(artifact: dict[str, Any]) -> str:
 def sealed_ci_fix_artifact(
     *,
     artifact_path: Path,
-    package_manifest: dict[str, Any],
     snapshot: dict[str, Any],
     invocation_id: str,
     owner_session_id: str,
@@ -9951,16 +9691,12 @@ def sealed_ci_fix_artifact(
         "invocation_sha256_file": str(
             artifact_path.with_name(f"{artifact_path.name}.sha256")
         ),
-        "package_manifest": package_manifest,
         "request": {
             "target": target["pr_url"],
             "repo_root": str(repo_root),
             "state": str(state_path),
             "owner_session_id": owner_session_id,
             "execution_mode": "foreground_controller",
-            "execution_handle": str(artifact_path.with_name(
-                f"ci-fix-loop-sealed-{invocation_id}-execution.json"
-            )),
             "model_alias": "sol",
             "model": "gpt-5.6-sol",
             "fresh_invocation": True,
@@ -9977,7 +9713,6 @@ def sealed_ci_fix_artifact(
             state_path=state_path,
             outputs=outputs,
         ),
-        "run_command_argv": sealed_ci_fix_run_command_argv(artifact_path),
     }
     artifact["seal"] = sealed_ci_fix_invocation_seal(artifact)
     return artifact
@@ -10004,11 +9739,9 @@ def load_sealed_ci_fix_artifact(
         "invocation_id",
         "invocation_artifact",
         "invocation_sha256_file",
-        "package_manifest",
         "request",
         "outputs",
         "inner_argv",
-        "run_command_argv",
         "seal",
     }
     if (
@@ -10027,25 +9760,20 @@ def load_sealed_ci_fix_artifact(
         is None
         or artifact.get("invocation_artifact") != str(artifact_path)
         or artifact.get("invocation_sha256_file") != str(digest_path)
-        or not isinstance(artifact.get("package_manifest"), dict)
         or not isinstance(artifact.get("request"), dict)
         or not isinstance(artifact.get("outputs"), dict)
         or not isinstance(artifact.get("inner_argv"), dict)
-        or artifact.get("run_command_argv")
-        != sealed_ci_fix_run_command_argv(artifact_path)
         or SHA256_PATTERN.fullmatch(str(artifact.get("seal") or "")) is None
         or sealed_ci_fix_invocation_seal(artifact) != artifact["seal"]
     ):
         raise WorkflowError("sealed CI Fix invocation artifact is malformed")
     request = artifact["request"]
-    package_manifest = artifact["package_manifest"]
     request_keys = {
         "target",
         "repo_root",
         "state",
         "owner_session_id",
         "execution_mode",
-        "execution_handle",
         "model_alias",
         "model",
         "fresh_invocation",
@@ -10055,29 +9783,11 @@ def load_sealed_ci_fix_artifact(
         "initial_snapshot",
         "initial_snapshot_sha256",
     }
-    package_keys = {
-        "path",
-        "sha256",
-        "schema",
-        "source_commit",
-        "installed_root",
-        "package",
-    }
     if (
-        set(package_manifest) != package_keys
-        or not isinstance(package_manifest.get("path"), str)
-        or not Path(package_manifest["path"]).is_absolute()
-        or SHA256_PATTERN.fullmatch(
-            str(package_manifest.get("sha256") or "")
-        )
-        is None
-        or set(request) != request_keys
+        set(request) != request_keys
         or request.get("model_alias") != "sol"
         or request.get("model") != "gpt-5.6-sol"
         or request.get("execution_mode") != "foreground_controller"
-        or request.get("execution_handle") != str(artifact_path.with_name(
-            f"ci-fix-loop-sealed-{artifact['invocation_id']}-execution.json"
-        ))
         or re.fullmatch(
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
             str(request.get("owner_session_id") or ""),
@@ -10095,6 +9805,15 @@ def load_sealed_ci_fix_artifact(
         != canonical_json_sha256(request["initial_snapshot"])
     ):
         raise WorkflowError("sealed CI Fix request identity is malformed")
+    if (
+        artifact_path.parent.parent.name != request["owner_session_id"]
+        or artifact_path.name
+        != (
+            "ci-fix-loop-sealed-"
+            f"{artifact['invocation_id']}-invocation.json"
+        )
+    ):
+        raise WorkflowError("sealed CI Fix session identity is malformed")
     snapshot = request["initial_snapshot"]
     snapshot_keys = {
         "schema",
@@ -10214,7 +9933,6 @@ def sealed_ci_fix_result_payload(
             "process_id": os.getpid(),
         },
         "request": artifact["request"],
-        "package_manifest": artifact["package_manifest"],
         "steps": steps,
         "outcome": outcome,
         "outcome_sha256": (
@@ -10254,7 +9972,6 @@ def finish_sealed_ci_fix_result(
         or current.get("artifact") != artifact["invocation_artifact"]
         or current.get("result_file") != str(result_path)
         or current.get("request") != artifact["request"]
-        or current.get("package_manifest") != artifact["package_manifest"]
         or current.get("owner")
         != {
             "executable": str(Path(sys.executable).resolve()),
@@ -10265,7 +9982,6 @@ def finish_sealed_ci_fix_result(
         or current.get("steps")
         != {
             "identity_passes": 0,
-            "package_passes": 1,
             "loop": None,
         }
         or current.get("outcome") is not None
@@ -10292,40 +10008,30 @@ def finish_sealed_ci_fix_result(
     return payload
 
 
-def command_prepare_sealed_ci_fix(args: argparse.Namespace) -> None:
-    require_tools()
-    repo_root = resolve_repo_root(args.repo_root)
-    target = resolve_target(args.target, repo_root)
-    artifact_path = sealed_ci_fix_session_path(
-        cli_path(args.invocation_artifact),
-        description="sealed CI Fix invocation artifact",
-        must_exist=False,
+def create_sealed_ci_fix_invocation(
+    *,
+    repo_root: Path,
+    target: dict[str, Any],
+    owner_session_id: str,
+) -> Path:
+    invocation_id = uuid.uuid4().hex
+    artifact_path = sealed_ci_fix_invocation_path(
+        invocation_id,
+        owner_session_id,
     )
     digest_path = sealed_ci_fix_session_path(
         artifact_path.with_name(f"{artifact_path.name}.sha256"),
         description="sealed CI Fix invocation digest",
         must_exist=False,
     )
-    invocation_id = uuid.uuid4().hex
     outputs = sealed_ci_fix_output_paths(artifact_path, invocation_id)
     state_path = sealed_ci_fix_session_path(
         outputs["state"],
         description="sealed CI Fix invocation state",
         must_exist=False,
     )
-    package_manifest_path = cli_path(args.package_manifest)
-    for path in (
-        state_path,
-        artifact_path,
-        digest_path,
-        package_manifest_path,
-    ):
+    for path in (state_path, artifact_path, digest_path):
         require_outside_repository(path, repo_root)
-    package_manifest = verify_installed_package_manifest(
-        package_manifest_path,
-        args.expected_package_manifest_sha256,
-        repo_root,
-    )
     snapshot = sealed_ci_fix_live_snapshot(
         repo_root=repo_root,
         target=target,
@@ -10333,10 +10039,9 @@ def command_prepare_sealed_ci_fix(args: argparse.Namespace) -> None:
     )
     artifact = sealed_ci_fix_artifact(
         artifact_path=artifact_path,
-        package_manifest=package_manifest,
         snapshot=snapshot,
         invocation_id=invocation_id,
-        owner_session_id=args.owner_session_id,
+        owner_session_id=owner_session_id,
     )
     for output in artifact["outputs"].values():
         path = sealed_ci_fix_session_path(
@@ -10358,47 +10063,34 @@ def command_prepare_sealed_ci_fix(args: argparse.Namespace) -> None:
     except BaseException:
         artifact_path.unlink(missing_ok=True)
         raise
-    emit(
-        {
-            "schema": SEALED_CI_FIX_INVOCATION_SCHEMA,
-            "result": "sealed_ci_fix_prepared",
-            "invocation_artifact": str(artifact_path),
-            "invocation_artifact_sha256": artifact_sha256,
-            "invocation_sha256_file": str(digest_path),
-            "seal": artifact["seal"],
-            "result_file": artifact["outputs"]["result"],
-            "run_command_argv": artifact["run_command_argv"],
-            "workflow_started": False,
-            "task_created": False,
-            "source_mutated": False,
-            "github_mutated": False,
-        }
+    return artifact_path
+
+
+def command_run(args: argparse.Namespace) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(None)
+    target = resolve_ci_fix_target(args.target, repo_root)
+    owner_session_id = current_agent_session_id()
+    artifact_path = create_sealed_ci_fix_invocation(
+        repo_root=repo_root,
+        target=target,
+        owner_session_id=owner_session_id,
     )
+    consume_sealed_ci_fix_invocation(artifact_path)
 
 
-def command_run_sealed_ci_fix(args: argparse.Namespace) -> None:
+def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
     global ACTIVE_GITHUB_MUTATION_POLICY
 
-    artifact_path = cli_path(args.invocation_artifact)
     artifact_sha256, artifact = load_sealed_ci_fix_artifact(artifact_path)
     request = artifact["request"]
     repo_root = resolve_repo_root(request["repo_root"])
     target = resolve_target(request["target"], repo_root)
     state_path = cli_path(request["state"])
-    package_manifest_path = cli_path(artifact["package_manifest"]["path"])
-    for path in (
-        artifact_path,
-        state_path,
-        package_manifest_path,
-    ):
+    if request["owner_session_id"] != current_agent_session_id():
+        raise WorkflowError("sealed CI Fix owner session changed")
+    for path in (artifact_path, state_path):
         require_outside_repository(path, repo_root)
-    package_manifest = verify_installed_package_manifest(
-        package_manifest_path,
-        artifact["package_manifest"]["sha256"],
-        repo_root,
-    )
-    if package_manifest != artifact["package_manifest"]:
-        raise WorkflowError("sealed CI Fix installed package identity drifted")
     output_paths = {
         name: sealed_ci_fix_session_path(
             value,
@@ -10415,7 +10107,6 @@ def command_run_sealed_ci_fix(args: argparse.Namespace) -> None:
     started_at = utc_now()
     steps: dict[str, Any] = {
         "identity_passes": 0,
-        "package_passes": 1,
         "loop": None,
     }
     running = sealed_ci_fix_result_payload(
@@ -10454,19 +10145,6 @@ def command_run_sealed_ci_fix(args: argparse.Namespace) -> None:
             if pass_number == 1:
                 stage = "identity_pass_2"
 
-        stage = "package_pass_2"
-        if (
-            verify_installed_package_manifest(
-                package_manifest_path,
-                artifact["package_manifest"]["sha256"],
-                repo_root,
-            )
-            != package_manifest
-        ):
-            raise WorkflowError(
-                "sealed CI Fix installed package changed before loop"
-            )
-        steps["package_passes"] = 2
         stage = "loop"
         loop_args = build_parser().parse_args(
             artifact["inner_argv"]["loop"][2:]
@@ -10487,7 +10165,7 @@ def command_run_sealed_ci_fix(args: argparse.Namespace) -> None:
             "workflow": loop_result["outcome"],
             "result_file": str(result_path),
             "state": str(state_path),
-            "github_mutation_policy": "source-only",
+            "github_mutation_policy": "allow",
         }
         terminal = finish_sealed_ci_fix_result(
             result_path=result_path,
@@ -10509,7 +10187,7 @@ def command_run_sealed_ci_fix(args: argparse.Namespace) -> None:
             "error": str(error),
             "result_file": str(result_path),
             "state": str(state_path),
-            "github_mutation_policy": "source-only",
+            "github_mutation_policy": "allow",
         }
         finish_sealed_ci_fix_result(
             result_path=result_path,
@@ -14004,29 +13682,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    prepare_sealed_ci_fix = subparsers.add_parser(
-        "prepare-sealed-ci-fix",
-        help="write one sealed direct single-pull-request CI Fix invocation",
+    run_command = subparsers.add_parser(
+        "run",
+        help="run one self-contained CI Fix invocation for a pull request",
     )
-    prepare_sealed_ci_fix.add_argument("target")
-    prepare_sealed_ci_fix.add_argument("--repo-root", required=True)
-    prepare_sealed_ci_fix.add_argument("--owner-session-id", required=True)
-    prepare_sealed_ci_fix.add_argument("--invocation-artifact", required=True)
-    prepare_sealed_ci_fix.add_argument("--package-manifest", required=True)
-    prepare_sealed_ci_fix.add_argument(
-        "--expected-package-manifest-sha256",
-        required=True,
+    run_command.add_argument(
+        "target",
+        help="GitHub PR URL, owner/repo#number, or PR number in this repository",
     )
-    prepare_sealed_ci_fix.set_defaults(
-        function=command_prepare_sealed_ci_fix
-    )
-
-    run_sealed_ci_fix = subparsers.add_parser(
-        "run-sealed-ci-fix",
-        help="execute one exact sealed CI Fix invocation",
-    )
-    run_sealed_ci_fix.add_argument("invocation_artifact")
-    run_sealed_ci_fix.set_defaults(function=command_run_sealed_ci_fix)
+    run_command.set_defaults(function=command_run)
 
     agent_task = subparsers.add_parser(
         "agent-task",
@@ -14564,26 +14228,12 @@ def _load_execution():
 
 
 def execution_main():
-    commands = ('pipeline', 'run-sealed-ci-fix')
+    commands = ("pipeline", "run")
     arguments = sys.argv[1:]
-    if arguments and arguments[0] in {"run-sealed-ci-fix", "execution-status", "execution-cancel"}:
-        if len(arguments) != 2:
-            raise WorkflowError("sealed execution requires exactly one invocation artifact")
-        _, artifact = load_sealed_ci_fix_artifact(cli_path(arguments[1]))
-        helper = _load_execution()
-        handle = Path(artifact["request"]["execution_handle"])
-        if arguments[0] != "run-sealed-ci-fix":
-            operation = helper.status if arguments[0] == "execution-status" else helper.cancel
-            emit(operation(handle))
-            return 0
-        return helper.entrypoint(
-            main, globals(), commands=commands, sealed_handle=handle,
-            run_id=artifact["invocation_id"],
-        )
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
         "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
-        or arguments and arguments[0] in {"execution-status", "execution-cancel"}
+        or arguments and arguments[0] in {"run", "execution-status", "execution-cancel"}
     )
     if not selected or not enabled:
         return main()
