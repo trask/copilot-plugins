@@ -3545,13 +3545,20 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("An unavailable effort value is allowed", text)
         self.assertIn("cannot be determined", text)
 
-    def test_agent_uses_foreground_controller_and_optional_observers(self):
+    def test_agent_uses_one_synchronous_terminal_controller(self):
         text = AGENT.read_text(encoding="utf-8")
         self.assertIn("pr_pipeline.py\" run <target>", text)
         self.assertIn("at most two sweeps", text)
         self.assertIn("Sweeps never reset a stage budget", text)
-        self.assertIn("execution-status` synchronously with no arguments", text)
-        self.assertIn("execution-cancel` with no arguments", text)
+        self.assertIn("Invoke the helper synchronously", text)
+        self.assertIn(
+            "Do not send a user-visible response while the command is running",
+            text,
+        )
+        self.assertIn("There is no intermediate user-visible outcome", text)
+        self.assertNotIn("execution-status", text)
+        self.assertNotIn("execution-cancel", text)
+        self.assertNotIn("execution tool's asynchronous mode", text)
         self.assertIn("verified terminal `workflow_result`", text)
         self.assertIn("verified Markdown presentation exactly", text)
         self.assertIn("Do not reconstruct a summary from workflow state", text)

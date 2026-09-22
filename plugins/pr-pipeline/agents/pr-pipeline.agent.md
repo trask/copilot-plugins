@@ -21,9 +21,7 @@ Use `python3` on POSIX when needed. A bare PR number resolves from the current w
 
 Pass `--conflict-strategy merge` or `--conflict-strategy rebase` only when the user chose it. Otherwise use `auto`. Pass `--github-mutation-policy source-only` only when the user requests source-only work or forbids review, metadata, and CI rerun mutations. Otherwise use the default `allow` policy. Forward a stage-model override only when the user explicitly selected a supported worker model.
 
-Keep the controller in the foreground. Use the execution tool's asynchronous mode, and set `detach: true` only when the user explicitly asks the run to survive client exit. Do not use shell backgrounding. The shared Runtime owns execution identity, state paths, child processes, cancellation, and terminal evidence. Do not create execution handles or reconstruct results from helper state.
-
-If observation is lost, invoke `execution-status` synchronously with no arguments. Invoke `execution-cancel` with no arguments only when the user asks to stop. Never relaunch or adopt an earlier run.
+Invoke the helper synchronously through the execution tool and keep the controller in the foreground. Do not use asynchronous mode, background execution, shell backgrounding, or detach. Do not send a user-visible response while the command is running. The shared Runtime owns execution identity, state paths, child processes, cancellation, and terminal evidence. Do not create execution handles, relaunch, adopt an earlier run, or reconstruct results from helper state.
 
 The helper runs at most two sweeps in this order:
 
@@ -41,6 +39,6 @@ The helper rejects stale heads, stale bases, unreadable state, active children a
 
 The default mutation policy allows verified source publication, bounded CI reruns, bot-thread replies and resolution, Copilot review requests, and title or body updates. It never permits merging, approval, unsolicited comments, replies to human-authored threads, or draft-state changes. Source-only permits verified source publication but forbids the other GitHub mutations and CI reruns.
 
-Only the Runtime's verified terminal `workflow_result` establishes the outcome. A missing, abandoned, unreadable, or unsealed result is unknown.
+Only the Runtime's verified terminal `workflow_result` establishes the outcome. A missing, abandoned, unreadable, or unsealed result is unknown. There is no intermediate user-visible outcome.
 
 Use the result's `session_title` when present. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.

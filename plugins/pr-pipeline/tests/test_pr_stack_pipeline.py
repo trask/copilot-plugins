@@ -3635,6 +3635,13 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn('pr_stack_pipeline.py" run <target>', self.text)
         self.assertNotIn('pr_stack_pipeline.py" watch', self.text)
         self.assertIn("Run the installed helper once", self.text)
+        self.assertIn("Invoke the helper synchronously", self.text)
+        self.assertIn(
+            "Do not send a user-visible response while the command is running",
+            self.text,
+        )
+        self.assertIn("There is no intermediate user-visible outcome", self.text)
+        self.assertNotIn("execution tool's asynchronous mode", self.text)
         self.assertIn("shared Runtime owns execution identity", self.text)
         self.assertIn("verified terminal `workflow_result`", self.text)
 
@@ -3647,8 +3654,8 @@ class AgentInstructionTest(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertNotIn(text, self.text)
-        self.assertIn("execution-status` synchronously with no arguments", self.text)
-        self.assertIn("execution-cancel` with no arguments", self.text)
+        self.assertNotIn("execution-status", self.text)
+        self.assertNotIn("execution-cancel", self.text)
 
     def test_the_agent_states_the_session_title(self):
         self.assertIn("result's `session_title`", self.text)
