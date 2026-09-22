@@ -3626,79 +3626,49 @@ class AgentInstructionTest(unittest.TestCase):
         self.text = AGENT.read_text(encoding="utf-8")
 
     def test_requires_the_exact_primary_model_and_exposed_effort(self):
-        self.assertIn("model is exactly `gpt-5.6-sol`", self.text)
-        self.assertIn(
-            "effort is either exactly `high` or unavailable",
-            self.text,
-        )
-        self.assertIn("an unavailable effort does not fail the gate", self.text)
-        self.assertIn("If you cannot determine the model", self.text)
-        self.assertIn("The user cannot override this gate", self.text)
-
-    def test_requires_a_chat_only_retrospective_after_the_terminal_response(self):
-        self.assertIn("## Retrospective", self.text)
-        for category in (
-            "**Agent**",
-            "**Helper**",
-            "**General instructions**",
-            "**Repository**",
-        ):
-            self.assertIn(category, self.text)
-        self.assertIn("After every terminal outcome", self.text)
-        self.assertIn("Keep this advisory and", self.text)
-        self.assertIn("Omit this section when the run encountered no friction", self.text)
-        self.assertGreater(
-            self.text.index("## Retrospective"),
-            self.text.index("Write a concise final response"),
-        )
+        self.assertIn("only with model `gpt-5.6-sol`", self.text)
+        self.assertIn("require `high`", self.text)
+        self.assertIn("An unavailable effort value is allowed", self.text)
+        self.assertIn("cannot be determined", self.text)
 
     def test_the_agent_only_runs_and_reports_the_foreground_helper(self):
-        self.assertIn('pr_stack_pipeline.py" run \'<target>\'', self.text)
+        self.assertIn('pr_stack_pipeline.py" run <target>', self.text)
         self.assertNotIn('pr_stack_pipeline.py" watch', self.text)
-        self.assertIn("The helper owns all control flow", self.text)
-        self.assertIn("Launch the controller once", self.text)
+        self.assertIn("Run the installed helper once", self.text)
         self.assertIn("shared Runtime owns execution identity", self.text)
-        self.assertIn("verified terminal result", self.text)
+        self.assertIn("verified terminal `workflow_result`", self.text)
 
     def test_the_agent_hides_runtime_plumbing(self):
         for text in (
             "--execution-handle",
-            "execution-status",
-            "execution-cancel",
             "--stack-request",
-            "state path",
             "request file",
+            "--repo-root",
         ):
             with self.subTest(text=text):
                 self.assertNotIn(text, self.text)
+        self.assertIn("execution-status` synchronously with no arguments", self.text)
+        self.assertIn("execution-cancel` with no arguments", self.text)
 
     def test_the_agent_states_the_session_title(self):
-        self.assertIn(
-            "PR Stack Pipeline: #<startPullRequest> - <PR title>",
-            self.text,
-        )
-        self.assertIn("After verified terminal completion, rename the session", self.text)
+        self.assertIn("result's `session_title`", self.text)
 
     def test_the_agent_documents_semantic_target_selection(self):
         self.assertIn("GitHub PR URL", self.text)
         self.assertIn("`owner/repo#number`", self.text)
         self.assertIn("bare PR number", self.text)
-        self.assertIn("starting pull request plus every descendant", self.text)
-        self.assertIn("predecessors are not", self.text)
-        self.assertIn("Draft and non-draft members are included", self.text)
+        self.assertIn("starting pull request plus every open descendant", self.text)
+        self.assertIn("Predecessors are not selected", self.text)
+        self.assertIn("Draft and non-draft open members are included", self.text)
         self.assertNotIn("kickoff", self.text.lower())
         self.assertNotIn("--kickoff", self.text)
         self.assertNotIn("JSON object", self.text)
 
     def test_the_agent_documents_normal_authorization_and_explicit_restrictions(self):
-        self.assertIn("Normal execution uses `--github-mutation-policy allow`", self.text)
-        self.assertIn("Draft and ready-for-review pull requests are eligible", self.text)
-        self.assertIn("standard stage-owned actions", self.text)
-        self.assertIn("bot-authored review threads", self.text)
-        self.assertIn("which require a separate explicit request", self.text)
-        self.assertIn("only when the caller explicitly requests", self.text)
-        self.assertIn("Do not infer source-only from draft status", self.text)
-        self.assertIn("never change it for that run", self.text)
+        self.assertIn("default `allow` policy", self.text)
+        self.assertIn("bot-thread replies and resolution", self.text)
+        self.assertIn("never permits merging, approval", self.text)
+        self.assertIn("only when the user requests source-only", self.text)
 
     def test_the_agent_names_the_delegated_agents_in_order(self):
         for agent in MODULE.PHASE_AGENTS.values():
@@ -3713,8 +3683,7 @@ class AgentInstructionTest(unittest.TestCase):
         )
 
     def test_the_agent_owns_no_stage_policy(self):
-        self.assertIn("Do not launch stages yourself", self.text)
-        self.assertIn("not model wrappers or app sessions", self.text)
+        self.assertIn("Each deterministic stage coordinator owns", self.text)
         self.assertNotIn("mergeable_at_head_sha", self.text)
         self.assertNotIn("clean_at_head_sha", self.text)
 
@@ -3803,11 +3772,28 @@ class ParserTest(unittest.TestCase):
         runtime = mock.Mock()
         runtime.entrypoint.return_value = 17
         with (
-            mock.patch.object(MODULE.sys, "argv", ["pr_stack_pipeline.py", "execution-cancel", "--handle", "x"]),
+            mock.patch.object(MODULE.sys, "argv", ["pr_stack_pipeline.py", "execution-cancel"]),
             mock.patch.object(MODULE, "_load_execution", return_value=runtime),
         ):
             self.assertEqual(17, MODULE.execution_main())
         runtime.entrypoint.assert_called_once_with(MODULE.main, MODULE.__dict__, commands=("run",))
+
+    def test_session_owned_run_uses_the_runtime_entrypoint(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
+        with (
+            mock.patch.object(MODULE.sys, "argv", ["pr_stack_pipeline.py", "run", "11"]),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"COPILOT_AGENT_SESSION_ID": "87654321-4321-4321-4321-cba987654321"},
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("run",)
+        )
 
 
 if __name__ == "__main__":

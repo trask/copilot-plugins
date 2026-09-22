@@ -46,11 +46,11 @@ On a later native pass, an unchanged member reuses Description only when this ru
 
 ## Foreground ownership
 
-The agent entrypoints use `run --execution-handle <fresh-absolute-path>` with the
-shared, source-pinned Runtime execution library. One official execution-tool
-launch owns the foreground scheduler. Optional `execution-status --handle` reads
-the generation-bound handle and verifies the terminal result hash.
-`execution-cancel --handle` requests local cancellation only. Neither observer
+The agent entrypoints use `run <target>` with the shared, source-pinned Runtime
+execution library. Runtime derives a fresh root record in the current Copilot
+session. `execution-status` reads the sole live root, or the latest unambiguous
+terminal root, for this session and helper. `execution-cancel` requests local
+cancellation only when exactly one matching live root exists. Neither observer
 disconnection nor tool-shell exit establishes cancellation or completion.
 
 Stage sequencing remains in these schedulers. Children inherit the root run
@@ -64,8 +64,9 @@ Both Pipeline and Conflict require the shared Runtime execution library;
 Conflict retains its dedicated hosted backend. No app-native Stop integration,
 automatic recovery, app-shutdown survival or remote cancellation is promised.
 The agent does not need to stay active.
-Foreground roots create their own run ID. They reject `--run-id` so a fresh
-execution handle cannot point the scheduler at old stage paths.
+Foreground roots create their own run ID. They reject caller-supplied execution
+handles and run IDs, so a fresh invocation cannot point the scheduler at old
+stage paths.
 
 ## Terminal reporting
 
@@ -83,7 +84,7 @@ Stack worker cleanup removes only clean, owned worktrees through ordinary `git w
 
 An exit code of zero and changed heads do not establish conflict-stage completion. Conflict Resolver must record a terminal outcome before Stack Pipeline starts review. A recorded `completed` outcome without current clearance can continue the bounded pass, but cannot clear the conflict stage or make the final snapshot complete. An absent outcome blocks with `conflict_did_not_record_outcome`.
 
-Only a full native-stack selection authorizes `--whole-stack` conflict publication. A partial suffix never launches the conflict coordinator. Fresh GitHub mergeability clears each selected member only at its exact head and base. Conflicting, unknown, or stale metadata blocks rather than changing an unselected prefix.
+Stack Pipeline launches the conflict coordinator only when its selected suffix is the complete open native stack. A partial suffix never changes an unselected prefix. Ordinary PR Pipeline passes no stack scope. Conflict Resolver detects native-stack work, creates a run-bound authorization for every current open member, and rechecks the complete topology and exact source heads before atomic publication.
 
 For an already-mergeable whole stack, Conflict Resolver records one aggregate clearance in the clicked member's state without starting hosted work. The final snapshot can use that evidence for members with no conflict state only after this run accepted the producer's successful completion. The authorization, invocation, configuration, ordered topology, and every member's current head and direct base must still match. This creates no child receipts, cannot override existing child conflict failures or stale state, and does not clear any other stage.
 

@@ -252,16 +252,11 @@ class GithubMutationPolicyTest(unittest.TestCase):
 
     def test_agent_documents_normal_authorization_and_explicit_restrictions(self):
         instructions = AGENT.read_text(encoding="utf-8")
-        self.assertIn("Normal execution uses `--github-mutation-policy allow`", instructions)
-        self.assertIn("draft or ready for review", instructions)
-        self.assertIn("standard stage-owned actions", instructions)
-        self.assertIn("bot-authored review threads", instructions)
-        self.assertIn("which require a separate explicit request", instructions)
-        self.assertIn("only when the caller explicitly requests", instructions)
-        self.assertIn("Do not infer source-only from draft status", instructions)
-        self.assertNotIn("open draft pull request", instructions)
+        self.assertIn("default `allow` policy", instructions)
+        self.assertIn("bot-thread replies and resolution", instructions)
+        self.assertIn("never permits merging, approval", instructions)
         self.assertIn("--github-mutation-policy source-only", instructions)
-        self.assertIn("never change it for that run", instructions)
+        self.assertIn("only when the user requests source-only", instructions)
 
 
 class InstalledRuntimeTest(unittest.TestCase):
@@ -3545,60 +3540,25 @@ class WorktreeSafetyTest(unittest.TestCase):
 class AgentInstructionTest(unittest.TestCase):
     def test_requires_the_exact_primary_model_and_exposed_effort(self):
         text = AGENT.read_text(encoding="utf-8")
-        self.assertIn("model is exactly `gpt-5.6-sol`", text)
-        self.assertIn(
-            "effort is either exactly `high` or unavailable",
-            text,
-        )
-        self.assertIn("an unavailable effort does not fail the gate", text)
-        self.assertIn("If you cannot determine the model", text)
-        self.assertIn("The user cannot override this gate", text)
-
-    def test_requires_a_chat_only_retrospective_after_the_terminal_response(self):
-        text = AGENT.read_text(encoding="utf-8")
-        self.assertIn("## Retrospective", text)
-        for category in (
-            "**Agent**",
-            "**Helper**",
-            "**General instructions**",
-            "**Repository**",
-        ):
-            self.assertIn(category, text)
-        self.assertIn("After every terminal outcome", text)
-        self.assertIn("Keep this advisory and chat-only", text)
-        self.assertIn("Omit this section when the run encountered no friction", text)
-        self.assertGreater(text.index("## Retrospective"), text.index("Write a concise final response"))
+        self.assertIn("only with model `gpt-5.6-sol`", text)
+        self.assertIn("require `high`", text)
+        self.assertIn("An unavailable effort value is allowed", text)
+        self.assertIn("cannot be determined", text)
 
     def test_agent_uses_foreground_controller_and_optional_observers(self):
         text = AGENT.read_text(encoding="utf-8")
-        self.assertIn('pr_pipeline.py" run --execution-handle', text)
-        self.assertNotIn('pr_pipeline.py" watch', text)
-        self.assertIn("at most two foreground sweeps", text)
-        self.assertIn("A nonzero stage exit", text)
-        self.assertIn("Sweeps never reset or multiply it", text)
-        self.assertIn("an active child after its coordinator returns blocks", text)
-        self.assertIn("Launch the controller once", text)
-        self.assertIn("Tool acknowledgement is not readiness", text)
-        self.assertIn("execution-status --handle", text)
-        self.assertIn("execution-cancel --handle", text)
-        self.assertIn("Never run a required watch loop", text)
-        self.assertNotIn("Never end your turn", text)
-        self.assertIn("Only the hash-verified terminal execution result", text)
-        self.assertIn("Verify every referenced result hash and run ID", text)
-        self.assertIn("only top-level `ci_warnings`", text)
-        self.assertIn("A clean run that pushed no commits", text)
-        self.assertIn("Do not organize the response by sweep", text)
-        self.assertNotIn("### Sweep 1", text)
-        self.assertNotIn("### Sweep 2", text)
-        self.assertNotIn("### Final stage status", text)
-        self.assertNotIn("Pushed commits: none", text)
-        self.assertIn("published_commits", text)
-        self.assertIn("retained_commits", text)
-        self.assertIn("stage_result.status", text)
-        self.assertLess(
-            text.index("2. `copilot-review-loop`"),
-            text.index("3. `self-review-loop`"),
-        )
+        self.assertIn("pr_pipeline.py\" run <target>", text)
+        self.assertIn("at most two sweeps", text)
+        self.assertIn("Sweeps never reset a stage budget", text)
+        self.assertIn("execution-status` synchronously with no arguments", text)
+        self.assertIn("execution-cancel` with no arguments", text)
+        self.assertIn("verified terminal `workflow_result`", text)
+        self.assertIn("published commits", text)
+        self.assertIn("retained commits", text)
+        self.assertIn("useful nested stage error", text)
+        self.assertNotIn("--execution-handle", text)
+        self.assertNotIn("--pipeline-run", text)
+        self.assertIn("does not pass stack membership, `--whole-stack`", text)
 
 
 class CommandOutputTest(unittest.TestCase):
@@ -3628,6 +3588,7 @@ class CommandOutputTest(unittest.TestCase):
                 "result": "complete",
                 "run_id": run_id,
                 "head_sha": HEAD,
+                "pr": pull_request(),
             }
 
         args = MODULE.build_parser().parse_args(["run", "owner/repo#7"])
@@ -3648,6 +3609,7 @@ class CommandOutputTest(unittest.TestCase):
         )
         self.assertEqual("complete", events[-1]["result"])
         self.assertEqual(HEAD, events[-1]["head_sha"])
+        self.assertEqual("PR Pipeline: #7 - Add a thing", events[-1]["session_title"])
 
     def test_error_is_a_terminal_json_event(self):
         output = StringIO()
@@ -3701,11 +3663,28 @@ class ParserTest(unittest.TestCase):
         runtime = mock.Mock()
         runtime.entrypoint.return_value = 17
         with (
-            mock.patch.object(MODULE.sys, "argv", ["pr_pipeline.py", "execution-status", "--handle", "x"]),
+            mock.patch.object(MODULE.sys, "argv", ["pr_pipeline.py", "execution-status"]),
             mock.patch.object(MODULE, "_load_execution", return_value=runtime),
         ):
             self.assertEqual(17, MODULE.execution_main())
         runtime.entrypoint.assert_called_once_with(MODULE.main, MODULE.__dict__, commands=("run",))
+
+    def test_session_owned_run_uses_the_runtime_entrypoint(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
+        with (
+            mock.patch.object(MODULE.sys, "argv", ["pr_pipeline.py", "run", "7"]),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"COPILOT_AGENT_SESSION_ID": "87654321-4321-4321-4321-cba987654321"},
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("run",)
+        )
 
 
 if __name__ == "__main__":

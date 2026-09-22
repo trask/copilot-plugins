@@ -215,7 +215,8 @@ def compact_terminal_result(
     compact = {
         key: payload[key]
         for key in (
-            "event", "result", "run_id", "number", "head_sha", "local_head_sha", "sweeps",
+            "event", "result", "run_id", "number", "head_sha", "local_head_sha",
+            "sweeps", "session_title",
         )
         if key in payload
     }
@@ -1292,6 +1293,16 @@ def command_run(args: argparse.Namespace) -> None:
         "run_id": args.run_id,
     }
     result = run_pipeline(target, repo_root, **options)
+    pr = result.get("pr")
+    if (
+        isinstance(pr, dict)
+        and type(pr.get("number")) is int
+        and isinstance(pr.get("title"), str)
+        and pr["title"]
+    ):
+        result["session_title"] = (
+            f"PR Pipeline: #{pr['number']} - {pr['title']}"
+        )
     reporter({"event": "pipeline_finished", **result})
 
 

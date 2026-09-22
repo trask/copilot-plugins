@@ -4252,7 +4252,7 @@ def compact_terminal_result(
 def command_run(args: argparse.Namespace) -> None:
     common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
     common.require_tools()
-    repo_root = Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
+    repo_root = common.resolve_repo_root()
     target = common.resolve_target(args.target, repo_root)
     kickoff = selection_from_stack(
         target, read_native_stack(target["repo_name"], target["number"])
@@ -4291,9 +4291,6 @@ def build_parser() -> argparse.ArgumentParser:
             "starting PR URL, owner/repo#number, or a bare number resolved from "
             "the current workspace repository"
         ),
-    )
-    run.add_argument(
-        "--repo-root", help="the repository clone the run works from"
     )
     run.add_argument(
         "--stage-model",
