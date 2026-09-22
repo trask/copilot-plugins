@@ -87,7 +87,14 @@ class ExecutionTest(unittest.TestCase):
         EXECUTION.write(dispatch, {
             "schema": "github.copilot.dispatch-observation.v1", "request_id": name,
             "repository": "owner/repo", "task": {"id": f"task-{name}"},
-            "remote_status": "unconfirmed",
+            "remote_status": "terminal",
+            "history": [
+                {
+                    "observed_at": 1.0,
+                    "remote_status": "terminal",
+                    "task": {"id": f"task-{name}", "state": "completed"},
+                }
+            ],
         })
         EXECUTION.write(handle, {
             "schema": EXECUTION.SCHEMA, "handle": str(handle), "root": str(context.root),
@@ -101,6 +108,7 @@ class ExecutionTest(unittest.TestCase):
         EXECUTION.write(record, {
             "schema": EXECUTION.SCHEMA, "root": str(context.root), "run_id": context.run_id,
             "handle": str(handle), "process_identity": owner, "command_sha256": command_sha256,
+            "lifecycle": "drained",
             "requires_execution_result": True, "local_drained": True,
             "result_file": str(result_path),
         })
@@ -298,8 +306,38 @@ class ExecutionTest(unittest.TestCase):
         observations = {item["request_id"]: item for item in result["remote_tasks"]}
         self.assertEqual("task-one", observations["request-one"]["task"]["id"])
         self.assertIsNone(observations["request-two"]["task"])
-        self.assertEqual("unknown", observations["request-two"]["remote_status"])
+        self.assertEqual("creating", observations["request-two"]["remote_status"])
+        self.assertEqual(2, len(observations["request-one"]["history"]))
         self.assertTrue(result["remote_work_may_continue"])
+
+    def test_terminal_dispatch_history_proves_remote_drainage(self):
+        context = self.context()
+        result_path = self.root / "remote-result.json"
+        context.record_dispatch(result_path, "request-one", "owner/repo")
+        context.record_dispatch(
+            result_path,
+            "request-one",
+            "owner/repo",
+            {"id": "task-one", "state": "queued", "url": "https://example/task-one"},
+        )
+        context.record_dispatch(
+            result_path,
+            "request-one",
+            "owner/repo",
+            {"id": "task-one", "state": "completed", "url": "https://example/task-one"},
+        )
+        context.emit({"result": "complete"})
+
+        result = context.finish(0)
+
+        self.assertEqual("terminal", result["remote_status"])
+        self.assertFalse(result["remote_work_may_continue"])
+        observation = result["remote_tasks"][0]
+        self.assertEqual("terminal", observation["remote_status"])
+        self.assertEqual(
+            ["creating", "active", "terminal"],
+            [event["remote_status"] for event in observation["history"]],
+        )
 
     def test_nonzero_preserves_original_result_and_error(self):
         context = self.context()
@@ -492,7 +530,7 @@ class ExecutionTest(unittest.TestCase):
         EXECUTION.write(child_record, {
             "schema": EXECUTION.SCHEMA, "process_identity": child_identity,
             "root": str(root.handle), "run_id": root.run_id, "handle": str(child_handle),
-            "command_sha256": EXECUTION.digest(command),
+            "command_sha256": EXECUTION.digest(command), "lifecycle": "bound",
         })
         EXECUTION.write(request, {
             "schema": EXECUTION.SCHEMA, "root": str(root.handle), "parent": str(root.handle),
@@ -530,7 +568,7 @@ class ExecutionTest(unittest.TestCase):
         EXECUTION.write(child_record, {
             "schema": EXECUTION.SCHEMA, "process_identity": IDENTITY,
             "root": str(root.handle), "run_id": root.run_id, "handle": str(child_handle),
-            "command_sha256": EXECUTION.digest(command),
+            "command_sha256": EXECUTION.digest(command), "lifecycle": "bound",
         })
         EXECUTION.write(request, {
             "schema": EXECUTION.SCHEMA, "root": str(root.handle), "parent": str(root.handle),
@@ -1886,6 +1924,7 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual(before, state.read_bytes())
         self.assertEqual(str(state), result["retained_evidence"][0]["path"])
         self.assertTrue(result["remote_work_may_continue"])
+        self.assertEqual("unconfirmed", result["remote_status"])
 
 
 
@@ -2320,6 +2359,31 @@ class ExecutionTest(unittest.TestCase):
         process.kill.assert_called_once()
         self.assertEqual(1, len(context.launch_failures))
         self.assertIn("denied", context.launch_failures[0]["error"])
+        receipt = EXECUTION.read(next(context.directory.glob("child-*.json")))
+        self.assertEqual("launch_failed", receipt["lifecycle"])
+        self.assertTrue(receipt["local_drained"])
+
+    def test_output_stream_failure_keeps_a_durable_failed_admission(self):
+        context = self.context()
+        original = Path.open
+
+        def open_path(path, *args, **kwargs):
+            if path.name.startswith("child-") and path.name.endswith("-stdout.log"):
+                raise OSError("child output unavailable")
+            return original(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(Path, "open", open_path),
+            mock.patch.object(EXECUTION.subprocess, "Popen") as launch,
+            self.assertRaisesRegex(OSError, "child output unavailable"),
+        ):
+            context.start(["python", "child.py"])
+
+        launch.assert_not_called()
+        receipt = EXECUTION.read(next(context.directory.glob("child-*.json")))
+        self.assertEqual("launch_failed", receipt["lifecycle"])
+        self.assertTrue(receipt["local_drained"])
+        self.assertIn("child output unavailable", receipt["launch_error"])
 
     def test_windows_binding_failure_uses_created_owner_for_bounded_cleanup(self):
         context = self.context()

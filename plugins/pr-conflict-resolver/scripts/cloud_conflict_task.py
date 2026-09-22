@@ -3528,6 +3528,32 @@ def main(
         }
         print(f"error: {safe_error_message(str(error))}", file=stderr)
         exit_code = 2
+    if (
+        _EXECUTION is not None
+        and result_path is not None
+        and result.request_id is not None
+        and result.repository is not None
+        and progress.task_id is not None
+    ):
+        try:
+            _EXECUTION.record_dispatch(
+                result_path,
+                result.request_id,
+                result.repository,
+                {
+                    "id": progress.task_id,
+                    "state": progress.task_state,
+                    "url": result.task_url,
+                },
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            result.status = "error"
+            result.error = {
+                "code": "remote_observation_failed",
+                "message": safe_error_message(str(error)),
+            }
+            result.application_status = "not_started"
+            exit_code = 2
     if result_path is not None:
         try:
             atomic_write_json(result_path, result.as_dict())
@@ -3538,7 +3564,7 @@ def main(
 
 
 _EXECUTION = None
-EXECUTION_SHA256 = "c545a2de1dda55ef3b930c21d7e90a1513079076aed94ccfbb73429a26ea726f"
+EXECUTION_SHA256 = "d61d298d15687181eaef3dfd98f83cd62c6222a95ceb262d2336fba3a1d1a828"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 
@@ -3590,9 +3616,30 @@ def _load_execution():
 def execution_main():
     if not os.environ.get("TRASK_EXECUTION_PARENT"):
         return main()
-    return _load_execution().controller_main(
-        lambda: main(stdout=sys.stdout, stderr=sys.stderr), globals(),
-    )
+    try:
+        return _load_execution().controller_main(
+            lambda: main(stdout=sys.stdout, stderr=sys.stderr), globals(),
+        )
+    except BaseException as error:
+        result_path = result_path_from_args(sys.argv[1:])
+        message = safe_error_message(f"{type(error).__name__}: {error}")
+        if result_path is not None and not result_path.exists():
+            result = Result(
+                status="error",
+                error={
+                    "code": "execution_runtime_unavailable",
+                    "message": message,
+                },
+            )
+            try:
+                atomic_write_json(result_path, result.as_dict())
+            except ConflictError as write_error:
+                print(
+                    f"error: {safe_error_message(str(write_error))}",
+                    file=sys.stderr,
+                )
+        print(f"error: {message}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

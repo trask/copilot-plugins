@@ -23,6 +23,10 @@ SESSION_ENV = "COPILOT_AGENT_SESSION_ID"
 IS_WINDOWS = os.name == "nt"
 FORCED_DRAINAGE_ERROR = "owned Windows job required forced drainage"
 PRESENTATION_INLINE_MAX_BYTES = 4096
+REMOTE_TERMINAL_STATES = frozenset(
+    {"completed", "failed", "timed_out", "cancelled", "waiting_for_user", "idle"}
+)
+REMOTE_ACTIVE_STATES = frozenset({"queued", "in_progress"})
 
 
 class ExecutionError(RuntimeError):
@@ -896,7 +900,13 @@ class OwnedProcess:
                     raise ExecutionError("owned process group still has active descendants")
             self.drained = True
             release_resources = True
-            result = {**read(self.record), "exit_code": code, "local_drained": True}
+            result = {
+                **read(self.record),
+                "lifecycle": "drained",
+                "drained_at": time.time(),
+                "exit_code": code,
+                "local_drained": True,
+            }
             if self.observed_descendants:
                 result["observed_descendants"] = self.observed_descendants
             if self.completion_error is not None:
@@ -918,6 +928,8 @@ class OwnedProcess:
                 self.record,
                 {
                     **read(self.record),
+                    "lifecycle": "drain_failed",
+                    "drain_failed_at": time.time(),
                     "exit_code": code,
                     "local_drained": False,
                     "drainage_error": message,
@@ -941,7 +953,12 @@ class OwnedProcess:
         return True
 
     def _write_pending(self, code: int) -> None:
-        result = {**read(self.record), "exit_code": code, "local_drained": False}
+        result = {
+            **read(self.record),
+            "lifecycle": "draining",
+            "exit_code": code,
+            "local_drained": False,
+        }
         if self.observed_descendants:
             result["observed_descendants"] = self.observed_descendants
         if self.completion_error is not None:
@@ -1032,10 +1049,20 @@ class Execution:
                     raise ExecutionError("parent did not bind child generation")
                 time.sleep(0.02)
             child = read(child_record)
+            while (
+                child.get("lifecycle") == "admitted"
+                and child.get("process_identity") is None
+            ):
+                require_owner(root["owner"])
+                if time.monotonic() >= deadline:
+                    raise ExecutionError("parent did not bind child generation")
+                time.sleep(0.02)
+                child = read(child_record)
             if (
                 child.get("schema") != SCHEMA or child.get("root") != request["root"]
                 or child.get("run_id") != root["run_id"] or child.get("handle") != str(self.handle)
                 or child.get("command_sha256") != request["command_sha256"]
+                or child.get("lifecycle") != "bound"
             ):
                 raise ExecutionError("parent child record identity changed")
             expected = child["process_identity"]
@@ -1101,11 +1128,39 @@ class Execution:
                         task: dict[str, Any] | None = None) -> None:
         path = result_path.with_name(result_path.name + ".dispatch.json")
         self.record_state(path, {})
+        state = task.get("state") if isinstance(task, dict) else None
+        remote_status = (
+            "creating"
+            if task is None else
+            "terminal"
+            if state in REMOTE_TERMINAL_STATES else
+            "active"
+            if state in REMOTE_ACTIVE_STATES else
+            "unconfirmed"
+        )
+        event = {
+            "observed_at": time.time(),
+            "remote_status": remote_status,
+            "task": task,
+        }
+        history = []
+        if path.is_file():
+            prior = read(path)
+            if (
+                prior.get("schema") != "github.copilot.dispatch-observation.v1"
+                or prior.get("request_id") != request_id
+                or prior.get("repository") != repository
+                or not isinstance(prior.get("history"), list)
+            ):
+                raise ExecutionError("dispatch observation identity changed")
+            history = prior["history"]
+        history.append(event)
         write(path, {
             "schema": "github.copilot.dispatch-observation.v1",
             "request_id": request_id, "repository": repository,
-            "status": "creating" if task is None else "observing",
-            "task": task, "remote_status": "unknown" if task is None else "unconfirmed",
+            "status": "terminal" if remote_status == "terminal" else "observing",
+            "task": task, "remote_status": remote_status,
+            "history": history,
         })
 
     def start(self, command: list[str], *, require_execution: bool = False, **options: Any) -> OwnedProcess:
@@ -1117,10 +1172,25 @@ class Execution:
         supplied_environment = options.pop("env", None)
         env = dict(os.environ if supplied_environment is None else supplied_environment)
         env[PARENT_ENV] = str(request)
+        result_file = (
+            command[command.index("--result-file") + 1]
+            if "--result-file" in command and command.index("--result-file") + 1 < len(command)
+            else None
+        )
         write(request, {
             "schema": SCHEMA, "root": str(self.root), "parent": str(self.handle),
             "child_record": str(record), "handle": str(child_handle),
             "command_sha256": digest(command),
+        }, exclusive=True)
+        write(record, {
+            "schema": SCHEMA, "run_id": self.run_id,
+            "lifecycle": "admitted", "admitted_at": time.time(),
+            "process_identity": None, "handle": str(child_handle),
+            "root": str(self.root), "command_sha256": digest(command),
+            "exit_code": None, "local_drained": False,
+            "requires_execution_result": require_execution,
+            "breakaway_requested": False,
+            "result_file": result_file,
         }, exclusive=True)
         streams = []
         try:
@@ -1129,9 +1199,25 @@ class Execution:
                     stream = (self.directory / f"child-{sequence}-{name}.log").open("wb")
                     streams.append(stream)
                     options[name] = stream
-        except BaseException:
+        except BaseException as failure:
             for stream in streams:
                 stream.close()
+            launch_error = f"{type(failure).__name__}: {failure}"
+            write(record, {
+                **read(record),
+                "lifecycle": "launch_failed",
+                "launch_failed_at": time.time(),
+                "local_drained": True,
+                "launch_error": launch_error,
+                "cleanup_errors": [],
+            })
+            self.launch_failures.append({
+                "error": launch_error,
+                "pid": None,
+                "local_drained": True,
+                "cleanup_errors": [],
+                "request": str(request),
+            })
             raise
         options.setdefault("stdin", subprocess.DEVNULL)
         options["env"] = env
@@ -1158,18 +1244,10 @@ class Execution:
                 if identity is None:
                     raise ExecutionError("child generation is unavailable")
                 write(record, {
-                    "schema": SCHEMA, "run_id": self.run_id,
-                    "process_identity": identity, "handle": str(child_handle),
-                    "root": str(self.root), "command_sha256": digest(command),
-                    "exit_code": None, "local_drained": False,
-                    "requires_execution_result": require_execution,
-                    "breakaway_requested": False,
-                    "result_file": (
-                        command[command.index("--result-file") + 1]
-                        if "--result-file" in command and command.index("--result-file") + 1 < len(command)
-                        else None
-                    ),
-                }, exclusive=True)
+                    **read(record),
+                    "lifecycle": "bound", "bound_at": time.time(),
+                    "process_identity": identity,
+                })
                 if IS_WINDOWS:
                     resume_process(process.pid)
             owned = OwnedProcess(
@@ -1230,6 +1308,19 @@ class Execution:
                     cleanup_errors.append(str(cleanup))
             for stream in streams:
                 stream.close()
+            write(record, {
+                **read(record),
+                "lifecycle": "launch_failed",
+                "launch_failed_at": time.time(),
+                "exit_code": (
+                    process.returncode
+                    if process is not None and isinstance(process.returncode, int)
+                    else None
+                ),
+                "local_drained": not cleanup_errors,
+                "launch_error": f"{type(failure).__name__}: {failure}",
+                "cleanup_errors": cleanup_errors,
+            })
             self.launch_failures.append({
                 "error": f"{type(failure).__name__}: {failure}",
                 "pid": process.pid if process is not None else None,
@@ -1381,6 +1472,7 @@ class Execution:
         evidence_errors = list(child_errors)
         records = [self.record]
         child_executions = {}
+        child_remote_uncertain = False
         for handle in self.directory.rglob("handle-*.json"):
             try:
                 child = load_handle(handle)
@@ -1389,6 +1481,8 @@ class Execution:
                 records.append(child)
                 terminal = status(handle)
                 child_executions[str(handle)] = child
+                if terminal.get("remote_work_may_continue") is True:
+                    child_remote_uncertain = True
                 if terminal.get("terminal") is True:
                     retained.append({
                         "path": terminal["result_file"], "sha256": terminal["result_sha256"],
@@ -1404,6 +1498,7 @@ class Execution:
             except (OSError, ValueError, KeyError, ExecutionError) as failure:
                 evidence_errors.append(f"{handle}: {failure}")
         state_paths = sorted({path for record in records for path in record.get("domain_states", [])})
+        state_remote_identity = False
         for path in state_paths:
             source = Path(path)
             if source.is_file():
@@ -1412,6 +1507,8 @@ class Execution:
                     value = read(source)
                     if value.get("schema") == "github.copilot.dispatch-observation.v1":
                         remote_tasks.append({**value, "evidence": path})
+                    elif isinstance(value.get("task_id"), str) and value["task_id"]:
+                        state_remote_identity = True
                 except (OSError, ValueError, ExecutionError) as failure:
                     evidence_errors.append(f"{path}: {failure}")
             else:
@@ -1421,12 +1518,34 @@ class Execution:
         for source in child_records:
             try:
                 record = read(source)
+                lifecycle = record.get("lifecycle")
+                if lifecycle == "launch_failed":
+                    if (
+                        record.get("schema") != SCHEMA
+                        or record.get("root") != str(self.root)
+                        or record.get("run_id") != self.run_id
+                        or not isinstance(record.get("handle"), str)
+                        or not isinstance(record.get("command_sha256"), str)
+                    ):
+                        raise ExecutionError(
+                            "failed child launch receipt belongs to a different execution"
+                        )
+                    retained.append({
+                        "path": str(source),
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    })
+                    if record.get("local_drained") is not True:
+                        evidence_errors.append(
+                            f"failed child launch did not drain locally: {source}"
+                        )
+                    continue
                 handle = record.get("handle")
                 child = child_executions.get(handle) if isinstance(handle, str) else None
                 if record.get("requires_execution_result") or child is not None:
                     if (
                         record.get("schema") != SCHEMA
                         or record.get("root") != str(self.root) or record.get("run_id") != self.run_id
+                        or lifecycle not in {"bound", "draining", "drained", "drain_failed"}
                     ):
                         raise ExecutionError("child launch receipt belongs to a different execution")
                     if (
@@ -1486,6 +1605,28 @@ class Execution:
             not code and not error and not drainage_errors and not cancelled
             and (self.root != self.handle or outcome in self.terminal_results)
         )
+        remote_observations_uncertain = any(
+            task.get("remote_status") != "terminal" for task in remote_tasks
+        )
+        remote_work_may_continue = (
+            child_remote_uncertain
+            or remote_observations_uncertain
+            or bool(drainage_errors or evidence_errors or forced_cleanup_errors)
+            or (
+                not confirmed
+                and (
+                    state_remote_identity
+                    or isinstance((self.last_result or {}).get("task_id"), str)
+                )
+            )
+        )
+        remote_status = (
+            "unconfirmed"
+            if remote_work_may_continue else
+            "terminal"
+            if remote_tasks else
+            "not_dispatched"
+        )
         payload = {
             "schema": SCHEMA, "run_id": self.run_id, "owner": self.owner,
             "terminal": True, "exit_code": code, "error": error,
@@ -1498,8 +1639,8 @@ class Execution:
             "local_children_drained": not drainage_errors,
             "drainage_errors": drainage_errors,
             "finalization_errors": [*forced_cleanup_errors, *evidence_errors],
-            "remote_status": "see_workflow_result" if confirmed else "unconfirmed",
-            "remote_work_may_continue": not confirmed,
+            "remote_status": remote_status,
+            "remote_work_may_continue": remote_work_may_continue,
             "workflow_result": self.last_result,
             "presentation": presentation,
             "domain_states": state_paths,

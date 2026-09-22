@@ -4340,7 +4340,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "complete",
     "partial",
 })
-EXECUTION_SHA256 = "c545a2de1dda55ef3b930c21d7e90a1513079076aed94ccfbb73429a26ea726f"
+EXECUTION_SHA256 = "d61d298d15687181eaef3dfd98f83cd62c6222a95ceb262d2336fba3a1d1a828"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

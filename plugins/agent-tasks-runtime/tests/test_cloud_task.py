@@ -1016,5 +1016,55 @@ class CurrentRuntimeApiTest(unittest.TestCase):
                 )
 
 
+class ManagedResultPersistenceTest(unittest.TestCase):
+    def test_unexpected_failure_writes_terminal_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            options = SimpleNamespace(result_file=result_path)
+            with (
+                mock.patch.object(MODULE, "parse_args", return_value=options),
+                mock.patch.object(
+                    MODULE, "execute", side_effect=RuntimeError("helper failed")
+                ),
+            ):
+                code = MODULE.main(
+                    ["--result-file", str(result_path)],
+                    stderr=io.StringIO(),
+                )
+
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(2, code)
+            self.assertEqual("error", result["status"])
+            self.assertEqual("unexpected_helper_error", result["error"]["code"])
+
+    def test_runtime_bootstrap_failure_writes_terminal_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.json"
+            with (
+                mock.patch.dict(
+                    MODULE.os.environ,
+                    {"TRASK_EXECUTION_PARENT": str(Path(directory) / "parent.json")},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    MODULE.sys,
+                    "argv",
+                    ["cloud_task.py", "--result-file", str(result_path)],
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_load_execution",
+                    side_effect=RuntimeError("runtime unavailable"),
+                ),
+            ):
+                code = MODULE.execution_main()
+
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(2, code)
+            self.assertEqual(
+                "execution_runtime_unavailable", result["error"]["code"]
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

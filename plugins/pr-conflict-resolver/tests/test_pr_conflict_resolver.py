@@ -937,7 +937,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "28c08df797894f35a5b21d08f5f66fbafeb34895597a1c0fed67cbc5a22fed13",
+            "9e4bfc2017fa3efa5e481364d8a311619e8a624020ece87ba355d3f19f18ae6e",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -1388,6 +1388,9 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual("invocation_abandoned", payload["result"])
         self.assertEqual(task["process"], payload["process"])
         self.assertNotIn("retry_command", payload)
+        result = json.loads(Path(task["result_file"]).read_text(encoding="utf-8"))
+        self.assertEqual("error", result["status"])
+        self.assertEqual("managed_task_result_missing", result["error"]["code"])
 
     def test_unreadable_result_retains_process_diagnostics_without_replacement(self):
         directory = temporary_directory(self)
@@ -4477,6 +4480,35 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertFalse(result_path.exists())
         self.assertIn("could not write result file", stderr.getvalue())
+
+    def test_runtime_bootstrap_failure_writes_terminal_result(self):
+        directory = temporary_directory(self)
+        result_path = directory / "result.json"
+        with (
+            mock.patch.dict(
+                CLOUD_MODULE.os.environ,
+                {"TRASK_EXECUTION_PARENT": str(directory / "parent.json")},
+                clear=True,
+            ),
+            mock.patch.object(
+                CLOUD_MODULE.sys,
+                "argv",
+                ["cloud_conflict_task.py", "--result-file", str(result_path)],
+            ),
+            mock.patch.object(
+                CLOUD_MODULE,
+                "_load_execution",
+                side_effect=RuntimeError("runtime unavailable"),
+            ),
+        ):
+            exit_code = CLOUD_MODULE.execution_main()
+
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(2, exit_code)
+        self.assertEqual("error", result["status"])
+        self.assertEqual(
+            "execution_runtime_unavailable", result["error"]["code"]
+        )
 
 
 class ManagedTaskWorkingDirectoryTest(unittest.TestCase):

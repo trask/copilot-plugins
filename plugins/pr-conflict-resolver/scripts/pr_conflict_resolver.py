@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "28c08df797894f35a5b21d08f5f66fbafeb34895597a1c0fed67cbc5a22fed13"
+    "9e4bfc2017fa3efa5e481364d8a311619e8a624020ece87ba355d3f19f18ae6e"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@10"
@@ -7580,6 +7580,45 @@ def managed_process_diagnostics(
     }
 
 
+def write_missing_managed_result(
+    path: Path,
+    request: dict[str, Any],
+) -> None:
+    atomic_write_text(
+        path,
+        canonical_json(
+            {
+                "schema": CONFLICT_RESULT_SCHEMA,
+                "status": "error",
+                "error": {
+                    "code": "managed_task_result_missing",
+                    "message": "managed conflict helper exited without a result",
+                },
+                "model": request["model"],
+                "policy": CONFLICT_POLICY_IDENTITY,
+                "repository": request["repository"],
+                "task": {
+                    "id": None,
+                    "url": None,
+                    "state": None,
+                    "base_ref": None,
+                    "base_sha": None,
+                },
+                "mode": "conflict_with_report",
+                "strategy": request["strategy"],
+                "request": {
+                    "id": request["request_id"],
+                    "sha256": request["request_sha256"],
+                },
+                "pull_request": request["pull_request"],
+                "generated": {"artifact": None, "code_refs": []},
+                "application": {"status": "not_started"},
+            }
+        )
+        + "\n",
+    )
+
+
 def discover_conflict_task() -> Path:
     helper = Path(__file__).resolve().with_name(CONFLICT_TASK_FILENAME)
     if (
@@ -9926,29 +9965,8 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
         )
         return
     if not result_path.is_file():
-        task["status"] = "interrupted"
-        task["task_id"] = None
-        task["task_id_status"] = "unknown"
         task["process"] = managed_process_diagnostics(process)
-        task["error"] = {
-            "code": "managed_task_result_missing",
-            "message": "managed conflict helper returned no result file",
-        }
-        save_state(state_path, state)
-        output(
-            {
-                "result": "invocation_abandoned",
-                "state": str(state_path),
-                "task_id": None,
-                "task_id_status": task["task_id_status"],
-                "error": task["error"],
-                "process": task["process"],
-                "audit_files": task["audit_files"],
-                "next_action": "Start a fresh invocation.",
-                "stage_outcome": "escalated",
-            }
-        )
-        return
+        write_missing_managed_result(result_path, preflight["request"])
     try:
         result = load_conflict_result(result_path)
     except WorkflowError as error:
@@ -9993,13 +10011,20 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             if isinstance(result.get("task"), dict)
             else None
         )
-        task["status"] = "interrupted" if task_id else "failed"
+        unknown_task_identity = code == "managed_task_result_missing"
+        task["status"] = "interrupted" if task_id or unknown_task_identity else "failed"
         task["task_id"] = task_id
-        task["task_id_status"] = "known" if task_id else "not_created"
+        task["task_id_status"] = (
+            "known" if task_id else "unknown" if unknown_task_identity else "not_created"
+        )
         task["error"] = {"code": code, "message": message}
         save_state(state_path, state)
         payload = {
-            "result": "invocation_abandoned" if task_id else "task_creation_failed",
+            "result": (
+                "invocation_abandoned"
+                if task_id or unknown_task_identity
+                else "task_creation_failed"
+            ),
             "state": str(state_path),
             "task_id": task_id,
             "task_id_status": task["task_id_status"],
@@ -10007,6 +10032,8 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             "audit_files": task["audit_files"],
             "stage_outcome": "escalated",
         }
+        if "process" in task:
+            payload["process"] = task["process"]
         output(payload)
         return
     code_refs, artifact = validate_conflict_result_identity(
@@ -10510,7 +10537,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "c545a2de1dda55ef3b930c21d7e90a1513079076aed94ccfbb73429a26ea726f"
+EXECUTION_SHA256 = "d61d298d15687181eaef3dfd98f83cd62c6222a95ceb262d2336fba3a1d1a828"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 
