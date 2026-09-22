@@ -37,7 +37,7 @@ EXPECTED_PACKAGE_VERSIONS = {
     "ci-fix-loop": "1.6.70",
     "copilot-review-loop": "1.1.80",
     "historical-pr-audit": "1.1.34",
-    "pr-conflict-resolver": "1.1.48",
+    "pr-conflict-resolver": "1.1.49",
     "pr-description": "1.0.79",
     "pr-pipeline": "1.5.50",
     "pr-reviewer": "1.8.23",

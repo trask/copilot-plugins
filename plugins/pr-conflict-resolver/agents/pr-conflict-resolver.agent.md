@@ -1,7 +1,7 @@
 ---
 name: PR Conflict Resolver
 description: "Explicit invocation only: never select automatically; resolve one pull request or its complete native stack through verified hosted conflict work."
-argument-hint: "PR URL, owner/repo#number, or PR number; omit only from an attached PR worktree"
+argument-hint: "PR URL or owner/repo#number; omit from an attached PR worktree"
 tools: [execute]
 user-invocable: true
 disable-model-invocation: true
@@ -11,15 +11,15 @@ Run only when the user explicitly selects PR Conflict Resolver or invokes its co
 
 Use this agent only with model `gpt-5.6-sol`. If the runtime exposes reasoning effort, require `high`. Stop when the model is different or cannot be determined. An unavailable effort value is allowed.
 
-Run the bundled helper once through the official execution tool:
+Run the bundled helper once through the official execution tool. In an attached PR worktree, omit the target even when the activation names the PR by number:
 
 ```text
-python "<installed-pr-conflict-resolver>/scripts/pr_conflict_resolver.py" run <target>
+python "<installed-pr-conflict-resolver>/scripts/pr_conflict_resolver.py" run
 ```
 
-Use `python3` on POSIX when needed. Pass `--strategy merge` or `--strategy rebase` only when the user explicitly chose it. Otherwise omit the option and use `auto`. A bare PR number resolves from the current workspace. The helper derives the repository, run identity, state paths, Sol worker model, and three-attempt limit.
+Outside an attached PR worktree, append the supplied PR URL or `owner/repo#number`. Never pass a bare PR number. Use `python3` on POSIX when needed. The installed helper is under `.copilot/installed-plugins/trask-plugins/pr-conflict-resolver` in the user's home directory; do not search recursively for it. Pass `--strategy merge` or `--strategy rebase` only when the user explicitly chose it. Otherwise omit the option and use `auto`. The helper derives the repository, run identity, state paths, Sol worker model, and three-attempt limit.
 
-Keep the Python controller in the foreground. Use the execution tool's asynchronous mode, and set `detach: true` only when the user explicitly asks the run to survive client exit. Do not imitate detachment with shell syntax. The shared Runtime owns execution records, child processes, cancellation, and terminal evidence. Do not create paths, pass execution handles, inspect internal state, or reconstruct a result from process exit codes.
+Invoke that command directly and synchronously through the execution tool. Keep the Python controller in the foreground. Do not use asynchronous mode, background execution, shell backgrounding, detach, `ProcessStartInfo`, or a wrapper command. Do not send a user-visible response while the command is running. The shared Runtime owns execution records, child processes, cancellation, and terminal evidence. Do not create paths, pass execution handles, inspect internal state, relaunch, or reconstruct a result from process exit codes.
 
 The helper first proves a clean checkout at the exact PR head. An exact attached branch or detached head is reused. A different branch, stale head, dirty tree, or changed checkout blocks.
 
@@ -31,6 +31,6 @@ The helper rechecks task provenance, model, prompt and request digests, source i
 
 This agent may push only verified conflict-resolution commits to the selected PR branch or the complete native stack. It must not merge or approve pull requests, change draft state, post comments or reviews, edit labels, or use a local conflict-resolution fallback.
 
-Only the Runtime's verified terminal `workflow_result` establishes the outcome. Preserve `published`, `mergeable`, `head_changed`, blocked, exhausted, cancelled, and failed results exactly. Do not call a nonzero exit, missing terminal result, unreadable evidence, or unknown remote task successful.
+Only the Runtime's verified terminal `workflow_result` establishes the outcome. Preserve `published`, `mergeable`, `head_changed`, blocked, exhausted, cancelled, and failed results exactly. A nonzero process exit can still carry the verified terminal failure result and presentation. A missing, abandoned, unreadable, or unsealed result is unknown. There is no intermediate user-visible outcome.
 
 Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.

@@ -1007,10 +1007,10 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_run_parser_exposes_only_target_and_strategy(self):
         parser = MODULE.build_parser()
         parsed = parser.parse_args(
-            ["run", "7", "--strategy", "rebase"]
+            ["run", "--strategy", "rebase"]
         )
         self.assertIs(parsed.function, MODULE.command_run)
-        self.assertEqual("7", parsed.target)
+        self.assertIsNone(parsed.target)
         self.assertEqual("rebase", parsed.strategy)
         for obsolete in (
             "--repo-root",
@@ -1895,6 +1895,27 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertIn("consumes its attempt", self.instructions)
         self.assertIn("never adopted into a new run", self.instructions)
 
+    def test_agent_avoids_the_lost_async_terminal_result_path(self):
+        self.assertIn(
+            'pr_conflict_resolver.py" run\n```',
+            self.instructions,
+        )
+        self.assertIn(
+            "omit the target even when the activation names the PR by number",
+            self.instructions,
+        )
+        self.assertIn("Never pass a bare PR number", self.instructions)
+        self.assertIn("do not search recursively for it", self.instructions)
+        self.assertIn("directly and synchronously", self.instructions)
+        self.assertIn(
+            "A nonzero process exit can still carry the verified terminal "
+            "failure result and presentation",
+            self.instructions,
+        )
+        self.assertIn("There is no intermediate user-visible outcome", self.instructions)
+        self.assertNotIn("execution tool's asynchronous mode", self.instructions)
+        self.assertNotIn("execution-status", self.instructions)
+
 
     def test_success_result_requires_exact_request_and_task_identity(self):
         request = self.request()
@@ -2146,6 +2167,22 @@ class TargetParsingTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(MODULE.WorkflowError):
                     MODULE.parse_target(value)
+
+    def test_run_help_does_not_advertise_the_rejected_bare_number(self):
+        parser = MODULE.build_parser()
+        run_parser = next(
+            action
+            for action in parser._actions
+            if isinstance(action, MODULE.argparse._SubParsersAction)
+        ).choices["run"]
+        target = next(
+            action for action in run_parser._actions if action.dest == "target"
+        )
+        self.assertEqual(
+            "PR URL or owner/repo#number; omit from a worktree attached to "
+            "the pull request branch",
+            target.help,
+        )
 
     def test_state_path_encodes_the_target(self):
         path = MODULE.default_state_path(MODULE.parse_target("owner/repo#9"))

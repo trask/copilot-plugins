@@ -10417,8 +10417,8 @@ def build_parser() -> argparse.ArgumentParser:
         "target",
         nargs="?",
         help=(
-            "PR URL, owner/repo#number, or a bare number; omit only from a "
-            "worktree attached to the pull request branch"
+            "PR URL or owner/repo#number; omit from a worktree attached to "
+            "the pull request branch"
         ),
     )
     run.add_argument("--strategy", choices=list(STRATEGIES), default="auto")
