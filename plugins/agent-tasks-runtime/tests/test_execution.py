@@ -233,10 +233,25 @@ class ExecutionTest(unittest.TestCase):
 
     def test_parent_managed_command_routes_without_agent_allowlist_entry(self):
         namespace = {}
+        request = self.root / "request.json"
+        record = self.root / "child.json"
+        handle = self.root / "child-handle.json"
+        EXECUTION.write(request, {
+            "schema": EXECUTION.SCHEMA,
+            "root": str(self.handle),
+            "child_record": str(record),
+            "handle": str(handle),
+        })
+        EXECUTION.write(record, {
+            "schema": EXECUTION.SCHEMA,
+            "root": str(self.handle),
+            "handle": str(handle),
+            "requires_execution_result": True,
+        })
         with (
             mock.patch.dict(
                 EXECUTION.os.environ,
-                {EXECUTION.PARENT_ENV: str(self.root / "request.json")},
+                {EXECUTION.PARENT_ENV: str(request)},
                 clear=True,
             ),
             mock.patch.object(
@@ -260,6 +275,42 @@ class ExecutionTest(unittest.TestCase):
             run_id=None,
             commands=("run",),
         )
+
+    def test_parent_unmanaged_command_preserves_direct_stdout_contract(self):
+        request = self.root / "request.json"
+        record = self.root / "child.json"
+        handle = self.root / "child-handle.json"
+        EXECUTION.write(request, {
+            "schema": EXECUTION.SCHEMA,
+            "root": str(self.handle),
+            "child_record": str(record),
+            "handle": str(handle),
+        })
+        EXECUTION.write(record, {
+            "schema": EXECUTION.SCHEMA,
+            "root": str(self.handle),
+            "handle": str(handle),
+            "requires_execution_result": False,
+        })
+        with (
+            mock.patch.dict(
+                EXECUTION.os.environ,
+                {EXECUTION.PARENT_ENV: str(request)},
+                clear=True,
+            ),
+            mock.patch.object(
+                sys, "argv", ["controller.py", "status", "--state", "state.json"]
+            ),
+            mock.patch.object(EXECUTION, "controller_main") as controller,
+        ):
+            self.assertEqual(
+                17,
+                EXECUTION.entrypoint(
+                    lambda: 17, {}, commands=("run",)
+                ),
+            )
+
+        controller.assert_not_called()
 
     def test_execution_artifacts_cannot_enter_an_explicit_target_checkout(self):
         target = self.root / "target"

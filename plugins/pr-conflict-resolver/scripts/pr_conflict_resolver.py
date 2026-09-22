@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "ddb7a1c90f964ed86b405523973f32a636c11d9c45fa364f407fe9b7b8d286c0"
+    "efd69033c799fe482793266932ddeb531b43d1e89a56105c4ccb46fdd46a94b8"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@10"
@@ -10537,7 +10537,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "27fa66f9d2245e984771bb215d0d24e86747dc6aaa75e01e120c400d1e91ab77"
+EXECUTION_SHA256 = "2972a39513197ad0ffbaed94e608f3084d297d3ede86bbe6283df8c711a510c3"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

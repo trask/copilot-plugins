@@ -2061,8 +2061,25 @@ def entrypoint(main: Callable[[], int], namespace: dict[str, Any], *,
     ):
         raise ExecutionError("--execution-handle is not supported")
     controls = {"execution-status", "execution-cancel"}
+    parent_requires_execution = False
+    parent_text = os.environ.get(PARENT_ENV)
+    if parent_text:
+        request = read(Path(parent_text))
+        child_record = request.get("child_record")
+        if not isinstance(child_record, str):
+            raise ExecutionError("child execution request has no launch receipt")
+        receipt = read(Path(child_record))
+        if (
+            receipt.get("schema") != SCHEMA
+            or receipt.get("handle") != request.get("handle")
+            or receipt.get("root") != request.get("root")
+        ):
+            raise ExecutionError("child execution launch receipt is invalid")
+        parent_requires_execution = (
+            receipt.get("requires_execution_result") is True
+        )
     if (
-        not os.environ.get(PARENT_ENV)
+        not parent_requires_execution
         and (not arguments or arguments[0] not in {*commands, *controls})
     ):
         return main()
