@@ -2874,7 +2874,7 @@ def main(
 
 
 _EXECUTION = None
-EXECUTION_SHA256 = "248cc03692aaa456618a666e859c7decb8053363349fbaa46cfcc568e9142a6e"
+EXECUTION_SHA256 = "d26f8813ced87aee12b0dec3008f5fc554486c757b05b1758670b4791a330f8e"
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""

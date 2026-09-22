@@ -12,7 +12,12 @@ entrypoints pin its source bytes. Pipeline and Conflict use this library for
 local execution without changing Conflict's dedicated hosted backend. It
 supplies fresh generation-bound root and child identities, file-backed output
 and canonical terminal results, optional read-only status and explicit local
-cancellation. Windows
+cancellation. Installed custom-agent commands derive fresh root handles under
+the current agent session's canonical files directory. `execution-status` and
+`execution-cancel` take no arguments and select only roots owned by that session
+and helper; callers cannot supply or recover a handle. Historical roots are
+control evidence only and never authorize, block, recover or replace a fresh
+launch. Windows
 binds the suspended direct child's exact handle, job, generation and image
 before resume. Completion uses that retained binding and the handle's signaled
 state, with unavailable post-exit image data recorded explicitly. The verified

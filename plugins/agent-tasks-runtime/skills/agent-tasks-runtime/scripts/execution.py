@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -18,6 +19,7 @@ import uuid
 
 SCHEMA = "github.copilot.foreground-execution.v1"
 PARENT_ENV = "TRASK_EXECUTION_PARENT"
+SESSION_ENV = "COPILOT_AGENT_SESSION_ID"
 IS_WINDOWS = os.name == "nt"
 FORCED_DRAINAGE_ERROR = "owned Windows job required forced drainage"
 
@@ -38,6 +40,123 @@ def digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _same_path(left: Path | str, right: Path | str) -> bool:
+    return os.path.normcase(str(left)) == os.path.normcase(str(right))
+
+
+def _canonical_directory(path: Path, description: str) -> Path:
+    absolute = Path(os.path.abspath(path.expanduser()))
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError as failure:
+        raise ExecutionError(f"{description} is unavailable: {absolute}") from failure
+    if not resolved.is_dir() or not _same_path(absolute, resolved):
+        raise ExecutionError(f"{description} must be a canonical directory: {absolute}")
+    current = absolute
+    while True:
+        if current.is_symlink():
+            raise ExecutionError(f"{description} must not contain symlinks: {absolute}")
+        if current == current.parent:
+            break
+        current = current.parent
+    return resolved
+
+
+def _session_files() -> tuple[str, Path]:
+    if SESSION_ENV not in os.environ:
+        raise ExecutionError(f"{SESSION_ENV} is required for execution controls")
+    session_text = os.environ[SESSION_ENV]
+    try:
+        session = uuid.UUID(session_text)
+    except (AttributeError, ValueError) as failure:
+        raise ExecutionError(f"{SESSION_ENV} must be a canonical UUID") from failure
+    if session_text != str(session):
+        raise ExecutionError(f"{SESSION_ENV} must be a canonical UUID")
+    copilot_home = Path.home() / ".copilot"
+    files = _canonical_directory(
+        copilot_home / "session-state" / session_text / "files",
+        "agent session files directory",
+    )
+    return session_text, files
+
+
+def _helper_identity() -> dict[str, str]:
+    source = Path(sys.argv[0])
+    absolute = Path(os.path.abspath(source))
+    try:
+        helper = absolute.resolve(strict=True)
+    except OSError as failure:
+        raise ExecutionError(f"custom-agent helper is unavailable: {absolute}") from failure
+    if (
+        not helper.is_file()
+        or absolute.is_symlink()
+        or not _same_path(absolute, helper)
+    ):
+        raise ExecutionError(f"custom-agent helper must be a canonical regular file: {absolute}")
+    return {
+        "path": str(helper),
+        "sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+    }
+
+
+def _owned_prefix(helper: dict[str, str]) -> str:
+    return f"execution-{digest(helper)[:16]}-"
+
+
+def _validate_new_route(
+    handle: Path, command: list[str], route: dict[str, Any]
+) -> None:
+    if len(command) < 3 or not all(isinstance(argument, str) for argument in command):
+        raise ExecutionError("custom-agent command identity is invalid")
+    session_id, files = _session_files()
+    helper = _helper_identity()
+    prefix = _owned_prefix(helper)
+    if (
+        route != {
+            "session_id": session_id,
+            "session_files": str(files),
+            "helper": helper,
+            "command": command[2],
+            "command_sha256": digest(command),
+        }
+        or handle.parent != files
+        or not handle.name.startswith(prefix)
+        or not handle.name.endswith(".json")
+        or handle.exists()
+        or handle.with_name(handle.name + ".d").exists()
+    ):
+        raise ExecutionError("derived execution route is invalid or not fresh")
+    generation = handle.name[len(prefix):-5]
+    try:
+        if uuid.UUID(hex=generation).hex != generation:
+            raise ValueError
+    except ValueError as failure:
+        raise ExecutionError("derived execution generation is invalid") from failure
+
+
+def _owned_route(command: list[str]) -> tuple[Path, dict[str, Any]]:
+    session_id, files = _session_files()
+    helper = _helper_identity()
+    if (
+        len(command) < 3
+        or not all(isinstance(argument, str) for argument in command)
+        or not _same_path(command[1], helper["path"])
+    ):
+        raise ExecutionError("custom-agent command identity is invalid")
+    route = {
+        "session_id": session_id,
+        "session_files": str(files),
+        "helper": helper,
+        "command": command[2],
+        "command_sha256": digest(command),
+    }
+    for _ in range(16):
+        handle = files / f"{_owned_prefix(helper)}{uuid.uuid4().hex}.json"
+        if not handle.exists() and not handle.with_name(handle.name + ".d").exists():
+            return handle, route
+    raise ExecutionError("could not derive a fresh execution handle")
 
 
 def read(path: Path) -> dict[str, Any]:
@@ -820,9 +939,12 @@ class OwnedProcess:
 
 class Execution:
     def __init__(self, handle: Path, *, command: list[str], parent: Path | None = None,
-                 run_id: str | None = None, terminal_results: frozenset[str] = frozenset()) -> None:
+                 run_id: str | None = None, terminal_results: frozenset[str] = frozenset(),
+                 route: dict[str, Any] | None = None) -> None:
         if not handle.is_absolute() or handle.is_symlink():
             raise ExecutionError("execution handle must be a fresh absolute regular path")
+        if route is not None:
+            _validate_new_route(handle, command, route)
         for index, argument in enumerate(command):
             target = None
             if argument == "--repo-root" and index + 1 < len(command):
@@ -889,6 +1011,8 @@ class Execution:
             "progress": str(self.directory / "progress.jsonl"),
             "cancel": str(self.directory / "cancel.json"),
         }
+        if route is not None:
+            self.record["route"] = route
         write(self.handle, self.record, exclusive=True)
 
     def check_cancel(self) -> None:
@@ -1360,6 +1484,138 @@ def load_handle(path: Path) -> dict[str, Any]:
     return value
 
 
+def _owned_root(
+    path: Path,
+    *,
+    session_id: str,
+    files: Path,
+    helper: dict[str, str],
+    commands: tuple[str, ...],
+) -> dict[str, Any]:
+    prefix = _owned_prefix(helper)
+    if path.parent != files or not path.name.startswith(prefix) or not path.name.endswith(".json"):
+        raise ExecutionError(f"foreign execution record: {path}")
+    generation = path.name[len(prefix):-5]
+    try:
+        if uuid.UUID(hex=generation).hex != generation:
+            raise ValueError
+    except ValueError as failure:
+        raise ExecutionError(f"malformed execution record name: {path}") from failure
+    try:
+        value = load_handle(path)
+        route = value["route"]
+        directory = path.with_name(path.name + ".d")
+        if (
+            path.is_symlink()
+            or not _same_path(path.resolve(strict=True), path)
+            or value.get("root") != str(path)
+            or value.get("parent_request") is not None
+            or route.get("session_id") != session_id
+            or route.get("session_files") != str(files)
+            or route.get("helper") != helper
+        ):
+            raise ExecutionError(f"foreign execution record: {path}")
+        if (
+            not isinstance(route.get("command"), str)
+            or route["command"] not in commands
+            or not isinstance(route.get("command_sha256"), str)
+            or len(route["command_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in route["command_sha256"]
+            )
+            or route["command_sha256"] != value.get("command_sha256")
+        ):
+            raise ExecutionError(f"execution command identity is invalid: {path}")
+        if (
+            not isinstance(value.get("run_id"), str)
+            or uuid.UUID(hex=value["run_id"]).hex != value["run_id"]
+            or not same_process(value.get("owner"), value.get("owner"))
+            or not isinstance(value.get("started_at"), (int, float))
+            or isinstance(value.get("started_at"), bool)
+            or not math.isfinite(value["started_at"])
+            or value["started_at"] <= 0
+            or value.get("mode") != "foreground"
+            or value.get("status")
+            not in {"starting", "ready", "finished", "failed", "cancelled_local"}
+        ):
+            raise ExecutionError(f"execution generation identity is invalid: {path}")
+        if (
+            directory.is_symlink()
+            or not _same_path(directory.resolve(strict=True), directory)
+            or any(
+                value.get(name) != str(directory / filename)
+                for name, filename in {
+                    "result": "result.json",
+                    "stdout": "stdout.log",
+                    "stderr": "stderr.log",
+                    "progress": "progress.jsonl",
+                    "cancel": "cancel.json",
+                }.items()
+            )
+        ):
+            raise ExecutionError(f"execution artifact identity is invalid: {path}")
+        return value
+    except ExecutionError:
+        raise
+    except (KeyError, OSError, TypeError, ValueError) as failure:
+        raise ExecutionError(f"malformed execution record: {path}") from failure
+
+
+def _owned_roots(commands: tuple[str, ...]) -> tuple[
+    list[tuple[Path, dict[str, Any], dict[str, Any]]],
+    list[tuple[Path, dict[str, Any], dict[str, Any]]],
+]:
+    session_id, files = _session_files()
+    helper = _helper_identity()
+    live = []
+    terminal = []
+    for path in sorted(files.glob(f"{_owned_prefix(helper)}*.json")):
+        value = _owned_root(
+            path, session_id=session_id, files=files, helper=helper, commands=commands
+        )
+        current = status(path)
+        if current.get("terminal") is True:
+            finished_at = current.get("finished_at")
+            if (
+                not isinstance(finished_at, (int, float))
+                or isinstance(finished_at, bool)
+                or not math.isfinite(finished_at)
+                or finished_at < value["started_at"]
+            ):
+                raise ExecutionError(f"terminal execution timestamp is invalid: {path}")
+            terminal.append((path, value, current))
+            continue
+        observed = process_identity(value["owner"]["pid"])
+        if same_process(value["owner"], observed) and observed["running"]:
+            live.append((path, value, current))
+    return live, terminal
+
+
+def _owned_control(control: str, commands: tuple[str, ...]) -> dict[str, Any]:
+    live, terminal = _owned_roots(commands)
+    if len(live) > 1:
+        raise ExecutionError("multiple live executions belong to the current session and helper")
+    if control == "execution-cancel":
+        if len(live) != 1:
+            raise ExecutionError(
+                "execution-cancel requires exactly one live execution "
+                "owned by the current session and helper"
+            )
+        return cancel(live[0][0])
+    if live:
+        return live[0][2]
+    if not terminal:
+        raise ExecutionError(
+            "no live or terminal execution belongs to the current session and helper"
+        )
+    latest = max(item[2]["finished_at"] for item in terminal)
+    selected = [item for item in terminal if item[2]["finished_at"] == latest]
+    if len(selected) != 1:
+        raise ExecutionError("latest terminal execution evidence is ambiguous")
+    return selected[0][2]
+
+
 def status(path: Path) -> dict[str, Any]:
     value = load_handle(path)
     result = Path(value["result"])
@@ -1431,13 +1687,15 @@ def cancel(path: Path) -> dict[str, Any]:
 
 
 def controller_main(main: Callable[[], int], namespace: dict[str, Any], *,
-                    handle: Path | None = None, run_id: str | None = None) -> int:
+                    handle: Path | None = None, run_id: str | None = None,
+                    commands: tuple[str, ...] = ()) -> int:
     arguments = list(sys.argv[1:])
     if arguments and arguments[0] in {"execution-status", "execution-cancel"}:
-        if len(arguments) != 3 or arguments[1] != "--handle":
-            raise ExecutionError("execution control requires exactly --handle <absolute-path>")
-        operation = status if arguments[0] == "execution-status" else cancel
-        print(json.dumps(operation(Path(arguments[2])), sort_keys=True))
+        if len(arguments) != 1:
+            raise ExecutionError("execution controls take no arguments")
+        if os.environ.get(PARENT_ENV):
+            raise ExecutionError("child execution cannot invoke root execution controls")
+        print(json.dumps(_owned_control(arguments[0], commands), sort_keys=True))
         return 0
     parent_text = os.environ.get(PARENT_ENV)
     parent = Path(parent_text) if parent_text else None
@@ -1445,10 +1703,14 @@ def controller_main(main: Callable[[], int], namespace: dict[str, Any], *,
         if handle is not None:
             raise ExecutionError("child execution cannot choose a root handle")
         handle = Path(read(parent)["handle"])
+    route = None
+    command = [sys.executable, str(Path(sys.argv[0]).resolve()), *arguments]
+    if parent is None and SESSION_ENV in os.environ:
+        handle, route = _owned_route(command)
+        run_id = None
     if handle is None:
         return main()
-    context = Execution(handle, command=[sys.executable, str(Path(sys.argv[0]).resolve()), *arguments],
-                        parent=parent, run_id=run_id,
+    context = Execution(handle, command=command, parent=parent, run_id=run_id, route=route,
                         terminal_results=frozenset(namespace.get("EXECUTION_TERMINAL_RESULTS", ())))
     namespace["_EXECUTION"] = context
     common = namespace.get("common")
@@ -1499,16 +1761,14 @@ def entrypoint(main: Callable[[], int], namespace: dict[str, Any], *,
                commands: tuple[str, ...], sealed_handle: Path | None = None,
                run_id: str | None = None) -> int:
     arguments = sys.argv[1:]
+    if any(
+        argument == "--execution-handle" or argument.startswith("--execution-handle=")
+        for argument in arguments
+    ):
+        raise ExecutionError("--execution-handle is not supported")
     controls = {"execution-status", "execution-cancel"}
     if not arguments or arguments[0] not in {*commands, *controls}:
         return main()
-    handle = sealed_handle
-    if "--execution-handle" in arguments:
-        if arguments.count("--execution-handle") != 1 or sealed_handle is not None:
-            raise ExecutionError("choose exactly one execution handle")
-        index = sys.argv.index("--execution-handle")
-        if index + 1 >= len(sys.argv):
-            raise ExecutionError("--execution-handle requires an absolute path")
-        handle = Path(sys.argv[index + 1])
-        del sys.argv[index:index + 2]
-    return controller_main(main, namespace, handle=handle, run_id=run_id)
+    return controller_main(
+        main, namespace, handle=sealed_handle, run_id=run_id, commands=commands
+    )

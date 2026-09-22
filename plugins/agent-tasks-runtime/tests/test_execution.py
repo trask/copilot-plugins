@@ -4,6 +4,7 @@ import io
 import json
 import ctypes
 import concurrent.futures
+from contextlib import redirect_stdout
 from pathlib import Path
 import subprocess
 import sys
@@ -37,6 +38,22 @@ class ExecutionTest(unittest.TestCase):
     def context(self):
         return EXECUTION.Execution(self.handle, command=["python", "controller.py"],
                                    terminal_results=frozenset({"complete"}))
+
+    def owned_environment(self, session_id="12345678-1234-4234-8234-123456789abc"):
+        home = self.root / ".copilot"
+        files = home / "session-state" / session_id / "files"
+        files.mkdir(parents=True)
+        helper = self.root / "helper.py"
+        helper.write_text("pass\n", encoding="utf-8")
+        return helper, files, {
+            EXECUTION.SESSION_ENV: session_id,
+        }
+
+    def owned_context(self, helper, command, *, terminal_results=frozenset({"complete"})):
+        handle, route = EXECUTION._owned_route(command)
+        return EXECUTION.Execution(
+            handle, command=command, route=route, terminal_results=terminal_results
+        )
 
     def windows_owned(self, process, owner, record, streams=None):
         identity = EXECUTION.read(record)["process_identity"]
@@ -95,6 +112,116 @@ class ExecutionTest(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.context()
         self.assertEqual(before, self.handle.read_bytes())
+
+    def test_installed_agent_derives_a_fresh_session_owned_root_each_time(self):
+        helper, files, environment = self.owned_environment()
+        namespace = {"EXECUTION_TERMINAL_RESULTS": frozenset({"complete"})}
+
+        def main():
+            namespace["_EXECUTION"].emit({"result": "complete"})
+            return 0
+
+        with (
+            mock.patch.dict(EXECUTION.os.environ, environment, clear=True),
+            mock.patch.object(Path, "home", return_value=self.root),
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+        ):
+            self.assertEqual(
+                0,
+                EXECUTION.entrypoint(
+                    main, namespace, commands=("run",), sealed_handle=self.handle,
+                    run_id="caller-supplied",
+                ),
+            )
+            self.assertEqual(0, EXECUTION.entrypoint(main, namespace, commands=("run",)))
+
+        handles = sorted(files.glob("execution-*.json"))
+        self.assertEqual(2, len(handles))
+        self.assertNotEqual(handles[0], handles[1])
+        self.assertFalse(self.handle.exists())
+        for handle in handles:
+            record = EXECUTION.read(handle)
+            self.assertEqual(environment[EXECUTION.SESSION_ENV], record["route"]["session_id"])
+            self.assertEqual(str(files), record["route"]["session_files"])
+            self.assertEqual(str(helper), record["route"]["helper"]["path"])
+            self.assertEqual("run", record["route"]["command"])
+            self.assertEqual(
+                EXECUTION.digest([sys.executable, str(helper), "run"]),
+                record["route"]["command_sha256"],
+            )
+            self.assertEqual(str(handle), record["root"])
+            self.assertNotEqual("caller-supplied", record["run_id"])
+
+    def test_installed_agent_validates_session_id_and_canonical_files_path(self):
+        helper = self.root / "helper.py"
+        helper.write_text("pass\n", encoding="utf-8")
+        home = self.root / ".copilot"
+        session_id = "12345678-1234-4234-8234-123456789abc"
+        files = home / "session-state" / session_id / "files"
+        files.mkdir(parents=True)
+        original_is_symlink = Path.is_symlink
+
+        with (
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+            mock.patch.dict(
+                EXECUTION.os.environ,
+                {EXECUTION.SESSION_ENV: "not-a-uuid"},
+                clear=True,
+            ),
+            mock.patch.object(Path, "home", return_value=self.root),
+            self.assertRaisesRegex(EXECUTION.ExecutionError, "canonical UUID"),
+        ):
+            EXECUTION.entrypoint(lambda: 0, {}, commands=("run",))
+
+        with (
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+            mock.patch.dict(
+                EXECUTION.os.environ,
+                {EXECUTION.SESSION_ENV: session_id},
+                clear=True,
+            ),
+            mock.patch.object(Path, "home", return_value=self.root),
+            mock.patch.object(
+                Path,
+                "is_symlink",
+                autospec=True,
+                side_effect=lambda path: path == files or original_is_symlink(path),
+            ),
+            self.assertRaisesRegex(EXECUTION.ExecutionError, "must not contain symlinks"),
+        ):
+            EXECUTION.entrypoint(lambda: 0, {}, commands=("run",))
+
+    def test_execution_handle_argument_is_rejected_without_being_stripped(self):
+        called = False
+
+        def main():
+            nonlocal called
+            called = True
+            return 0
+
+        with (
+            mock.patch.object(
+                sys, "argv", ["controller.py", "run", "--execution-handle", str(self.handle)]
+            ),
+            self.assertRaisesRegex(EXECUTION.ExecutionError, "not supported"),
+        ):
+            EXECUTION.entrypoint(main, {}, commands=("run",))
+        self.assertFalse(called)
+
+    def test_local_development_without_agent_session_runs_directly(self):
+        helper = self.root / "helper.py"
+        helper.write_text("pass\n", encoding="utf-8")
+        namespace = {}
+
+        def main():
+            self.assertNotIn("_EXECUTION", namespace)
+            return 17
+
+        with (
+            mock.patch.dict(EXECUTION.os.environ, {}, clear=True),
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+        ):
+            self.assertEqual(17, EXECUTION.entrypoint(main, namespace, commands=("run",)))
 
     def test_execution_artifacts_cannot_enter_an_explicit_target_checkout(self):
         target = self.root / "target"
@@ -360,6 +487,45 @@ class ExecutionTest(unittest.TestCase):
             self.assertEqual("cancel_requested", EXECUTION.status(root.handle)["status"])
             self.assertEqual(before, {path: path.read_bytes() for path in before})
 
+    def test_parent_binding_wins_over_inherited_agent_session_identity(self):
+        root = self.context()
+        helper = self.root / "child.py"
+        helper.write_text("pass\n", encoding="utf-8")
+        child_handle = root.directory / "handle-child-controller.json"
+        child_record = root.directory / "child-controller.json"
+        request = root.directory / "request-child-controller.json"
+        command = [sys.executable, str(helper), "run"]
+        EXECUTION.write(child_record, {
+            "schema": EXECUTION.SCHEMA, "process_identity": IDENTITY,
+            "root": str(root.handle), "run_id": root.run_id, "handle": str(child_handle),
+            "command_sha256": EXECUTION.digest(command),
+        })
+        EXECUTION.write(request, {
+            "schema": EXECUTION.SCHEMA, "root": str(root.handle), "parent": str(root.handle),
+            "handle": str(child_handle), "child_record": str(child_record),
+            "command_sha256": EXECUTION.digest(command),
+        })
+        namespace = {"EXECUTION_TERMINAL_RESULTS": frozenset({"complete"})}
+
+        def main():
+            namespace["_EXECUTION"].emit({"result": "complete"})
+            return 0
+
+        with (
+            mock.patch.dict(
+                EXECUTION.os.environ,
+                {EXECUTION.PARENT_ENV: str(request), EXECUTION.SESSION_ENV: "not-a-uuid"},
+                clear=True,
+            ),
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+        ):
+            self.assertEqual(
+                0, EXECUTION.controller_main(main, namespace, commands=("run",))
+            )
+        child = EXECUTION.read(child_handle)
+        self.assertEqual(str(root.handle), child["root"])
+        self.assertNotIn("route", child)
+
     def test_cancellation_is_idempotent_and_fences_new_launch(self):
         context = self.context()
         first = EXECUTION.cancel(self.handle)
@@ -382,6 +548,124 @@ class ExecutionTest(unittest.TestCase):
         with self.assertRaises(EXECUTION.ExecutionError):
             EXECUTION.cancel(self.handle)
         self.assertEqual(before, destination.read_bytes())
+
+    def test_no_argument_controls_select_live_root_and_latest_terminal_root(self):
+        helper, _, environment = self.owned_environment()
+        command = [sys.executable, str(helper), "run"]
+        with (
+            mock.patch.dict(EXECUTION.os.environ, environment, clear=True),
+            mock.patch.object(Path, "home", return_value=self.root),
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+        ):
+            first = self.owned_context(helper, command)
+            first.emit({"result": "complete", "generation": "first"})
+            first.finish(0)
+            second = self.owned_context(helper, command)
+            second.emit({"result": "complete", "generation": "second"})
+            second.finish(0)
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", [str(helper), "execution-status"]),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    0, EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
+                )
+            terminal = json.loads(output.getvalue())
+            self.assertEqual(second.run_id, terminal["run_id"])
+            self.assertEqual("second", terminal["workflow_result"]["generation"])
+
+            live = self.owned_context(helper, command)
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", [str(helper), "execution-status"]),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    0, EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
+                )
+            self.assertEqual(live.run_id, json.loads(output.getvalue())["run_id"])
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", [str(helper), "execution-cancel"]),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    0, EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
+                )
+            self.assertEqual("cancel_requested", json.loads(output.getvalue())["result"])
+
+    def test_execution_controls_reject_arguments_foreign_records_and_ambiguity(self):
+        helper, files, environment = self.owned_environment()
+        command = [sys.executable, str(helper), "run"]
+        with (
+            mock.patch.dict(EXECUTION.os.environ, environment, clear=True),
+            mock.patch.object(Path, "home", return_value=self.root),
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+        ):
+            first = self.owned_context(helper, command)
+            with (
+                mock.patch.object(
+                    sys, "argv",
+                    [str(helper), "execution-status", "--handle", str(first.handle)],
+                ),
+                self.assertRaisesRegex(EXECUTION.ExecutionError, "take no arguments"),
+            ):
+                EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
+
+            second = self.owned_context(helper, command)
+            with (
+                mock.patch.object(sys, "argv", [str(helper), "execution-status"]),
+                self.assertRaisesRegex(EXECUTION.ExecutionError, "multiple live"),
+            ):
+                EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
+
+            second.record["route"]["session_id"] = "87654321-4321-4321-8321-cba987654321"
+            EXECUTION.write(second.handle, second.record)
+            with (
+                mock.patch.object(sys, "argv", [str(helper), "execution-status"]),
+                self.assertRaisesRegex(EXECUTION.ExecutionError, "foreign execution"),
+            ):
+                EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
+
+            second.record["route"]["session_id"] = environment[EXECUTION.SESSION_ENV]
+            second.record["route"]["command"] = "other"
+            EXECUTION.write(second.handle, second.record)
+            with (
+                mock.patch.object(sys, "argv", [str(helper), "execution-status"]),
+                self.assertRaisesRegex(EXECUTION.ExecutionError, "command identity"),
+            ):
+                EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
+
+            second.handle.unlink()
+            malformed = files / (
+                f"{EXECUTION._owned_prefix(EXECUTION._helper_identity())}not-a-generation.json"
+            )
+            malformed.write_text("{}\n", encoding="utf-8")
+            with (
+                mock.patch.object(sys, "argv", [str(helper), "execution-status"]),
+                self.assertRaisesRegex(EXECUTION.ExecutionError, "malformed execution record name"),
+            ):
+                EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
+
+    def test_cancel_requires_one_live_owned_root(self):
+        helper, _, environment = self.owned_environment()
+        command = [sys.executable, str(helper), "run"]
+        with (
+            mock.patch.dict(EXECUTION.os.environ, environment, clear=True),
+            mock.patch.object(Path, "home", return_value=self.root),
+            mock.patch.object(sys, "argv", [str(helper), "run"]),
+        ):
+            terminal = self.owned_context(helper, command)
+            terminal.emit({"result": "complete"})
+            terminal.finish(0)
+            with (
+                mock.patch.object(sys, "argv", [str(helper), "execution-cancel"]),
+                self.assertRaisesRegex(EXECUTION.ExecutionError, "exactly one live"),
+            ):
+                EXECUTION.entrypoint(lambda: 1, {}, commands=("run",))
 
     def test_closed_observer_output_does_not_control_execution(self):
         namespace = {}
