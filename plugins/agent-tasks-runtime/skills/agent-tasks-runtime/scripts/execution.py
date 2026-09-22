@@ -2075,7 +2075,24 @@ def controller_main(main: Callable[[], int], namespace: dict[str, Any], *,
         if common is not None:
             common._EXECUTION = None
     try:
-        return context.finish(code, error, cancelled=cancelled)["exit_code"]
+        terminal = context.finish(code, error, cancelled=cancelled)
+        if parent is None:
+            try:
+                print(json.dumps({
+                    "schema": terminal["schema"],
+                    "terminal": terminal["terminal"],
+                    "exit_code": terminal["exit_code"],
+                    "local_status": terminal["local_status"],
+                    "error": terminal["error"],
+                    "finalization_errors": terminal["finalization_errors"],
+                    "remote_status": terminal["remote_status"],
+                    "remote_work_may_continue": terminal["remote_work_may_continue"],
+                    "workflow_result": terminal["workflow_result"],
+                    "presentation": terminal["presentation"],
+                }, sort_keys=True), flush=True)
+            except (OSError, ValueError):
+                pass
+        return terminal["exit_code"]
     except (OSError, ValueError, KeyError, TypeError, ExecutionError) as failure:
         message = (
             f"controller exit {code}, error {error!r}; "

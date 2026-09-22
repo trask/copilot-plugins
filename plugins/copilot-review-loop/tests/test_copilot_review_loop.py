@@ -1762,7 +1762,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.81")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.82")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -3202,6 +3202,42 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertRaisesRegex(MODULE.WorkflowError, "identity drifted"),
         ):
             MODULE.require_live_comments(self.preflight)
+
+    def test_candidate_snapshot_accepts_only_linear_base_advancement(self):
+        advanced = {**self.preflight["pr"], "base_sha": "8" * 40}
+        with mock.patch.object(
+            MODULE, "live_base_contains", return_value=True
+        ) as contains:
+            self.assertTrue(
+                MODULE.require_live_pr_snapshot(
+                    self.preflight["pr"],
+                    advanced,
+                    expected_head=self.head,
+                    allow_linear_base_advance=True,
+                )
+            )
+        contains.assert_called_once_with(
+            self.preflight["pr"]["repo_name"],
+            self.preflight["pr"]["base_sha"],
+            advanced["base_sha"],
+        )
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "drifted"):
+            MODULE.require_live_pr_snapshot(
+                self.preflight["pr"],
+                advanced,
+                expected_head=self.head,
+            )
+        with (
+            mock.patch.object(MODULE, "live_base_contains", return_value=False),
+            self.assertRaisesRegex(MODULE.WorkflowError, "drifted"),
+        ):
+            MODULE.require_live_pr_snapshot(
+                self.preflight["pr"],
+                advanced,
+                expected_head=self.head,
+                allow_linear_base_advance=True,
+            )
 
     def test_waits_for_its_own_published_head_but_rejects_other_drift(self):
         final = {**self.preflight["pr"], "head_sha": self.fix}

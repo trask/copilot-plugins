@@ -41,6 +41,7 @@ class PublicationOutcomeTest(unittest.TestCase):
                 item["new_sha"] for item in self.refs
             ]},
             "metadata_for": {"side_effect": lambda *_: copy.deepcopy(self.metadata)},
+            "commit_contains": {"return_value": True},
             "run": {"return_value": subprocess.CompletedProcess([], 0, "", "")},
             "git_try": {},
         }.items():
@@ -124,12 +125,15 @@ class PublicationOutcomeTest(unittest.TestCase):
         evidence = self.root / "candidate.json"
         evidence.write_text("retained", encoding="utf-8")
         self.state["agent_task"]["recovery_files"] = [str(evidence)]
-        with self.assertRaisesRegex(MODULE.WorkflowError, "head, base, or member"):
-            MODULE.publish_conflict_result(self.path, self.state)
+        result = MODULE.publish_conflict_result(self.path, self.state)
+        self.assertTrue(result["clearance_stale"])
+        self.assertEqual("completed", result["stage_outcome"])
         self.assertEqual("retained", evidence.read_text(encoding="utf-8"))
-        self.assertIsNone(MODULE.stage_outcome(MODULE.load_state(self.path)))
+        self.assertEqual(
+            "completed",
+            MODULE.stage_outcome(MODULE.load_state(self.path)),
+        )
         self.assertIsNone(MODULE.cleared_head_sha(self.state))
-        self.mocks["git_try"].assert_not_called()
 
     def test_partial_or_failed_push_never_records_clearance(self):
         for heads in (["unexpected"], ["b" * 40]):

@@ -66,6 +66,77 @@ def decode_compact_path_evidence(evidence):
     return paths
 
 
+class BaseDriftPublicationTest(unittest.TestCase):
+    def task(self):
+        old_base = "1" * 40
+        new_head = "3" * 40
+        return {
+            "preflight": {
+                "request": {
+                    "request_id": "request-1",
+                    "repository": "owner/repo",
+                    "pull_request": {
+                        "number": 7,
+                        "head_sha": "2" * 40,
+                        "base_sha": old_base,
+                    },
+                },
+            },
+            "code_refs": [{
+                "pr_number": 7,
+                "lease_sha": "2" * 40,
+                "new_sha": new_head,
+                "base_sha": old_base,
+            }],
+            "published_heads": [new_head],
+        }
+
+    def test_linear_base_advance_keeps_candidate_but_stales_clearance(self):
+        task = self.task()
+        metadata = {
+            "head_sha": "3" * 40,
+            "base_sha": "4" * 40,
+        }
+        with mock.patch.object(
+            MODULE, "commit_contains", return_value=True
+        ) as contains:
+            publication = MODULE.published_conflict_snapshot(task, metadata)
+
+        self.assertTrue(publication["clearance_stale"])
+        self.assertEqual("unknown", publication["mergeability"])
+        self.assertEqual("1" * 40, publication["candidate_base_sha"])
+        self.assertEqual("4" * 40, publication["current_base_sha"])
+        contains.assert_called_once_with(
+            "owner/repo", "1" * 40, "4" * 40
+        )
+
+    def test_rewritten_base_rejects_candidate_publication(self):
+        task = self.task()
+        metadata = {
+            "head_sha": "3" * 40,
+            "base_sha": "4" * 40,
+        }
+        with (
+            mock.patch.object(MODULE, "commit_contains", return_value=False),
+            self.assertRaisesRegex(MODULE.WorkflowError, "rewritten"),
+        ):
+            MODULE.published_conflict_snapshot(task, metadata)
+
+    def test_exact_current_base_can_record_clearance(self):
+        task = self.task()
+        metadata = {
+            "head_sha": "3" * 40,
+            "base_sha": "1" * 40,
+        }
+        with mock.patch.object(
+            MODULE, "classify_mergeability", return_value="mergeable"
+        ):
+            publication = MODULE.published_conflict_snapshot(task, metadata)
+
+        self.assertFalse(publication["clearance_stale"])
+        self.assertEqual("mergeable", publication["mergeability"])
+
+
 class WindowsSubprocessTest(unittest.TestCase):
     def test_embedded_loaders_accept_current_execution_runtime(self):
         resolver_execution = MODULE.load_execution_runtime(RUNTIME_SCRIPT)
@@ -937,7 +1008,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "25c14087d03d93b0bedb4fa1ccad68e2185bc589800b8c72590ba3fbffcef279",
+            "c5ff3f4a1c9a2526e4bf81dc310f032119e8a43f669454718f113e76948b9b49",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,

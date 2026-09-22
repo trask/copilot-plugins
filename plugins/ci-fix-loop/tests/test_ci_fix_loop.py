@@ -3463,7 +3463,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.71", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.72", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -6195,6 +6195,34 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ), self.assertRaisesRegex(MODULE.WorkflowError, "snapshot changed"):
             MODULE.require_live_check_snapshot(self.preflight)
 
+    def test_candidate_snapshot_accepts_only_linear_base_advancement(self):
+        advanced = {**self.preflight["pr"], "base_sha": "8" * 40}
+        with mock.patch.object(MODULE, "commit_contains", return_value=True) as contains:
+            self.assertTrue(
+                MODULE.require_live_pr_snapshot(
+                    self.preflight["pr"],
+                    advanced,
+                    expected_head=self.head,
+                    allow_linear_base_advance=True,
+                )
+            )
+        contains.assert_called_once_with(
+            self.preflight["pr"]["repo_name"],
+            self.preflight["pr"]["base_sha"],
+            advanced["base_sha"],
+        )
+
+        with (
+            mock.patch.object(MODULE, "commit_contains", return_value=False),
+            self.assertRaisesRegex(MODULE.WorkflowError, "drifted"),
+        ):
+            MODULE.require_live_pr_snapshot(
+                self.preflight["pr"],
+                advanced,
+                expected_head=self.head,
+                allow_linear_base_advance=True,
+            )
+
     def test_waits_for_its_own_published_head_but_rejects_other_drift(self):
         fix = "5" * 40
         final = {**self.preflight["pr"], "head_sha": fix}
@@ -6372,7 +6400,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("recovery_command", task)
 
     def hosted_diagnosis_flow(
-        self, diagnosis, *, changed=False, candidate=False, source_changed=False
+        self,
+        diagnosis,
+        *,
+        changed=False,
+        candidate=False,
+        source_changed=False,
+        base_changed=False,
     ):
         repo = self.root / "repo"
         repo.mkdir()
@@ -6453,6 +6487,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 return_value=(
                     {**preflight["pr"], "head_sha": "6" * 40}
                     if source_changed
+                    else {**preflight["pr"], "base_sha": "7" * 40}
+                    if base_changed
                     else preflight["pr"]
                 ),
             ),
@@ -6531,6 +6567,21 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual("6" * 40, state["agent_task"]["superseded_by_head_sha"])
         self.assertEqual(1, state["iterations"])
         apply.assert_not_called()
+
+    def test_linear_base_advance_retries_current_ci_without_resetting_budget(self):
+        payload, state, apply = self.hosted_diagnosis_flow(
+            "transient",
+            base_changed=True,
+        )
+
+        self.assertEqual("ci_changed", payload["result"])
+        self.assertEqual("base_advanced", payload["outcome"])
+        self.assertTrue(state["agent_task"]["clearance_stale"])
+        self.assertEqual(self.base, state["agent_task"]["observed_base_sha"])
+        self.assertEqual("7" * 40, state["agent_task"]["current_base_sha"])
+        self.assertEqual(1, state["iterations"])
+        self.assertIsNone(MODULE.stage_outcome(state))
+        apply.assert_called_once()
 
     def test_managed_fix_publishes_only_the_verified_fix_commit(self):
         repo = self.root / "repo"

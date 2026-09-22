@@ -38,7 +38,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "d1f2816ae4b222159079202b877f88117c379b678e0bff7a06c8fa2563917474"
+    "7304791a4fb91fa820340d1fa3b1e48698ee7036cd5408b85554aa7cb0290c91"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -1574,9 +1574,74 @@ def same_snapshot(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
     return all(expected.get(key) == actual.get(key) for key in keys)
 
 
-def ensure_snapshot_unchanged(expected: dict[str, Any], stage: str) -> None:
+def live_base_contains(
+    repository: str, ancestor: Any, descendant: Any
+) -> bool:
+    if (
+        not isinstance(ancestor, str)
+        or SHA_PATTERN.fullmatch(ancestor.lower()) is None
+        or not isinstance(descendant, str)
+        or SHA_PATTERN.fullmatch(descendant.lower()) is None
+    ):
+        return False
+    comparison = gh_json(
+        ["api", f"repos/{repository}/compare/{ancestor}...{descendant}"]
+    )
+    return isinstance(comparison, dict) and comparison.get("status") in {
+        "ahead",
+        "identical",
+    }
+
+
+def same_candidate_snapshot(
+    expected: dict[str, Any], actual: dict[str, Any]
+) -> bool:
+    keys = (
+        "repo_name",
+        "number",
+        "url",
+        "title",
+        "body",
+        "state",
+        "is_draft",
+        "head",
+        "head_sha",
+        "cross_repository",
+    )
+    if not all(expected.get(key) == actual.get(key) for key in keys):
+        return False
+    expected_base = expected.get("base")
+    actual_base = actual.get("base")
+    if (
+        not isinstance(expected_base, dict)
+        or not isinstance(actual_base, dict)
+        or expected_base.get("repository") != actual_base.get("repository")
+        or expected_base.get("ref") != actual_base.get("ref")
+    ):
+        return False
+    return (
+        expected_base.get("sha") == actual_base.get("sha")
+        or live_base_contains(
+            expected_base["repository"],
+            expected_base.get("sha"),
+            actual_base.get("sha"),
+        )
+    )
+
+
+def ensure_snapshot_unchanged(
+    expected: dict[str, Any],
+    stage: str,
+    *,
+    allow_linear_base_advance: bool = False,
+) -> dict[str, Any]:
     actual = resolve_pr(expected)
-    if not same_snapshot(expected, actual):
+    unchanged = (
+        same_candidate_snapshot(expected, actual)
+        if allow_linear_base_advance
+        else same_snapshot(expected, actual)
+    )
+    if not unchanged:
         raise WorkflowError(
             f"live pull request state changed {stage}; restart from check",
             details={
@@ -1586,6 +1651,7 @@ def ensure_snapshot_unchanged(expected: dict[str, Any], stage: str) -> None:
                 "source_mutation_performed": False,
             },
         )
+    return actual
 
 
 def expected_cloud_pull_request(pr: dict[str, Any]) -> dict[str, Any]:
@@ -1784,7 +1850,14 @@ def run_hosted_review_phase(
         status="completed", session_id=verified["completion"]["session"]["id"],
         completion=verified["completion"], candidate=verified["candidate"],
     )
-    ensure_snapshot_unchanged(pr, f"after hosted {phase}")
+    observed = ensure_snapshot_unchanged(
+        pr,
+        f"after hosted {phase}",
+        allow_linear_base_advance=phase == "discovery",
+    )
+    if not isinstance(observed, dict):
+        observed = pr
+    phase_state["observed_pr"] = observed
     save_run_state(state_path, state)
     return payload
 
@@ -1823,6 +1896,37 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
             runtime=runtime, helper=helper, repo_root=repo_root, state_path=state_path,
             state=state, anchors=anchors, candidates=None,
         )
+        observed_pr = state["phases"][-1]["observed_pr"]
+        if observed_pr["base"] != pr["base"]:
+            (
+                refreshed_pr,
+                refreshed_viewer,
+                refreshed_anchors,
+                refreshed_pending,
+                _,
+                _,
+                _,
+                _,
+            ) = preflight(args.target, pr["head_sha"])
+            if (
+                refreshed_pending is not None
+                or refreshed_viewer.casefold()
+                != str(state["viewer"]["login"]).casefold()
+                or not same_candidate_snapshot(pr, refreshed_pr)
+                or refreshed_pr["base"] != observed_pr["base"]
+            ):
+                raise WorkflowError(
+                    "pull request changed while refreshing discovery against "
+                    "the advanced base"
+                )
+            state["base_refresh"] = {
+                "discovery_base_sha": pr["base"]["sha"],
+                "current_base_sha": refreshed_pr["base"]["sha"],
+            }
+            pr = refreshed_pr
+            anchors = refreshed_anchors
+            state["pr"] = pr
+            save_run_state(state_path, state)
         candidates = []
         for index, raw in enumerate(discovery["candidates"]):
             if (
@@ -1831,13 +1935,49 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
                 or len(json.dumps(raw).encode("utf-8")) > MAX_CANDIDATE_BYTES
             ):
                 raise WorkflowError("hosted discovery candidate evidence is invalid")
-            comment = validate_comments([{key: value for key, value in raw.items() if key != "evidence"}], anchors)[0]
+            try:
+                comment = validate_comments(
+                    [
+                        {
+                            key: value
+                            for key, value in raw.items()
+                            if key != "evidence"
+                        }
+                    ],
+                    anchors,
+                )[0]
+            except WorkflowError:
+                if state.get("base_refresh") is None:
+                    raise
+                continue
             candidates.append({
                 "candidate_id": f"candidate-{index + 1:03d}", "path": comment["path"],
                 "anchor": {key: comment.get(key) for key in ("line", "side", "start_line", "start_side")},
                 "explanation": comment["body"], "evidence": raw["evidence"],
             })
         state["candidates"] = candidates
+        if state.get("base_refresh") is not None and not candidates:
+            state["agent_task"]["clearance_stale"] = True
+            save_run_state(state_path, state)
+            remove_transient_artifacts([
+                Path(phase[key])
+                for phase in state["phases"]
+                for key in ("prompt_file", "result_file")
+            ])
+            result_sink({
+                "result": "incomplete",
+                "reason": "base_advanced",
+                "state": str(state_path),
+                "run_id": run_id,
+                "pr_url": pr["pr_url"],
+                "pr_number": pr["number"],
+                "pr_title": pr["title"],
+                "head_sha": pr["head_sha"],
+                "session_title": f"PR Review: {pr['number']} - {pr['title']}",
+                "review_mutation_performed": False,
+                **state["base_refresh"],
+            })
+            return
         comments = []
         if candidates:
             critique = run_hosted_review_phase(
@@ -1858,6 +1998,28 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
                 comments.append({"candidate_id": item["candidate_id"], **validate_comments([comment], anchors)[0]})
             if seen != [candidate["candidate_id"] for candidate in candidates if candidate["candidate_id"] in seen]:
                 raise WorkflowError("hosted critique changed candidate order")
+        if state.get("base_refresh") is not None and not comments:
+            state["agent_task"]["clearance_stale"] = True
+            save_run_state(state_path, state)
+            remove_transient_artifacts([
+                Path(phase[key])
+                for phase in state["phases"]
+                for key in ("prompt_file", "result_file")
+            ])
+            result_sink({
+                "result": "incomplete",
+                "reason": "base_advanced",
+                "state": str(state_path),
+                "run_id": run_id,
+                "pr_url": pr["pr_url"],
+                "pr_number": pr["number"],
+                "pr_title": pr["title"],
+                "head_sha": pr["head_sha"],
+                "session_title": f"PR Review: {pr['number']} - {pr['title']}",
+                "review_mutation_performed": False,
+                **state["base_refresh"],
+            })
+            return
         state["hosted_comments"] = comments
         comments_path = state_path.with_name(f"{state_path.stem}--comments.json")
         atomic_write_text(comments_path, json.dumps(comments, ensure_ascii=False))
@@ -2147,7 +2309,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "existing_pending_review",
     "created_pending_review",
 })
-EXECUTION_SHA256 = "29e311216bde1db84a1017c4d2e2dd5d0e97b595f766cc91d5b2743fc89625cd"
+EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

@@ -164,7 +164,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "d1f2816ae4b222159079202b877f88117c379b678e0bff7a06c8fa2563917474"
+    "7304791a4fb91fa820340d1fa3b1e48698ee7036cd5408b85554aa7cb0290c91"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -6518,7 +6518,8 @@ def require_live_pr_snapshot(
     actual: dict[str, Any],
     *,
     expected_head: str,
-) -> None:
+    allow_linear_base_advance: bool = False,
+) -> bool:
     fields = (
         "number",
         "repo_name",
@@ -6528,16 +6529,46 @@ def require_live_pr_snapshot(
         "head_repo",
         "head_branch",
         "base_branch",
-        "base_sha",
         "state",
     )
-    if actual.get("head_sha") != expected_head or any(
+    mismatched = actual.get("head_sha") != expected_head or any(
         actual.get(field) != expected.get(field) for field in fields
+    )
+    base_advanced = actual.get("base_sha") != expected.get("base_sha")
+    if base_advanced and (
+        not allow_linear_base_advance
+        or not live_base_contains(
+            expected["repo_name"],
+            expected["base_sha"],
+            actual.get("base_sha"),
+        )
     ):
+        mismatched = True
+    if mismatched:
         raise WorkflowError(
             "live pull request identity, head, base, title, or body drifted from "
             "the pinned snapshot"
         )
+    return base_advanced
+
+
+def live_base_contains(
+    repository: str, ancestor: Any, descendant: Any
+) -> bool:
+    if (
+        not isinstance(ancestor, str)
+        or SHA_PATTERN.fullmatch(ancestor) is None
+        or not isinstance(descendant, str)
+        or SHA_PATTERN.fullmatch(descendant) is None
+    ):
+        return False
+    comparison = gh_json(
+        ["api", f"repos/{repository}/compare/{ancestor}...{descendant}"]
+    )
+    return isinstance(comparison, dict) and comparison.get("status") in {
+        "ahead",
+        "identical",
+    }
 
 
 def same_ref_forward_head_drift(
@@ -6577,21 +6608,33 @@ def wait_for_live_pr_snapshot(
     expected: dict[str, Any],
     *,
     expected_head: str,
+    allow_linear_base_advance: bool = False,
 ) -> dict[str, Any]:
     actual = metadata_for(target)
     for delay in PR_HEAD_LAG_RETRY_DELAYS:
         if actual.get("head_sha") == expected_head:
             break
         if actual.get("head_sha") != expected.get("head_sha"):
-            require_live_pr_snapshot(expected, actual, expected_head=expected_head)
+            require_live_pr_snapshot(
+                expected,
+                actual,
+                expected_head=expected_head,
+                allow_linear_base_advance=allow_linear_base_advance,
+            )
         require_live_pr_snapshot(
             expected,
             actual,
             expected_head=expected["head_sha"],
+            allow_linear_base_advance=allow_linear_base_advance,
         )
         time.sleep(delay)
         actual = metadata_for(target)
-    require_live_pr_snapshot(expected, actual, expected_head=expected_head)
+    require_live_pr_snapshot(
+        expected,
+        actual,
+        expected_head=expected_head,
+        allow_linear_base_advance=allow_linear_base_advance,
+    )
     return actual
 
 
@@ -8616,7 +8659,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
             return
         require_live_pr_snapshot(
-            pr, live_before_import, expected_head=pr["head_sha"]
+            pr,
+            live_before_import,
+            expected_head=pr["head_sha"],
+            allow_linear_base_advance=True,
         )
         require_live_comments(preflight)
         imported = apply_verified_import(
@@ -8651,7 +8697,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
             allowed_heads = {pr["head_sha"], remote["final_local_head"]}
             if live.get("head_sha") not in allowed_heads:
                 raise WorkflowError("live pull request head drifted before publication")
-            require_live_pr_snapshot(pr, live, expected_head=live["head_sha"])
+            require_live_pr_snapshot(
+                pr,
+                live,
+                expected_head=live["head_sha"],
+                allow_linear_base_advance=True,
+            )
             require_live_comments(
                 preflight,
                 allow_resolved=live.get("head_sha") == remote["final_local_head"],
@@ -8707,6 +8758,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 target,
                 pr,
                 expected_head=published_head,
+                allow_linear_base_advance=True,
             )
             task_state["published_head_sha"] = published_head
             task_state["status"] = "published"
@@ -8724,6 +8776,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             target,
             pr,
             expected_head=published_head,
+            allow_linear_base_advance=True,
         )
         published_identity = local_identity(repo_root)
         if (
@@ -9209,7 +9262,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "source_changed",
     "review_comments_pending_preparation",
 })
-EXECUTION_SHA256 = "29e311216bde1db84a1017c4d2e2dd5d0e97b595f766cc91d5b2743fc89625cd"
+EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

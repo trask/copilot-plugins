@@ -41,4 +41,4 @@ Run it once. If observation is lost, use the same installed helper prefix with `
 
 ## Final response
 
-Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state or post anything to GitHub.
+A nonzero controller exit can still carry the hash-verified terminal result and presentation; report that exact outcome instead of calling `workflow_result` missing. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state or post anything to GitHub.

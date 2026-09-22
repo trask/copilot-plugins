@@ -28,6 +28,6 @@ The helper owns authenticated preflight, hosted dispatch, budgets, candidate ver
 
 Never inspect or edit repository code, run tests or builds, invoke Agent Tasks directly, use another agent or sandbox, scrape stdout, or reconstruct internal state. Never put credentials in prompts or output. Stop on every helper error and report its exact terminal error. Do not resume, adopt, replace, or import an abandoned invocation.
 
-Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
+Use the verified `session_title` from the terminal result with `rename_session` once when available. A nonzero controller exit can still carry the verified sealed terminal result and presentation; report that exact outcome instead of calling `workflow_result` missing. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
 
 The terminal response is the run's last message.

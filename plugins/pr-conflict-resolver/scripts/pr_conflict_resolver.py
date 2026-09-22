@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "25c14087d03d93b0bedb4fa1ccad68e2185bc589800b8c72590ba3fbffcef279"
+    "c5ff3f4a1c9a2526e4bf81dc310f032119e8a43f669454718f113e76948b9b49"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@10"
@@ -264,6 +264,16 @@ def base_ref_tip(repo_name: str, base_branch: str) -> str:
             f"the tip of base branch {base_branch!r} in {repo_name} has no commit SHA"
         )
     return sha
+
+
+def commit_contains(repository: str, ancestor: str, descendant: str) -> bool:
+    comparison = gh_json(
+        ["api", f"repos/{repository}/compare/{ancestor}...{descendant}"]
+    )
+    return isinstance(comparison, dict) and comparison.get("status") in {
+        "ahead",
+        "identical",
+    }
 
 
 def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
@@ -9250,7 +9260,7 @@ def verify_quarantined_result(
 
 def require_live_conflict_guards(
     repo_root: Path, preflight: dict[str, Any]
-) -> None:
+) -> dict[str, Any]:
     request = preflight["request"]
     authorization = preflight.get("stack_request")
     if authorization is not None:
@@ -9267,12 +9277,20 @@ def require_live_conflict_guards(
         raise WorkflowError("local repository changed after conflict preflight")
     current = metadata_for(parse_target(request["pull_request"]["url"]))
     pr = request["pull_request"]
+    base_advanced = current["base_sha"] != pr["base_sha"]
     if (
         current["state"] != "OPEN"
         or current["head_sha"] != pr["head_sha"]
-        or current["base_sha"] != pr["base_sha"]
         or current["head_branch"] != pr["head_ref"]
         or current["base_branch"] != pr["base_ref"]
+        or (
+            base_advanced
+            and not commit_contains(
+                request["repository"],
+                pr["base_sha"],
+                current["base_sha"],
+            )
+        )
     ):
         raise WorkflowError("pull request target changed after cloud resolution")
     methods = repository_merge_methods(request["repository"])
@@ -9296,10 +9314,40 @@ def require_live_conflict_guards(
                 authorization["selected"],
             )
         expected = request["native_stack"]
+        current_trunk_sha = base_ref_tip(
+            request["repository"], expected["trunk"]["ref"]
+        )
+        trunk_advanced = current_trunk_sha != expected["trunk"]["sha"]
+        direct_bases_match = all(
+            (
+                base_ref_tip(
+                    request["repository"],
+                    member["direct_base_ref"],
+                )
+                == member["direct_base_sha"]
+            )
+            or (
+                index == 0
+                and trunk_advanced
+                and member["direct_base_ref"] == expected["trunk"]["ref"]
+                and commit_contains(
+                    request["repository"],
+                    member["direct_base_sha"],
+                    current_trunk_sha,
+                )
+            )
+            for index, member in enumerate(expected["members"])
+        )
         if (
             stack is None
-            or base_ref_tip(request["repository"], expected["trunk"]["ref"])
-            != expected["trunk"]["sha"]
+            or (
+                trunk_advanced
+                and not commit_contains(
+                    request["repository"],
+                    expected["trunk"]["sha"],
+                    current_trunk_sha,
+                )
+            )
             or [
                 (
                     member["number"],
@@ -9316,18 +9364,15 @@ def require_live_conflict_guards(
                     member["head_ref"],
                     member["head_sha"],
                     member["direct_base_ref"],
-                    member["retained_base_sha"],
+                    (
+                        current_trunk_sha
+                        if index == 0 and trunk_advanced
+                        else member["retained_base_sha"]
+                    ),
                 )
-                for member in expected["members"]
+                for index, member in enumerate(expected["members"])
             ]
-            or any(
-                base_ref_tip(
-                    request["repository"],
-                    member["direct_base_ref"],
-                )
-                != member["direct_base_sha"]
-                for member in expected["members"]
-            )
+            or not direct_bases_match
         ):
             raise WorkflowError("native stack topology changed after cloud resolution")
         current_outside = []
@@ -9345,6 +9390,9 @@ def require_live_conflict_guards(
             )
         if current_outside != expected["outside_dependents"]:
             raise WorkflowError("native stack outside dependents changed")
+        base_advanced = base_advanced or trunk_advanced
+    current["_candidate_base_advanced"] = base_advanced
+    return current
 
 
 def conflict_push_command(
@@ -9408,16 +9456,26 @@ def published_conflict_snapshot(
     )
     if invoked is None or (
         metadata["head_sha"] != invoked["new_sha"]
-        or metadata["base_sha"] != invoked["base_sha"]
         or task.get("published_heads") != [item["new_sha"] for item in refs]
     ):
-        raise WorkflowError("published conflict head, base, or member identity changed")
+        raise WorkflowError("published conflict head or member identity changed")
+    direct_base_advanced = metadata["base_sha"] != invoked["base_sha"]
+    if direct_base_advanced and not commit_contains(
+        request["repository"],
+        invoked["base_sha"],
+        metadata["base_sha"],
+    ):
+        raise WorkflowError("published conflict base history was rewritten")
+    base_advanced = direct_base_advanced or task.get("candidate_base_advanced") is True
     authorization = preflight.get("stack_request")
     return {
         "request_id": request["request_id"],
         "request_sha256": request_digest(request),
         "repository": request["repository"],
         "invoked_pr": request["pull_request"]["number"],
+        "candidate_base_sha": invoked["base_sha"],
+        "current_base_sha": metadata["base_sha"],
+        "clearance_stale": base_advanced,
         "members": [
             {
                 "number": item["pr_number"], "head_sha": item["new_sha"],
@@ -9434,7 +9492,11 @@ def published_conflict_snapshot(
             }
             if authorization is not None else None
         ),
-        "mergeability": classify_mergeability(metadata, expected_head=invoked["new_sha"]),
+        "mergeability": (
+            "unknown"
+            if base_advanced
+            else classify_mergeability(metadata, expected_head=invoked["new_sha"])
+        ),
     }
 
 
@@ -9458,7 +9520,11 @@ def publish_conflict_result(
     repo_root = Path(preflight["repository_root"])
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
-    require_live_conflict_guards(repo_root, preflight)
+    guarded = require_live_conflict_guards(repo_root, preflight)
+    task["candidate_base_advanced"] = (
+        task.get("candidate_base_advanced") is True
+        or guarded["_candidate_base_advanced"] is True
+    )
     expected_old = [item["lease_sha"] for item in code_refs]
     expected_new = [item["new_sha"] for item in code_refs]
     current = remote_publication_heads(request, code_refs)
@@ -9513,13 +9579,12 @@ def publish_conflict_result(
     state["last_result"] = "published"
     state["attempts"] = int(state.get("attempts", 0))
     save_state(state_path, state)
-    mergeability = classify_mergeability(
-        refreshed, expected_head=invoked["new_sha"]
-    )
     publication = published_conflict_snapshot(task, refreshed)
+    base_advanced = publication["clearance_stale"]
+    mergeability = publication["mergeability"]
     if preflight.get("stack_request") is not None:
         require_stack_request_owner(preflight["stack_request"])
-    if request["strategy"] == "native-stack":
+    if request["strategy"] == "native-stack" and not base_advanced:
         record_stack_member_clearances(
             state,
             [
@@ -9532,6 +9597,8 @@ def publish_conflict_result(
             ],
             request["pull_request"]["number"],
         )
+    elif base_advanced:
+        state["native_stack_clearance"] = None
     if preflight.get("stack_request") is not None:
         require_stack_request_owner(preflight["stack_request"])
     if remote_publication_heads(request, code_refs) != expected_new:
@@ -9546,8 +9613,13 @@ def publish_conflict_result(
         "base_sha": refreshed["base_sha"],
         "published_head_sha": invoked["new_sha"],
         "mergeable_at_head_sha": (
-            invoked["new_sha"] if mergeability == "mergeable" else None
+            invoked["new_sha"]
+            if mergeability == "mergeable" and not base_advanced
+            else None
         ),
+        "clearance_stale": base_advanced,
+        "candidate_base_sha": invoked["base_sha"],
+        "current_base_sha": refreshed["base_sha"],
     }
     task["publication"] = publication
     task["status"] = "completed"
@@ -9572,6 +9644,7 @@ def publish_conflict_result(
         "previous_head_sha": request["pull_request"]["head_sha"],
         "published_heads": expected_new,
         "mergeability": mergeability,
+        "clearance_stale": base_advanced,
         "stage_outcome": stage_outcome(state),
     }
 
@@ -10537,7 +10610,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "29e311216bde1db84a1017c4d2e2dd5d0e97b595f766cc91d5b2743fc89625cd"
+EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

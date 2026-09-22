@@ -1957,7 +1957,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.58")
+        self.assertEqual(plugin["version"], "1.3.59")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -3071,6 +3071,36 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual("source_changed", emit.call_args.args[0]["result"])
         self.assertEqual("superseded", state["agent_task"]["status"])
         self.assertEqual(fix, state["agent_task"]["superseded_by_head_sha"])
+
+    def test_candidate_snapshot_accepts_only_linear_base_advancement(self):
+        advanced = {**self.preflight["pr"], "base_sha": "8" * 40}
+        with mock.patch.object(
+            MODULE, "live_base_contains", return_value=True
+        ) as contains:
+            self.assertTrue(
+                MODULE.require_live_pr_snapshot(
+                    self.preflight["pr"],
+                    advanced,
+                    expected_head=self.head,
+                    allow_linear_base_advance=True,
+                )
+            )
+        contains.assert_called_once_with(
+            self.preflight["pr"]["repo_name"],
+            self.preflight["pr"]["base_sha"],
+            advanced["base_sha"],
+        )
+
+        with (
+            mock.patch.object(MODULE, "live_base_contains", return_value=False),
+            self.assertRaisesRegex(MODULE.WorkflowError, "drifted"),
+        ):
+            MODULE.require_live_pr_snapshot(
+                self.preflight["pr"],
+                advanced,
+                expected_head=self.head,
+                allow_linear_base_advance=True,
+            )
 
 
 

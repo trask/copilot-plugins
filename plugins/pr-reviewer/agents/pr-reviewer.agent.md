@@ -30,6 +30,6 @@ Never inspect or execute PR code locally, run `gh pr diff`, filter candidates, a
 
 The posting guard uses only the verified hosted result and exact stored comments. It rechecks source, anchors, viewer permission, ownership, pending-review state, and its one-mutation claim. It creates and verifies one viewer-owned pending review and never submits it. No selected findings creates no review mutation. A ready read-only result grants no posting permission. Existing pending reviews are preserved.
 
-Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
+Use the verified `session_title` from the terminal result with `rename_session` once when available. A nonzero controller exit can still carry the verified sealed terminal result and presentation; report that exact outcome instead of calling `workflow_result` missing. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
 
 The terminal response is the run's last message.

@@ -183,7 +183,7 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "d1f2816ae4b222159079202b877f88117c379b678e0bff7a06c8fa2563917474"
+    "7304791a4fb91fa820340d1fa3b1e48698ee7036cd5408b85554aa7cb0290c91"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -8848,8 +8848,12 @@ def publication_lock(pr: dict[str, Any]) -> Iterator[Path]:
 
 
 def require_live_pr_snapshot(
-    expected: dict[str, Any], actual: dict[str, Any], *, expected_head: str
-) -> None:
+    expected: dict[str, Any],
+    actual: dict[str, Any],
+    *,
+    expected_head: str,
+    allow_linear_base_advance: bool = False,
+) -> bool:
     fields = (
         "number",
         "repo_name",
@@ -8859,16 +8863,29 @@ def require_live_pr_snapshot(
         "head_repo",
         "head_branch",
         "base_branch",
-        "base_sha",
         "state",
     )
-    if actual.get("head_sha", "").lower() != expected_head.lower() or any(
+    mismatched = actual.get("head_sha", "").lower() != expected_head.lower() or any(
         actual.get(field) != expected.get(field) for field in fields
+    )
+    base_advanced = actual.get("base_sha") != expected.get("base_sha")
+    if base_advanced and (
+        not allow_linear_base_advance
+        or not isinstance(actual.get("base_sha"), str)
+        or SHA_PATTERN.fullmatch(actual["base_sha"]) is None
+        or not commit_contains(
+            expected["repo_name"],
+            expected["base_sha"],
+            actual["base_sha"],
+        )
     ):
+        mismatched = True
+    if mismatched:
         raise WorkflowError(
             "live pull request identity, head, base, title, or body drifted from "
             "the pinned snapshot"
         )
+    return base_advanced
 
 
 def same_ref_forward_head_drift(
@@ -8904,21 +8921,33 @@ def wait_for_live_pr_snapshot(
     expected: dict[str, Any],
     *,
     expected_head: str,
+    allow_linear_base_advance: bool = False,
 ) -> dict[str, Any]:
     actual = metadata_for(target)
     for delay in REMOTE_REF_LAG_RETRY_DELAYS:
         if actual.get("head_sha", "").lower() == expected_head.lower():
             break
         if actual.get("head_sha", "").lower() != expected.get("head_sha", "").lower():
-            require_live_pr_snapshot(expected, actual, expected_head=expected_head)
+            require_live_pr_snapshot(
+                expected,
+                actual,
+                expected_head=expected_head,
+                allow_linear_base_advance=allow_linear_base_advance,
+            )
         require_live_pr_snapshot(
             expected,
             actual,
             expected_head=expected["head_sha"],
+            allow_linear_base_advance=allow_linear_base_advance,
         )
         time.sleep(delay)
         actual = metadata_for(target)
-    require_live_pr_snapshot(expected, actual, expected_head=expected_head)
+    require_live_pr_snapshot(
+        expected,
+        actual,
+        expected_head=expected_head,
+        allow_linear_base_advance=allow_linear_base_advance,
+    )
     return actual
 
 
@@ -10721,29 +10750,35 @@ def command_agent_task(args: argparse.Namespace) -> None:
             return
         if live["head_sha"].lower() != pr["head_sha"]:
             raise WorkflowError("pull request head moved before authenticated publication")
-        try:
-            require_live_check_snapshot(preflight)
-        except WorkflowError as error:
-            if error.details.get("reason") != "ci_observation_changed":
-                raise
-            task_state.update({
-                "status": "completed", "task_id": remote["task_id"],
-                "completed_at": utc_now(), "discarded_reason": str(error),
-                "candidate_manifest": remote["candidate_manifest"],
-                "completion": remote["completion"],
-                "consumer_report": coordinator_report,
-                "imported": False,
-            })
-            state["clean_at_head_sha"] = None
-            state["outcome"] = None
-            save_state(state_path, state)
-            emit({
-                "result": "ci_changed", "state": str(state_path),
-                "head_sha": pr["head_sha"], "detail": str(error),
-                "task": {"id": remote["task_id"], "url": remote["task_url"]},
-            })
-            return
-        require_live_pr_snapshot(pr, live, expected_head=live["head_sha"])
+        base_advanced = require_live_pr_snapshot(
+            pr,
+            live,
+            expected_head=live["head_sha"],
+            allow_linear_base_advance=True,
+        )
+        if not base_advanced:
+            try:
+                require_live_check_snapshot(preflight)
+            except WorkflowError as error:
+                if error.details.get("reason") != "ci_observation_changed":
+                    raise
+                task_state.update({
+                    "status": "completed", "task_id": remote["task_id"],
+                    "completed_at": utc_now(), "discarded_reason": str(error),
+                    "candidate_manifest": remote["candidate_manifest"],
+                    "completion": remote["completion"],
+                    "consumer_report": coordinator_report,
+                    "imported": False,
+                })
+                state["clean_at_head_sha"] = None
+                state["outcome"] = None
+                save_state(state_path, state)
+                emit({
+                    "result": "ci_changed", "state": str(state_path),
+                    "head_sha": pr["head_sha"], "detail": str(error),
+                    "task": {"id": remote["task_id"], "url": remote["task_url"]},
+                })
+                return
         validated_hosted_result = True
         task_state.update(
             {
@@ -10818,7 +10853,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     raise WorkflowError(
                         "local source moved before verified local import"
                     )
-                require_live_check_snapshot(preflight)
+                if not base_advanced:
+                    require_live_check_snapshot(preflight)
                 imported = apply_verified_candidate_import(
                     repo_root,
                     helper=helper,
@@ -10909,10 +10945,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 task_state["publication_source_head_sha"] = pr["head_sha"]
                 task_state["status"] = "published_pending_verification"
                 save_state(state_path, state)
-            wait_for_live_pr_snapshot(
+            final_live = wait_for_live_pr_snapshot(
                 target,
                 pr,
                 expected_head=remote["final_local_head"],
+                allow_linear_base_advance=True,
+            )
+            base_advanced = (
+                base_advanced or final_live["base_sha"] != pr["base_sha"]
             )
             if pending is not None:
                 accepted_push = finalize_pending_stack_push(
@@ -10949,17 +10989,37 @@ def command_agent_task(args: argparse.Namespace) -> None:
             task_state["imported_head_sha"] = remote["final_local_head"]
             save_state(state_path, state)
             published_head = pr["head_sha"]
+            final_live = metadata_for(target)
+            base_advanced = require_live_pr_snapshot(
+                pr,
+                final_live,
+                expected_head=published_head,
+                allow_linear_base_advance=True,
+            )
 
         run_state = state["run"]
+        state["pr"] = final_live
+        if base_advanced:
+            task_state["clearance_stale"] = True
+            task_state["observed_base_sha"] = pr["base_sha"]
+            task_state["current_base_sha"] = final_live["base_sha"]
+            state["outcome"] = None
+            state["clean_at_head_sha"] = None
+            state["clean_at_base_sha"] = None
+            state["warning_at_head_sha"] = None
+            state["warning_at_base_sha"] = None
+            state.pop("ci_warnings", None)
         if diagnoses is not None:
             run_state["diagnoses"] = diagnoses
             state.setdefault("history", []).extend({
                 "iteration": run_state["iteration"],
                 "head_sha": pr["head_sha"],
+                "base_sha": pr["base_sha"],
+                "check_snapshot_sha256": preflight["check_snapshot"]["sha256"],
                 "task_id": remote["task_id"],
                 **item,
             } for item in diagnoses)
-            if report["outcome"] == "warning":
+            if report["outcome"] == "warning" and not base_advanced:
                 require_live_check_snapshot(preflight)
                 warning_runs = snapshot["workflow_runs"]
                 require_diagnosable_ci_runs(
@@ -10975,7 +11035,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 state["warning_snapshot_sha256"] = ci_warning_snapshot_sha256(
                     pr, snapshot["rollup"], warning_runs,
                 )
-            elif report["outcome"] == "unfixable":
+            elif report["outcome"] == "unfixable" and not base_advanced:
                 state["escalation"] = {
                     "reason": "unfixable_failure",
                     "detail": "hosted diagnosis did not establish a scoped fix or a safe retry",
@@ -11042,7 +11102,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
             dict.fromkeys(cleanup_paths),
             preserve=bool(getattr(args, "preserve_artifacts", False)),
         )
-        result_name = {
+        result_name = (
+            "published" if remote["commits"] else "ci_changed"
+        ) if base_advanced else {
             "candidate": "published",
             "fixed": "published",
             "no_change": "nothing_to_publish",
@@ -11059,7 +11121,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "head_sha": published_head,
                 "commits": remote["commits"],
                 "iterations": state["iterations"],
-                "outcome": report["outcome"],
+                "outcome": (
+                    "base_advanced" if base_advanced else report["outcome"]
+                ),
                 "action_checks": [
                     item["check_key"] for item in diagnoses or []
                     if item["diagnosis"] == "transient"
@@ -14196,7 +14260,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "sealed_ci_fix_completed",
     "complete",
 })
-EXECUTION_SHA256 = "29e311216bde1db84a1017c4d2e2dd5d0e97b595f766cc91d5b2743fc89625cd"
+EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

@@ -1425,7 +1425,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "complete",
     "incomplete",
 })
-EXECUTION_SHA256 = "29e311216bde1db84a1017c4d2e2dd5d0e97b595f766cc91d5b2743fc89625cd"
+EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

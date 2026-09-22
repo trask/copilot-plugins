@@ -1217,8 +1217,32 @@ class ManagedCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(str(error), "Agent Task failed [task_failed]: worker stopped")
 
+    def test_candidate_snapshot_preserves_findings_only_across_linear_base_advance(self):
+        advanced = {
+            **self.pr,
+            "base": {**self.pr["base"], "sha": "3" * 40},
+        }
+        with mock.patch.object(
+            MODULE, "live_base_contains", return_value=True
+        ) as contains:
+            self.assertTrue(MODULE.same_candidate_snapshot(self.pr, advanced))
+        contains.assert_called_once_with(
+            self.pr["base"]["repository"],
+            self.pr["base"]["sha"],
+            advanced["base"]["sha"],
+        )
+        with mock.patch.object(MODULE, "live_base_contains", return_value=False):
+            self.assertFalse(MODULE.same_candidate_snapshot(self.pr, advanced))
+        self.assertFalse(MODULE.same_snapshot(self.pr, advanced))
+
     def hosted_check(
-        self, *, nonempty=False, reject_all=False, incomplete=False, source_drift=False
+        self,
+        *,
+        nonempty=False,
+        reject_all=False,
+        incomplete=False,
+        source_drift=False,
+        base_advance=False,
     ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -1270,6 +1294,10 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 },
             }
         runtime.verify_current_candidate.side_effect = verify
+        advanced_pr = {
+            **self.pr,
+            "base": {**self.pr["base"], "sha": "3" * 40},
+        }
         snapshot_check = (
             [
                 None,
@@ -1284,12 +1312,29 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 ),
             ]
             if source_drift
+            else [self.pr, advanced_pr, advanced_pr, advanced_pr]
+            if base_advance
             else None
         )
+        initial_preflight = (
+            self.pr, "viewer", MODULE.parse_unified_diff(DIFF),
+            None, None, [], [], DIFF,
+        )
+        refreshed_preflight = (
+            advanced_pr, "viewer", MODULE.parse_unified_diff(DIFF),
+            None, None, [], [], DIFF,
+        )
         with (
-            mock.patch.object(MODULE, "preflight", return_value=(
-                self.pr, "viewer", MODULE.parse_unified_diff(DIFF), None, None, [], [], DIFF,
-            )),
+            mock.patch.object(
+                MODULE,
+                "preflight",
+                side_effect=(
+                    [initial_preflight, refreshed_preflight]
+                    if base_advance
+                    else None
+                ),
+                return_value=initial_preflight,
+            ),
             mock.patch.object(MODULE, "resolve_viewer_permissions", return_value={"login": "viewer"}),
             mock.patch.object(MODULE, "local_identity", return_value=self.identity),
             mock.patch.object(MODULE, "state_path_for", return_value=state_path),
@@ -1299,6 +1344,11 @@ class ManagedCoordinatorTest(unittest.TestCase):
                 MODULE,
                 "ensure_snapshot_unchanged",
                 side_effect=snapshot_check,
+            ),
+            mock.patch.object(
+                MODULE,
+                "live_base_contains",
+                return_value=True,
             ),
             mock.patch.object(MODULE, "run", side_effect=invoke),
             mock.patch.object(MODULE, "emit") as emit,
@@ -1340,6 +1390,19 @@ class ManagedCoordinatorTest(unittest.TestCase):
         self.assertEqual(2, len(commands))
         self.assertEqual("no_findings", payload["result"])
         self.assertEqual([], state["hosted_comments"])
+        self.assertEqual("not_attempted", state["mutation"]["status"])
+
+    def test_base_advanced_discovery_cannot_claim_no_findings(self):
+        commands, state, payload = self.hosted_check(
+            nonempty=True,
+            reject_all=True,
+            base_advance=True,
+        )
+
+        self.assertEqual(2, len(commands))
+        self.assertEqual("incomplete", payload["result"])
+        self.assertEqual("base_advanced", payload["reason"])
+        self.assertTrue(state["agent_task"]["clearance_stale"])
         self.assertEqual("not_attempted", state["mutation"]["status"])
 
     def test_check_failure_preserves_recovery_state_without_fallback(self):

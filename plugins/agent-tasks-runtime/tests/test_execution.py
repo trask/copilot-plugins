@@ -503,6 +503,43 @@ class ExecutionTest(unittest.TestCase):
         self.assertEqual("original failure", result["error"])
         self.assertEqual(["abc"], result["workflow_result"]["retained_commits"])
 
+    def test_nonzero_controller_surfaces_sealed_result_and_presentation(self):
+        namespace = {"EXECUTION_TERMINAL_RESULTS": frozenset({"blocked"})}
+
+        def main():
+            namespace["_EXECUTION"].emit({
+                "result": "blocked",
+                "session_title": "Blocked workflow",
+                "failures": ["child evidence remained unconfirmed"],
+            })
+            return 7
+
+        output = io.StringIO()
+        with (
+            mock.patch.dict(EXECUTION.os.environ, {}, clear=True),
+            mock.patch.object(sys, "argv", ["controller.py", "run"]),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(
+                7,
+                EXECUTION.controller_main(
+                    main,
+                    namespace,
+                    handle=self.handle,
+                    commands=("run",),
+                ),
+            )
+
+        surfaced = json.loads(output.getvalue())
+        self.assertEqual(7, surfaced["exit_code"])
+        self.assertEqual("failed", surfaced["local_status"])
+        self.assertEqual("blocked", surfaced["workflow_result"]["result"])
+        self.assertIn(
+            "Result: `blocked`",
+            surfaced["presentation"]["text"],
+        )
+        self.assertEqual([], surfaced["finalization_errors"])
+
     def test_explicit_error_cannot_keep_a_zero_exit_code(self):
         context = self.context()
         context.emit({"result": "complete"})

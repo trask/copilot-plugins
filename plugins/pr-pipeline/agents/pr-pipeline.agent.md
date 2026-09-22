@@ -41,4 +41,4 @@ The default mutation policy allows verified source publication, bounded CI rerun
 
 Only the Runtime's verified terminal `workflow_result` establishes the outcome. A missing, abandoned, unreadable, or unsealed result is unknown. There is no intermediate user-visible outcome.
 
-Use the result's `session_title` when present. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
+Use the result's `session_title` when present. A nonzero controller exit can still carry the verified sealed terminal result and presentation; report that exact outcome instead of calling `workflow_result` missing. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
