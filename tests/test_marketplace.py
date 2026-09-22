@@ -30,7 +30,7 @@ CI_FIX_RELEASE_BOUNDARY_HELPER_SHA256 = (
 RUNTIME_PLUGIN = "agent-tasks-runtime"
 RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
 CONFLICT_HELPER_SHA256 = (
-    "383e626298ce822c829ed4fded9d5e155dbcd6b73c15e9799c35bc31ba4afd50"
+    "28c08df797894f35a5b21d08f5f66fbafeb34895597a1c0fed67cbc5a22fed13"
 )
 EXPECTED_PACKAGE_VERSIONS = {
     "agent-tasks-runtime": "1.0.25",
@@ -349,7 +349,7 @@ class MarketplaceTest(unittest.TestCase):
             finally:
                 sys.modules.pop(module_name, None)
 
-    def test_pipeline_stages_expose_direct_coordinator_entrypoints(self):
+    def pipeline_common(self):
         common_path = (
             ROOT / "plugins" / "pr-pipeline" / "scripts" / "pipeline_common.py"
         )
@@ -362,56 +362,88 @@ class MarketplaceTest(unittest.TestCase):
         sys.modules[spec.name] = module
         self.addCleanup(sys.modules.pop, spec.name, None)
         spec.loader.exec_module(module)
-        for stage in module.STAGES:
-            with (
-                self.subTest(stage=stage["stage"]),
-                tempfile.TemporaryDirectory() as directory,
+        return module
+
+    def assert_stage_entrypoint(self, stage_name):
+        module = self.pipeline_common()
+        stage = module.STAGE_BY_NAME[stage_name]
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = Path(directory) / stage["plugin"]
+            shutil.copytree(ROOT / "plugins" / stage["plugin"], plugin_root)
+            coordinator = plugin_root / "scripts" / f"{stage['module']}.py"
+            with mock.patch.object(
+                module, "stage_script_path", return_value=coordinator
             ):
-                plugin_root = Path(directory) / stage["plugin"]
-                shutil.copytree(ROOT / "plugins" / stage["plugin"], plugin_root)
-                coordinator = plugin_root / "scripts" / f"{stage['module']}.py"
-                models = (
-                    tuple(module.COORDINATOR_MODEL_ARGUMENTS)
-                    if stage["stage"] == module.STAGE_DESCRIPTION
-                    else (stage["model"],)
+                command = module.stage_command(
+                    stage,
+                    {"repo_name": "owner/repo", "number": 1},
+                    model=stage["model"],
+                    effort=module.DEFAULT_EFFORT,
+                    arguments=[
+                        "--state", str(Path(directory) / "state.json"),
+                        "--pipeline-run", "a" * 32,
+                        "--pipeline-iteration", "1",
+                        "--pipeline-max-iterations", "2",
+                        "--help",
+                    ],
                 )
-                for model in models:
-                    with (
-                        self.subTest(model=model),
-                        mock.patch.object(
-                            module, "stage_script_path", return_value=coordinator
-                        ),
-                    ):
-                        command = module.stage_command(
-                            stage,
-                            {"repo_name": "owner/repo", "number": 1},
-                            model=model,
-                            effort=module.DEFAULT_EFFORT,
-                            arguments=[
-                                "--state", str(Path(directory) / "state.json"),
-                                "--pipeline-run", "a" * 32,
-                                "--pipeline-iteration", "1",
-                                "--pipeline-max-iterations", "2",
-                                "--help",
-                            ],
-                        )
-                        process = subprocess.run(
-                            command,
-                            cwd=directory,
-                            env=dict(os.environ),
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            timeout=30,
-                            creationflags=(
-                                subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                            ),
-                        )
-                        self.assertEqual(process.returncode, 0, process.stderr)
-                        self.assertIn("--state ", process.stdout)
-                        self.assertIn("--pipeline-run ", process.stdout)
-                        if stage.get("github_mutation_policy"):
-                            self.assertIn("--github-mutation-policy ", process.stdout)
+                process = subprocess.run(
+                    command,
+                    cwd=directory,
+                    env=dict(os.environ),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=30,
+                    creationflags=(
+                        subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+                    ),
+                )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("--state ", process.stdout)
+        self.assertIn("--pipeline-run ", process.stdout)
+        if stage.get("github_mutation_policy"):
+            self.assertIn("--github-mutation-policy ", process.stdout)
+
+    def test_conflict_stage_exposes_direct_coordinator_entrypoint(self):
+        self.assert_stage_entrypoint("pr-conflict-resolver")
+
+    def test_copilot_review_stage_exposes_direct_coordinator_entrypoint(self):
+        self.assert_stage_entrypoint("copilot-review-loop")
+
+    def test_self_review_stage_exposes_direct_coordinator_entrypoint(self):
+        self.assert_stage_entrypoint("self-review-loop")
+
+    def test_ci_stage_exposes_direct_coordinator_entrypoint(self):
+        self.assert_stage_entrypoint("ci-fix-loop")
+
+    def test_description_stage_exposes_direct_coordinator_entrypoint(self):
+        self.assert_stage_entrypoint("pr-description")
+
+    def test_description_models_change_only_the_coordinator_argument(self):
+        module = self.pipeline_common()
+        stage = module.STAGE_BY_NAME[module.STAGE_DESCRIPTION]
+        expected = {
+            "gpt-5.6-sol": "sol",
+            "gpt-5.6-luna": "luna",
+            "gpt-5.6-terra": "terra",
+            "gpt-6-astra": "astra",
+        }
+        self.assertEqual(expected, module.COORDINATOR_MODEL_ARGUMENTS)
+        commands = [
+            module.stage_command(
+                stage,
+                {"repo_name": "owner/repo", "number": 1},
+                model=model,
+                effort=module.DEFAULT_EFFORT,
+                arguments=["--help"],
+            )
+            for model in expected
+        ]
+        self.assertEqual(
+            list(expected.values()),
+            [command[command.index("--model") + 1] for command in commands],
+        )
 
 
 if __name__ == "__main__":

@@ -3118,6 +3118,24 @@ def stack_member_request(
     return projected
 
 
+def record_native_stack_member_result(
+    options: Options,
+    result: Result,
+    code_refs: list[Mapping[str, object]],
+    artifacts: list[Mapping[str, object]],
+    code_ref: Mapping[str, object],
+    member_artifact: Mapping[str, object],
+    source_drift: SourceHeadChanged | None,
+) -> None:
+    code_refs.append(code_ref)
+    artifacts.append(member_artifact)
+    result.code_refs = list(code_refs)
+    result.artifact = {"members": list(artifacts)}
+    atomic_write_json(options.result_file, result.as_dict())
+    if source_drift is not None:
+        raise source_drift
+
+
 def execute_native_stack(
     options: Options,
     snapshot: LocalSnapshot,
@@ -3255,14 +3273,16 @@ def execute_native_stack(
             member_options.result_file,
             {"task_response": final, "artifact": member_artifact, "code_ref": code_ref},
         )
-        code_refs.append(code_ref)
-        artifacts.append(member_artifact)
-        result.code_refs = list(code_refs)
-        result.artifact = {"members": list(artifacts)}
-        atomic_write_json(options.result_file, result.as_dict())
+        record_native_stack_member_result(
+            options,
+            result,
+            code_refs,
+            artifacts,
+            code_ref,
+            member_artifact,
+            source_drift,
+        )
         base_sha = tip
-        if source_drift is not None:
-            raise source_drift
     for artifact in artifacts:
         _, current_head = fetch_quarantined(
             runner,

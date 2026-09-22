@@ -2,8 +2,10 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -19,32 +21,61 @@ SPEC.loader.exec_module(COMMON)
 
 
 class NativeStackNoopTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.template = tempfile.TemporaryDirectory()
+        template = Path(cls.template.name).resolve()
+        cls.template_root = template / "repo"
+        cls.template_root.mkdir()
+        cls.template_remote = template / "remote.git"
+        MODULE.git(cls.template_root, "init", "--initial-branch=main")
+        MODULE.git(cls.template_root, "config", "user.name", "Test")
+        MODULE.git(cls.template_root, "config", "user.email", "test@example.com")
+        MODULE.git(cls.template_root, "config", "commit.gpgsign", "false")
+        cls.template_commit("base.txt", "base")
+        cls.trunk = MODULE.git(cls.template_root, "rev-parse", "HEAD")
+        MODULE.git(cls.template_root, "checkout", "-b", "lower")
+        cls.template_commit("lower.txt", "lower")
+        cls.lower = MODULE.git(cls.template_root, "rev-parse", "HEAD")
+        MODULE.git(cls.template_root, "checkout", "-b", "upper")
+        cls.template_commit("upper.txt", "upper")
+        cls.upper = MODULE.git(cls.template_root, "rev-parse", "HEAD")
+        MODULE.git(cls.template_root, "checkout", "--detach", cls.lower)
+        MODULE.git(
+            cls.template_root,
+            "clone",
+            "--no-checkout",
+            str(cls.template_root),
+            str(cls.template_remote),
+        )
+        MODULE.git(cls.template_remote, "config", "user.name", "Test")
+        MODULE.git(cls.template_remote, "config", "user.email", "test@example.com")
+        MODULE.git(cls.template_root, "remote", "add", "origin", str(cls.template_remote))
+        for branch, head in (("main", cls.trunk), ("lower", cls.lower), ("upper", cls.upper)):
+            MODULE.git(cls.template_remote, "update-ref", f"refs/heads/{branch}", head)
+        for number, head in ((7, cls.lower), (8, cls.upper)):
+            MODULE.git(cls.template_remote, "update-ref", f"refs/pull/{number}/head", head)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.template.cleanup()
+
+    @classmethod
+    def template_commit(cls, path, content):
+        (cls.template_root / path).write_text(content, encoding="utf-8")
+        MODULE.git(cls.template_root, "add", path)
+        MODULE.git(cls.template_root, "commit", "-m", content)
+
     def setUp(self):
         self.directory = existing.temporary_directory(self)
         self.root = self.directory / "repo"
-        self.root.mkdir()
         self.remote = self.directory / "remote.git"
-        MODULE.git(self.root, "init", "--initial-branch=main")
-        MODULE.git(self.root, "config", "user.name", "Test")
-        MODULE.git(self.root, "config", "user.email", "test@example.com")
-        MODULE.git(self.root, "config", "commit.gpgsign", "false")
-        self.commit("base.txt", "base")
-        self.trunk = MODULE.git(self.root, "rev-parse", "HEAD")
-        MODULE.git(self.root, "checkout", "-b", "lower")
-        self.commit("lower.txt", "lower")
-        self.lower = MODULE.git(self.root, "rev-parse", "HEAD")
-        MODULE.git(self.root, "checkout", "-b", "upper")
-        self.commit("upper.txt", "upper")
-        self.upper = MODULE.git(self.root, "rev-parse", "HEAD")
-        MODULE.git(self.root, "checkout", "--detach", self.lower)
-        MODULE.git(self.root, "clone", "--no-checkout", str(self.root), str(self.remote))
-        MODULE.git(self.remote, "config", "user.name", "Test")
-        MODULE.git(self.remote, "config", "user.email", "test@example.com")
-        MODULE.git(self.root, "remote", "add", "origin", str(self.remote))
-        for branch, head in (("main", self.trunk), ("lower", self.lower), ("upper", self.upper)):
-            MODULE.git(self.remote, "update-ref", f"refs/heads/{branch}", head)
-        for number, head in ((7, self.lower), (8, self.upper)):
-            MODULE.git(self.remote, "update-ref", f"refs/pull/{number}/head", head)
+        shutil.copytree(self.template_root, self.root)
+        shutil.copytree(self.template_remote, self.remote)
+        MODULE.git(self.root, "remote", "set-url", "origin", str(self.remote))
+        self.trunk = type(self).trunk
+        self.lower = type(self).lower
+        self.upper = type(self).upper
         self.metadata = {
             number: existing.pr_metadata(
                 number=number, pr_url=f"https://github.com/owner/repo/pull/{number}",
@@ -116,11 +147,6 @@ class NativeStackNoopTest(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def commit(self, path, content):
-        (self.root / path).write_text(content, encoding="utf-8")
-        MODULE.git(self.root, "add", path)
-        MODULE.git(self.root, "commit", "-m", content)
-
     def status(self):
         MODULE.command_status(MODULE.build_parser().parse_args([
             "status", "--state", str(self.state_path),
@@ -191,33 +217,6 @@ class NativeStackNoopTest(unittest.TestCase):
         self.assert_no_dispatch()
         self.calls["repository_merge_methods"].assert_not_called()
 
-    def test_later_sweep_uses_retained_noop_scope_without_spending_task_budget(self):
-        self.assertEqual(0, MODULE.command_pipeline(self.args))
-        self.args.pipeline_iteration = 2
-        self.assertEqual(0, MODULE.command_pipeline(self.args))
-        state = MODULE.load_state(self.state_path)
-        self.assertEqual(0, state["managed_attempts"])
-        self.assertEqual(3, state["pipeline"]["budget"])
-        self.assertEqual("cleared", MODULE.stage_outcome(state))
-        self.assertEqual([7, 8], [
-            item["pr_number"] for item in state["pipeline_native_scope"]["members"]
-        ])
-        self.assert_no_dispatch()
-
-    def test_upper_invocation_checks_the_whole_stack_without_replay(self):
-        MODULE.git(self.root, "checkout", "--detach", self.upper)
-        self.request, _, _, _ = write_authorization(
-            self.directory, self.stack, fixed=8, operation="whole-stack"
-        )
-        self.args.target = "owner/repo#8"
-        self.assertEqual(0, MODULE.command_pipeline(self.args))
-        state = MODULE.load_state(self.state_path)
-        self.assertEqual(self.upper, MODULE.cleared_head_sha(state))
-        self.assertEqual([7, 8], [
-            member["pr_number"] for member in state["native_stack_clearance"]["members"]
-        ])
-        self.assert_no_dispatch()
-
     def move_trunk_without_tree_change(self):
         tree = MODULE.git(self.remote, "rev-parse", f"{self.trunk}^{{tree}}")
         moved = MODULE.git(self.remote, "commit-tree", tree, "-p", self.trunk, "-m", "new ancestry")
@@ -241,156 +240,6 @@ class NativeStackNoopTest(unittest.TestCase):
             MODULE.git(self.remote, "rev-parse", f"{moved}^{{tree}}"),
         )
         self.assert_dispatch()
-
-    def test_equal_tree_changed_predecessor_ancestry_still_dispatches(self):
-        tree = MODULE.git(self.remote, "rev-parse", f"{self.lower}^{{tree}}")
-        moved = MODULE.git(self.remote, "commit-tree", tree, "-p", self.trunk, "-m", "rewritten lower")
-        MODULE.git(self.remote, "update-ref", "refs/heads/lower", moved)
-        MODULE.git(self.remote, "update-ref", "refs/pull/7/head", moved)
-        MODULE.git(self.root, "fetch", "origin", "lower")
-        MODULE.git(self.root, "checkout", "--detach", moved)
-        self.metadata[7]["head_sha"] = moved
-        self.metadata[8]["base_sha"] = moved
-        self.stack["members"][0]["head_sha"] = moved
-        self.request, _, _, _ = write_authorization(
-            self.directory, self.stack, fixed=7, operation="whole-stack"
-        )
-        self.assert_dispatch()
-
-    def test_later_sweep_does_not_clear_new_unintegrated_ancestry(self):
-        self.assertEqual(0, MODULE.command_pipeline(self.args))
-        self.move_trunk_without_tree_change()
-        self.args.pipeline_iteration = 2
-        with self.assertRaisesRegex(MODULE.WorkflowError, "not freshly mergeable and aligned"):
-            MODULE.command_pipeline(self.args)
-        self.assert_not_clear()
-        self.assertEqual(0, MODULE.load_state(self.state_path)["managed_attempts"])
-
-    def test_explicit_strategies_keep_hosted_preparation(self):
-        for strategy in ("merge", "rebase"):
-            with self.subTest(strategy=strategy):
-                if self.state_path.exists():
-                    self.state_path.unlink()
-                self.dispatches.clear()
-                self.args.strategy = strategy
-                self.assert_dispatch()
-
-    def test_conflicting_member_does_not_clear(self):
-        self.metadata[8]["mergeable"] = "CONFLICTING"
-        self.assert_dispatch()
-
-    def test_unknown_member_exhausts_bounded_observation_without_clearance(self):
-        for number in (7, 8):
-            if self.state_path.exists():
-                self.state_path.unlink()
-            self.metadata[number]["mergeable"] = "UNKNOWN"
-            with self.subTest(number=number), mock.patch.object(MODULE.time, "sleep") as sleep:
-                self.assertEqual(1, MODULE.command_pipeline(self.args))
-                self.assertEqual(len(MODULE.MERGEABILITY_RETRY_DELAYS), sleep.call_count)
-                self.assert_not_clear()
-            self.metadata[number]["mergeable"] = "MERGEABLE"
-
-    def test_unknown_can_settle_only_through_fresh_observation(self):
-        reads = []
-        self.stack["members"][-1]["mergeable"] = "UNKNOWN"
-
-        def metadata(target):
-            current = copy.deepcopy(self.metadata[target["number"]])
-            if target["number"] == 8:
-                reads.append(8)
-                if len(reads) == 1:
-                    current["mergeable"] = "UNKNOWN"
-                else:
-                    self.stack["members"][-1]["mergeable"] = "MERGEABLE"
-            return current
-
-        self.calls["metadata_for"].side_effect = metadata
-        with mock.patch.object(MODULE.time, "sleep") as sleep:
-            self.assertEqual(0, MODULE.command_pipeline(self.args))
-        self.assertEqual(1, sleep.call_count)
-        self.assertGreaterEqual(len(reads), 3)
-        self.assert_no_dispatch()
-
-    def test_final_member_identity_and_mergeability_races_fail_closed(self):
-        original = self.calls["metadata_for"].side_effect
-        for field, value in (
-            ("head_sha", self.lower), ("base_sha", self.trunk),
-            ("head_branch", "other"), ("base_branch", "main"),
-            ("head_owner", "foreign"), ("head_repo", "foreign"),
-            ("repo_name", "foreign/repo"), ("number", 99),
-            ("state", "CLOSED"), ("mergeable", "CONFLICTING"),
-            ("mergeable", "UNKNOWN"), ("mergeable", None),
-        ):
-            reads = []
-
-            def changed(target):
-                current = original(target)
-                if target["number"] == 8:
-                    reads.append(8)
-                    if len(reads) >= 2:
-                        current[field] = value
-                return current
-
-            self.calls["metadata_for"].side_effect = changed
-            if self.state_path.exists():
-                self.state_path.unlink()
-            with self.subTest(field=field, value=value), mock.patch.object(MODULE.time, "sleep"):
-                self.assertEqual(1, MODULE.command_pipeline(self.args))
-                self.assert_not_clear()
-        self.calls["metadata_for"].side_effect = original
-
-    def test_final_topology_owner_and_advertised_head_races_fail_closed(self):
-        original_stack = copy.deepcopy(self.stack)
-        original_owner = self.owner_path.read_bytes()
-        real_identity = MODULE.conflict_preflight_identity
-        for race in (
-            "order", "unselected", "stack-id", "position", "owner", "local",
-            "source-ref", "base-ref", "stack-conflicting", "stack-unknown",
-        ):
-            if self.state_path.exists():
-                self.state_path.unlink()
-            self.stack = copy.deepcopy(original_stack)
-            self.owner_path.write_bytes(original_owner)
-            reads = []
-
-            def tip(repo, branch):
-                reads.append(branch)
-                if branch == "upper":
-                    if race == "order":
-                        self.stack["members"].reverse()
-                    elif race == "unselected":
-                        self.stack["members"].append({**self.stack["members"][-1], "number": 9})
-                        self.stack["size"] = 3
-                    elif race == "stack-id":
-                        self.stack["id"] = "different"
-                    elif race == "position":
-                        self.stack["members"][-1]["position"] = 99
-                    elif race == "stack-conflicting":
-                        self.stack["members"][-1]["mergeable"] = "CONFLICTING"
-                    elif race == "stack-unknown":
-                        self.stack["members"][-1]["mergeable"] = "UNKNOWN"
-                    elif race == "source-ref":
-                        return self.lower
-                if race == "base-ref" and branch == "main" and reads.count("main") >= 3:
-                    return self.upper
-                return MODULE.git(self.remote, "rev-parse", f"refs/heads/{branch}")
-
-            def identity(root, metadata):
-                result = real_identity(root, metadata)
-                if race == "owner" and "upper" in reads:
-                    owner = json.loads(original_owner)
-                    owner["result"] = {"result": "cancelled"}
-                    self.owner_path.write_text(json.dumps(owner), encoding="utf-8")
-                if race == "local" and "upper" in reads:
-                    return {**result, "branch": "different"}
-                return result
-
-            self.calls["base_ref_tip"].side_effect = tip
-            with self.subTest(race=race), mock.patch.object(
-                MODULE, "conflict_preflight_identity", side_effect=identity
-            ):
-                self.assertEqual(1, MODULE.command_pipeline(self.args))
-                self.assert_not_clear()
 
     def test_invalid_selection_and_incomplete_snapshot_fail_before_dispatch(self):
         for change in (

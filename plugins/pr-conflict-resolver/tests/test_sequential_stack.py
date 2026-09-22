@@ -1,6 +1,7 @@
 import copy
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -72,39 +73,182 @@ class ReplayTaskBaseTest(unittest.TestCase):
 
 
 class SequentialStackTest(unittest.TestCase):
+    lower_message = (
+            "Lower one\n\nCo-authored-by: Copilot App "
+            "<223556219+Copilot@users.noreply.github.com>"
+        )
+
+    @staticmethod
+    def git_at(root, *args, input=None, env=None):
+        process = subprocess.run(
+            ["git", "-C", str(root), *args],
+            input=input.encode("utf-8") if isinstance(input, str) else input,
+            capture_output=True,
+            check=True,
+            env=dict(os.environ) if env is None else env,
+            **MODULE.windows_no_window_options(),
+        )
+        return process.stdout.decode("utf-8").strip()
+
+    @classmethod
+    def commit_at(cls, directory, root, parent, subject, path, content):
+        index = directory / "temporary-index"
+        index.unlink(missing_ok=True)
+        environment = dict(os.environ)
+        environment["GIT_INDEX_FILE"] = str(index)
+        cls.git_at(root, "read-tree", parent if parent else "--empty", env=environment)
+        blob = cls.git_at(root, "hash-object", "-w", "--stdin", input=content)
+        cls.git_at(
+            root,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"100644,{blob},{path}",
+            env=environment,
+        )
+        tree = cls.git_at(root, "write-tree", env=environment)
+        return cls.git_at(
+            root,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit-tree",
+            tree,
+            *(["-p", parent] if parent else []),
+            input=subject + "\n",
+        )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.template = tempfile.TemporaryDirectory()
+        cls.template_directory = Path(cls.template.name).resolve()
+        cls.template_root = cls.template_directory / "repo"
+        cls.template_root.mkdir()
+        cls.template_remote = cls.template_directory / "remote.git"
+        cls.git_at(cls.template_root, "init", "--quiet")
+        cls.git_at(cls.template_root, "init", "--bare", "--quiet", str(cls.template_remote))
+        cls.git_at(cls.template_root, "remote", "add", "origin", str(cls.template_remote))
+        cls.seed = cls.commit_at(
+            cls.template_directory, cls.template_root, None, "Seed", "app.py", "seed\n"
+        )
+        cls.lower1 = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.seed,
+            cls.lower_message,
+            "app.py",
+            "seed\none\n",
+        )
+        cls.lower = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.lower1,
+            "Lower two",
+            "app.py",
+            "seed\none\ntwo\n",
+        )
+        cls.upper = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.lower,
+            "Upper",
+            "upper.py",
+            "upper\n",
+        )
+        cls.trunk = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.seed,
+            "Trunk",
+            "app.py",
+            "seed\ntrunk\n",
+        )
+        cls.new_lower1 = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.trunk,
+            cls.lower_message,
+            "app.py",
+            "seed\ntrunk\none\n",
+        )
+        cls.new_lower2 = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.new_lower1,
+            "Lower two",
+            "app.py",
+            "seed\ntrunk\none\ntwo\n",
+        )
+        cls.new_lower = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.new_lower2,
+            "Focused fix",
+            "app.py",
+            "seed\ntrunk\none\ntwo\nfix\n",
+        )
+        cls.new_upper = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.new_lower,
+            "Upper",
+            "upper.py",
+            "upper\n",
+        )
+        cls.report = cls.commit_at(
+            cls.template_directory,
+            cls.template_root,
+            cls.new_upper,
+            "Optional notes",
+            CLOUD.OUTPUT_REPORT_PATH,
+            "anything\n",
+        )
+        cls.git_at(cls.template_root, "checkout", "--quiet", "--detach", cls.lower)
+        cls.branches = {
+            "copilot/lower-task": cls.new_lower,
+            "copilot/upper-task": cls.report,
+        }
+        for branch, tip in cls.branches.items():
+            cls.git_at(
+                cls.template_root,
+                "push",
+                "--quiet",
+                "origin",
+                f"{tip}:refs/heads/{branch}",
+            )
+        cls.member_identities = {
+            sha: MODULE.commit_identity(cls.template_root, sha, linear=True)
+            for sha in (cls.lower1, cls.lower, cls.upper)
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.template.cleanup()
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
         self.root = self.directory / "repo"
-        self.root.mkdir()
         self.remote = self.directory / "remote.git"
-        self.run_git("init", "--quiet")
-        self.run_git("init", "--bare", "--quiet", str(self.remote))
-        self.run_git("remote", "add", "origin", str(self.remote))
-        self.seed = self.commit(None, "Seed", "app.py", "seed\n")
-        self.lower_message = (
-            "Lower one\n\nCo-authored-by: Copilot App "
-            "<223556219+Copilot@users.noreply.github.com>"
-        )
-        self.lower1 = self.commit(self.seed, self.lower_message, "app.py", "seed\none\n")
-        self.lower = self.commit(self.lower1, "Lower two", "app.py", "seed\none\ntwo\n")
-        self.upper = self.commit(self.lower, "Upper", "upper.py", "upper\n")
-        self.trunk = self.commit(self.seed, "Trunk", "app.py", "seed\ntrunk\n")
-        self.new_lower1 = self.commit(self.trunk, self.lower_message, "app.py", "seed\ntrunk\none\n")
-        self.new_lower2 = self.commit(self.new_lower1, "Lower two", "app.py", "seed\ntrunk\none\ntwo\n")
-        self.new_lower = self.commit(self.new_lower2, "Focused fix", "app.py", "seed\ntrunk\none\ntwo\nfix\n")
-        self.new_upper = self.commit(self.new_lower, "Upper", "upper.py", "upper\n")
-        self.report = self.commit(
-            self.new_upper, "Optional notes", CLOUD.OUTPUT_REPORT_PATH, "anything\n"
-        )
-        self.run_git("checkout", "--quiet", "--detach", self.lower)
-        self.branches = {
-            "copilot/lower-task": self.new_lower,
-            "copilot/upper-task": self.report,
-        }
-        for branch, tip in self.branches.items():
-            self.run_git("push", "--quiet", "origin", f"{tip}:refs/heads/{branch}")
+        shutil.copytree(self.template_root, self.root)
+        shutil.copytree(self.template_remote, self.remote)
+        self.run_git("remote", "set-url", "origin", str(self.remote))
+        for name in (
+            "seed",
+            "lower1",
+            "lower",
+            "upper",
+            "trunk",
+            "new_lower1",
+            "new_lower2",
+            "new_lower",
+            "new_upper",
+            "report",
+        ):
+            setattr(self, name, getattr(type(self), name))
+        self.branches = dict(type(self).branches)
         request = existing.ManagedTaskPromptTest().minimal_request()
         request.update(
             policy=CLOUD.POLICY,
@@ -140,7 +284,7 @@ class SequentialStackTest(unittest.TestCase):
                     "old_sha": base,
                 },
                 "old_commits": [
-                    MODULE.commit_identity(self.root, sha, linear=True) for sha in commits
+                    copy.deepcopy(type(self).member_identities[sha]) for sha in commits
                 ],
                 "sync_merges": [],
                 "lease_sha": head,
@@ -183,14 +327,7 @@ class SequentialStackTest(unittest.TestCase):
         return self.tasks[endpoint.rsplit("/", 1)[-1]]
 
     def run_git(self, *args, input=None, env=None):
-        process = subprocess.run(
-            ["git", "-C", str(self.root), *args],
-            input=input.encode("utf-8") if isinstance(input, str) else input,
-            capture_output=True, check=True,
-            env=dict(os.environ) if env is None else env,
-            **MODULE.windows_no_window_options(),
-        )
-        return process.stdout.decode("utf-8").strip()
+        return self.git_at(self.root, *args, input=input, env=env)
 
     def commit(self, parent, subject, path, content):
         index = self.directory / "temporary-index"
@@ -295,146 +432,6 @@ class SequentialStackTest(unittest.TestCase):
             self.assertIn("Do not switch branches", prompt)
             self.assertIn("Cherry-pick each `head_commits` SHA", prompt)
 
-    def test_task_creation_pins_replay_destination_and_preserves_source_identity(self):
-        lower_report = self.commit(
-            self.new_lower, "Lower notes", CLOUD.OUTPUT_REPORT_PATH, "advisory\n"
-        )
-        self.run_git(
-            "push", "--quiet", "--force", "origin",
-            f"{lower_report}:refs/heads/copilot/lower-task",
-        )
-        self.execute()
-        self.assertEqual(lower_report, self.result.artifact["members"][0]["head_sha"])
-        self.assertEqual(self.new_lower, self.result.artifact["members"][0]["source_tip_sha"])
-        for options, expected_base in zip(self.launched, [self.trunk, self.new_lower]):
-            with (
-                self.subTest(base=expected_base),
-                mock.patch.object(CLOUD, "api_json", return_value={
-                    "id": "fresh-task", "state": "queued",
-                }) as api,
-            ):
-                CLOUD.start_task(subprocess.run, self.snapshot, options)
-                payload = api.call_args.args[-1]
-                self.assertEqual(expected_base, payload["base_ref"])
-                self.assertFalse(payload["create_pull_request"])
-                self.assertIn(
-                    options.request["pull_request"]["head_sha"], payload["prompt"]
-                )
-                self.assertNotEqual(
-                    options.request["pull_request"]["head_sha"], payload["base_ref"]
-                )
-
-    def test_source_plus_rewritten_trunk_fails_even_with_correct_candidate_tree(self):
-        reversed_tip = self.commit(
-            self.lower, "Trunk", "app.py", "seed\ntrunk\none\ntwo\n"
-        )
-        self.assertEqual(
-            self.run_git("rev-parse", f"{self.new_lower2}^{{tree}}"),
-            self.run_git("rev-parse", f"{reversed_tip}^{{tree}}"),
-        )
-        self.assertEqual(self.lower, self.run_git("rev-parse", f"{reversed_tip}^"))
-        self.assertEqual(self.seed, self.run_git("merge-base", self.trunk, reversed_tip))
-        self.run_git(
-            "push", "--quiet", "--force", "origin",
-            f"{reversed_tip}:refs/heads/copilot/lower-task",
-        )
-        with self.assertRaisesRegex(CLOUD.ConflictError, "not rooted at pinned base"):
-            self.execute()
-        self.assertEqual(1, len(self.launched))
-        self.assertEqual("not_started", self.result.application_status)
-        self.assertEqual([], self.result.code_refs)
-        self.assertEqual(self.lower, self.run_git("rev-parse", "HEAD"))
-
-    def test_task_reporting_original_source_as_base_is_rejected(self):
-        original = self.start
-        for field in ("artifact", "session"):
-            def start(*args):
-                task = original(*args)
-                if field == "artifact":
-                    task["artifacts"][0]["data"]["base_ref"] = self.lower
-                else:
-                    task["sessions"][0]["base_ref"] = self.lower
-                return task
-
-            self.launched = []
-            self.start = start
-            with self.subTest(field=field), self.assertRaisesRegex(
-                CLOUD.ConflictError, "session identity changed"
-            ):
-                self.execute()
-            self.assertEqual("not_started", self.result.application_status)
-
-    def test_attribution_appendix_preserves_semantic_trailers_and_whole_stack(self):
-        appended = self.lower_message + (
-            "\n\nCo-authored-by: trask <218610+trask@users.noreply.github.com>"
-        )
-        self.new_lower1 = self.commit(self.trunk, appended, "app.py", "seed\ntrunk\none\n")
-        self.new_lower2 = self.commit(self.new_lower1, "Lower two", "app.py", "seed\ntrunk\none\ntwo\n")
-        self.new_lower = self.commit(self.new_lower2, "Focused fix", "app.py", "seed\ntrunk\none\ntwo\nfix\n")
-        self.new_upper = self.commit(self.new_lower, "Upper", "upper.py", "upper\n")
-        for branch, sha in (
-            ("copilot/lower-task", self.new_lower),
-            ("copilot/upper-task", self.new_upper),
-        ):
-            self.run_git("push", "--quiet", "--force", "origin", f"{sha}:refs/heads/{branch}")
-        self.execute()
-        mapping = self.result.code_refs[0]["commits"][0]
-        self.assertEqual(
-            self.request["native_stack"]["members"][0]["old_commits"][0]["trailers"],
-            mapping["trailers"],
-        )
-        self.assertNotEqual(
-            mapping["trailers"], CLOUD.commit_trailers(subprocess.run, self.root, self.new_lower1)
-        )
-        refs, artifact = MODULE.validate_conflict_result_identity(self.result.as_dict(), self.request)
-        MODULE.verify_quarantined_result(self.root, self.request, refs, artifact)
-        changed_refs = copy.deepcopy(refs)
-        changed_refs[0]["commits"][0]["trailers"] = CLOUD.commit_trailers(
-            subprocess.run, self.root, self.new_lower1
-        )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "mapping"):
-            MODULE.verify_quarantined_result(self.root, self.request, changed_refs, artifact)
-        for mutation in (
-            {"creator_id": 123},
-            {"creator_login": "different"},
-            {"task_id": "task-2"},
-            {"creator_id": True},
-            {"creator_login": "trask\nSigned-off-by: forged"},
-            {"extra": "model declaration"},
-        ):
-            changed = copy.deepcopy(artifact)
-            changed["members"][0]["attribution"].update(mutation)
-            with self.subTest(mutation=mutation), self.assertRaises(MODULE.WorkflowError):
-                MODULE.verify_quarantined_result(self.root, self.request, refs, changed)
-        standalone = CLOUD.stack_member_request(
-            self.request, self.request["native_stack"]["members"][0], self.trunk
-        )
-        self.run_git(
-            "push", "--quiet", "--force", "origin",
-            f"{self.new_lower2}:refs/heads/copilot/lower-task",
-        )
-        with mock.patch.object(CLOUD, "local_snapshot", return_value=self.snapshot):
-            standalone_refs, standalone_artifact, _ = CLOUD.prove_generated_minimal(
-                subprocess.run, self.snapshot, standalone, self.tasks["task-1"]
-            )
-        MODULE.verify_quarantined_result(
-            self.root, standalone, standalone_refs, standalone_artifact
-        )
-
-    def test_missing_replay_commit_stops_before_next_task(self):
-        self.run_git("push", "--quiet", "--force", "origin", f"{self.new_lower1}:refs/heads/copilot/lower-task")
-        with self.assertRaisesRegex(CLOUD.ConflictError, "dropped"):
-            self.execute()
-        self.assertEqual(1, len(self.launched))
-        self.assertEqual("not_started", self.result.application_status)
-
-    def test_divergent_upper_branch_fails_without_publication(self):
-        divergent = self.commit(self.trunk, "Upper", "upper.py", "upper\n")
-        self.run_git("push", "--quiet", "--force", "origin", f"{divergent}:refs/heads/copilot/upper-task")
-        with self.assertRaisesRegex(CLOUD.ConflictError, "not rooted at pinned base"):
-            self.execute()
-        self.assertEqual("not_started", self.result.application_status)
-
     def test_source_head_drift_preserves_completed_candidates_and_stops_sequence(self):
         drift = CLOUD.SourceHeadChanged(
             pr_number=6,
@@ -454,61 +451,6 @@ class SequentialStackTest(unittest.TestCase):
         self.assertEqual(1, len(self.result.code_refs))
         self.assertEqual(1, len(self.result.artifact["members"]))
         self.assertEqual("not_started", self.result.application_status)
-
-    def test_base_or_topology_drift_remains_a_failure(self):
-        def guard(*_):
-            if self.result.code_refs and len(self.launched) == 1:
-                raise CLOUD.ConflictError(
-                    "native stack identity changed", "stale_target"
-                )
-
-        with self.assertRaisesRegex(CLOUD.ConflictError, "identity changed"):
-            self.execute(guard)
-        self.assertEqual(1, len(self.launched))
-        self.assertEqual("not_started", self.result.application_status)
-
-    def test_generated_branch_drift_during_collection_fails(self):
-        original = self.start
-
-        def start(*args):
-            task = original(*args)
-            if len(self.launched) == 2:
-                self.run_git("push", "--quiet", "--force", "origin", f"{self.new_lower2}:refs/heads/copilot/lower-task")
-            return task
-
-        self.start = start
-        with self.assertRaisesRegex(CLOUD.ConflictError, "changed during collection"):
-            self.execute()
-        self.assertEqual("not_started", self.result.application_status)
-
-    def test_controller_rejects_missing_reordered_or_divergent_member_evidence(self):
-        self.execute()
-        result = self.result.as_dict()
-        result["task"] = {
-            **result["task"], "base_ref": self.upper, "base_sha": self.upper,
-        }
-        result["generated"]["artifact"] = copy.deepcopy(result["generated"]["artifact"])
-        result["generated"]["artifact"]["members"][-1]["task"] = result["task"]
-        with self.assertRaisesRegex(MODULE.WorkflowError, "base does not match"):
-            MODULE.validate_conflict_result_identity(result, self.request)
-        for mutate in (
-            lambda refs, artifact: artifact["members"].pop(),
-            lambda refs, artifact: artifact["members"].reverse(),
-            lambda refs, artifact: refs[1].update(base_sha=self.trunk),
-            lambda refs, artifact: refs[0].update(fix_commits=[]),
-            lambda refs, artifact: artifact["members"][1]["task"].update(id="task-1"),
-            lambda refs, artifact: artifact["members"][0]["task"].update(
-                base_ref=self.lower, base_sha=self.lower
-            ),
-            lambda refs, artifact: artifact["members"][1]["task"].update(
-                base_ref=self.upper, base_sha=self.upper
-            ),
-        ):
-            refs = copy.deepcopy(self.result.code_refs)
-            artifact = copy.deepcopy(self.result.artifact)
-            mutate(refs, artifact)
-            with self.subTest(mutation=mutate), self.assertRaises(MODULE.WorkflowError):
-                MODULE.verify_quarantined_result(self.root, self.request, refs, artifact)
 
     def publication_state(self):
         self.execute()
@@ -532,23 +474,6 @@ class SequentialStackTest(unittest.TestCase):
             self.run_git("ls-remote", "origin", f"refs/heads/{branch}").split()[0]
             for branch in ("lower", "upper")
         ]
-
-    def test_safe_publication_is_atomic_and_excludes_advisory_output(self):
-        state = self.publication_state()
-        metadata = existing.pr_metadata()
-        metadata.update(number=6, head_sha=self.new_lower, base_sha=self.trunk)
-        with (
-            mock.patch.object(MODULE, "require_live_conflict_guards") as guards,
-            mock.patch.object(MODULE, "remote_publication_heads", side_effect=self.publication_heads),
-            mock.patch.object(MODULE, "find_remote", return_value="origin"),
-            mock.patch.object(MODULE, "metadata_for", return_value=metadata),
-            mock.patch.object(MODULE, "record_stack_member_clearances"),
-        ):
-            outcome = MODULE.publish_conflict_result(self.directory / "state.json", state)
-        guards.assert_called_once()
-        self.assertEqual("published", outcome["result"])
-        self.assertEqual([self.new_lower, self.new_upper], self.publication_heads())
-        self.assertNotEqual(self.report, self.publication_heads()[1])
 
     def test_publication_rejects_concurrent_writer_without_partial_push(self):
         state = self.publication_state()

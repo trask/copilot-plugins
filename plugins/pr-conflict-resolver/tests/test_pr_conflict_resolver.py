@@ -937,7 +937,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "383e626298ce822c829ed4fded9d5e155dbcd6b73c15e9799c35bc31ba4afd50",
+            "28c08df797894f35a5b21d08f5f66fbafeb34895597a1c0fed67cbc5a22fed13",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -11681,20 +11681,37 @@ class StackRebaseCommandTest(unittest.TestCase):
 
 
 class StackFormatCommandTest(GitTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.template = tempfile.TemporaryDirectory()
+        cls.template_workspace = Path(cls.template.name).resolve() / "workspace"
+        cls.template_workspace.mkdir()
+        cls.git_in(cls.template_workspace, "init", "--initial-branch", "main")
+        cls.git_in(cls.template_workspace, "config", "user.name", "Stack Test")
+        cls.git_in(
+            cls.template_workspace,
+            "config",
+            "user.email",
+            "stack@example.invalid",
+        )
+        cls.write_in(cls.template_workspace, "main.txt", "main\n")
+        cls.commit_in(cls.template_workspace, "main")
+        cls.main_sha = cls.git_in(cls.template_workspace, "rev-parse", "HEAD")
+        cls.git_in(cls.template_workspace, "checkout", "-b", "feature")
+        cls.write_in(cls.template_workspace, "feature.txt", "before\n")
+        cls.commit_in(cls.template_workspace, "feature")
+        cls.feature_sha = cls.git_in(cls.template_workspace, "rev-parse", "HEAD")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.template.cleanup()
+
     def setUp(self):
         self.directory = temporary_directory(self)
         self.workspace = self.directory / "workspace"
-        self.workspace.mkdir()
-        self.git_in(self.workspace, "init", "--initial-branch", "main")
-        self.git_in(self.workspace, "config", "user.name", "Stack Test")
-        self.git_in(self.workspace, "config", "user.email", "stack@example.invalid")
-        self.write_in(self.workspace, "main.txt", "main\n")
-        self.commit_in(self.workspace, "main")
-        self.main_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
-        self.git_in(self.workspace, "checkout", "-b", "feature")
-        self.write_in(self.workspace, "feature.txt", "before\n")
-        self.commit_in(self.workspace, "feature")
-        self.feature_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
+        shutil.copytree(self.template_workspace, self.workspace)
+        self.main_sha = type(self).main_sha
+        self.feature_sha = type(self).feature_sha
         self.stack = {
             "number": 77,
             "size": 1,
@@ -12106,26 +12123,43 @@ class StackFormatCommandTest(GitTestCase):
 
 
 class StackValidationFixCommandTest(GitTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.template = tempfile.TemporaryDirectory()
+        cls.template_workspace = Path(cls.template.name).resolve() / "workspace"
+        cls.template_workspace.mkdir()
+        cls.git_in(cls.template_workspace, "init", "--initial-branch", "main")
+        cls.git_in(cls.template_workspace, "config", "user.name", "Stack Test")
+        cls.git_in(
+            cls.template_workspace,
+            "config",
+            "user.email",
+            "stack@example.invalid",
+        )
+        cls.write_in(cls.template_workspace, "base-caller.txt", "old expectation\n")
+        cls.commit_in(cls.template_workspace, "main")
+        cls.main_sha = cls.git_in(cls.template_workspace, "rev-parse", "HEAD")
+        cls.git_in(
+            cls.template_workspace,
+            "update-ref",
+            "refs/remotes/origin/main",
+            cls.main_sha,
+        )
+        cls.git_in(cls.template_workspace, "checkout", "-b", "feature")
+        cls.write_in(cls.template_workspace, "feature.txt", "resolved behavior\n")
+        cls.commit_in(cls.template_workspace, "feature")
+        cls.feature_sha = cls.git_in(cls.template_workspace, "rev-parse", "HEAD")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.template.cleanup()
+
     def setUp(self):
         self.directory = temporary_directory(self)
         self.workspace = self.directory / "workspace"
-        self.workspace.mkdir()
-        self.git_in(self.workspace, "init", "--initial-branch", "main")
-        self.git_in(self.workspace, "config", "user.name", "Stack Test")
-        self.git_in(self.workspace, "config", "user.email", "stack@example.invalid")
-        self.write_in(self.workspace, "base-caller.txt", "old expectation\n")
-        self.commit_in(self.workspace, "main")
-        self.main_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
-        self.git_in(
-            self.workspace,
-            "update-ref",
-            "refs/remotes/origin/main",
-            self.main_sha,
-        )
-        self.git_in(self.workspace, "checkout", "-b", "feature")
-        self.write_in(self.workspace, "feature.txt", "resolved behavior\n")
-        self.commit_in(self.workspace, "feature")
-        self.feature_sha = self.git_in(self.workspace, "rev-parse", "HEAD")
+        shutil.copytree(self.template_workspace, self.workspace)
+        self.main_sha = type(self).main_sha
+        self.feature_sha = type(self).feature_sha
         self.stack = {
             "number": 77,
             "size": 1,

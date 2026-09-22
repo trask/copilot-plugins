@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "383e626298ce822c829ed4fded9d5e155dbcd6b73c15e9799c35bc31ba4afd50"
+    "28c08df797894f35a5b21d08f5f66fbafeb34895597a1c0fed67cbc5a22fed13"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@10"
@@ -4697,6 +4697,63 @@ def require_transaction_config_unchanged(
         raise WorkflowError(f"the {operation} command changed local Git configuration")
 
 
+def validate_transaction_position(
+    *,
+    branch: str,
+    head: str,
+    expected_branch: str,
+    expected_head: str,
+    operation: str,
+) -> None:
+    if branch != expected_branch or head != expected_head:
+        raise WorkflowError(
+            f"the {operation} moved the final branch or created a commit"
+        )
+
+
+def validate_transaction_refs(
+    expected: dict[str, str],
+    observed: dict[str, str],
+    *,
+    operation: str,
+    mutable_ref: str | None = None,
+    mutable_value: str | None = None,
+) -> None:
+    if set(observed) != set(expected):
+        raise WorkflowError(f"the {operation} changed the stack ref set")
+    for ref, before in expected.items():
+        wanted = mutable_value if ref == mutable_ref else before
+        if observed[ref] != wanted:
+            raise WorkflowError(f"the {operation} moved stack ref {ref!r}")
+
+
+def validate_transaction_paths(
+    changed: set[str],
+    allowed: set[str],
+    *,
+    operation: str,
+    exact: bool,
+) -> None:
+    if exact and changed != allowed:
+        undeclared = sorted(changed - allowed)
+        unchanged = sorted(allowed - changed)
+        details = []
+        if undeclared:
+            details.append("undeclared changes: " + ", ".join(undeclared))
+        if unchanged:
+            details.append("declared paths unchanged: " + ", ".join(unchanged))
+        raise WorkflowError(
+            f"the {operation} did not match its exact declared path set"
+            + (f" ({'; '.join(details)})" if details else "")
+        )
+    outside = sorted(changed - allowed)
+    if outside:
+        raise WorkflowError(
+            f"the {operation} changed files outside the current PR layer: "
+            + ", ".join(outside)
+        )
+
+
 def clean_formatter_paths(
     workspace: Path, paths: list[str], *, ignored: bool
 ) -> None:
@@ -4925,25 +4982,27 @@ def format_stack_member(
                     f"the formatter failed for PR #{member['number']} "
                     f"(exit code {process.returncode}): {output or 'no output'}"
                 )
-        if (
-            git(workspace, "branch", "--show-current") != member["branch"]
-            or git(workspace, "rev-parse", "HEAD") != before_sha
-        ):
-            raise WorkflowError(
-                "the formatter moved the formatting branch or created a commit"
-            )
-        for ref, expected in snapshot["refs"].items():
-            if git(workspace, "rev-parse", ref) != expected:
-                raise WorkflowError(f"the formatter moved stack ref {ref!r}")
+        validate_transaction_position(
+            branch=git(workspace, "branch", "--show-current"),
+            head=git(workspace, "rev-parse", "HEAD"),
+            expected_branch=member["branch"],
+            expected_head=before_sha,
+            operation="formatter",
+        )
+        validate_transaction_refs(
+            snapshot["refs"],
+            {ref: git(workspace, "rev-parse", ref) for ref in snapshot["refs"]},
+            operation="formatter",
+        )
         require_transaction_config_unchanged(snapshot, "formatter")
 
         changed_paths, unchanged_status = formatter_changed_paths(workspace)
-        outside = sorted(changed_paths - allowed_paths)
-        if outside:
-            raise WorkflowError(
-                "the formatter changed files outside the current PR layer: "
-                + ", ".join(outside)
-            )
+        validate_transaction_paths(
+            changed_paths,
+            allowed_paths,
+            operation="formatter",
+            exact=False,
+        )
         paths_to_refresh = sorted(unchanged_status - changed_paths)
         if paths_to_refresh:
             refresh = git_try(
@@ -5017,12 +5076,13 @@ def format_stack_member(
                     "the formatting commit changed files outside the current PR "
                     "layer: " + ", ".join(committed_outside)
                 )
-        for ref, expected in snapshot["refs"].items():
-            final_expected = after_sha if ref == member["branch_ref"] else expected
-            if git(workspace, "rev-parse", ref) != final_expected:
-                raise WorkflowError(
-                    f"the formatting commit moved stack ref {ref!r} unexpectedly"
-                )
+        validate_transaction_refs(
+            snapshot["refs"],
+            {ref: git(workspace, "rev-parse", ref) for ref in snapshot["refs"]},
+            operation="formatting commit",
+            mutable_ref=member["branch_ref"],
+            mutable_value=after_sha,
+        )
         require_transaction_config_unchanged(snapshot, "formatting commit")
         require_clean_worktree(workspace)
         checkpoint = record_formatting_checkpoint(
@@ -5403,34 +5463,28 @@ def command_stack_validation_fix(args: argparse.Namespace) -> None:
                 f"(exit code {process.returncode}): {output or 'no output'}"
             )
         require_no_integration_in_progress(workspace)
-        if (
-            git(workspace, "branch", "--show-current") != member["branch"]
-            or git(workspace, "rev-parse", "HEAD") != before_sha
-        ):
-            raise WorkflowError(
-                "the validation fix command moved the final branch or created a commit"
-            )
-        for ref, expected in snapshot["refs"].items():
-            if git(workspace, "rev-parse", ref) != expected:
-                raise WorkflowError(
-                    f"the validation fix command moved stack ref {ref!r}"
-                )
+        validate_transaction_position(
+            branch=git(workspace, "branch", "--show-current"),
+            head=git(workspace, "rev-parse", "HEAD"),
+            expected_branch=member["branch"],
+            expected_head=before_sha,
+            operation="validation fix command",
+        )
+        validate_transaction_refs(
+            snapshot["refs"],
+            {ref: git(workspace, "rev-parse", ref) for ref in snapshot["refs"]},
+            operation="validation fix command",
+        )
         require_transaction_config_unchanged(snapshot, "validation fix")
 
         changed_paths, unchanged_status = formatter_changed_paths(workspace)
         declared = set(paths)
-        if changed_paths != declared:
-            undeclared = sorted(changed_paths - declared)
-            unchanged = sorted(declared - changed_paths)
-            details = []
-            if undeclared:
-                details.append("undeclared changes: " + ", ".join(undeclared))
-            if unchanged:
-                details.append("declared paths unchanged: " + ", ".join(unchanged))
-            raise WorkflowError(
-                "the validation fix did not match its exact declared path set"
-                + (f" ({'; '.join(details)})" if details else "")
-            )
+        validate_transaction_paths(
+            changed_paths,
+            declared,
+            operation="validation fix",
+            exact=True,
+        )
         for path in paths:
             target = workspace / Path(path)
             if not target.is_file():
@@ -5512,12 +5566,13 @@ def command_stack_validation_fix(args: argparse.Namespace) -> None:
             raise WorkflowError(
                 "the validation fix changed the resolved stack unexpectedly"
             )
-        for ref, expected in snapshot["refs"].items():
-            final_expected = after_sha if ref == member["branch_ref"] else expected
-            if git(workspace, "rev-parse", ref) != final_expected:
-                raise WorkflowError(
-                    f"validation fix commit moved stack ref {ref!r} unexpectedly"
-                )
+        validate_transaction_refs(
+            snapshot["refs"],
+            {ref: git(workspace, "rev-parse", ref) for ref in snapshot["refs"]},
+            operation="validation fix commit",
+            mutable_ref=member["branch_ref"],
+            mutable_value=after_sha,
+        )
         require_transaction_config_unchanged(snapshot, "validation fix commit")
         require_clean_worktree(workspace)
         checkpoint = {
@@ -7957,6 +8012,82 @@ def native_stack_clearance_key(detection: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+NATIVE_STACK_IDENTITY_KEYS = (
+    "number",
+    "pr_url",
+    "repo_name",
+    "upstream_owner",
+    "upstream_repo",
+    "head_owner",
+    "head_repo",
+    "head_branch",
+    "head_sha",
+    "base_branch",
+    "base_sha",
+    "state",
+)
+
+
+def validate_native_stack_member_observation(
+    current: dict[str, Any],
+    member: dict[str, Any],
+    invoked: dict[str, Any],
+    target: dict[str, Any],
+    parent_sha: str,
+    observed_base_sha: str,
+) -> None:
+    if (
+        current["number"] != member["number"]
+        or current["pr_url"] != target["pr_url"]
+        or current["repo_name"] != invoked["repo_name"]
+        or current["upstream_owner"] != invoked["upstream_owner"]
+        or current["upstream_repo"] != invoked["upstream_repo"]
+        or f"{current['head_owner']}/{current['head_repo']}".casefold()
+        != invoked["repo_name"].casefold()
+        or current["head_branch"] != member["head_branch"]
+        or current["head_sha"] != member["head_sha"]
+        or current["base_branch"] != member["base_branch"]
+        or current["base_sha"] != parent_sha
+        or observed_base_sha != parent_sha
+        or (
+            current["number"] == invoked["number"]
+            and any(
+                current.get(key) != invoked.get(key)
+                for key in NATIVE_STACK_IDENTITY_KEYS
+            )
+        )
+    ):
+        raise WorkflowError("native stack identity, head, or direct base changed")
+    if current.get("mergeable") not in {"MERGEABLE", "CONFLICTING"}:
+        raise WorkflowError("GitHub did not return stable native stack mergeability")
+
+
+def native_stack_members_aligned(members: list[dict[str, Any]]) -> bool:
+    return all(
+        member["merge_base"] == member["direct_base_sha"]
+        and member["mergeable"] == "MERGEABLE"
+        for member in members
+    )
+
+
+def validate_native_stack_clearance_refresh(
+    detection: dict[str, Any],
+    refreshed_scope: dict[str, Any],
+    outside: list[dict[str, Any]],
+    refreshed_outside: list[dict[str, Any]],
+) -> None:
+    if (
+        native_stack_clearance_key(refreshed_scope)
+        != native_stack_clearance_key(detection)
+        or any(
+            member.get("mergeable") != "MERGEABLE"
+            for member in refreshed_scope["stack"]["members"]
+        )
+        or refreshed_outside != outside
+    ):
+        raise WorkflowError("native stack scope changed during clearance observation")
+
+
 def aligned_native_stack_clearance(
     repo_root: Path,
     metadata: dict[str, Any],
@@ -7979,48 +8110,28 @@ def aligned_native_stack_clearance(
     fetch_preflight_ref(
         repo_root, remote, f"refs/heads/{stack['trunk']}", trunk_sha
     )
-    identity_keys = (
-        "number", "pr_url", "repo_name", "upstream_owner", "upstream_repo",
-        "head_owner", "head_repo", "head_branch", "head_sha", "base_branch", "base_sha",
-        "state",
-    )
     observed = []
     members = []
     parent_sha = trunk_sha
-    aligned = True
     outside = external_stack_dependents(metadata, stack)
     for member in stack["members"]:
         target = stack_member_target(metadata, member["number"])
         current = live_mergeability(target, expected_head=member["head_sha"])
         require_open_pull_request(current)
-        if (
-            current["number"] != member["number"]
-            or current["pr_url"] != target["pr_url"]
-            or current["repo_name"] != metadata["repo_name"]
-            or current["upstream_owner"] != metadata["upstream_owner"]
-            or current["upstream_repo"] != metadata["upstream_repo"]
-            or f"{current['head_owner']}/{current['head_repo']}".casefold()
-            != metadata["repo_name"].casefold()
-            or current["head_branch"] != member["head_branch"]
-            or current["head_sha"] != member["head_sha"]
-            or current["base_branch"] != member["base_branch"]
-            or current["base_sha"] != parent_sha
-            or base_ref_tip(current["repo_name"], current["base_branch"]) != parent_sha
-            or (
-                current["number"] == metadata["number"]
-                and any(current.get(key) != metadata.get(key) for key in identity_keys)
-            )
-        ):
-            raise WorkflowError("native stack identity, head, or direct base changed")
-        if current.get("mergeable") not in {"MERGEABLE", "CONFLICTING"}:
-            raise WorkflowError("GitHub did not return stable native stack mergeability")
+        validate_native_stack_member_observation(
+            current,
+            member,
+            metadata,
+            target,
+            parent_sha,
+            base_ref_tip(current["repo_name"], current["base_branch"]),
+        )
         fetch_preflight_ref(
             repo_root, remote, f"refs/heads/{current['head_branch']}", current["head_sha"]
         )
         merge_base = git(
             repo_root, "merge-base", "--all", parent_sha, current["head_sha"]
         )
-        aligned = aligned and merge_base == parent_sha and current["mergeable"] == "MERGEABLE"
         observed.append(current)
         members.append({
             "pr_number": current["number"],
@@ -8033,29 +8144,29 @@ def aligned_native_stack_clearance(
             "mergeable": current["mergeable"],
         })
         parent_sha = current["head_sha"]
-    if not aligned:
+    if not native_stack_members_aligned(members):
         return None
     for current in observed:
         refreshed = live_mergeability(
             parse_target(current["pr_url"]), expected_head=current["head_sha"]
         )
         if (
-            any(refreshed.get(key) != current.get(key) for key in identity_keys)
+            any(
+                refreshed.get(key) != current.get(key)
+                for key in NATIVE_STACK_IDENTITY_KEYS
+            )
             or refreshed.get("mergeable") != "MERGEABLE"
             or base_ref_tip(current["repo_name"], current["base_branch"]) != current["base_sha"]
             or base_ref_tip(current["repo_name"], current["head_branch"]) != current["head_sha"]
         ):
             raise WorkflowError("native stack changed during clearance observation")
     refreshed_scope = stack_membership(metadata)
-    if (
-        native_stack_clearance_key(refreshed_scope) != native_stack_clearance_key(detection)
-        or any(
-            member.get("mergeable") != "MERGEABLE"
-            for member in refreshed_scope["stack"]["members"]
-        )
-        or external_stack_dependents(metadata, stack) != outside
-    ):
-        raise WorkflowError("native stack scope changed during clearance observation")
+    validate_native_stack_clearance_refresh(
+        detection,
+        refreshed_scope,
+        outside,
+        external_stack_dependents(metadata, stack),
+    )
     if stack_request is not None:
         require_authorized_stack(stack_request, metadata, refreshed_scope["stack"])
     require_clean_worktree(repo_root)
@@ -8812,20 +8923,24 @@ def verify_source_artifact(
         raise WorkflowError("optional output report commit is malformed")
 
 
-def verify_stack_task_artifacts(
-    repo_root: Path,
+def validate_stack_task_artifacts(
     request: dict[str, Any],
     code_refs: list[dict[str, Any]],
     artifact: dict[str, Any],
-) -> None:
+) -> list[dict[str, Any]]:
     members = request["native_stack"]["members"]
     artifacts = artifact.get("members")
-    if not isinstance(artifacts, list) or len(artifacts) != len(members):
+    if (
+        not isinstance(artifacts, list)
+        or len(artifacts) != len(members)
+        or len(code_refs) != len(members)
+    ):
         raise WorkflowError("stack task artifacts are incomplete")
     task_ids: set[str] = set()
     branches: set[str] = set()
     forbidden_branches = {member["head_ref"] for member in members}
     forbidden_branches.add(request["native_stack"]["trunk"]["ref"])
+    previous_tip = request["native_stack"]["trunk"]["sha"]
     for member, code_ref, item in zip(members, code_refs, artifacts):
         if not isinstance(item, dict) or set(item) != {
             "pr_number", "task", "request", "branch",
@@ -8836,6 +8951,9 @@ def verify_stack_task_artifacts(
         branch = item["branch"]
         if (
             item["pr_number"] != member["pr_number"]
+            or code_ref.get("role") != f"member:{member['pr_number']}"
+            or code_ref.get("pr_number") != member["pr_number"]
+            or code_ref.get("base_sha") != previous_tip
             or not isinstance(task, dict)
             or set(task) != {"id", "url", "state", "base_ref", "base_sha"}
             or not isinstance(task["id"], str)
@@ -8876,15 +8994,29 @@ def verify_stack_task_artifacts(
             "id": projected["request_id"], "sha256": request_digest(projected),
         }:
             raise WorkflowError("stack task request does not match frozen member")
-        verify_source_artifact(
-            repo_root, request["request_id"], item, code_ref["new_sha"],
-            f"artifact-member-{member['pr_number']}",
-        )
+        previous_tip = code_ref.get("new_sha")
     if any(
         artifact.get(key) != artifacts[-1][key]
         for key in ("branch", "head_sha", "source_tip_sha", "report", "attribution")
     ):
         raise WorkflowError("stack final artifact is not the last member")
+    return artifacts
+
+
+def verify_stack_task_artifacts(
+    repo_root: Path,
+    request: dict[str, Any],
+    code_refs: list[dict[str, Any]],
+    artifact: dict[str, Any],
+) -> None:
+    artifacts = validate_stack_task_artifacts(request, code_refs, artifact)
+    for member, code_ref, item in zip(
+        request["native_stack"]["members"], code_refs, artifacts
+    ):
+        verify_source_artifact(
+            repo_root, request["request_id"], item, code_ref["new_sha"],
+            f"artifact-member-{member['pr_number']}",
+        )
 
 
 def verify_quarantined_result(
