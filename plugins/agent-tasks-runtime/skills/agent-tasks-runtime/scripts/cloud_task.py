@@ -283,6 +283,7 @@ class ResultEnvelope:
     mode: str = "unknown"
     requested_model: str | None = None
     repository: str | None = None
+    request_id: str | None = None
     pull_request: PullRequestSnapshot | None = None
     policy: Mapping[str, object] | None = None
     task_id: str | None = None
@@ -2616,6 +2617,8 @@ def execute(
     validate_policy_before_post(options, root, options.result_file)
 
     request_id = str(uuid_factory())
+    if result is not None:
+        result.request_id = request_id
     pull_request = resolve_pull_request(
         runner,
         root,

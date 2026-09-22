@@ -585,7 +585,15 @@ class CandidateDispatcherTest(unittest.TestCase):
                         drift_fields={field: value},
                     )
 
-    def check_candidate(self, branch, *, drift_phase=None, drift_fields=None, historical=False):
+    def check_candidate(
+        self,
+        branch,
+        *,
+        drift_phase=None,
+        drift_fields=None,
+        historical=False,
+        managed=False,
+    ):
         root = Path("C:/repo")
         base_sha = "1" * 40
         code_commit = "2" * 40
@@ -706,8 +714,16 @@ class CandidateDispatcherTest(unittest.TestCase):
             drifted if drift_phase == "preparation" else pull_request,
             drifted if drift_phase == "completion" else pull_request,
         ]
+
+        def complete_task(_api, _repository, _initial, progress, _sleep, _report):
+            progress.task_id = "task-1"
+            progress.last_state = "completed"
+            return task
+
         stderr = io.StringIO()
+        runtime = mock.Mock()
         with (
+            mock.patch.object(MODULE, "_EXECUTION", runtime if managed else None),
             mock.patch.object(MODULE, "GitRepository", return_value=repository),
             mock.patch.object(MODULE, "ApiClient", return_value=api),
             mock.patch.object(
@@ -724,7 +740,9 @@ class CandidateDispatcherTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "start_task", return_value={**task, "state": "queued"}
             ) as start,
-            mock.patch.object(MODULE, "monitor_task", return_value=task) as monitor,
+            mock.patch.object(
+                MODULE, "monitor_task", side_effect=complete_task
+            ) as monitor,
             mock.patch.object(MODULE, "parse_args", return_value=options),
             mock.patch.object(MODULE, "atomic_write_json") as write_result,
         ):
@@ -818,6 +836,28 @@ class CandidateDispatcherTest(unittest.TestCase):
             "e" * 64,
         )
         self.assertEqual(envelope["application"]["status"], "not_applied")
+        if managed:
+            runtime.record_dispatch.assert_has_calls(
+                [
+                    mock.call(
+                        options.result_file,
+                        "request-1",
+                        "owner/repo",
+                    ),
+                    mock.call(
+                        options.result_file,
+                        "request-1",
+                        "owner/repo",
+                        {"id": "task-1", "url": None, "state": "queued"},
+                    ),
+                    mock.call(
+                        options.result_file,
+                        "request-1",
+                        "owner/repo",
+                        {"id": "task-1", "state": "completed", "url": None},
+                    ),
+                ]
+            )
         self.assertEqual(
             envelope["attestation"],
             {
@@ -876,6 +916,9 @@ class CandidateDispatcherTest(unittest.TestCase):
                 historical_result, options=historical_options, pull_request=historical_pr,
                 root=root, git=repository,
             )
+
+    def test_managed_candidate_records_its_terminal_dispatch_observation(self):
+        self.check_candidate("feature", managed=True)
 
 
 class CurrentRuntimeApiTest(unittest.TestCase):
