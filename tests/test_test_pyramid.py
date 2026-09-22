@@ -202,3 +202,29 @@ class TestPyramidContractTest(unittest.TestCase):
                 for name in environment
             )
         )
+
+    def test_capable_local_windows_runs_use_eight_workers_with_work_stealing(self):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(validate.os, "name", "nt"),
+            mock.patch.object(validate.os, "cpu_count", return_value=16),
+        ):
+            self.assertEqual((8, "worksteal"), validate.pytest_parallelism())
+
+    def test_small_local_windows_runs_keep_four_workers_with_load_distribution(self):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(validate.os, "name", "nt"),
+            mock.patch.object(validate.os, "cpu_count", return_value=15),
+        ):
+            self.assertEqual((4, "load"), validate.pytest_parallelism())
+
+    def test_ci_and_non_windows_runs_keep_existing_parallelism(self):
+        for os_name, environment in (("nt", {"CI": "true"}), ("posix", {})):
+            with (
+                self.subTest(os_name=os_name, environment=environment),
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(validate.os, "name", os_name),
+                mock.patch.object(validate.os, "cpu_count", return_value=16),
+            ):
+                self.assertEqual((4, "load"), validate.pytest_parallelism())
