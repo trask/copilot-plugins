@@ -39,7 +39,6 @@ def head_of(number: int) -> str:
 
 def kickoff(numbers=(11, 12, 13), start=11, stack_number=77) -> dict:
     return {
-        "version": 1,
         "repository": "owner/repo",
         "stackNumber": stack_number,
         "startPullRequest": start,
@@ -184,31 +183,59 @@ class FakeLauncher:
         return {"result": "removed", "number": number}
 
 
-class KickoffTest(unittest.TestCase):
-    def test_accepts_the_documented_schema(self):
-        self.assertEqual(kickoff(), MODULE.parse_kickoff(kickoff()))
-
+class TargetSelectionTest(unittest.TestCase):
     def test_session_title_is_exact(self):
         self.assertEqual(
             "PR Stack Pipeline: #11 - Add a thing",
             MODULE.session_title(kickoff(), "Add a thing"),
         )
 
-    def test_rejects_payloads_that_are_not_this_schema(self):
-        cases = {
-            "version": {**kickoff(), "version": 2},
-            "repository": {**kickoff(), "repository": "owner"},
-            "stack": {**kickoff(), "stackNumber": "77"},
-            "start": {**kickoff(), "startPullRequest": 0},
-            "empty": {**kickoff(), "pullRequests": []},
-            "duplicate": {**kickoff(), "pullRequests": [11, 11]},
-            "not_a_suffix_start": {**kickoff(), "pullRequests": [12, 13]},
-            "not_an_object": [1, 2],
-        }
-        for name, payload in cases.items():
-            with self.subTest(case=name):
-                with self.assertRaises(MODULE.WorkflowError):
-                    MODULE.parse_kickoff(payload)
+    def test_starting_in_the_middle_selects_only_that_suffix(self):
+        live = stack(members=(9, 10, 11, 12))
+        selected = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 11), live
+        )
+
+        self.assertEqual("owner/repo", selected["repository"])
+        self.assertEqual(77, selected["stackNumber"])
+        self.assertEqual(11, selected["startPullRequest"])
+        self.assertEqual([11, 12], selected["pullRequests"])
+        self.assertEqual(
+            MODULE.topology_fingerprint(live), selected["topologyFingerprint"]
+        )
+        self.assertEqual(
+            MODULE.stack_source_identity(live)[1], selected["sourceSnapshot"]
+        )
+        self.assertEqual(
+            [9, 10, 11, 12],
+            [member["number"] for member in selected["sourceStack"]["members"]],
+        )
+
+    def test_starting_at_the_root_selects_the_whole_stack(self):
+        selected = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 11), stack()
+        )
+        self.assertEqual([11, 12, 13], selected["pullRequests"])
+
+    def test_starting_at_the_top_selects_only_the_top(self):
+        selected = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 13), stack()
+        )
+        self.assertEqual([13], selected["pullRequests"])
+
+    def test_rejects_a_pull_request_without_a_native_stack(self):
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "not a member of a native stack"
+        ):
+            MODULE.selection_from_stack(
+                COMMON.target_for("owner/repo", 11), None
+            )
+
+    def test_rejects_a_starting_pull_request_missing_from_the_stack(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "missing from"):
+            MODULE.selection_from_stack(
+                COMMON.target_for("owner/repo", 99), stack()
+            )
 
 
 class DelegationTest(unittest.TestCase):
@@ -430,6 +457,19 @@ class TopologyTest(unittest.TestCase):
             MODULE.topology_fingerprint(moved),
         )
 
+    def test_frozen_selection_rejects_topology_drift(self):
+        live = stack()
+        selected = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 11), live
+        )
+        moved = stack()
+        moved["members"][1]["base_branch"] = "other"
+
+        result = MODULE.validate_selection(selected, moved)
+
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("topology_changed", result["reason"])
+
     def test_reads_a_live_native_stack(self):
         payload = {
             "data": {
@@ -472,6 +512,14 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(BASE, live["members"][0]["base_sha"])
         self.assertEqual("MERGEABLE", live["members"][0]["mergeable"])
         self.assertIn("baseRef { target { oid } }", MODULE.STACK_QUERY)
+
+        payload["data"]["repository"]["pullRequest"]["stack"]["entries"]["nodes"][
+            0
+        ]["position"] = 1
+        with self.assertRaisesRegex(MODULE.WorkflowError, "positions are malformed"):
+            MODULE.read_native_stack(
+                "owner/repo", 11, api=lambda arguments: payload
+            )
 
 
 class StackFixture(unittest.TestCase):
@@ -621,6 +669,24 @@ class StackRunTest(StackFixture):
         self.assertEqual(0, result["dispatches"])
         self.assertTrue(result["clear"])
         self.assertEqual([], self.launcher.started)
+
+    def test_unselected_predecessors_are_never_dispatched(self):
+        self.stack = stack(members=(9, 10, 11, 12))
+        selected_scope = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 11), self.stack
+        )
+        pipeline = self.pipeline(selected_scope)
+        selected = MODULE.validate_selection(
+            selected_scope, self.stack
+        )["selected"]
+
+        pipeline.run_parallel_phase(
+            MODULE.STAGE_COPILOT_REVIEW, 1, selected
+        )
+
+        self.assertEqual(
+            [11, 12], [request["number"] for request in self.launcher.started]
+        )
 
     def test_partial_selection_blocks_conflicting_unknown_and_stale_metadata(self):
         for mergeable, base_sha in (
@@ -1876,9 +1942,9 @@ class StackRunTest(StackFixture):
         self.clear_everything()
         original = pipeline.revalidate
 
-        def drift():
+        def drift(**kwargs):
             self.stack = stack(members=(11, 12))
-            return original()
+            return original(**kwargs)
 
         with mock.patch.object(pipeline, "revalidate", side_effect=drift):
             result = pipeline.execute()
@@ -1888,6 +1954,19 @@ class StackRunTest(StackFixture):
             result["reason"],
             {"topology_changed", "selection_is_not_the_stack_suffix"},
         )
+
+    def test_source_drift_after_target_discovery_stops_before_mutation(self):
+        selected = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 11), self.stack
+        )
+        self.stack = stack(heads={11: "f" * 40})
+        pipeline = self.pipeline(selected)
+
+        result = pipeline.execute()
+
+        self.assertEqual("stopped", result["result"])
+        self.assertEqual("source_snapshot_changed_before_start", result["reason"])
+        self.assertEqual([], self.launcher.calls)
 
     def test_missing_stage_plugins_stop_the_run_before_any_worker(self):
         pipeline = self.pipeline(dependencies=lambda: ["ci-fix-loop"])
@@ -2754,12 +2833,30 @@ class StateTest(unittest.TestCase):
 
     def test_state_is_versioned_and_written_in_one_step(self):
         path = self.root / "state.json"
-        state = MODULE.new_state(kickoff(), "run-1", "fingerprint")
+        live = stack()
+        selected = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 11), live
+        )
+        state = MODULE.new_state(
+            selected, "run-1", selected["topologyFingerprint"]
+        )
         MODULE.save_state(path, state)
 
         loaded = MODULE.load_state(path)
         self.assertEqual(MODULE.STATE_VERSION, loaded["state_version"])
-        self.assertEqual(kickoff(), loaded["kickoff"])
+        self.assertEqual(selected, loaded["kickoff"])
+        self.assertEqual(
+            {
+                "repository": "owner/repo",
+                "stack_number": 77,
+                "start_pull_request": 11,
+                "selected": [11, 12, 13],
+                "topology_fingerprint": selected["topologyFingerprint"],
+                "source_snapshot": selected["sourceSnapshot"],
+                "source_stack": selected["sourceStack"],
+            },
+            loaded["selection"],
+        )
         self.assertEqual([], list(self.root.glob("*.tmp")))
 
     def test_each_run_has_a_distinct_state_path(self):
@@ -3520,24 +3617,24 @@ class AgentInstructionTest(unittest.TestCase):
         )
 
     def test_the_agent_only_runs_and_reports_the_foreground_helper(self):
-        self.assertIn('pr_stack_pipeline.py" run --execution-handle', self.text)
-        self.assertIn("--kickoff '<json>'", self.text)
+        self.assertIn('pr_stack_pipeline.py" run \'<target>\'', self.text)
         self.assertNotIn('pr_stack_pipeline.py" watch', self.text)
-        self.assertIn("execution-status --handle", self.text)
-        self.assertIn("execution-cancel --handle", self.text)
         self.assertIn("The helper owns all control flow", self.text)
         self.assertIn("Launch the controller once", self.text)
-        self.assertIn("Tool acknowledgement is not readiness", self.text)
-        self.assertIn("hash-verified terminal execution result", self.text)
-        self.assertIn("spent budgets", self.text)
-        self.assertIn("does not promise remote task cancellation", self.text)
+        self.assertIn("shared Runtime owns execution identity", self.text)
+        self.assertIn("verified terminal result", self.text)
 
-    def test_observers_are_optional_and_disconnect_is_not_cancellation(self):
-        self.assertIn("Never run a required watch loop", self.text)
-        self.assertIn("disconnecting an observer is not cancellation", self.text)
-        self.assertIn("Output, progress, child records and results remain", self.text)
-        self.assertNotIn("Never end your turn", self.text)
-        self.assertNotIn("invoke the returned `next_watch.arguments`", self.text)
+    def test_the_agent_hides_runtime_plumbing(self):
+        for text in (
+            "--execution-handle",
+            "execution-status",
+            "execution-cancel",
+            "--stack-request",
+            "state path",
+            "request file",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(text, self.text)
 
     def test_the_agent_states_the_session_title(self):
         self.assertIn(
@@ -3546,12 +3643,16 @@ class AgentInstructionTest(unittest.TestCase):
         )
         self.assertIn("After verified terminal completion, rename the session", self.text)
 
-    def test_the_agent_documents_the_kickoff_schema(self):
-        self.assertIn('"version":1', self.text)
-        self.assertIn('"stackNumber"', self.text)
-        self.assertIn('"startPullRequest"', self.text)
-        self.assertIn('"pullRequests"', self.text)
-        self.assertIn("Draft and non-draft members are both included", self.text)
+    def test_the_agent_documents_semantic_target_selection(self):
+        self.assertIn("GitHub PR URL", self.text)
+        self.assertIn("`owner/repo#number`", self.text)
+        self.assertIn("bare PR number", self.text)
+        self.assertIn("starting pull request plus every descendant", self.text)
+        self.assertIn("predecessors are not", self.text)
+        self.assertIn("Draft and non-draft members are included", self.text)
+        self.assertNotIn("kickoff", self.text.lower())
+        self.assertNotIn("--kickoff", self.text)
+        self.assertNotIn("JSON object", self.text)
 
     def test_the_agent_documents_normal_authorization_and_explicit_restrictions(self):
         self.assertIn("Normal execution uses `--github-mutation-policy allow`", self.text)
@@ -3598,18 +3699,69 @@ class ParserTest(unittest.TestCase):
             with (
                 self.subTest(command=command),
                 mock.patch.object(MODULE.sys, "argv", ["pr_stack_pipeline.py", command]),
-                mock.patch.object(MODULE, "load_kickoff", side_effect=side_effect),
+                mock.patch.object(MODULE.common, "resolve_target", side_effect=side_effect),
                 self.assertRaises(SystemExit),
             ):
                 MODULE.main()
             side_effect.assert_not_called()
 
-    def test_run_accepts_a_kickoff_payload_and_model_overrides(self):
+    def test_run_accepts_a_pr_target_and_model_overrides(self):
         args = MODULE.build_parser().parse_args(
-            ["run", "--kickoff", json.dumps(kickoff()), "--stage-model", "ci-fix-loop=claude-sonnet-5"]
+            ["run", "owner/repo#11", "--stage-model", "ci-fix-loop=claude-sonnet-5"]
         )
-        self.assertEqual(kickoff(), MODULE.load_kickoff(args))
+        self.assertEqual("owner/repo#11", args.target)
         self.assertEqual(["ci-fix-loop=claude-sonnet-5"], args.stage_model)
+
+    def test_run_accepts_every_documented_target_form(self):
+        parser = MODULE.build_parser()
+        for target in (
+            "https://github.com/owner/repo/pull/11",
+            "owner/repo#11",
+            "11",
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(
+                    target, parser.parse_args(["run", target]).target
+                )
+
+    def test_run_rejects_removed_json_options(self):
+        parser = MODULE.build_parser()
+        for option in ("--kickoff", "--kickoff-file"):
+            with self.subTest(option=option), self.assertRaises(SystemExit):
+                parser.parse_args(["run", "11", option, "{}"])
+
+    def test_command_discovers_and_freezes_the_live_suffix(self):
+        args = MODULE.build_parser().parse_args(["run", "11"])
+        target = COMMON.target_for("owner/repo", 11)
+        live = stack(members=(9, 10, 11, 12))
+        controller = mock.Mock()
+        controller.execute.return_value = {"result": "stopped"}
+        controller.result_path = None
+        with (
+            mock.patch.object(MODULE.common, "require_tools"),
+            mock.patch.object(
+                MODULE.common, "resolve_repo_root", return_value=Path("repo")
+            ),
+            mock.patch.object(
+                MODULE.common, "resolve_target", return_value=target
+            ) as resolve_target,
+            mock.patch.object(MODULE, "read_native_stack", return_value=live),
+            mock.patch.object(
+                MODULE, "StackPipeline", return_value=controller
+            ) as stack_pipeline,
+            mock.patch.object(MODULE, "ProgressReporter", return_value=mock.Mock()),
+        ):
+            MODULE.command_run(args)
+
+        resolve_target.assert_called_once_with("11", Path("repo"))
+        selected = stack_pipeline.call_args.args[0]
+        self.assertEqual([11, 12], selected["pullRequests"])
+        self.assertEqual(
+            MODULE.topology_fingerprint(live), selected["topologyFingerprint"]
+        )
+        self.assertEqual(
+            MODULE.stack_source_identity(live)[1], selected["sourceSnapshot"]
+        )
 
     def test_execution_controls_use_the_runtime_entrypoint(self):
         runtime = mock.Mock()

@@ -60,7 +60,6 @@ class PipelineCancelled(RuntimeError):
     pass
 
 
-KICKOFF_VERSION = 1
 STATE_VERSION = 1
 MAX_PASSES = 2
 DEFAULT_EFFORT = common.DEFAULT_EFFORT
@@ -228,58 +227,6 @@ def commit_contains(repository: str, ancestor: str, descendant: str) -> bool:
 
 def utc_now() -> str:
     return common.utc_now()
-
-
-def parse_kickoff(payload: Any) -> dict[str, Any]:
-    """Accept exactly the structured kickoff this agent is started with.
-
-    Anything that is not schema version 1, naming one repository, one native
-    stack, one clicked pull request, and the ordered selection that starts at
-    it, is rejected. A guessed selection would run stages against pull requests
-    the user never picked.
-    """
-    if not isinstance(payload, dict):
-        raise WorkflowError("the kickoff payload must be a JSON object")
-    version = payload.get("version")
-    if version != KICKOFF_VERSION:
-        raise WorkflowError(
-            f"the kickoff payload must use version {KICKOFF_VERSION}, not {version!r}"
-        )
-    repository = payload.get("repository")
-    if not isinstance(repository, str) or not common.REPO_NAME_PATTERN.fullmatch(
-        repository.strip()
-    ):
-        raise WorkflowError("the kickoff payload needs an owner/repo repository")
-    stack_number = payload.get("stackNumber")
-    if not isinstance(stack_number, int) or isinstance(stack_number, bool):
-        raise WorkflowError("the kickoff payload needs an integer stackNumber")
-    start = payload.get("startPullRequest")
-    if not isinstance(start, int) or isinstance(start, bool) or start <= 0:
-        raise WorkflowError("the kickoff payload needs a positive startPullRequest")
-    numbers = payload.get("pullRequests")
-    if not isinstance(numbers, list) or not numbers:
-        raise WorkflowError("the kickoff payload needs a non-empty pullRequests list")
-    selected: list[int] = []
-    for number in numbers:
-        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-            raise WorkflowError(
-                f"pullRequests must hold positive pull request numbers: {number!r}"
-            )
-        if number in selected:
-            raise WorkflowError(f"pullRequests repeats #{number}")
-        selected.append(number)
-    if selected[0] != start:
-        raise WorkflowError(
-            "pullRequests must start at startPullRequest "
-            f"#{start}, not #{selected[0]}"
-        )
-    return {
-        "version": KICKOFF_VERSION,
-        "repository": repository.strip(),
-        "stackNumber": stack_number,
-        "startPullRequest": start,
-        "pullRequests": selected,
-    }
 
 
 def session_title(kickoff: dict[str, Any], pull_request_title: str) -> str:
@@ -734,16 +681,29 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
     """
     if not isinstance(raw, dict):
         return None
+    stack_id = raw.get("id")
+    stack_number = raw.get("number")
+    if not isinstance(stack_id, str) or not stack_id:
+        raise WorkflowError("the native stack has no stable identity")
+    if (
+        not isinstance(stack_number, int)
+        or isinstance(stack_number, bool)
+        or stack_number <= 0
+    ):
+        raise WorkflowError("the native stack has no valid number")
     trunk = raw.get("baseRefName")
     if not isinstance(trunk, str) or not trunk:
         raise WorkflowError("the native stack has no trunk branch")
     entries = raw.get("entries")
     nodes = entries.get("nodes") if isinstance(entries, dict) else None
+    if not isinstance(nodes, list):
+        raise WorkflowError("the native stack has no ordered member list")
     members: list[dict[str, Any]] = []
-    for node in nodes or []:
+    for node in nodes:
         member = node.get("pullRequest") if isinstance(node, dict) else None
         if not isinstance(member, dict):
             raise WorkflowError("the native stack has an unreadable member")
+        position = node.get("position")
         number = member.get("number")
         title = member.get("title")
         head_branch = member.get("headRefName")
@@ -752,7 +712,12 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
         base_ref = member.get("baseRef")
         base_target = base_ref.get("target") if isinstance(base_ref, dict) else None
         if (
-            not isinstance(number, int)
+            not isinstance(position, int)
+            or isinstance(position, bool)
+            or position < 0
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or number <= 0
             or not isinstance(title, str)
             or not title
             or not isinstance(head_branch, str)
@@ -767,7 +732,7 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
             )
         members.append(
             {
-                "position": node.get("position"),
+                "position": position,
                 "number": number,
                 "title": title,
                 "head_branch": head_branch,
@@ -783,13 +748,27 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
         key=lambda item: (item["position"] is None, item["position"], item["number"])
     )
     size = raw.get("size")
-    if not isinstance(size, int) or size != len(members):
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or size != len(members)
+    ):
         raise WorkflowError(
             f"the native stack reports {size!r} members but exposes {len(members)}"
         )
+    if [member["position"] for member in members] != list(range(size)):
+        raise WorkflowError("the native stack member positions are malformed")
+    if len({member["number"] for member in members}) != size:
+        raise WorkflowError("the native stack repeats a pull request")
+    if len({member["head_branch"] for member in members}) != size:
+        raise WorkflowError("the native stack repeats a head branch")
+    expected_bases = [trunk, *(member["head_branch"] for member in members[:-1])]
+    if [member["base_branch"] for member in members] != expected_bases:
+        raise WorkflowError("the native stack branch topology is malformed")
     return {
-        "id": raw.get("id"),
-        "number": raw.get("number"),
+        "id": stack_id,
+        "number": stack_number,
         "size": size,
         "trunk": trunk,
         "members": members,
@@ -856,6 +835,43 @@ def stack_source_identity(stack: dict[str, Any]) -> tuple[dict[str, Any], str]:
     return source, digest
 
 
+def selection_from_stack(
+    target: dict[str, Any], stack: dict[str, Any] | None
+) -> dict[str, Any]:
+    if stack is None:
+        raise WorkflowError(
+            f"pull request #{target['number']} is not a member of a native stack"
+        )
+    numbers = [member["number"] for member in stack["members"]]
+    if target["number"] not in numbers:
+        raise WorkflowError(
+            f"pull request #{target['number']} is missing from its native stack"
+        )
+    selected = numbers[numbers.index(target["number"]):]
+    source_stack, source_snapshot = stack_source_identity(stack)
+    return {
+        "repository": target["repo_name"],
+        "stackNumber": stack["number"],
+        "startPullRequest": target["number"],
+        "pullRequests": selected,
+        "topologyFingerprint": topology_fingerprint(stack),
+        "sourceSnapshot": source_snapshot,
+        "sourceStack": source_stack,
+    }
+
+
+def selection_evidence(selection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "repository": selection["repository"],
+        "stack_number": selection["stackNumber"],
+        "start_pull_request": selection["startPullRequest"],
+        "selected": list(selection["pullRequests"]),
+        "topology_fingerprint": selection.get("topologyFingerprint"),
+        "source_snapshot": selection.get("sourceSnapshot"),
+        "source_stack": selection.get("sourceStack"),
+    }
+
+
 def validate_selection(
     kickoff: dict[str, Any], stack: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -891,10 +907,21 @@ def validate_selection(
                 f"{[member['number'] for member in suffix]}"
             ),
         }
+    fingerprint = topology_fingerprint(stack)
+    expected_fingerprint = kickoff.get("topologyFingerprint")
+    if (
+        isinstance(expected_fingerprint, str)
+        and fingerprint != expected_fingerprint
+    ):
+        return {
+            "result": "stopped",
+            "reason": "topology_changed",
+            "detail": "the native stack topology changed after target discovery",
+        }
     return {
         "result": "ready",
         "selected": suffix,
-        "fingerprint": topology_fingerprint(stack),
+        "fingerprint": fingerprint,
     }
 
 
@@ -925,13 +952,20 @@ def accept_completion(
 
 
 def new_state(kickoff: dict[str, Any], run_id: str, fingerprint: str) -> dict[str, Any]:
+    evidence = selection_evidence(kickoff)
     return {
         "state_version": STATE_VERSION,
         "kind": RUN_KIND,
         "run_id": run_id,
         "kickoff": kickoff,
+        "selection": evidence,
+        "repository": evidence["repository"],
+        "stack_number": evidence["stack_number"],
+        "start_pull_request": evidence["start_pull_request"],
         "topology_fingerprint": fingerprint,
         "selected": list(kickoff["pullRequests"]),
+        "source_snapshot": evidence["source_snapshot"],
+        "source_stack": evidence["source_stack"],
         "pass": 0,
         "phase": None,
         "dispatch": None,
@@ -1823,7 +1857,9 @@ class StackPipeline:
 
     # Topology ------------------------------------------------------------
 
-    def revalidate(self) -> dict[str, Any]:
+    def revalidate(
+        self, *, require_initial_source_snapshot: bool = False
+    ) -> dict[str, Any]:
         stack = self.read_stack(self.repository, self.kickoff["startPullRequest"])
         if stack is not None:
             start = next(
@@ -1839,6 +1875,20 @@ class StackPipeline:
         validation = validate_selection(self.kickoff, stack)
         if validation["result"] != "ready":
             return validation
+        if require_initial_source_snapshot:
+            _, source_snapshot = stack_source_identity(stack)
+            expected_snapshot = self.kickoff.get("sourceSnapshot")
+            if (
+                isinstance(expected_snapshot, str)
+                and source_snapshot != expected_snapshot
+            ):
+                return {
+                    "result": "stopped",
+                    "reason": "source_snapshot_changed_before_start",
+                    "detail": (
+                        "the native stack source changed after target discovery"
+                    ),
+                }
         return {**validation, "stack": stack}
 
     def base_sha_for(self, member: dict[str, Any]) -> str | None:
@@ -3118,7 +3168,7 @@ class StackPipeline:
         if (
             self.state.get("kind") != RUN_KIND
             or self.state.get("run_id") != self.run_id
-            or self.state.get("kickoff") != self.kickoff
+            or self.state.get("selection") != selection_evidence(self.kickoff)
             or self.state.get("selected") != self.kickoff["pullRequests"]
             or validation["fingerprint"] != self.state.get("topology_fingerprint")
             or [member["number"] for member in validation["stack"]["members"]]
@@ -3615,7 +3665,7 @@ class StackPipeline:
             selected=list(self.kickoff["pullRequests"]),
         )
         self.check_cancellation()
-        opening = self.revalidate()
+        opening = self.revalidate(require_initial_source_snapshot=True)
         if opening["result"] != "ready":
             self.state = new_state(self.kickoff, self.run_id, "")
             return self.finish(
@@ -3623,7 +3673,7 @@ class StackPipeline:
                 reason=opening["reason"],
                 detail=opening.get("detail"),
             )
-        fingerprint = opening["fingerprint"]
+        fingerprint = self.kickoff.get("topologyFingerprint") or opening["fingerprint"]
         if self.state_path.exists():
             self.state = new_state(self.kickoff, self.run_id, fingerprint)
             result = {
@@ -4180,25 +4230,14 @@ def compact_terminal_result(
     return compact
 
 
-def load_kickoff(args: argparse.Namespace) -> dict[str, Any]:
-    if args.kickoff_file:
-        raw = Path(args.kickoff_file).read_text(encoding="utf-8")
-    elif args.kickoff:
-        raw = args.kickoff
-    else:
-        raw = sys.stdin.read()
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise WorkflowError(f"the kickoff payload is not valid JSON: {error}") from error
-    return parse_kickoff(payload)
-
-
 def command_run(args: argparse.Namespace) -> None:
     common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
     common.require_tools()
-    kickoff = load_kickoff(args)
     repo_root = Path(args.repo_root).resolve() if args.repo_root else common.resolve_repo_root()
+    target = common.resolve_target(args.target, repo_root)
+    kickoff = selection_from_stack(
+        target, read_native_stack(target["repo_name"], target["number"])
+    )
     reporter = ProgressReporter()
     pipeline = StackPipeline(
         kickoff,
@@ -4228,11 +4267,11 @@ def build_parser() -> argparse.ArgumentParser:
         "run", help="run up to two bounded passes over one native stack"
     )
     run.add_argument(
-        "--kickoff",
-        help="the structured kickoff JSON; omit to read it from standard input",
-    )
-    run.add_argument(
-        "--kickoff-file", help="read the structured kickoff JSON from this file"
+        "target",
+        help=(
+            "starting PR URL, owner/repo#number, or a bare number resolved from "
+            "the current workspace repository"
+        ),
     )
     run.add_argument(
         "--repo-root", help="the repository clone the run works from"

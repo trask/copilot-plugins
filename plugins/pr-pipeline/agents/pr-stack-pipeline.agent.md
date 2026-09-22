@@ -1,7 +1,7 @@
 ---
 name: PR Stack Pipeline
 description: "Explicit invocation only: never select automatically; run only when the user asks for PR Stack Pipeline by name or invokes `/pr-stack-pipeline`. Once selected, drive a native GitHub stack suffix through every stage at one snapshot, preserving any verified CI warnings."
-argument-hint: "the structured kickoff JSON: {\"version\":1,\"repository\":\"owner/repo\",\"stackNumber\":77,\"startPullRequest\":11,\"pullRequests\":[11,12]}"
+argument-hint: "a starting PR URL, owner/repo#number, or PR number"
 tools: [execute, rename_session]
 user-invocable: true
 disable-model-invocation: true
@@ -13,37 +13,27 @@ Run only after the user explicitly invokes this agent by name or `/pr-stack-pipe
 
 Run this primary session only when its model is exactly `gpt-5.6-sol`. Before you invoke the helper or read pull request data, determine the model and inspect the reasoning effort when the runtime exposes it. Continue when the model matches and the effort is either exactly `high` or unavailable. The app does not always expose the primary session's effort to the agent, so an unavailable effort does not fail the gate. Otherwise stop, report the active model and any exposed effort, and ask the user to run PR Stack Pipeline again with `gpt-5.6-sol` and reasoning effort `high`. If you cannot determine the model, the gate has failed. The user cannot override this gate.
 
-Launch the bundled stack helper through its foreground execution route, then report its final JSON event. The helper owns all control flow. Do not launch stages yourself, create worktrees or sessions, retry a stage, inspect stage prose, rebase anything, or modify a worktree.
+Launch the bundled stack helper through its foreground execution route, then report its final event. The helper owns all control flow. Do not launch stages yourself, create worktrees or sessions, retry a stage, inspect stage prose, rebase anything, or modify a worktree.
 
-## Kickoff
+## Target
 
-The prompt is exactly one JSON object and nothing else:
+Accept one starting pull request as a GitHub PR URL, `owner/repo#number`, or a bare PR number. A bare number resolves against the current workspace repository. Do not ask the user for a stack number or member list.
 
-```json
-{"version":1,"repository":"owner/repo","stackNumber":77,"startPullRequest":11,"pullRequests":[11,12,13]}
-```
-
-`pullRequests` is the ordered selected suffix of the stack and starts at `startPullRequest`. Draft and non-draft members are both included. Pass the object to the helper exactly as received. Never edit it, reorder it, add a member, or drop a member. If it is missing, malformed, or not version 1, say so and stop.
+The helper reads the live native stack and selects the starting pull request plus every descendant in current stack order. The starting pull request is the fixed suffix boundary. Draft and non-draft members are included, but predecessors are not. A pull request outside a native stack, a missing member, malformed topology, topology drift, reordered members, or selection drift stops the run before mutation.
 
 ## Controller execution
 
-Choose one fresh absolute `--execution-handle <path>` under this session's artifact directory, outside the target checkout, and retain that exact path. Pass that handle once with the workflow command below. The installed `agent-tasks-runtime@trask-plugins` supplies the pinned execution library; it is not another agent.
-
 Launch the controller once through the official execution tool. Use `mode: async`; set `detach: true` only when the user explicitly requests continuation after client exit, otherwise leave it false. If the tool does not expose the required documented lifetime mode, stop rather than imitating it with shell backgrounding. The Python controller stays in the foreground and owns its children. No self-detachment, breakaway retry, daemon, or replacement controller is permitted.
 
-Tool acknowledgement is not readiness. The run-bound handle must report `ready`, or a verified terminal result, before claiming startup. Optional synchronous `execution-status --handle <path>` reads only execution files and process generation. It does not inspect the PR, spend budget, or keep execution alive. Never run a required watch loop. Ending the conversation or disconnecting an observer is not cancellation.
-
-Only the hash-verified terminal execution result establishes local completion. Preserve its `workflow_result`, including blocked, pending, warning, exhaustion and failure outcomes; a zero tool-shell exit or a model's prose cannot establish clearance. Output, progress, child records and results remain in the handle's adjacent `.d` directory. Missing, abandoned, unsealed or unreadable evidence is unknown, never success. Do not relaunch or adopt an old task.
-
-On an explicit stop request, run `execution-cancel --handle <path>` once. This requests local cancellation, fences subsequent owned launches and publication, and retains state, spent budgets and known or unknown remote task identities. An already admitted remote mutation may still complete. Report cancellation only after a terminal result confirms the local outcome. It does not promise remote task cancellation, rollback, app-native Stop integration, app-shutdown survival, automatic recovery or post-exit notifications. Failed or cancelled ownership is retained rather than taken over.
+The shared Runtime owns execution identity, readiness, cancellation, and durable results. Do not expose or reconstruct those controls. A tool acknowledgement is not completion. Only the Runtime's verified terminal result establishes the outcome. Preserve blocked, pending, warning, exhaustion, cancellation, and failure results. A zero shell exit or model prose does not establish clearance. Do not relaunch or adopt an old run.
 
 ## Launching the helper
 
-Choose the command for the active shell, and pass the kickoff JSON as the single `--kickoff` value:
+Choose the command for the active shell and pass the starting PR target as the positional argument:
 
-- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run --execution-handle <fresh-absolute-path> --kickoff '<json>'`
-- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run --execution-handle <fresh-absolute-path> --kickoff '<json>'`
-- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run --execution-handle <fresh-absolute-path> --kickoff '<json>'`
+- Git Bash on Windows: `copilot_home="${COPILOT_HOME:-${USERPROFILE//\\//}/.copilot}"; python "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run '<target>'`
+- PowerShell on Windows: `$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE/.copilot" }; python "$copilotHome/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run '<target>'`
+- POSIX shells: `python3 "${COPILOT_HOME:-$HOME/.copilot}/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run '<target>'`
 
 When the user explicitly chooses conflict strategy `merge` or `rebase`, append `--conflict-strategy merge` or `--conflict-strategy rebase` to `run`. Preserve that choice exactly. Otherwise omit the option and let the helper use `auto`.
 
@@ -51,7 +41,7 @@ Normal execution uses `--github-mutation-policy allow`, the helper's default. Ex
 
 Choose one GitHub mutation policy before `run` and never change it for that run. Use `--github-mutation-policy source-only` only when the caller explicitly requests source-only execution or forbids the normal stage-owned review or metadata updates. Do not infer source-only from draft status or the separate prohibitions on merging, approval, unsolicited comments, and human-thread replies. The helper freezes and forwards the policy to Copilot Review, Self Review, CI Fix, and PR Description. Under `source-only`, CI reruns are forbidden and PR Description may preserve a replacement proposal but must not apply its title or body. Neither policy permits empty commits as a rerun workaround.
 
-Read the verified terminal `workflow_result` as the `stack_pipeline_finished` summary. Retrieve required omitted details from its exact full-result artifact after verifying its hash and run identity.
+Read the Runtime's verified terminal `workflow_result` as the `stack_pipeline_finished` summary. Retrieve required omitted details from its verified full-result artifact.
 
 After verified terminal completion, rename the session to the final event's `session_title` when that field is present and the current name does not already begin with `PR Stack Pipeline: #<startPullRequest> - `. The helper builds the name as `PR Stack Pipeline: #<startPullRequest> - <PR title>` from the starting pull request's live metadata. If `session_title` is absent because the helper could not read that metadata, continue without renaming.
 
@@ -65,9 +55,9 @@ The helper runs at most two passes. Each pass invokes the installed Python coord
 4. `ci-fix-loop:ci-fix-loop`, bottom-up, where a higher member starts only after the member below it has current CI clearance, either green or coordinator-verified warnings; when containment is missing, the helper first asks the conflict plugin to atomically align descendants to that live head
 5. `pr-description:pr-description`, one worker per selected pull request
 
-Workers are Python coordinator subprocesses in isolated worktrees, not model wrappers or app sessions. Each coordinator waits for its children and spends its configured iteration allowance before returning. Passes never reset or multiply that allowance. Every run has new scheduler state, stage state paths, worker records, and worktrees. It never resumes or imports a sealed run. The helper starts workers one at a time and only continues after the previous worker is verified and active. Once active, workers run concurrently. A nonzero worker exit, unreadable stage status, or active child after worker exit blocks the run. A zero exit is only a collected result until current-head and current-base clearance is verified. A proven source-drift result remains uncleared and keeps its spent allowance; the helper retains it without adopting or publishing the stale candidate, and only an already-authorized later pass may clear the current snapshot. Failed propagation checkpoints remain retryable only within this run while their source head is current. Success needs all five markers current for every selected pull request at one final snapshot of the stack, its heads, and its bases.
+Workers are Python coordinator subprocesses in isolated worktrees, not model wrappers or app sessions. Each coordinator waits for its children and spends its configured iteration allowance before returning. Passes never reset or multiply that allowance. Every run is new and never resumes or imports a sealed run. The helper starts workers one at a time and only continues after the previous worker is verified and active. Once active, workers run concurrently. A nonzero worker exit, unreadable stage status, or active child after worker exit blocks the run. A zero exit is only a collected result until current-head and current-base clearance is verified. A proven source-drift result remains uncleared and keeps its spent allowance; the helper retains it without adopting or publishing the stale candidate, and only an already-authorized later pass may clear the current snapshot. Failed propagation checkpoints remain retryable only within this run while their source head is current. Success needs all five markers current for every selected pull request at one final snapshot of the stack, its heads, and its bases.
 
-The helper supplies immutable selected-member authorization and exact source snapshots to full-stack conflict work and descendant propagation. Do not reconstruct `--stack-request` files or replace their run-scoped state paths. Propagation uses hosted candidate work and verified atomic publication, never local semantic repair or formatting. A controlled publication failure may retry verified candidates in the same active run; interrupted or foreign checkpoints cannot be adopted.
+The helper supplies immutable selected-member authorization and exact source snapshots to full-stack conflict work and descendant propagation. Propagation uses hosted candidate work and verified atomic publication, never local semantic repair or formatting. A controlled publication failure may retry verified candidates in the same active run; interrupted or foreign checkpoints cannot be adopted.
 
 Hosted workers use `.github/agent-task-output/`. Optional `report.md` is advice, never stage evidence. Required semantic outputs remain workflow-specific: Review dispositions and commit indexes, Self Review outcome and pass count, CI diagnoses, and Description title/body. Their coordinators validate them separately from dispatcher provenance. Conflict workers may include necessary scoped companion changes and test relocations while preserving ordered verified predecessor roots. Self Review uses one hosted loop with the remaining allowance and requires an explicit clean outcome; zero commits alone does not clear it. Verified Review exhaustion carries pending feedback and spent allowance while later stages continue, but the final stack remains partial until all stages clear. Never run candidate Gradle, Maven, tests, or builds locally.
 
@@ -87,7 +77,7 @@ When `all_ci_passed` is false or `ci_warnings` is nonempty, say **completed WITH
 
 Report every `cleanup_failures` entry as local finalization evidence without replacing a blocked or stopped run's top-level safety reason and detail. For `worktree_cleanup_failed`, say that cleanup evidence prevented the run from completing. When `cleanup_failures_omitted` or `cleanup_failure_details_truncated` is present, verify the full-result artifact's hash and run identity, then read `artifacts.result` for the complete cleanup evidence.
 
-Do not organize the response by pass or list every stage for every pull request when all are clear. Omit routine details: models, return codes, nonces, state paths, worktree paths, and log paths. The terminal event is bounded and links to `artifacts.result` for the full durable result.
+Do not organize the response by pass or list every stage for every pull request when all are clear. Omit internal execution details. The terminal event is bounded and links to `artifacts.result` for the full durable result.
 
 Add only what changed the stack or needs attention:
 
@@ -109,7 +99,7 @@ improvement exists.
 For each suggestion, use exactly one of these categories:
 
 - **Agent** — the PR Stack Pipeline instructions or stack-sweep protocol.
-- **Helper** — the bundled helper's commands, state, or reporting.
+- **Helper** — the bundled helper's commands or reporting.
 - **General instructions** — the broader Copilot instructions or environment.
 - **Repository** — the reviewed repository's workflows, scripts, or guidance.
 

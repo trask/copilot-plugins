@@ -339,7 +339,11 @@ class StageFailureReportingTest(unittest.TestCase):
 
                 with (
                     mock.patch.object(STACK, "command_run", side_effect=report),
-                    mock.patch.object(STACK.sys, "argv", ["pr_stack_pipeline.py", "run"]),
+                    mock.patch.object(
+                        STACK.sys,
+                        "argv",
+                        ["pr_stack_pipeline.py", "run", "owner/repo#11"],
+                    ),
                 ):
                     code, output = captured_bytes(STACK.main)
                 self.assertEqual(1, code)
