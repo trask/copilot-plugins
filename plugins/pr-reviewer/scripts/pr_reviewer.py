@@ -1794,7 +1794,14 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
         result_sink = emit
     pr, viewer, anchors, pending_url, _, _, _, _ = preflight(args.target)
     if pending_url:
-        result_sink({"result": "existing_pending_review", "review_url": pending_url})
+        result_sink({
+            "result": "existing_pending_review",
+            "pr_url": pr["pr_url"],
+            "pr_number": pr["number"],
+            "pr_title": pr["title"],
+            "session_title": f"PR Review: {pr['number']} - {pr['title']}",
+            "review_url": pending_url,
+        })
         return
     if args.model != "sol":
         raise WorkflowError("PR Reviewer discovery requires Sol; independent critique requires Astra")
@@ -1862,6 +1869,7 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
             "result": "ready" if comments else "no_findings", "state": str(state_path),
             "run_id": run_id, "pr_url": pr["pr_url"], "pr_number": pr["number"],
             "pr_title": pr["title"], "head_sha": pr["head_sha"],
+            "session_title": f"PR Review: {pr['number']} - {pr['title']}",
             "comments_file": str(comments_path), "comments": comments,
             "candidate_count": len(candidates), "hosted_task_count": len(state["phases"]),
         })
@@ -1901,6 +1909,11 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
                     "reason": "head_changed",
                     "state": str(state_path),
                     "pr_url": pr["pr_url"],
+                    "pr_number": pr["number"],
+                    "pr_title": pr["title"],
+                    "session_title": (
+                        f"PR Review: {pr['number']} - {pr['title']}"
+                    ),
                     **error.details,
                     "candidate_status": "superseded",
                     "consumed_allowance": sum(
@@ -1979,7 +1992,14 @@ def command_post(args: argparse.Namespace, *, result_sink=None) -> None:
     if pending_url:
         if viewer.casefold() != str(state["viewer"]["login"]).casefold():
             raise WorkflowError("authenticated viewer changed since check")
-        result_sink({"result": "existing_pending_review", "review_url": pending_url})
+        result_sink({
+            "result": "existing_pending_review",
+            "pr_url": pr["pr_url"],
+            "pr_number": pr["number"],
+            "pr_title": pr["title"],
+            "session_title": f"PR Review: {pr['number']} - {pr['title']}",
+            "review_url": pending_url,
+        })
         return
     if mutation["status"] != "not_attempted":
         raise WorkflowError(
@@ -2059,6 +2079,10 @@ def command_post(args: argparse.Namespace, *, result_sink=None) -> None:
     result_sink(
         {
             "result": "created_pending_review",
+            "pr_url": pr["pr_url"],
+            "pr_number": pr["number"],
+            "pr_title": pr["title"],
+            "session_title": f"PR Review: {pr['number']} - {pr['title']}",
             "review_id": review_id,
             "review_url": review_url(pr, verified),
         }
@@ -2090,38 +2114,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     foreground = subparsers.add_parser("run", help="run hosted review with explicit pending-review authority")
     foreground.add_argument("target")
-    foreground.add_argument("--model", choices=sorted(MODEL_ALIASES), default="sol")
-    foreground.add_argument("--repo-root")
     foreground.add_argument("--post-pending-review", action="store_true",
                             help="authorize the existing guarded pending-review creation, never submission")
-    foreground.set_defaults(function=command_run)
-    check = subparsers.add_parser(
-        "check",
-        help="run authoritative local preflight and one managed Agent Task review",
+    foreground.set_defaults(
+        model="sol",
+        repo_root=None,
+        function=command_run,
     )
-    check.add_argument("target")
-    check.add_argument(
-        "--model",
-        choices=sorted(MODEL_ALIASES),
-        default="sol",
-        help="managed Agent Task worker model (default: sol)",
-    )
-    check.add_argument(
-        "--repo-root",
-        help="local repository used only for pinned Agent Task dispatch identity",
-    )
-    check.set_defaults(function=command_check)
-    post = subparsers.add_parser("post", help="create and verify one pending review")
-    post.add_argument("target")
-    post.add_argument(
-        "--expected-head",
-        required=True,
-        help="head SHA returned by check for the snapshot that was analyzed",
-    )
-    post.add_argument("--state", required=True, help="run state returned by check")
-    post.add_argument("--run-id", required=True, help="run id returned by check")
-    post.add_argument("--comments", required=True, help="JSON file, or - for standard input")
-    post.set_defaults(function=command_post)
     return parser
 
 
@@ -2202,9 +2201,25 @@ def _load_execution():
 def execution_main():
     commands = ('run',)
     arguments = sys.argv[1:]
+    standalone_internal = {
+        "--comments",
+        "--execution-handle",
+        "--expected-head",
+        "--model",
+        "--repo-root",
+        "--run-id",
+        "--state",
+    }
+    if (
+        arguments
+        and arguments[0] == "run"
+        and any(flag in arguments for flag in standalone_internal)
+    ):
+        return main()
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
-        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        os.environ.get("COPILOT_AGENT_SESSION_ID")
+        or os.environ.get("TRASK_EXECUTION_PARENT")
         or arguments and arguments[0] in {"execution-status", "execution-cancel"}
     )
     if not selected or not enabled:

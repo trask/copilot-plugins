@@ -177,15 +177,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 },
             )
             args = MODULE.build_parser().parse_args(
-                [
-                    "agent-task",
-                    METADATA["pr_url"],
-                    "--repo-root",
-                    str(repo_root),
-                    "--state",
-                    str(state_path),
-                ]
+                ["agent-task", METADATA["pr_url"]]
             )
+            args.repo_root = str(repo_root)
+            args.state = str(state_path)
             with (
                 mock.patch.object(MODULE, "require_tools"),
                 mock.patch.object(
@@ -208,14 +203,59 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         for text in (
             "disable-model-invocation: true",
             "tools: [execute, rename_session, rename_branch]",
-            "python \"$helper\" agent-task <target>",
-            "Agent Task performs all repository analysis",
-            "Never run another local repository command",
-            "Never use Cloud Sandboxes",
+            "python <helper> agent-task <target>",
+            "execution-status` takes no arguments",
+            "Use the verified `session_title`",
         ):
             self.assertIn(text, instructions)
+        self.assertNotIn("--execution-handle", instructions)
+        self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read, edit, search", instructions)
         self.assertNotIn("custom_agent:", instructions)
+
+    def test_standalone_parser_rejects_internal_execution_arguments(self):
+        parser = MODULE.build_parser()
+        for flag, value in (
+            ("--repo-root", "repo"),
+            ("--state", "state.json"),
+            ("--pipeline-run", "run"),
+            ("--pipeline-iteration", "1"),
+            ("--pipeline-max-iterations", "2"),
+            ("--execution-handle", "handle.json"),
+        ):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit):
+                parser.parse_args(["agent-task", "7", flag, value])
+
+    def test_execution_runtime_uses_the_current_agent_session(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
+        with (
+            mock.patch.object(
+                MODULE.sys, "argv", ["helper", "execution-status"]
+            ),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"COPILOT_AGENT_SESSION_ID": "session-1"},
+                clear=False,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("agent-task", "pipeline")
+        )
+        with (
+            mock.patch.object(
+                MODULE.sys,
+                "argv",
+                ["helper", "agent-task", "7", "--pipeline-run", "run"],
+            ),
+            mock.patch.object(MODULE, "main", return_value=23),
+            mock.patch.object(MODULE, "_load_execution") as load_execution,
+        ):
+            self.assertEqual(23, MODULE.execution_main())
+        load_execution.assert_not_called()
 
     def test_pins_shared_helper_and_current_policy(self):
         self.assertEqual(

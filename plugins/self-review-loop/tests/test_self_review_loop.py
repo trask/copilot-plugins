@@ -1949,15 +1949,58 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("marketplace-agent-code-candidate-worker@1", instructions)
-        self.assertIn("Never use Cloud Sandboxes", instructions)
-        self.assertIn("marketplace `custom_agent`", instructions)
-        self.assertIn("Never run `gh pr diff`", instructions)
+        self.assertIn("model: gpt-5.6-sol", instructions)
+        self.assertIn("execution-status` takes no arguments", instructions)
+        self.assertIn("Use the verified `session_title`", instructions)
+        self.assertNotIn("--execution-handle", instructions)
+        self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
         self.assertEqual(plugin["version"], "1.3.51")
         self.assertNotIn("custom_agent", plugin)
+
+    def test_standalone_parser_rejects_internal_execution_arguments(self):
+        parser = MODULE.build_parser()
+        for flag, value in (
+            ("--repo-root", "repo"),
+            ("--state", "state.json"),
+            ("--pipeline-run", "run"),
+            ("--pipeline-iteration", "1"),
+            ("--pipeline-max-iterations", "2"),
+            ("--execution-handle", "handle.json"),
+        ):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit):
+                parser.parse_args(["agent-task", "7", flag, value])
+
+    def test_execution_runtime_uses_the_current_agent_session(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
+        with (
+            mock.patch.object(MODULE.sys, "argv", ["helper", "agent-task", "7"]),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"COPILOT_AGENT_SESSION_ID": "session-1"},
+                clear=False,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("agent-task", "pipeline")
+        )
+        with (
+            mock.patch.object(
+                MODULE.sys,
+                "argv",
+                ["helper", "agent-task", "7", "--state", "state.json"],
+            ),
+            mock.patch.object(MODULE, "main", return_value=23),
+            mock.patch.object(MODULE, "_load_execution") as load_execution,
+        ):
+            self.assertEqual(23, MODULE.execution_main())
+        load_execution.assert_not_called()
 
     def test_report_parser_accepts_markdown_with_one_json_payload(self):
         content = "# Result\n\nReadable summary.\n\n```json\n{\"ok\":true}\n```"
@@ -2342,6 +2385,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             commands[0][commands[0].index("--policy") + 1],
         )
         self.assertEqual(emitted[0]["result"], "nothing_to_publish")
+        self.assertEqual(
+            emitted[0]["session_title"],
+            f"Self Review Loop: 7 - {self.preflight['pr']['title']}",
+        )
         self.assertEqual(emitted[0]["stage_outcome"], "cleared")
         state = MODULE.load_state(state_path)
         self.assertEqual(state["agent_task"]["status"], "completed")

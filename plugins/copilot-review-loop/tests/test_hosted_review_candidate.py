@@ -400,11 +400,10 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.preflight["pr"].update(head_owner="owner", head_repo="repo")
         tip = self.candidate(extra_code=True)
         commits = self.result["generated"]["commits"]
-        args = MODULE.build_parser().parse_args([
-            "agent-task", "owner/repo#7", "--model", "sol",
-            "--repo-root", str(self.repo), "--state", str(self.directory / "state.json"),
-            "--preserve-artifacts",
-        ])
+        args = MODULE.build_parser().parse_args(["agent-task", "owner/repo#7"])
+        args.repo_root = str(self.repo)
+        args.state = str(self.directory / "state.json")
+        args.preserve_artifacts = True
         published = self.head
         pushes = []
         original_run = MODULE.run

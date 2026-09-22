@@ -101,43 +101,84 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
 
         self.assertIn("tools: [execute, rename_session]", instructions)
         self.assertIn("disable-model-invocation: true", instructions)
-        self.assertIn("`PR Review: <PR number> - <PR title>`", instructions)
-        self.assertIn('run <target> --model sol --post-pending-review --execution-handle', instructions)
+        self.assertIn("model: gpt-5.6-sol", instructions)
+        self.assertIn("python <helper> run <target>", instructions)
+        self.assertIn("Use the verified `session_title`", instructions)
+        self.assertNotIn("--execution-handle", instructions)
+        self.assertNotIn("--model sol", instructions)
         self.assertIn("separate fresh Astra task", instructions)
-        self.assertIn("verifies each task's actual model", instructions)
-        self.assertIn("no hosted max-effort attestation", instructions)
+        self.assertIn("verifies each task's model", instructions)
         self.assertIn("Sol fallback for Astra", instructions)
         self.assertIn("Empty discovery uses one task; nonempty discovery uses two", instructions)
 
     def test_forbids_local_analysis_and_fallbacks(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("Never run another local repository command", instructions)
-        self.assertIn("Never invoke `gh pr diff`", instructions)
-        self.assertIn("install or execute PR code locally", instructions)
-        self.assertIn("Cloud Sandboxes", instructions)
+        self.assertIn("Never inspect or execute PR code locally", instructions)
+        self.assertIn("run `gh pr diff`", instructions)
+        self.assertIn("another agent or sandbox", instructions)
         self.assertIn("local critique, replacement task", instructions)
-        self.assertIn("All semantic work stays hosted", instructions)
 
     def test_preserves_pending_review_and_recovery_contract(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("only its verified check result", instructions)
+        self.assertIn("only the verified hosted result", instructions)
         self.assertIn("creates and verifies one viewer-owned pending review", instructions)
         self.assertIn("never submits it", instructions)
-        self.assertIn("A `ready` result alone grants no posting permission", instructions)
-        self.assertIn("Never retry or use direct `gh api` as a fallback", instructions)
+        self.assertIn("ready read-only result grants no posting permission", instructions)
+        self.assertIn("do not retry a review mutation", instructions)
         self.assertIn("no findings with no mutation", instructions)
 
     def test_all_evaluator_rejections_end_without_posting(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "Astra rejecting every candidate",
-            instructions,
+        self.assertIn("Omit it for read-only findings", instructions)
+        self.assertIn("The posting guard uses only the verified hosted result", instructions)
+
+    def test_parser_rejects_fixed_model_and_internal_posting_arguments(self):
+        parser = MODULE.build_parser()
+        args = parser.parse_args(["run", "42"])
+        self.assertEqual("sol", args.model)
+        for arguments in (
+            ["run", "42", "--model", "sol"],
+            ["run", "42", "--repo-root", "repo"],
+            ["run", "42", "--execution-handle", "handle"],
+            ["check", "42"],
+            ["post", "42", "--state", "state"],
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                parser.parse_args(arguments)
+
+    def test_execution_runtime_uses_the_current_agent_session(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
+        with (
+            mock.patch.object(
+                MODULE.sys, "argv", ["helper", "execution-cancel"]
+            ),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"COPILOT_AGENT_SESSION_ID": "session-1"},
+                clear=False,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("run",)
         )
-        self.assertIn("no review mutation is needed", instructions)
-        self.assertIn("comments_file` unchanged", instructions)
+        with (
+            mock.patch.object(
+                MODULE.sys,
+                "argv",
+                ["helper", "run", "7", "--model", "sol"],
+            ),
+            mock.patch.object(MODULE, "main", return_value=23),
+            mock.patch.object(MODULE, "_load_execution") as load_execution,
+        ):
+            self.assertEqual(23, MODULE.execution_main())
+        load_execution.assert_not_called()
 
 
 class ForegroundDriverTest(unittest.TestCase):
@@ -977,6 +1018,7 @@ class PendingReviewTest(unittest.TestCase):
         pr = {
             "repo_name": "owner/repo",
             "number": 42,
+            "title": "Fix the reviewer",
             "pr_url": "https://github.com/owner/repo/pull/42",
             "head_sha": "abc",
         }
@@ -995,6 +1037,10 @@ class PendingReviewTest(unittest.TestCase):
             ))
 
         self.assertEqual(emit.call_args.args[0]["result"], "existing_pending_review")
+        self.assertEqual(
+            "PR Review: 42 - Fix the reviewer",
+            emit.call_args.args[0]["session_title"],
+        )
         self.assertEqual(
             emit.call_args.args[0]["review_url"],
             f"{pr['pr_url']}#pullrequestreview-7",
@@ -1418,9 +1464,8 @@ class ManagedCoordinatorTest(unittest.TestCase):
     def test_independent_hosted_critique_has_no_local_semantic_fallback(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("separate fresh Astra task", instructions)
-        self.assertIn("no hosted max-effort attestation", instructions)
-        self.assertIn("Do not filter candidates", instructions)
-        self.assertIn("comments_file", instructions)
+        self.assertIn("filter candidates", instructions)
+        self.assertNotIn("comments_file", instructions)
         self.assertNotIn("tools: [execute, agent", instructions)
 
 

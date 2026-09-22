@@ -331,16 +331,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             repo_root.mkdir()
             state_path = root / "state.json"
             state_path.write_text("preserve me\n", encoding="utf-8")
-            args = MODULE.build_parser().parse_args(
-                [
-                    "agent-task",
-                    "owner/repo#7",
-                    "--repo-root",
-                    str(repo_root),
-                    "--state",
-                    str(state_path),
-                ]
-            )
+            args = MODULE.build_parser().parse_args(["agent-task", "owner/repo#7"])
+            args.repo_root = str(repo_root)
+            args.state = str(state_path)
             with (
                 mock.patch.object(MODULE, "require_tools"),
                 mock.patch.object(
@@ -362,16 +355,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_explicit_state_inside_repository_is_rejected_before_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
             repo_root = Path(directory).resolve()
-            args = MODULE.build_parser().parse_args(
-                [
-                    "agent-task",
-                    "owner/repo#7",
-                    "--repo-root",
-                    str(repo_root),
-                    "--state",
-                    str(repo_root / "source.py"),
-                ]
-            )
+            args = MODULE.build_parser().parse_args(["agent-task", "owner/repo#7"])
+            args.repo_root = str(repo_root)
+            args.state = str(repo_root / "source.py")
             with (
                 mock.patch.object(MODULE, "require_tools"),
                 mock.patch.object(
@@ -547,14 +533,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
     def test_agent_definition_uses_only_the_managed_agent_task_path(self):
         instructions = AGENT.read_text(encoding="utf-8")
-        self.assertIn("You are a thin local coordinator", instructions)
+        self.assertIn("You are a thin controller", instructions)
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn(
-            "marketplace-agent-report-recommendation-worker@1", instructions
-        )
-        self.assertIn("Never use Cloud Sandboxes", instructions)
-        self.assertIn("Never run `gh pr diff`", instructions)
-        self.assertIn("Never scrape", instructions)
+        self.assertIn("execution-status` takes no arguments", instructions)
+        self.assertIn("Use the verified `session_title`", instructions)
+        self.assertNotIn("--execution-handle", instructions)
+        self.assertNotIn("--pipeline-run", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
         self.assertNotIn("custom_agent", plugin)
 
@@ -796,11 +780,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.assertIn(instruction, prompt)
 
         instructions = AGENT.read_text(encoding="utf-8")
-        self.assertIn("it does not guarantee semantic rejection", instructions)
-        self.assertIn(
-            "There is no additional hosted pass or local semantic validator",
-            instructions,
-        )
+        self.assertIn("Never inspect changed files", instructions)
 
     def test_success_uses_atomic_result_not_stdout_and_cleans_artifacts(self):
         report_content = self.proposal_report()
@@ -809,6 +789,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         state = MODULE.load_run_state(index.with_name("owner--repo--7--run-1.json"))
         self.assertEqual(emitted[-1]["result"], "validated")
+        self.assertEqual(
+            emitted[-1]["session_title"],
+            f"PR Description: 7 - {emitted[-1]['title']}",
+        )
         self.assertEqual(state["agent_task"]["status"], "completed")
         self.assertTrue(state["agent_task"]["artifacts_removed"])
         self.assertNotIn("prompt_file", state["agent_task"])
@@ -2856,8 +2840,6 @@ class ParserShapeTest(unittest.TestCase):
                 [
                     "agent-task",
                     "owner/repo#7",
-                    "--repo-root",
-                    "repo",
                     "--model",
                     "terra",
                 ],
@@ -2899,9 +2881,42 @@ class ParserShapeTest(unittest.TestCase):
             ["archive-taskless-runs", "owner/repo#7"],
             ["agent-task", "owner/repo#7", "--resume"],
             ["agent-task", "owner/repo#7", "--apply-prepared"],
+            ["agent-task", "owner/repo#7", "--repo-root", "repo"],
+            ["agent-task", "owner/repo#7", "--state", "state"],
+            ["agent-task", "owner/repo#7", "--pipeline-run", "run"],
+            ["agent-task", "owner/repo#7", "--execution-handle", "handle"],
         ):
             with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
                 self.parser.parse_args(arguments)
+
+    def test_execution_runtime_uses_the_current_agent_session(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
+        with (
+            mock.patch.object(sys, "argv", ["helper", "execution-cancel"]),
+            mock.patch.dict(
+                os.environ,
+                {"COPILOT_AGENT_SESSION_ID": "session-1"},
+                clear=False,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("agent-task", "pipeline")
+        )
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["helper", "agent-task", "7", "--repo-root", "repo"],
+            ),
+            mock.patch.object(MODULE, "main", return_value=23),
+            mock.patch.object(MODULE, "_load_execution") as load_execution,
+        ):
+            self.assertEqual(23, MODULE.execution_main())
+        load_execution.assert_not_called()
 
     def test_requires_exactly_one_status_source(self):
         with self.assertRaises(SystemExit):

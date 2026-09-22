@@ -1755,10 +1755,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn(MODULE.HOSTED_DECISION_POLICY, instructions)
-        self.assertIn("`--model sol`", instructions)
-        self.assertIn("Never use a local semantic worker", instructions)
-        self.assertIn("result schema version 5", instructions)
+        self.assertIn("model: gpt-5.6-sol", instructions)
+        self.assertIn("Do not pass a model argument", instructions)
+        self.assertIn("Use the verified `session_title`", instructions)
+        self.assertNotIn("--execution-handle", instructions)
+        self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.74")
@@ -1859,16 +1860,57 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(original, history)
 
-    def test_agent_task_model_gate_accepts_only_explicit_sol(self):
+    def test_agent_task_model_gate_is_internal_and_rejects_caller_flags(self):
         parser = MODULE.build_parser()
-        args = parser.parse_args(["agent-task", "--model", "sol"])
+        args = parser.parse_args(["agent-task"])
 
         self.assertEqual(args.model, "sol")
+        rejected = (
+            ("--model", "sol"),
+            ("--model", "astra"),
+            ("--repo-root", "repo"),
+            ("--state", "state.json"),
+            ("--pipeline-run", "run"),
+            ("--execution-handle", "handle.json"),
+            ("--watch-interval", "1"),
+            ("--invocation-run", "run"),
+        )
+        for flag, value in rejected:
+            with (
+                self.subTest(flag=flag),
+                mock.patch.object(sys, "stderr"),
+                self.assertRaises(SystemExit),
+            ):
+                parser.parse_args(["agent-task", flag, value])
+
+    def test_execution_runtime_uses_the_current_agent_session(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
         with (
-            mock.patch.object(sys, "stderr"),
-            self.assertRaises(SystemExit),
+            mock.patch.object(sys, "argv", ["helper", "execution-status"]),
+            mock.patch.dict(
+                os.environ,
+                {"COPILOT_AGENT_SESSION_ID": "session-1"},
+                clear=False,
+            ),
+            mock.patch.object(MODULE, "_load_execution", return_value=runtime),
         ):
-            parser.parse_args(["agent-task", "--model", "astra"])
+            self.assertEqual(17, MODULE.execution_main())
+
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("agent-task", "pipeline")
+        )
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["helper", "agent-task", "7", "--model", "sol"],
+            ),
+            mock.patch.object(MODULE, "main", return_value=23),
+            mock.patch.object(MODULE, "_load_execution") as load_execution,
+        ):
+            self.assertEqual(23, MODULE.execution_main())
+        load_execution.assert_not_called()
 
     def test_local_coordinator_waits_for_stable_actionable_feedback(self):
         state_path = self.directory / "stable-state.json"
@@ -3403,6 +3445,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             MODULE.command_agent_task(self.arguments(clean_path, max_iterations=5))
         self.assertEqual(emitted[-1]["result"], "no_unresolved_comments")
+        self.assertEqual(
+            emitted[-1]["session_title"],
+            f"Copilot Review Loop: 7 - {clean['pr']['title']}",
+        )
         discover.assert_not_called()
 
         emitted.clear()
@@ -3427,14 +3473,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_uses_foreground_execution_without_a_required_watch_loop(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("Use `mode: async`", instructions)
+        self.assertIn("with `mode: async`", instructions)
         self.assertIn("only when the user explicitly requests continuation after client exit", instructions)
-        self.assertIn("Never run a required watch loop", instructions)
-        self.assertIn("hash-verified terminal execution result", instructions)
-        self.assertIn(
-            "`stage_outcome: skipped` only with the exact frozen-head source-only proof",
-            instructions,
-        )
+        self.assertIn("Do not poll", instructions)
+        self.assertIn("hash-verified terminal result", instructions)
+        self.assertIn("frozen-head policy skip", instructions)
 
     def arguments(self, state_path, *, resume=False, max_iterations=5):
         return SimpleNamespace(
@@ -3595,102 +3638,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
 
 
-
-
-    def dead_local_package_identity(self, manifest_path):
-        return {
-            "path": str(manifest_path),
-            "sha256": "a" * 64,
-            "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
-            "source_commit": "1" * 40,
-            "installed_root": str(self.directory / "installed"),
-            "generator": {
-                "name": "trask/copilot-plugins plugin_package_manifest",
-                "version": "1.0.0",
-                "sha256": "b" * 64,
-            },
-            "packages": [
-                {
-                    "name": "copilot-review-loop",
-                    "version": "1.1.53",
-                    "file_count": 25,
-                    "package_sha256": "c" * 64,
-                }
-            ],
-        }
-
-
-
-
-
-    def test_dead_local_owner_package_manifest_verifies_every_installed_byte(self):
-        installed_root = (self.directory / "installed").resolve()
-        package_root = installed_root / "copilot-review-loop"
-        helper_path = package_root / "scripts" / "copilot_review_loop.py"
-        helper_path.parent.mkdir(parents=True)
-        helper_path.write_text("exact helper bytes\n", encoding="utf-8", newline="\n")
-        plugin_path = package_root / "plugin.json"
-        plugin_path.write_text(
-            '{"name":"copilot-review-loop","version":"1.1.53"}\n',
-            encoding="utf-8",
-            newline="\n",
-        )
-        files = []
-        for relative in ("plugin.json", "scripts/copilot_review_loop.py"):
-            content = (package_root / Path(relative)).read_bytes()
-            files.append(
-                {
-                    "path": relative,
-                    "size": len(content),
-                    "sha256": MODULE.sha256_file(package_root / Path(relative)),
-                }
-            )
-        package = {
-            "name": "copilot-review-loop",
-            "version": "1.1.53",
-            "file_count": len(files),
-            "byte_count": sum(item["size"] for item in files),
-            "package_sha256": MODULE.canonical_package_digest(files),
-            "published_git_tree_oid": "1" * 40,
-            "files": files,
-        }
-        manifest = {
-            "schema": MODULE.PLUGIN_PACKAGE_MANIFEST_SCHEMA,
-            "generator": {
-                "name": "trask/copilot-plugins plugin_package_manifest",
-                "version": "1.0.0",
-                "sha256": "2" * 64,
-                "command_argv": ["python", "plugin_package_manifest.py", "create"],
-            },
-            "generated_at": "2026-09-17T00:00:00Z",
-            "source_commit": "3" * 40,
-            "installed_root": str(installed_root),
-            "algorithm": MODULE.PLUGIN_PACKAGE_MANIFEST_ALGORITHM,
-            "packages": [package],
-        }
-        manifest_path = self.directory / "canonical-packages.json"
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        manifest_sha256 = MODULE.sha256_file(manifest_path)
-        with mock.patch.object(MODULE, "__file__", str(helper_path)):
-            identity = MODULE.verify_installed_package_manifest(
-                manifest_path, manifest_sha256, self.repo_root
-            )
-            self.assertEqual(manifest_sha256, identity["sha256"])
-            self.assertEqual(
-                package["package_sha256"],
-                identity["packages"][0]["package_sha256"],
-            )
-            helper_path.write_text(
-                "drifted helper bytes\n", encoding="utf-8", newline="\n"
-            )
-            with self.assertRaisesRegex(MODULE.WorkflowError, "installed bytes drifted"):
-                MODULE.verify_installed_package_manifest(
-                    manifest_path, manifest_sha256, self.repo_root
-                )
 
 
     def terminal_local_recovery_case(self, state_path):
@@ -8037,10 +7984,8 @@ class StageProgressTest(unittest.TestCase):
 
     def test_agent_marks_validation_with_structured_progress(self):
         instructions = AGENT.read_text(encoding="utf-8")
-        self.assertIn("progress --state <path> --phase validating", instructions)
-        self.assertIn(
-            "progress --state <path> --phase addressing_comments", instructions
-        )
+        self.assertIn("The helper owns review requests", instructions)
+        self.assertNotIn("progress --state", instructions)
 
 
 class StageOutcomeTest(unittest.TestCase):
@@ -9744,10 +9689,7 @@ class DerivedCeilingTest(unittest.TestCase):
         """Left as a replacement in prose, the next reader reinstates it in code."""
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "Pipeline sweeps never reset or multiply that allowance.",
-            instructions,
-        )
+        self.assertIn("iteration budgets", instructions)
 
 class LocalValidationRecordTest(unittest.TestCase):
     """The record is what makes the push requirement falsifiable.

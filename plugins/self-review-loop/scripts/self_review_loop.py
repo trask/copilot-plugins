@@ -2881,6 +2881,9 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             "result": "max_iterations_reached",
             "state": str(state_path),
             "pr": pr["pr_url"],
+            "pr_number": pr["number"],
+            "pr_title": pr["title"],
+            "session_title": f"Self Review Loop: {pr['number']} - {pr['title']}",
             "head_sha": pr["head_sha"],
             "iterations": state["iterations"],
             "outcome": "max_iterations_reached",
@@ -3107,6 +3110,11 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 "result": "source_changed",
                 "state": str(state_path),
                 "pr": pr["pr_url"],
+                "pr_number": pr["number"],
+                "pr_title": pr["title"],
+                "session_title": (
+                    f"Self Review Loop: {pr['number']} - {pr['title']}"
+                ),
                 "head_sha": pr["head_sha"],
                 "next_head_sha": live_before_import["head_sha"],
                 "iterations": current["iterations"],
@@ -3329,6 +3337,12 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             "result": result_name,
             "state": str(state_path),
             "pr": current["pr"]["pr_url"],
+            "pr_number": current["pr"]["number"],
+            "pr_title": current["pr"]["title"],
+            "session_title": (
+                f"Self Review Loop: {current['pr']['number']} - "
+                f"{current['pr']['title']}"
+            ),
             "head_sha": published_head,
             "commits": remote["commits"],
             "iterations": current["iterations"],
@@ -3557,7 +3571,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_task = subparsers.add_parser(
         "agent-task",
-        aliases=["pipeline"],
         help="run the complete Self Review Loop through a managed GitHub Agent Task",
     )
     agent_task.add_argument(
@@ -3568,8 +3581,6 @@ def build_parser() -> argparse.ArgumentParser:
             "the PR's branch"
         ),
     )
-    agent_task.add_argument("--repo-root")
-    agent_task.add_argument("--state")
     agent_task.add_argument(
         "--model",
         choices=sorted(MODEL_ALIASES),
@@ -3580,19 +3591,50 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_ITERATIONS,
     )
-    agent_task.add_argument("--pipeline-run")
-    agent_task.add_argument("--pipeline-iteration", type=int)
-    agent_task.add_argument("--pipeline-max-iterations", type=int)
     agent_task.add_argument(
         "--github-mutation-policy",
         choices=("allow", "source-only"),
     )
-    agent_task.add_argument(
+    agent_task.set_defaults(
+        repo_root=None,
+        state=None,
+        pipeline_run=None,
+        pipeline_iteration=None,
+        pipeline_max_iterations=None,
+        preserve_artifacts=False,
+        function=command_agent_task,
+    )
+
+    pipeline = subparsers.add_parser(
+        "pipeline",
+        help=argparse.SUPPRESS,
+    )
+    pipeline.add_argument("target")
+    pipeline.add_argument("--repo-root")
+    pipeline.add_argument("--state", required=True)
+    pipeline.add_argument(
+        "--model",
+        choices=sorted(MODEL_ALIASES),
+        default="sol",
+    )
+    pipeline.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_MAX_ITERATIONS,
+    )
+    pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--pipeline-iteration", type=int, required=True)
+    pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
+    pipeline.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+    )
+    pipeline.add_argument(
         "--preserve-artifacts",
         action="store_true",
         help="retain the managed prompt and result after successful publication",
     )
-    agent_task.set_defaults(function=command_agent_task)
+    pipeline.set_defaults(function=command_agent_task)
 
     status = subparsers.add_parser("status", help="print compact workflow state")
     status_source = status.add_mutually_exclusive_group(required=True)
@@ -3679,9 +3721,25 @@ def _load_execution():
 def execution_main():
     commands = ('agent-task', 'pipeline')
     arguments = sys.argv[1:]
+    standalone_internal = {
+        "--execution-handle",
+        "--pipeline-iteration",
+        "--pipeline-max-iterations",
+        "--pipeline-run",
+        "--preserve-artifacts",
+        "--repo-root",
+        "--state",
+    }
+    if (
+        arguments
+        and arguments[0] == "agent-task"
+        and any(flag in arguments for flag in standalone_internal)
+    ):
+        return main()
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
-        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        os.environ.get("COPILOT_AGENT_SESSION_ID")
+        or os.environ.get("TRASK_EXECUTION_PARENT")
         or arguments and arguments[0] in {"execution-status", "execution-cancel"}
     )
     if not selected or not enabled:

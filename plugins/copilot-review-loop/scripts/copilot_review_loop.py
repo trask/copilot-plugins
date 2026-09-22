@@ -26,7 +26,6 @@ import tempfile
 import time
 from typing import Any, Callable, Iterable
 from types import ModuleType
-import unicodedata
 import urllib.parse
 import uuid
 
@@ -60,30 +59,6 @@ DEAD_LOCAL_OWNER_ELIGIBILITY_SCHEMA = (
 DEAD_LOCAL_OWNER_AUTHORIZATION_SCHEMA = (
     "github.copilot.review-loop-dead-local-owner-authorization.v1"
 )
-PLUGIN_PACKAGE_MANIFEST_SCHEMA = {
-    "id": "github.copilot.plugin-package-manifest",
-    "version": 1,
-}
-PLUGIN_PACKAGE_MANIFEST_ALGORITHM = {
-    "aggregate": "sha256",
-    "digest_encoding": "lowercase hexadecimal ASCII",
-    "file_set": (
-        "Every regular Git blob recursively tracked below plugins/<name> at "
-        "source_commit, with no missing or extra installed regular files and "
-        "no symlinks."
-    ),
-    "ordering": "Ascending lexicographic order of normalized UTF-8 path bytes.",
-    "path_normalization": (
-        "Plugin-relative Unicode NFC path with forward-slash separators; "
-        "absolute paths, empty components, dot components, backslashes, NUL, "
-        "CR, LF, and normalization collisions are rejected."
-    ),
-    "record_framing": (
-        "path_utf8 + NUL + decimal_byte_size_ascii + NUL + "
-        "file_sha256_lowercase_hex_ascii + LF"
-    ),
-}
-PLUGIN_NAME_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 LEGACY_RUNNING_LOCAL_OWNER_FIELDS = frozenset(
     {
@@ -1696,266 +1671,6 @@ def strict_json_file(path: Path, label: str) -> tuple[bytes, Any]:
         return content, json.loads(text, object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as error:
         raise WorkflowError(f"{label} is not valid JSON: {error}") from error
-
-
-def canonical_package_path(value: Any) -> str:
-    if not isinstance(value, str) or not value:
-        raise WorkflowError("canonical package path is malformed")
-    parts = value.split("/")
-    normalized = []
-    for part in parts:
-        if (
-            not part
-            or part in {".", ".."}
-            or "\\" in part
-            or any(character in part for character in "\0\r\n")
-        ):
-            raise WorkflowError("canonical package path is malformed")
-        normalized.append(unicodedata.normalize("NFC", part))
-    result = "/".join(normalized)
-    if result != value:
-        raise WorkflowError("canonical package path is not normalized")
-    return result
-
-
-def canonical_package_record(path: str, size: int, digest: str) -> bytes:
-    if (
-        canonical_package_path(path) != path
-        or not isinstance(size, int)
-        or isinstance(size, bool)
-        or size < 0
-        or SHA256_PATTERN.fullmatch(digest) is None
-    ):
-        raise WorkflowError("canonical package record is malformed")
-    return (
-        path.encode("utf-8")
-        + b"\0"
-        + str(size).encode("ascii")
-        + b"\0"
-        + digest.encode("ascii")
-        + b"\n"
-    )
-
-
-def canonical_package_digest(files: list[dict[str, Any]]) -> str:
-    if not isinstance(files, list) or not files:
-        raise WorkflowError("canonical package file list is empty")
-    paths = []
-    for item in files:
-        if (
-            not isinstance(item, dict)
-            or set(item) != {"path", "size", "sha256"}
-            or not isinstance(item.get("path"), str)
-            or not isinstance(item.get("size"), int)
-            or isinstance(item["size"], bool)
-            or not isinstance(item.get("sha256"), str)
-        ):
-            raise WorkflowError("canonical package file record is malformed")
-        paths.append(canonical_package_path(item["path"]))
-    ordered = sorted(files, key=lambda item: item["path"].encode("utf-8"))
-    if paths != [item["path"] for item in ordered] or len(set(paths)) != len(paths):
-        raise WorkflowError("canonical package files are not unique and ordered")
-    return hashlib.sha256(
-        b"".join(
-            canonical_package_record(item["path"], item["size"], item["sha256"])
-            for item in ordered
-        )
-    ).hexdigest()
-
-
-def installed_package_files(package_root: Path) -> dict[str, Path]:
-    if not package_root.is_dir() or package_root.is_symlink():
-        raise WorkflowError(f"installed package directory is invalid: {package_root}")
-    files: dict[str, Path] = {}
-    for current, directories, names in os.walk(package_root, followlinks=False):
-        current_path = Path(current)
-        for name in directories:
-            path = current_path / name
-            if path.is_symlink() or (
-                hasattr(path, "is_junction") and path.is_junction()
-            ):
-                raise WorkflowError(f"installed package contains a link: {path}")
-        for name in names:
-            path = current_path / name
-            if path.is_symlink() or not path.is_file():
-                raise WorkflowError(
-                    f"installed package contains a non-regular file: {path}"
-                )
-            relative = canonical_package_path(
-                "/".join(path.relative_to(package_root).parts)
-            )
-            if relative in files:
-                raise WorkflowError(
-                    f"installed package paths collide after normalization: {relative}"
-                )
-            files[relative] = path
-    return files
-
-
-def verify_installed_package_manifest(
-    manifest_path: Path,
-    expected_sha256: str,
-    repo_root: Path,
-) -> dict[str, Any]:
-    require_outside_repository(manifest_path, repo_root)
-    if SHA256_PATTERN.fullmatch(expected_sha256) is None:
-        raise WorkflowError("expected package manifest SHA-256 is malformed")
-    manifest_bytes, manifest = strict_json_file(
-        manifest_path, "canonical package manifest"
-    )
-    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    if manifest_sha256 != expected_sha256:
-        raise WorkflowError("canonical package manifest SHA-256 drifted")
-    if (
-        not isinstance(manifest, dict)
-        or set(manifest)
-        != {
-            "schema",
-            "generator",
-            "generated_at",
-            "source_commit",
-            "installed_root",
-            "algorithm",
-            "packages",
-        }
-        or manifest.get("schema") != PLUGIN_PACKAGE_MANIFEST_SCHEMA
-        or manifest.get("algorithm") != PLUGIN_PACKAGE_MANIFEST_ALGORITHM
-        or not isinstance(manifest.get("generator"), dict)
-        or set(manifest["generator"])
-        != {"name", "version", "sha256", "command_argv"}
-        or manifest["generator"].get("name")
-        != "trask/copilot-plugins plugin_package_manifest"
-        or manifest["generator"].get("version") != "1.0.0"
-        or SHA256_PATTERN.fullmatch(str(manifest["generator"].get("sha256", "")))
-        is None
-        or not isinstance(manifest["generator"].get("command_argv"), list)
-        or not all(
-            isinstance(value, str)
-            for value in manifest["generator"]["command_argv"]
-        )
-        or not isinstance(manifest.get("generated_at"), str)
-        or not manifest["generated_at"]
-        or re.fullmatch(
-            r"[0-9a-f]{40}|[0-9a-f]{64}",
-            str(manifest.get("source_commit", "")),
-        )
-        is None
-        or not isinstance(manifest.get("installed_root"), str)
-        or not isinstance(manifest.get("packages"), list)
-        or not manifest["packages"]
-    ):
-        raise WorkflowError("canonical package manifest schema or fields are invalid")
-    installed_root = Path(manifest["installed_root"])
-    if (
-        not installed_root.is_absolute()
-        or str(installed_root.resolve()) != manifest["installed_root"]
-        or not installed_root.is_dir()
-        or installed_root.is_symlink()
-    ):
-        raise WorkflowError("canonical package installed root is invalid")
-    package_names = []
-    package_summaries = []
-    helper_record = None
-    for package in manifest["packages"]:
-        if (
-            not isinstance(package, dict)
-            or set(package)
-            != {
-                "name",
-                "version",
-                "file_count",
-                "byte_count",
-                "package_sha256",
-                "published_git_tree_oid",
-                "files",
-            }
-            or not isinstance(package.get("name"), str)
-            or PLUGIN_NAME_PATTERN.fullmatch(package["name"]) is None
-            or not isinstance(package.get("version"), str)
-            or not package["version"]
-            or not isinstance(package.get("file_count"), int)
-            or isinstance(package["file_count"], bool)
-            or not isinstance(package.get("byte_count"), int)
-            or isinstance(package["byte_count"], bool)
-            or not isinstance(package.get("files"), list)
-            or package["file_count"] != len(package["files"])
-            or package["byte_count"]
-            != sum(
-                item.get("size", -1)
-                for item in package["files"]
-                if isinstance(item, dict)
-            )
-            or SHA256_PATTERN.fullmatch(
-                str(package.get("package_sha256", ""))
-            )
-            is None
-            or re.fullmatch(
-                r"[0-9a-f]{40}|[0-9a-f]{64}",
-                str(package.get("published_git_tree_oid", "")),
-            )
-            is None
-            or canonical_package_digest(package["files"])
-            != package["package_sha256"]
-        ):
-            raise WorkflowError("canonical package manifest entry is invalid")
-        package_names.append(package["name"])
-        expected_files = {item["path"]: item for item in package["files"]}
-        actual_files = installed_package_files(installed_root / package["name"])
-        if set(actual_files) != set(expected_files):
-            raise WorkflowError(
-                f"installed file set drifted for {package['name']}"
-            )
-        for relative, expected in expected_files.items():
-            content = actual_files[relative].read_bytes()
-            if (
-                len(content) != expected["size"]
-                or hashlib.sha256(content).hexdigest() != expected["sha256"]
-            ):
-                raise WorkflowError(
-                    f"installed bytes drifted for {package['name']}/{relative}"
-                )
-        if package["name"] == "copilot-review-loop":
-            helper_record = expected_files.get("scripts/copilot_review_loop.py")
-        package_summaries.append(
-            {
-                "name": package["name"],
-                "version": package["version"],
-                "file_count": package["file_count"],
-                "package_sha256": package["package_sha256"],
-            }
-        )
-    if package_names != sorted(set(package_names)):
-        raise WorkflowError(
-            "canonical package manifest entries are not unique and ordered"
-        )
-    expected_helper = (
-        installed_root
-        / "copilot-review-loop"
-        / "scripts"
-        / "copilot_review_loop.py"
-    ).resolve()
-    current_helper = Path(__file__).resolve()
-    if (
-        current_helper != expected_helper
-        or helper_record is None
-        or helper_record["sha256"] != sha256_file(current_helper)
-    ):
-        raise WorkflowError(
-            "canonical package manifest does not identify this installed helper"
-        )
-    return {
-        "path": str(manifest_path),
-        "sha256": manifest_sha256,
-        "schema": PLUGIN_PACKAGE_MANIFEST_SCHEMA,
-        "source_commit": manifest["source_commit"],
-        "installed_root": manifest["installed_root"],
-        "generator": {
-            "name": manifest["generator"]["name"],
-            "version": manifest["generator"]["version"],
-            "sha256": manifest["generator"]["sha256"],
-        },
-        "packages": package_summaries,
-    }
 
 
 def contains_credentials(value: str) -> bool:
@@ -8396,6 +8111,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     "result": "max_iterations_reached",
                     "state": str(state_path),
                     "pr": existing["pr"]["pr_url"],
+                    "pr_number": existing["pr"]["number"],
+                    "pr_title": existing["pr"]["title"],
+                    "session_title": (
+                        f"Copilot Review Loop: {existing['pr']['number']} - "
+                        f"{existing['pr']['title']}"
+                    ),
                     "head_sha": existing["pr"]["head_sha"],
                     "iterations": existing["iterations"],
                     "stage_outcome": "carried",
@@ -8622,6 +8343,18 @@ def command_agent_task(args: argparse.Namespace) -> None:
             {
                 "result": "no_unresolved_comments",
                 "state": str(state_path),
+                "pr": pr["pr_url"],
+                **(
+                    {
+                        "pr_number": pr["number"],
+                        "pr_title": pr["title"],
+                        "session_title": (
+                            f"Copilot Review Loop: {pr['number']} - {pr['title']}"
+                        ),
+                    }
+                    if isinstance(pr.get("title"), str) and pr["title"]
+                    else {}
+                ),
                 "head_sha": clean_head,
                 "iterations": state["iterations"],
                 "stage_outcome": "cleared",
@@ -8638,6 +8371,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "result": "max_iterations_reached",
                 "state": str(state_path),
                 "pr": pr["pr_url"],
+                "pr_number": pr["number"],
+                "pr_title": pr["title"],
+                "session_title": (
+                    f"Copilot Review Loop: {pr['number']} - {pr['title']}"
+                ),
                 "head_sha": pr["head_sha"],
                 "iterations": state["iterations"],
                 "pending_comments": state["queue"]["comments"],
@@ -8665,6 +8403,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
             {
                 "result": "review_requested",
                 "state": str(state_path),
+                "pr": pr["pr_url"],
+                "pr_number": pr["number"],
+                "pr_title": pr["title"],
+                "session_title": (
+                    f"Copilot Review Loop: {pr['number']} - {pr['title']}"
+                ),
                 "head_sha": pr["head_sha"],
                 "monitoring": monitoring,
                 "iterations": state["iterations"],
@@ -8679,6 +8423,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
             {
                 "result": "review_comments_pending_preparation",
                 "state": str(state_path),
+                "pr": pr["pr_url"],
+                "pr_number": pr["number"],
+                "pr_title": pr["title"],
+                "session_title": (
+                    f"Copilot Review Loop: {pr['number']} - {pr['title']}"
+                ),
                 "head_sha": pr["head_sha"],
                 "iterations": state["iterations"],
                 "review_id": preflight.get("head_review_id"),
@@ -8848,6 +8598,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     "result": "source_changed",
                     "state": str(state_path),
                     "pr": pr["pr_url"],
+                    "pr_number": pr["number"],
+                    "pr_title": pr["title"],
+                    "session_title": (
+                        f"Copilot Review Loop: {pr['number']} - {pr['title']}"
+                    ),
                     "head_sha": pr["head_sha"],
                     "next_head_sha": live_before_import["head_sha"],
                     "iterations": state["iterations"],
@@ -9071,6 +8826,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "result": "published" if remote["commits"] else "nothing_to_publish",
                 "state": str(state_path),
                 "pr": pr["pr_url"],
+                "pr_number": pr["number"],
+                "pr_title": pr["title"],
+                "session_title": (
+                    f"Copilot Review Loop: {pr['number']} - {pr['title']}"
+                ),
                 "head_sha": published_head,
                 "commits": remote["commits"],
                 "reply_ids": reply_ids,
@@ -9264,7 +9024,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_task = subparsers.add_parser(
         "agent-task",
-        aliases=["pipeline"],
         help="run Copilot Review Loop through a validated hosted candidate task",
     )
     agent_task.add_argument(
@@ -9275,40 +9034,14 @@ def build_parser() -> argparse.ArgumentParser:
             "attached to the PR's branch"
         ),
     )
-    agent_task.add_argument("--repo-root")
-    agent_task.add_argument("--state")
-    agent_task.add_argument(
-        "--model",
-        choices=sorted(MODEL_ALIASES),
-        default="sol",
-    )
     agent_task.add_argument(
         "--max-iterations",
         type=int,
         default=DEFAULT_MAX_ITERATIONS,
     )
-    agent_task.add_argument("--pipeline-run")
-    agent_task.add_argument("--pipeline-iteration", type=int)
-    agent_task.add_argument("--pipeline-max-iterations", type=int)
     agent_task.add_argument(
         "--github-mutation-policy",
         choices=("allow", "source-only"),
-    )
-    agent_task.add_argument("--watch-interval", type=float, default=30.0)
-    agent_task.add_argument(
-        "--poll-max-interval",
-        type=float,
-        default=DEFAULT_MAX_WATCH_INTERVAL,
-    )
-    agent_task.add_argument(
-        "--wait-timeout",
-        type=float,
-        default=DEFAULT_WATCH_TIMEOUT,
-    )
-    agent_task.add_argument(
-        "--preserve-artifacts",
-        action="store_true",
-        help="retain local decision artifacts after successful publication",
     )
     agent_task.add_argument(
         "--request-review-only",
@@ -9318,26 +9051,76 @@ def build_parser() -> argparse.ArgumentParser:
             "before any local decision session"
         ),
     )
-    agent_task.add_argument(
+    agent_task.set_defaults(
+        repo_root=None,
+        state=None,
+        model="sol",
+        pipeline_run=None,
+        pipeline_iteration=None,
+        pipeline_max_iterations=None,
+        watch_interval=30.0,
+        poll_max_interval=DEFAULT_MAX_WATCH_INTERVAL,
+        wait_timeout=DEFAULT_WATCH_TIMEOUT,
+        preserve_artifacts=False,
+        stability_polls=DEFAULT_STABILITY_POLLS,
+        debounce_seconds=DEFAULT_DEBOUNCE_SECONDS,
+        poll_jitter=DEFAULT_POLL_JITTER,
+        cancellation_grace=120.0,
+        new_invocation=False,
+        invocation_run=None,
+        function=command_agent_task,
+    )
+
+    pipeline = subparsers.add_parser("pipeline", help=argparse.SUPPRESS)
+    pipeline.add_argument("target")
+    pipeline.add_argument("--repo-root")
+    pipeline.add_argument("--state", required=True)
+    pipeline.add_argument("--model", choices=("sol",), default="sol")
+    pipeline.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_MAX_ITERATIONS,
+    )
+    pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--pipeline-iteration", type=int, required=True)
+    pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
+    pipeline.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+    )
+    pipeline.add_argument("--watch-interval", type=float, default=30.0)
+    pipeline.add_argument(
+        "--poll-max-interval",
+        type=float,
+        default=DEFAULT_MAX_WATCH_INTERVAL,
+    )
+    pipeline.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=DEFAULT_WATCH_TIMEOUT,
+    )
+    pipeline.add_argument("--preserve-artifacts", action="store_true")
+    pipeline.add_argument("--request-review-only", action="store_true")
+    pipeline.add_argument(
         "--stability-polls",
         type=int,
         default=DEFAULT_STABILITY_POLLS,
     )
-    agent_task.add_argument(
+    pipeline.add_argument(
         "--debounce-seconds",
         type=float,
         default=DEFAULT_DEBOUNCE_SECONDS,
     )
-    agent_task.add_argument(
+    pipeline.add_argument(
         "--poll-jitter",
         type=float,
         default=DEFAULT_POLL_JITTER,
     )
-    agent_task.add_argument("--cancellation-grace", type=float, default=120.0)
-    invocation = agent_task.add_mutually_exclusive_group()
+    pipeline.add_argument("--cancellation-grace", type=float, default=120.0)
+    invocation = pipeline.add_mutually_exclusive_group()
     invocation.add_argument("--new-invocation", action="store_true")
     invocation.add_argument("--invocation-run")
-    agent_task.set_defaults(function=command_agent_task)
+    pipeline.set_defaults(function=command_agent_task)
 
     watch = subparsers.add_parser("watch", help="watch one requested Copilot review")
     watch.add_argument("--state", required=True)
@@ -9477,9 +9260,35 @@ def _load_execution():
 def execution_main():
     commands = ('agent-task', 'pipeline')
     arguments = sys.argv[1:]
+    standalone_internal = {
+        "--cancellation-grace",
+        "--debounce-seconds",
+        "--execution-handle",
+        "--invocation-run",
+        "--model",
+        "--new-invocation",
+        "--pipeline-iteration",
+        "--pipeline-max-iterations",
+        "--pipeline-run",
+        "--poll-jitter",
+        "--poll-max-interval",
+        "--preserve-artifacts",
+        "--repo-root",
+        "--stability-polls",
+        "--state",
+        "--wait-timeout",
+        "--watch-interval",
+    }
+    if (
+        arguments
+        and arguments[0] == "agent-task"
+        and any(flag in arguments for flag in standalone_internal)
+    ):
+        return main()
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
-        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        os.environ.get("COPILOT_AGENT_SESSION_ID")
+        or os.environ.get("TRASK_EXECUTION_PARENT")
         or arguments and arguments[0] in {"execution-status", "execution-cancel"}
     )
     if not selected or not enabled:

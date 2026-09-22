@@ -2330,6 +2330,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                         "result": "source_only_no_mutation",
                         "state": str(path),
                         "pr": target["pr_url"],
+                        "pr_number": pr["number"],
+                        "pr_title": pr["title"],
+                        "session_title": (
+                            f"PR Description: {pr['number']} - {pr['title']}"
+                        ),
                         "head_sha": pr["head_sha"],
                         "validated_head_sha": None,
                         "stage_outcome": "excluded",
@@ -2559,6 +2564,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     "result": "head_changed",
                     "state": str(path),
                     "pr": pr["url"],
+                    "pr_number": pr["number"],
+                    "pr_title": pr["title"],
+                    "session_title": (
+                        f"PR Description: {pr['number']} - {pr['title']}"
+                    ),
                     **source_drift,
                     "task": result["task"],
                     "generated": result["generated"],
@@ -2653,6 +2663,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "result": action["result"],
                 "state": str(path),
                 "pr": pr["url"],
+                "pr_number": pr["number"],
+                "pr_title": action["title"],
+                "session_title": (
+                    f"PR Description: {pr['number']} - {action['title']}"
+                ),
                 "head_sha": pr["head_sha"],
                 "current": {"title": pr["title"], "body": pr["body"]},
                 "decision": recommendation["decision"],
@@ -2946,7 +2961,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_task = subparsers.add_parser(
         "agent-task",
-        aliases=["pipeline"],
         help="analyze and update a pull request through the managed Agent Tasks worker",
     )
     agent_task.add_argument(
@@ -2957,24 +2971,33 @@ def build_parser() -> argparse.ArgumentParser:
             "omit to use the current branch's PR"
         ),
     )
-    agent_task.add_argument("--repo-root")
-    agent_task.add_argument(
-        "--state",
-        help="external state path; fresh for standalone, run-bound for Pipeline",
-    )
-    agent_task.add_argument("--preserve-artifacts", action="store_true")
     agent_task.add_argument("--model", choices=tuple(MODEL_ALIASES), default="sol")
     agent_task.add_argument(
         "--github-mutation-policy", choices=("allow", "source-only")
     )
-    agent_task.add_argument("--pipeline-run", help="opaque Pipeline run identity")
-    agent_task.add_argument(
-        "--pipeline-iteration", type=int, help="current Pipeline sweep"
+    agent_task.set_defaults(
+        repo_root=None,
+        state=None,
+        preserve_artifacts=False,
+        pipeline_run=None,
+        pipeline_iteration=None,
+        pipeline_max_iterations=None,
+        function=command_agent_task,
     )
-    agent_task.add_argument(
-        "--pipeline-max-iterations", type=int, help="Pipeline sweep limit"
+
+    pipeline = subparsers.add_parser("pipeline", help=argparse.SUPPRESS)
+    pipeline.add_argument("target")
+    pipeline.add_argument("--repo-root")
+    pipeline.add_argument("--state", required=True)
+    pipeline.add_argument("--preserve-artifacts", action="store_true")
+    pipeline.add_argument("--model", choices=tuple(MODEL_ALIASES), default="sol")
+    pipeline.add_argument(
+        "--github-mutation-policy", choices=("allow", "source-only")
     )
-    agent_task.set_defaults(function=command_agent_task)
+    pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--pipeline-iteration", type=int, required=True)
+    pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
+    pipeline.set_defaults(function=command_agent_task)
 
     status = subparsers.add_parser("status", help="print compact workflow state")
     status_source = status.add_mutually_exclusive_group(required=True)
@@ -3072,9 +3095,25 @@ def _load_execution():
 def execution_main():
     commands = ('agent-task', 'pipeline')
     arguments = sys.argv[1:]
+    standalone_internal = {
+        "--execution-handle",
+        "--pipeline-iteration",
+        "--pipeline-max-iterations",
+        "--pipeline-run",
+        "--preserve-artifacts",
+        "--repo-root",
+        "--state",
+    }
+    if (
+        arguments
+        and arguments[0] == "agent-task"
+        and any(flag in arguments for flag in standalone_internal)
+    ):
+        return main()
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
-        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        os.environ.get("COPILOT_AGENT_SESSION_ID")
+        or os.environ.get("TRASK_EXECUTION_PARENT")
         or arguments and arguments[0] in {"execution-status", "execution-cancel"}
     )
     if not selected or not enabled:

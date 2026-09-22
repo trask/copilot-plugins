@@ -148,16 +148,16 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
             return MODULE.subprocess.CompletedProcess(command, 0, "", "")
 
         arguments = [
-            "agent-task",
+            "pipeline" if pipeline else "agent-task",
             METADATA["pr_url"],
-            "--repo-root",
-            str(self.repo),
-            "--state",
-            str(self.state_path),
         ]
         if pipeline:
             arguments.extend(
                 [
+                    "--repo-root",
+                    str(self.repo),
+                    "--state",
+                    str(self.state_path),
                     "--pipeline-run",
                     "pipeline-1",
                     "--pipeline-iteration",
@@ -167,6 +167,9 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
                 ]
             )
         args = MODULE.build_parser().parse_args(arguments)
+        if not pipeline:
+            args.repo_root = str(self.repo)
+            args.state = str(self.state_path)
         metadata_values = iter([METADATA, METADATA, observed or METADATA])
 
         def metadata(*_args):
@@ -215,6 +218,10 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
     def test_fresh_no_code_clean_uses_current_candidate_and_creates_no_remote_branch(self):
         output = self.execute(self.candidate())
         self.assertEqual("nothing_to_publish", output["result"])
+        self.assertEqual(
+            f"Historical PR Audit: 7 - {METADATA['title']}",
+            output["session_title"],
+        )
         self.assertEqual([], self.commands)
         state = MODULE.load_state(self.state_path)
         self.assertEqual(2, state["iterations"])

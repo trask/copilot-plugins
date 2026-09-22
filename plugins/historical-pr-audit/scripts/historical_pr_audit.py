@@ -1636,6 +1636,9 @@ def publish_agent_task_result(
         "pr": metadata["pr_url"],
         "pr_number": metadata["number"],
         "pr_title": metadata["title"],
+        "session_title": (
+            f"Historical PR Audit: {metadata['number']} - {metadata['title']}"
+        ),
         "audit_branch": audit_branch,
         "head_sha": remote["final_local_head"],
         "commits": commits,
@@ -2092,6 +2095,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     "result": "head_moved",
                     "state": str(state_path),
                     "pr": metadata["pr_url"],
+                    "pr_number": metadata["number"],
+                    "pr_title": metadata["title"],
+                    "session_title": (
+                        f"Historical PR Audit: {metadata['number']} - "
+                        f"{metadata['title']}"
+                    ),
                     **source_drift,
                     "task": result["task"],
                     "generated": result["generated"],
@@ -2176,8 +2185,6 @@ def build_parser() -> argparse.ArgumentParser:
         "target",
         help="merged PR URL, owner/repo#number, or bare PR number",
     )
-    agent_task.add_argument("--repo-root")
-    agent_task.add_argument("--state")
     agent_task.add_argument("--model", choices=tuple(MODEL_ALIASES), default="sol")
     agent_task.add_argument(
         "--max-iterations",
@@ -2185,14 +2192,30 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(1, DEFAULT_MAX_ITERATIONS + 1),
         default=DEFAULT_MAX_ITERATIONS,
     )
-    agent_task.add_argument("--pipeline-run", help=argparse.SUPPRESS)
-    agent_task.add_argument(
-        "--pipeline-iteration", type=int, help=argparse.SUPPRESS
+    agent_task.set_defaults(
+        repo_root=None,
+        state=None,
+        pipeline_run=None,
+        pipeline_iteration=None,
+        pipeline_max_iterations=None,
+        function=command_agent_task,
     )
-    agent_task.add_argument(
-        "--pipeline-max-iterations", type=int, help=argparse.SUPPRESS
+
+    pipeline = subparsers.add_parser("pipeline", help=argparse.SUPPRESS)
+    pipeline.add_argument("target")
+    pipeline.add_argument("--repo-root")
+    pipeline.add_argument("--state", required=True)
+    pipeline.add_argument("--model", choices=tuple(MODEL_ALIASES), default="sol")
+    pipeline.add_argument(
+        "--max-iterations",
+        type=int,
+        choices=range(1, DEFAULT_MAX_ITERATIONS + 1),
+        default=DEFAULT_MAX_ITERATIONS,
     )
-    agent_task.set_defaults(function=command_agent_task)
+    pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--pipeline-iteration", type=int, required=True)
+    pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
+    pipeline.set_defaults(function=command_agent_task)
 
     status = subparsers.add_parser("status", help="print compact workflow state")
     status_source = status.add_mutually_exclusive_group(required=True)
@@ -2279,11 +2302,26 @@ def _load_execution():
 
 
 def execution_main():
-    commands = ('agent-task',)
+    commands = ('agent-task', 'pipeline')
     arguments = sys.argv[1:]
+    standalone_internal = {
+        "--execution-handle",
+        "--pipeline-iteration",
+        "--pipeline-max-iterations",
+        "--pipeline-run",
+        "--repo-root",
+        "--state",
+    }
+    if (
+        arguments
+        and arguments[0] == "agent-task"
+        and any(flag in arguments for flag in standalone_internal)
+    ):
+        return main()
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
-        "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        os.environ.get("COPILOT_AGENT_SESSION_ID")
+        or os.environ.get("TRASK_EXECUTION_PARENT")
         or arguments and arguments[0] in {"execution-status", "execution-cancel"}
     )
     if not selected or not enabled:
