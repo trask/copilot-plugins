@@ -64,6 +64,12 @@ class NativeStackClearanceTest(StackFixture):
             (CONFLICT, "base_ref_tip"): {"side_effect": lambda repo, branch: self.tips[branch]},
             (CONFLICT, "find_remote"): {"return_value": "origin"},
             (CONFLICT, "fetch_preflight_ref"): {},
+            (CONFLICT.PreflightRefStore, "fetch"): {
+                "side_effect": lambda source, role, expected=None: (
+                    expected or self.tips[source.removeprefix("refs/heads/")]
+                )
+            },
+            (CONFLICT.PreflightRefStore, "cleanup"): {},
             (CONFLICT, "external_stack_dependents"): {"return_value": []},
             (CONFLICT, "stack_owner_is_running"): {"return_value": True},
             (CONFLICT, "discover_conflict_task"): {"side_effect": AssertionError("unexpected hosted task")},

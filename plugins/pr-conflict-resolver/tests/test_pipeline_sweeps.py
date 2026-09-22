@@ -322,6 +322,22 @@ class ConflictPipelineSweepTest(unittest.TestCase):
             patch = mock.patch.object(MODULE, name, **options)
             self.calls[name] = patch.start()
             self.addCleanup(patch.stop)
+        patch = mock.patch.object(
+            MODULE.PreflightRefStore,
+            "fetch",
+            side_effect=lambda source, _role, expected=None: (
+                expected
+                or {
+                    "refs/heads/main": "d" * 40,
+                    "refs/heads/v143": "b" * 40,
+                }[source]
+            ),
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(MODULE.PreflightRefStore, "cleanup")
+        patch.start()
+        self.addCleanup(patch.stop)
         self.calls["live_mergeability"].side_effect = lambda target, **kw: copy.deepcopy(
             lower if target["number"] == 19483 else self.metadata
         )

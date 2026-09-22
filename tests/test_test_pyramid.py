@@ -39,7 +39,7 @@ FAIL_CLOSED_COVERAGE = {
     "native replay task base": (
         "plugins/pr-conflict-resolver/tests/test_sequential_stack.py",
         "ReplayTaskBaseTest",
-        "test_creation_and_collection_share_the_policy_10_task_base",
+        "test_creation_and_collection_share_the_policy_11_task_base",
     ),
     "native replay completeness": (
         "plugins/pr-conflict-resolver/tests/test_pr_conflict_resolver.py",

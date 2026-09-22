@@ -110,17 +110,36 @@ class BaseDriftPublicationTest(unittest.TestCase):
             "owner/repo", "1" * 40, "4" * 40
         )
 
-    def test_rewritten_base_rejects_candidate_publication(self):
+    def test_obsolete_candidate_topology_rejects_publication(self):
         task = self.task()
         metadata = {
             "head_sha": "3" * 40,
             "base_sha": "4" * 40,
         }
         with (
-            mock.patch.object(MODULE, "commit_contains", return_value=False),
-            self.assertRaisesRegex(MODULE.WorkflowError, "rewritten"),
+            mock.patch.object(
+                MODULE,
+                "commit_contains",
+                side_effect=[False, True],
+            ),
+            self.assertRaisesRegex(MODULE.WorkflowError, "obsolete base history"),
         ):
             MODULE.published_conflict_snapshot(task, metadata)
+
+    def test_non_linear_base_comparison_alone_does_not_reject_publication(self):
+        task = self.task()
+        metadata = {
+            "head_sha": "3" * 40,
+            "base_sha": "4" * 40,
+        }
+        with mock.patch.object(
+            MODULE,
+            "commit_contains",
+            side_effect=[False, False],
+        ):
+            publication = MODULE.published_conflict_snapshot(task, metadata)
+
+        self.assertTrue(publication["clearance_stale"])
 
     def test_exact_current_base_can_record_clearance(self):
         task = self.task()
@@ -1008,18 +1027,18 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "c5ff3f4a1c9a2526e4bf81dc310f032119e8a43f669454718f113e76948b9b49",
+            "152679ce8d1ed127ff6b66e75d60fea350362e98eaaeb01f870e914941fd9ed7",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "7d934b95e5e0b8ef83228e95464a5c4f70d8de9114a50c98811e55b4825a0435",
+            "3e7a64d521bc62610f143aefaa74ff66817e5997f0f14e974ee8b03531e29964",
         )
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
             hashlib.sha256(CLOUD_SCRIPT.read_bytes()).hexdigest(),
         )
         self.assertEqual(MODULE.CONFLICT_POLICY_IDENTITY, CLOUD_MODULE.POLICY)
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@10")
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@11")
         self.assertEqual(MODULE.CONFLICT_RESULT_SCHEMA, CLOUD_MODULE.RESULT_SCHEMA)
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
@@ -1780,7 +1799,14 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "checkout_pr_branch"),
             mock.patch.object(MODULE, "git", side_effect=fake_git()),
             mock.patch.object(MODULE, "find_remote", return_value="origin"),
-            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE.PreflightRefStore,
+                "fetch",
+                side_effect=lambda _source, _role, expected=None: (
+                    expected or metadata["base_sha"]
+                ),
+            ),
+            mock.patch.object(MODULE.PreflightRefStore, "cleanup"),
             mock.patch.object(
                 MODULE,
                 "stack_membership",
@@ -1844,7 +1870,14 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "checkout_pr_branch"),
             mock.patch.object(MODULE, "git", side_effect=fake_git()),
             mock.patch.object(MODULE, "find_remote", return_value="origin"),
-            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE.PreflightRefStore,
+                "fetch",
+                side_effect=lambda _source, _role, expected=None: (
+                    expected or "base1"
+                ),
+            ),
+            mock.patch.object(MODULE.PreflightRefStore, "cleanup"),
             mock.patch.object(
                 MODULE,
                 "stack_membership",
@@ -1897,7 +1930,14 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "checkout_pr_branch"),
             mock.patch.object(MODULE, "git", side_effect=fake_git()),
             mock.patch.object(MODULE, "find_remote", return_value="origin"),
-            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE.PreflightRefStore,
+                "fetch",
+                side_effect=lambda _source, _role, expected=None: (
+                    expected or "base1"
+                ),
+            ),
+            mock.patch.object(MODULE.PreflightRefStore, "cleanup"),
             mock.patch.object(
                 MODULE,
                 "stack_membership",
@@ -2108,7 +2148,14 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "require_clean_worktree"),
             mock.patch.object(MODULE, "require_no_integration_in_progress"),
-            mock.patch.object(MODULE, "require_live_conflict_guards"),
+            mock.patch.object(
+                MODULE,
+                "require_live_conflict_guards",
+                return_value={
+                    "base_sha": code_refs[0]["base_sha"],
+                    "_candidate_base_advanced": False,
+                },
+            ),
             mock.patch.object(
                 MODULE,
                 "remote_publication_heads",
@@ -3025,7 +3072,14 @@ class StrategyChoiceTest(unittest.TestCase):
             mock.patch.object(MODULE, "checkout_pr_branch"),
             mock.patch.object(MODULE, "git", side_effect=git_result),
             mock.patch.object(MODULE, "find_remote", return_value="origin"),
-            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE.PreflightRefStore,
+                "fetch",
+                side_effect=lambda _source, _role, expected=None: (
+                    expected or metadata["base_sha"]
+                ),
+            ),
+            mock.patch.object(MODULE.PreflightRefStore, "cleanup"),
             mock.patch.object(
                 MODULE,
                 "stack_membership",
@@ -3083,7 +3137,7 @@ class StrategyChoiceTest(unittest.TestCase):
             preflight["request"]["guards"]["merge_methods"],
         )
 
-    def test_native_stack_uses_live_direct_base_refs_not_pr_snapshots(self):
+    def test_native_stack_uses_fetched_direct_base_refs_not_pr_snapshots(self):
         trunk = "a" * 40
         lower = "b" * 40
         upper = "c" * 40
@@ -3128,7 +3182,10 @@ class StrategyChoiceTest(unittest.TestCase):
                 return "0" * 40
             raise AssertionError(arguments)
 
-        def live_tip(_repository, branch):
+        def fetch_snapshot(source, _role, expected=None):
+            if expected is not None:
+                return expected
+            branch = source.removeprefix("refs/heads/")
             return {"main": trunk, "lower": lower}[branch]
 
         with (
@@ -3138,7 +3195,12 @@ class StrategyChoiceTest(unittest.TestCase):
             mock.patch.object(MODULE, "checkout_pr_branch"),
             mock.patch.object(MODULE, "git", side_effect=git_result),
             mock.patch.object(MODULE, "find_remote", return_value="origin"),
-            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE.PreflightRefStore,
+                "fetch",
+                side_effect=fetch_snapshot,
+            ) as fetch,
+            mock.patch.object(MODULE.PreflightRefStore, "cleanup"),
             mock.patch.object(
                 MODULE,
                 "stack_membership",
@@ -3160,7 +3222,7 @@ class StrategyChoiceTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "native_stack_member_history",
-                side_effect=lambda _root, current_base, retained_base, head: (
+                side_effect=lambda _root, current_base, history_boundary, head: (
                     "f" * 40,
                     [head],
                     [],
@@ -3177,7 +3239,6 @@ class StrategyChoiceTest(unittest.TestCase):
                     "paths": ["src/File.java"],
                 },
             ),
-            mock.patch.object(MODULE, "base_ref_tip", side_effect=live_tip) as tip,
             mock.patch.object(MODULE, "external_stack_dependents", return_value=[]),
         ):
             preflight = MODULE.conflict_preflight(
@@ -3195,7 +3256,7 @@ class StrategyChoiceTest(unittest.TestCase):
         self.assertEqual([trunk, lower], [member["direct_base_sha"] for member in members])
         self.assertEqual(
             [lower_snapshot, upper_snapshot],
-            [member["retained_base_sha"] for member in members],
+            [member["observed_base_sha"] for member in members],
         )
         self.assertEqual(
             [lower_snapshot, upper_snapshot],
@@ -3207,16 +3268,22 @@ class StrategyChoiceTest(unittest.TestCase):
         )
         self.assertEqual(
             [
-                mock.call("owner/repo", "main"),
-                mock.call("owner/repo", "main"),
-                mock.call("owner/repo", "lower"),
+                mock.call("refs/heads/main", "invoked-base"),
+                mock.call("refs/heads/main", "trunk"),
+                mock.call("refs/heads/lower", "direct-base-20084"),
             ],
-            tip.call_args_list,
+            [
+                call
+                for call in fetch.call_args_list
+                if call.kwargs.get("expected") is None
+            ],
         )
 
 
 class NativeStackMemberHistoryTest(unittest.TestCase):
-    def validate(self, *, current_base, retained_base, head, merge_bases, ancestor=True):
+    def validate(
+        self, *, current_base, history_boundary, head, merge_bases, ancestor=True
+    ):
         def git_call(_root, *arguments):
             if arguments == (
                 "merge-base",
@@ -3229,7 +3296,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
                 "rev-list",
                 "--reverse",
                 "--first-parent",
-                f"{retained_base}..{head}",
+                f"{history_boundary}..{head}",
             ):
                 return head
             raise AssertionError(arguments)
@@ -3245,12 +3312,12 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         ), mock.patch.object(
             MODULE,
             "commit_parents",
-            return_value=[retained_base],
+            return_value=[history_boundary],
         ):
             return MODULE.native_stack_member_history(
                 Path("C:/repo"),
                 current_base=current_base,
-                retained_base=retained_base,
+                history_boundary=history_boundary,
                 head=head,
             )
 
@@ -3262,7 +3329,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
 
         merge_base, commits, sync_merges = self.validate(
             current_base=current,
-            retained_base=retained,
+            history_boundary=retained,
             head=head,
             merge_bases=common,
         )
@@ -3279,7 +3346,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
 
         merge_base, commits, sync_merges = self.validate(
             current_base=current_parent,
-            retained_base=retained_parent,
+            history_boundary=retained_parent,
             head=child,
             merge_bases=common,
         )
@@ -3295,7 +3362,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         ):
             self.validate(
                 current_base="3" * 40,
-                retained_base="4" * 40,
+                history_boundary="4" * 40,
                 head="5" * 40,
                 merge_bases="",
             )
@@ -3307,22 +3374,358 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         ):
             self.validate(
                 current_base="6" * 40,
-                retained_base="7" * 40,
+                history_boundary="7" * 40,
                 head="8" * 40,
                 merge_bases=f"{'9' * 40}\n{'a' * 40}",
             )
 
-    def test_member_rejects_rewritten_retained_snapshot_history(self):
+    def test_member_rejects_unproven_history_boundary(self):
         with self.assertRaisesRegex(
             MODULE.WorkflowError,
-            "retained direct-base snapshot",
+            "proven history boundary",
         ):
             self.validate(
                 current_base="b" * 40,
-                retained_base="c" * 40,
+                history_boundary="c" * 40,
                 head="d" * 40,
                 merge_bases="e" * 40,
                 ancestor=False,
+            )
+
+
+class NativeStackPreflightSnapshotIntegrationTest(unittest.TestCase):
+    def setUp(self):
+        self.root = temporary_directory(self)
+        self.remote = self.root / "remote.git"
+        self.seed = self.root / "seed"
+        self.local = self.root / "local"
+        self.git(self.root, "init", "--bare", "-q", str(self.remote))
+        self.git(self.root, "init", "-q", "-b", "main", str(self.seed))
+        self.git(self.seed, "config", "user.name", "Test")
+        self.git(self.seed, "config", "user.email", "test@example.invalid")
+        (self.seed / "base.txt").write_text(
+            "base\n", encoding="utf-8", newline="\n"
+        )
+        self.git(self.seed, "add", "base.txt")
+        self.git(self.seed, "commit", "-q", "-m", "base")
+        self.base = self.git(self.seed, "rev-parse", "HEAD")
+        self.git(self.seed, "remote", "add", "origin", str(self.remote))
+        self.git(self.seed, "push", "-q", "-u", "origin", "main")
+        self.git(
+            self.root,
+            "clone",
+            "-q",
+            "--no-local",
+            str(self.remote),
+            str(self.local),
+        )
+
+        self.git(self.seed, "checkout", "-q", "-b", "child")
+        (self.seed / "child.txt").write_text(
+            "child\n", encoding="utf-8", newline="\n"
+        )
+        self.git(self.seed, "add", "child.txt")
+        self.git(self.seed, "commit", "-q", "-m", "child")
+        self.child = self.git(self.seed, "rev-parse", "HEAD")
+        self.git(
+            self.seed,
+            "push",
+            "-q",
+            "origin",
+            "child:refs/pull/7/head",
+        )
+
+        self.git(self.seed, "checkout", "-q", "main")
+        (self.seed / "base.txt").write_text(
+            "base two\n", encoding="utf-8", newline="\n"
+        )
+        self.git(self.seed, "commit", "-q", "-am", "base two")
+        self.snapshot = self.git(self.seed, "rev-parse", "HEAD")
+        self.git(self.seed, "push", "-q", "origin", "main")
+
+    def git(self, root, *arguments, check=True):
+        result = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if check and result.returncode != 0:
+            self.fail(
+                f"git {' '.join(arguments)} failed ({result.returncode}): "
+                f"{result.stderr}"
+            )
+        return result.stdout.strip()
+
+    def test_missing_direct_base_is_fetched_into_an_isolated_cleaned_ref(self):
+        self.assertNotEqual(
+            0,
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.local),
+                    "cat-file",
+                    "-e",
+                    f"{self.snapshot}^{{commit}}",
+                ],
+                check=False,
+                capture_output=True,
+            ).returncode,
+        )
+        refs = MODULE.PreflightRefStore(
+            self.local,
+            "origin",
+            "iteration/missing-base",
+        )
+
+        fetched = refs.fetch("refs/heads/main", "trunk")
+
+        self.assertEqual(self.snapshot, fetched)
+        self.assertEqual(
+            self.snapshot,
+            self.git(self.local, "rev-parse", "--verify", refs.refs[0]),
+        )
+        self.assertTrue(
+            refs.refs[0].startswith(
+                "refs/pr-conflict-resolver/preflight/iteration-missing-base-"
+            )
+        )
+        refs.cleanup()
+        self.assertEqual(
+            "",
+            self.git(
+                self.local,
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/pr-conflict-resolver/preflight/",
+            ),
+        )
+
+    def test_hosted_fetch_keeps_the_iteration_snapshot_after_main_advances(self):
+        (self.seed / "base.txt").write_text(
+            "base three\n", encoding="utf-8", newline="\n"
+        )
+        self.git(self.seed, "commit", "-q", "-am", "base three")
+        advanced = self.git(self.seed, "rev-parse", "HEAD")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        request = {
+            "strategy": "native-stack",
+            "request_id": "request-moving-main",
+            "pull_request": {
+                "number": 7,
+                "head_sha": self.child,
+                "base_ref": "main",
+                "base_sha": self.snapshot,
+            },
+            "native_stack": {
+                "trunk": {"ref": "main", "sha": self.snapshot},
+                "members": [{
+                    "pr_number": 7,
+                    "head_sha": self.child,
+                    "direct_base_ref": "main",
+                    "direct_base_sha": self.snapshot,
+                    "observed_base_sha": self.snapshot,
+                    "history_boundary_sha": self.base,
+                }],
+            },
+        }
+        snapshot = CLOUD_MODULE.LocalSnapshot(
+            root=self.local,
+            control_root=self.local,
+            repository="owner/repo",
+            remote="origin",
+            branch="main",
+            head=self.base,
+            status="",
+            operation=None,
+        )
+
+        with mock.patch.object(CLOUD_MODULE, "require_local_unchanged"):
+            refs = CLOUD_MODULE.fetch_pinned_inputs(
+                subprocess.run,
+                snapshot,
+                request,
+            )
+
+        self.assertEqual(5, len(refs))
+        self.assertEqual(
+            advanced,
+            self.git(self.local, "rev-parse", "--verify", refs[1]),
+        )
+        self.assertEqual(
+            self.snapshot,
+            self.git(
+                self.local,
+                "rev-parse",
+                "--verify",
+                f"{self.snapshot}^{{commit}}",
+            ),
+        )
+        member = {
+            **request["native_stack"]["members"][0],
+            "old_commits": [
+                MODULE.commit_identity(self.local, self.child, linear=True)
+            ],
+            "sync_merges": [],
+        }
+        CLOUD_MODULE.prove_native_stack_member_input(
+            subprocess.run,
+            self.local,
+            member,
+        )
+
+
+class NativeStackHistoryBoundaryRecoveryTest(unittest.TestCase):
+    def test_retargeted_child_uses_verified_predecessor_original_head(self):
+        member = {
+            "number": 8,
+            "head_sha": "child",
+            "base_sha": "squash-result",
+            "commits": ["child"],
+            "commits_complete": False,
+            "merged_predecessor": {
+                "number": 7,
+                "head_sha": "predecessor-head",
+                "merge_sha": "squash-result",
+            },
+        }
+        refs = mock.Mock()
+
+        with mock.patch.object(
+            MODULE,
+            "is_ancestor",
+            side_effect=lambda _root, left, right: (
+                left,
+                right,
+            )
+            == ("predecessor-head", "child"),
+        ):
+            boundary = MODULE.recover_native_stack_history_boundary(
+                Path("C:/repo"),
+                member,
+                current_base="current-main",
+                preflight_refs=refs,
+            )
+
+        self.assertEqual("predecessor-head", boundary)
+        refs.fetch.assert_called_once_with(
+            "refs/pull/7/head",
+            "predecessor-8",
+            expected="predecessor-head",
+        )
+
+    def test_multiple_predecessor_proofs_may_agree(self):
+        member = {
+            "head_sha": "child",
+            "base_sha": "squash-result",
+            "commits": ["shared", "child"],
+            "commits_complete": True,
+        }
+        predecessor = {
+            "number": 7,
+            "head_sha": "shared",
+            "merge_sha": "squash-result",
+            "commits": ["shared"],
+            "commits_complete": True,
+        }
+
+        def git_call(_root, *arguments):
+            if arguments == ("merge-base", "--all", "shared", "child"):
+                return "shared"
+            if arguments == (
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                "shared..child",
+            ):
+                return "child"
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "is_ancestor",
+                side_effect=lambda _root, left, right: (
+                    left,
+                    right,
+                )
+                == ("shared", "child"),
+            ),
+            mock.patch.object(MODULE, "git", side_effect=git_call),
+        ):
+            boundary = MODULE.recover_merged_predecessor_boundary(
+                Path("C:/repo"),
+                member,
+                predecessor,
+            )
+
+        self.assertEqual("shared", boundary)
+
+    def test_conflicting_predecessor_proofs_fail_closed(self):
+        member = {
+            "head_sha": "child",
+            "base_sha": "merge-result",
+            "commits": ["merge-child"],
+            "commits_complete": True,
+        }
+        predecessor = {
+            "number": 7,
+            "head_sha": "predecessor-head",
+            "merge_sha": "merge-result",
+            "commits_complete": False,
+        }
+
+        with (
+            mock.patch.object(MODULE, "is_ancestor", return_value=True),
+            mock.patch.object(
+                MODULE,
+                "git",
+                return_value="merge-child",
+            ),
+            self.assertRaisesRegex(
+                MODULE.MergedPredecessorLineageError,
+                "multiple plausible",
+            ),
+        ):
+            MODULE.recover_merged_predecessor_boundary(
+                Path("C:/repo"),
+                member,
+                predecessor,
+            )
+
+    def test_distinct_observed_and_complete_range_boundaries_are_ambiguous(self):
+        member = {
+            "number": 8,
+            "head_sha": "child",
+            "base_sha": "observed",
+            "commits": ["child"],
+            "commits_complete": True,
+            "merged_predecessor": None,
+        }
+
+        def git_call(_root, *arguments):
+            if arguments == ("merge-base", "--all", "current", "child"):
+                return "other-boundary"
+            if arguments == (
+                "rev-list",
+                "--reverse",
+                "--topo-order",
+                "other-boundary..child",
+            ):
+                return "child"
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(MODULE, "is_ancestor", return_value=True),
+            mock.patch.object(MODULE, "git", side_effect=git_call),
+            self.assertRaisesRegex(MODULE.WorkflowError, "ambiguous"),
+        ):
+            MODULE.recover_native_stack_history_boundary(
+                Path("C:/repo"),
+                member,
+                current_base="current",
+                preflight_refs=mock.Mock(),
             )
 
 
@@ -3397,7 +3800,7 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
         merge_base, commits, sync_merges = MODULE.native_stack_member_history(
             self.repo,
             current_base=current_base,
-            retained_base=self.retained_base,
+            history_boundary=self.retained_base,
             head=head,
         )
 
@@ -3412,7 +3815,8 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
         )
         member = {
             "direct_base_sha": current_base,
-            "retained_base_sha": self.retained_base,
+            "observed_base_sha": self.retained_base,
+            "history_boundary_sha": self.retained_base,
             "direct_merge_base": current_base,
             "head_sha": head,
             "old_commits": [
@@ -3455,7 +3859,7 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
             MODULE.native_stack_member_history(
                 self.repo,
                 current_base=current_base,
-                retained_base=self.retained_base,
+                history_boundary=self.retained_base,
                 head=head,
             )
         manifest = raised.exception.manifest
@@ -3547,7 +3951,7 @@ class ManagedRequestStrategyTest(unittest.TestCase):
         self.assertTrue(CLOUD_MODULE.strategy_can_land("rebase", methods))
         self.assertTrue(CLOUD_MODULE.strategy_can_land("native-stack", methods))
 
-    def test_native_stack_request_binds_current_and_retained_base_history(self):
+    def test_native_stack_request_binds_current_observed_and_history_boundary(self):
         request = self.request(
             {
                 "merge_commit": False,
@@ -3567,7 +3971,8 @@ class ManagedRequestStrategyTest(unittest.TestCase):
                     "head_sha": "b" * 40,
                     "direct_base_ref": "main",
                     "direct_base_sha": "a" * 40,
-                    "retained_base_sha": "d" * 40,
+                    "observed_base_sha": "d" * 40,
+                    "history_boundary_sha": "f" * 40,
                     "direct_merge_base": "e" * 40,
                     "expected_new_parent": {
                         "role": "trunk",
@@ -3599,7 +4004,8 @@ class ManagedRequestStrategyTest(unittest.TestCase):
 
         member = validated["native_stack"]["members"][0]
         self.assertEqual("a" * 40, member["direct_base_sha"])
-        self.assertEqual("d" * 40, member["retained_base_sha"])
+        self.assertEqual("d" * 40, member["observed_base_sha"])
+        self.assertEqual("f" * 40, member["history_boundary_sha"])
         self.assertEqual("e" * 40, member["direct_merge_base"])
 
     def test_rebase_only_repository_rejects_merge_integration_history(self):
@@ -4143,7 +4549,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 task,
             )
 
-    def test_policy_10_omits_hosted_result_validation_and_annotations(self):
+    def test_policy_11_omits_hosted_result_validation_and_annotations(self):
         request = self.minimal_request()
         prompt = CLOUD_MODULE.policy_prompt(self.options(request))
         result = CLOUD_MODULE.Result(
@@ -4151,7 +4557,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
             policy=CLOUD_MODULE.POLICY,
         ).as_dict()
 
-        self.assertIn("Policy: marketplace-conflict-worker@10", prompt)
+        self.assertIn("Policy: marketplace-conflict-worker@11", prompt)
         self.assertIn(CLOUD_MODULE.OUTPUT_REPORT_PATH, prompt)
         self.assertIn("Do not run local validation through the dispatcher", prompt)
         self.assertNotIn("validation", result)

@@ -397,7 +397,18 @@ class StackPublicationTest(unittest.TestCase):
             mock.patch.object(MODULE, "checkout_pr_branch"),
             mock.patch.object(MODULE, "conflict_preflight_identity", return_value={}),
             mock.patch.object(MODULE, "find_remote", return_value="origin"),
-            mock.patch.object(MODULE, "fetch_preflight_ref"),
+            mock.patch.object(
+                MODULE.PreflightRefStore,
+                "fetch",
+                side_effect=lambda source, _role, expected=None: (
+                    expected
+                    or {
+                        "refs/heads/fixed": "b" * 40,
+                        "refs/heads/tip": "c" * 40,
+                    }[source]
+                ),
+            ),
+            mock.patch.object(MODULE.PreflightRefStore, "cleanup"),
             mock.patch.object(MODULE, "stack_relations", return_value=existing.NO_RELATIONS),
             mock.patch.object(MODULE, "repository_merge_methods", return_value=existing.ALL_MERGE_METHODS),
             mock.patch.object(MODULE, "git", return_value="f" * 40),
@@ -409,6 +420,11 @@ class StackPublicationTest(unittest.TestCase):
             mock.patch.object(MODULE, "native_stack_member_history", side_effect=lambda root, **kw: (
                 "f" * 40, [kw["head"]], [],
             )),
+            mock.patch.object(
+                MODULE,
+                "recover_native_stack_history_boundary",
+                side_effect=lambda _root, member, **_options: member["base_sha"],
+            ),
             mock.patch.object(MODULE, "commit_identity", side_effect=lambda root, sha, **kw: {
                 "sha": sha, "subject": "Change", "trailers": [],
                 "patch_sha256": "a" * 64, "paths": ["file.txt"],
@@ -469,16 +485,31 @@ class StackPublicationTest(unittest.TestCase):
                 "preflight": {
                     "repository_root": str(self.workspace),
                     "stack_request": self.request,
-                    "request": {"pull_request": {"number": 12}},
+                    "request": {
+                        "repository": "owner/repo",
+                        "pull_request": {"number": 12},
+                    },
                 },
-                "code_refs": [{"pr_number": 12, "lease_sha": "old", "new_sha": "new"}],
+                "code_refs": [{
+                    "pr_number": 12,
+                    "lease_sha": "old",
+                    "new_sha": "new",
+                    "base_sha": "base",
+                }],
                 "push_command": ["git", "push", "unselected"],
             },
         }
         with (
             mock.patch.object(MODULE, "require_clean_worktree"),
             mock.patch.object(MODULE, "require_no_integration_in_progress"),
-            mock.patch.object(MODULE, "require_live_conflict_guards"),
+            mock.patch.object(
+                MODULE,
+                "require_live_conflict_guards",
+                return_value={
+                    "base_sha": "base",
+                    "_candidate_base_advanced": False,
+                },
+            ),
             mock.patch.object(MODULE, "remote_publication_heads", return_value=["old"]),
             mock.patch.object(MODULE, "conflict_push_command", return_value=["git", "push", "--atomic"]),
             mock.patch.object(MODULE, "save_state") as save,

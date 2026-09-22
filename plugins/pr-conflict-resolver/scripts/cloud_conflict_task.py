@@ -33,7 +33,7 @@ TASK_PROMPT_MAX_UTF8_BYTES = (
     AGENT_TASK_PROMPT_MAX_UTF8_BYTES - TASK_PROMPT_HEADROOM_UTF8_BYTES
 )
 MODE = "conflict_with_report"
-REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 2}
+REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 3}
 RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
     "version": 5,
@@ -43,7 +43,7 @@ RECEIPT_SCHEMA = {
     "version": 3,
 }
 POLICY_ID = "marketplace-conflict-worker"
-POLICY_VERSION = 10
+POLICY_VERSION = 11
 POLICY_SPEC = {
     "id": POLICY_ID,
     "version": POLICY_VERSION,
@@ -67,6 +67,9 @@ POLICY_SPEC = {
     "safe_direct_base_sync_merge_omission": True,
     "terminal_completion_signal": "completed-without-platform-error",
     "native_stack_execution": "controller-sequenced-frozen-member-replay",
+    "native_stack_base_evidence": (
+        "fetched-current-base-observed-base-proven-history-boundary"
+    ),
     "member_fix_commits": "linear-scoped-companion-suffix-after-complete-replay",
     "resolution_context_paths": "informational-not-a-permission-set",
     "replay_task_base": "pinned-destination-sha",
@@ -477,7 +480,8 @@ def validate_native_stack(value: object) -> Mapping[str, object]:
                 "head_sha",
                 "direct_base_ref",
                 "direct_base_sha",
-                "retained_base_sha",
+                "observed_base_sha",
+                "history_boundary_sha",
                 "direct_merge_base",
                 "expected_new_parent",
                 "old_commits",
@@ -495,7 +499,11 @@ def validate_native_stack(value: object) -> Mapping[str, object]:
         require_sha(member["head_sha"], "native stack head SHA")
         require_ref(member["direct_base_ref"], "native stack direct base ref")
         require_sha(member["direct_base_sha"], "native stack direct base SHA")
-        require_sha(member["retained_base_sha"], "native stack retained base SHA")
+        require_sha(member["observed_base_sha"], "native stack observed base SHA")
+        require_sha(
+            member["history_boundary_sha"],
+            "native stack history boundary SHA",
+        )
         require_sha(member["direct_merge_base"], "native stack merge base SHA")
         expected_parent = require_exact_keys(
             member["expected_new_parent"],
@@ -1434,9 +1442,9 @@ def require_target_fresh(
         trunk_object = trunk.get("object")
         if (
             not isinstance(trunk_object, dict)
-            or trunk_object.get("sha") != expected_trunk["sha"]
+            or not isinstance(trunk_object.get("sha"), str)
         ):
-            raise ConflictError("native stack trunk changed", "stale_target")
+            raise ConflictError("native stack trunk is unavailable", "stale_target")
         for item in [*stack["members"], *stack["outside_dependents"]]:
             live = resolve_pr(
                 runner,
@@ -1447,7 +1455,6 @@ def require_target_fresh(
             expected_head_ref = item["head_ref"]
             expected_head_sha = item["head_sha"]
             expected_base_ref = item.get("direct_base_ref", item.get("base_ref"))
-            expected_base_sha = item.get("direct_base_sha", item.get("base_sha"))
             if (
                 live.head_sha != expected_head_sha
                 and live.state == "OPEN"
@@ -1456,7 +1463,6 @@ def require_target_fresh(
                 and live.head_ref == expected_head_ref
                 and live.base_repository == request["repository"]
                 and live.base_ref == expected_base_ref
-                and live.base_sha == expected_base_sha
             ):
                 raise SourceHeadChanged(
                     pr_number=item["pr_number"],
@@ -1467,7 +1473,6 @@ def require_target_fresh(
                 live.head_ref != expected_head_ref
                 or live.head_sha != expected_head_sha
                 or live.base_ref != expected_base_ref
-                or live.base_sha != expected_base_sha
                 or (
                     "lease_sha" in item
                     and item["lease_sha"] != live.head_sha
@@ -1502,33 +1507,50 @@ def fetch_pinned_inputs(
     request: Mapping[str, object],
 ) -> list[str]:
     request_id = request["request_id"]
-    inputs: list[tuple[str, str, str]] = [
+    inputs: list[tuple[str, str, str, bool]] = [
         (
             "source-head",
             f"refs/pull/{request['pull_request']['number']}/head",
             request["pull_request"]["head_sha"],
+            True,
         ),
         (
             "source-base",
             f"refs/heads/{request['pull_request']['base_ref']}",
             request["pull_request"]["base_sha"],
+            request["strategy"] != "native-stack",
         ),
     ]
     if request["strategy"] == "native-stack":
         stack = request["native_stack"]
         inputs.append(
-            ("trunk", f"refs/heads/{stack['trunk']['ref']}", stack["trunk"]["sha"])
+            (
+                "trunk",
+                f"refs/heads/{stack['trunk']['ref']}",
+                stack["trunk"]["sha"],
+                False,
+            )
         )
         inputs.extend(
             (
                 f"member-{member['pr_number']}",
                 f"refs/pull/{member['pr_number']}/head",
                 member["head_sha"],
+                True,
+            )
+            for member in stack["members"]
+        )
+        inputs.extend(
+            (
+                f"direct-base-{member['pr_number']}",
+                f"refs/heads/{member['direct_base_ref']}",
+                member["direct_base_sha"],
+                False,
             )
             for member in stack["members"]
         )
     targets: list[str] = []
-    for role, source, expected_sha in inputs:
+    for role, source, expected_sha, require_tip in inputs:
         target = quarantine_ref(request_id, f"input-{role}")
         git(
             runner,
@@ -1547,12 +1569,32 @@ def fetch_pinned_inputs(
             target,
             code="stale_target",
         ).strip().lower()
-        if actual != expected_sha:
+        if require_tip and actual != expected_sha:
             raise ConflictError(
                 f"pinned input {role} changed while fetched",
                 "stale_target",
             )
+        if not require_tip:
+            git(
+                runner,
+                snapshot.root,
+                "cat-file",
+                "-e",
+                f"{expected_sha}^{{commit}}",
+                code="stale_target",
+            )
         targets.append(target)
+    if request["strategy"] == "native-stack":
+        for member in request["native_stack"]["members"]:
+            for field in ("observed_base_sha", "history_boundary_sha"):
+                git(
+                    runner,
+                    snapshot.root,
+                    "cat-file",
+                    "-e",
+                    f"{member[field]}^{{commit}}",
+                    code="stale_target",
+                )
     require_local_unchanged(runner, snapshot, targets)
     return targets
 
@@ -1697,7 +1739,8 @@ def compact_request_contract(
                             "head_sha",
                             "direct_base_ref",
                             "direct_base_sha",
-                            "retained_base_sha",
+                            "observed_base_sha",
+                            "history_boundary_sha",
                             "direct_merge_base",
                             "expected_new_parent",
                             "lease_sha",
@@ -2211,6 +2254,30 @@ def prove_native_stack_member_input(
     root: Path,
     member: Mapping[str, object],
 ) -> None:
+    observed_ancestry = run_process(
+        runner,
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            member["observed_base_sha"],
+            member["head_sha"],
+        ],
+        cwd=root,
+    )
+    if observed_ancestry.returncode not in {0, 1}:
+        raise ConflictError(
+            "native stack observed base is unavailable",
+            "unexpected_history",
+        )
+    if (
+        observed_ancestry.returncode == 0
+        and member["observed_base_sha"] != member["history_boundary_sha"]
+    ):
+        raise ConflictError(
+            "native stack observed ancestry disagrees with its history boundary",
+            "unexpected_history",
+        )
     chain = [
         value.strip().lower()
         for value in git(
@@ -2219,7 +2286,7 @@ def prove_native_stack_member_input(
             "rev-list",
             "--reverse",
             "--first-parent",
-            f"{member['retained_base_sha']}..{member['head_sha']}",
+            f"{member['history_boundary_sha']}..{member['head_sha']}",
         ).splitlines()
         if value.strip()
     ]

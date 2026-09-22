@@ -42,14 +42,11 @@ class NativeStackClearanceDecisionTest(unittest.TestCase):
             self.member,
             self.invoked,
             self.target,
-            "a" * 40,
-            "a" * 40,
         )
 
     def test_member_observation_rejects_every_identity_and_state_drift(self):
         defects = [
             ("head_sha", "c" * 40),
-            ("base_sha", "d" * 40),
             ("head_branch", "other"),
             ("base_branch", "other"),
             ("head_owner", "foreign"),
@@ -73,9 +70,18 @@ class NativeStackClearanceDecisionTest(unittest.TestCase):
                     self.member,
                     self.invoked,
                     self.target,
-                    "a" * 40,
-                    "a" * 40,
                 )
+
+    def test_member_observation_allows_base_oid_movement(self):
+        current = copy.deepcopy(self.invoked)
+        current["base_sha"] = "d" * 40
+
+        MODULE.validate_native_stack_member_observation(
+            current,
+            self.member,
+            self.invoked,
+            self.target,
+        )
 
     def test_member_observation_rejects_unstable_mergeability(self):
         for mergeable in ("UNKNOWN", None, "BLOCKED"):
@@ -90,8 +96,6 @@ class NativeStackClearanceDecisionTest(unittest.TestCase):
                     self.member,
                     self.invoked,
                     self.target,
-                    "a" * 40,
-                    "a" * 40,
                 )
 
     def test_alignment_requires_every_member_to_be_mergeable_on_its_parent(self):
@@ -155,7 +159,6 @@ class NativeStackClearanceDecisionTest(unittest.TestCase):
             lambda value: value["stack"].update(id="different"),
             lambda value: value["stack"]["members"][0].update(position=9),
             lambda value: value["stack"]["members"][0].update(state="CLOSED"),
-            lambda value: value["stack"]["members"][1].update(base_sha="e" * 40),
             lambda value: value["stack"]["members"][1].update(mergeable="CONFLICTING"),
         ]
         for mutate in mutations:
@@ -179,6 +182,20 @@ class NativeStackClearanceDecisionTest(unittest.TestCase):
                 [],
             )
 
+    def test_refresh_allows_base_oid_movement(self):
+        detection = existing.native_stack_detection()
+        for member in detection["stack"]["members"]:
+            member["mergeable"] = "MERGEABLE"
+        refreshed = copy.deepcopy(detection)
+        refreshed["stack"]["members"][0]["base_sha"] = "e" * 40
+
+        MODULE.validate_native_stack_clearance_refresh(
+            detection,
+            refreshed,
+            [],
+            [],
+        )
+
 
 class NativeStackArtifactDecisionTest(unittest.TestCase):
     def setUp(self):
@@ -195,7 +212,8 @@ class NativeStackArtifactDecisionTest(unittest.TestCase):
                         "head_sha": "b" * 40,
                         "direct_base_ref": "main",
                         "direct_base_sha": "a" * 40,
-                        "retained_base_sha": "a" * 40,
+                        "observed_base_sha": "a" * 40,
+                        "history_boundary_sha": "a" * 40,
                         "direct_merge_base": "a" * 40,
                         "old_commits": [],
                         "sync_merges": [],
@@ -208,7 +226,8 @@ class NativeStackArtifactDecisionTest(unittest.TestCase):
                         "head_sha": "c" * 40,
                         "direct_base_ref": "lower",
                         "direct_base_sha": "b" * 40,
-                        "retained_base_sha": "b" * 40,
+                        "observed_base_sha": "b" * 40,
+                        "history_boundary_sha": "b" * 40,
                         "direct_merge_base": "b" * 40,
                         "old_commits": [],
                         "sync_merges": [],

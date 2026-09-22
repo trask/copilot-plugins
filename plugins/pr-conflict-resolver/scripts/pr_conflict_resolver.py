@@ -72,21 +72,21 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "c5ff3f4a1c9a2526e4bf81dc310f032119e8a43f669454718f113e76948b9b49"
+    "152679ce8d1ed127ff6b66e75d60fea350362e98eaaeb01f870e914941fd9ed7"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
-CONFLICT_POLICY = "marketplace-conflict-worker@10"
+CONFLICT_POLICY = "marketplace-conflict-worker@11"
 CONFLICT_POLICY_SHA256 = (
-    "7d934b95e5e0b8ef83228e95464a5c4f70d8de9114a50c98811e55b4825a0435"
+    "3e7a64d521bc62610f143aefaa74ff66817e5997f0f14e974ee8b03531e29964"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 10,
+    "version": 11,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-request",
-    "version": 2,
+    "version": 3,
 }
 CONFLICT_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
@@ -126,6 +126,10 @@ class NativeStackNormalizationRequired(WorkflowError):
 
 
 class MergedPredecessorLineageError(WorkflowError):
+    pass
+
+
+class AmbiguousHistoryBoundaryError(MergedPredecessorLineageError):
     pass
 
 
@@ -4007,12 +4011,25 @@ def repair_native_stack_topology(
     return [[member["number"] for member in segment] for segment in segments]
 
 
-def fetch_merged_predecessor(workspace: Path, predecessor: dict[str, Any]) -> None:
+def fetch_merged_predecessor(
+    workspace: Path,
+    predecessor: dict[str, Any],
+    *,
+    preflight_refs: Any | None = None,
+    role: str | None = None,
+) -> None:
     """Fetch and verify a merged PR's frozen original head through its pull ref."""
     number = predecessor.get("number")
     expected = predecessor.get("head_sha")
     if not isinstance(number, int) or not isinstance(expected, str) or not expected:
         raise WorkflowError("the merged stack predecessor is incomplete")
+    if preflight_refs is not None:
+        preflight_refs.fetch(
+            f"refs/pull/{number}/head",
+            role or f"predecessor-{number}",
+            expected=expected,
+        )
+        return
     fetched = git_try(
         workspace, "fetch", "--no-tags", "origin", f"refs/pull/{number}/head"
     )
@@ -4106,7 +4123,7 @@ def recover_rewritten_parent_boundary(
 def recover_merged_predecessor_boundary(
     workspace: Path, member: dict[str, Any], predecessor: dict[str, Any]
 ) -> str:
-    """Choose a predecessor boundary only from complete frozen commit ranges."""
+    """Choose one boundary from every available frozen lineage proof."""
     merge_sha = predecessor.get("merge_sha")
     if merge_sha != member["base_sha"]:
         raise WorkflowError(
@@ -4115,8 +4132,13 @@ def recover_merged_predecessor_boundary(
         )
     original_head = predecessor["head_sha"]
     child_sha = member["head_sha"]
+    candidates: dict[str, list[str]] = {}
+
+    def record(candidate: str, proof: str) -> None:
+        candidates.setdefault(candidate, []).append(proof)
+
     if is_ancestor(workspace, original_head, child_sha):
-        return original_head
+        record(original_head, "verified predecessor original head")
 
     exact_merge_detail: str
     if member.get("commits_complete") is not True:
@@ -4142,11 +4164,13 @@ def recover_merged_predecessor_boundary(
             and recorded_commits
             and actual_commits == recorded_commits
         ):
-            return merge_sha
-        exact_merge_detail = (
-            "the complete commit range above its merge result does not match "
-            "GitHub's recorded pull request commits"
-        )
+            record(merge_sha, "exact merge-result range")
+            exact_merge_detail = ""
+        else:
+            exact_merge_detail = (
+                "the complete commit range above its merge result does not match "
+                "GitHub's recorded pull request commits"
+            )
     else:
         exact_merge_detail = "its exact merge result is not an ancestor of the child"
 
@@ -4201,13 +4225,115 @@ def recover_merged_predecessor_boundary(
                 and boundary == shared_from_predecessor[-1]
                 and actual_child_commits == expected_child_commits
             ):
-                return boundary
+                record(boundary, "complete predecessor and child commit lists")
+
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if len(candidates) > 1:
+        detail = ", ".join(
+            f"{candidate} ({', '.join(proofs)})"
+            for candidate, proofs in sorted(candidates.items())
+        )
+        raise AmbiguousHistoryBoundaryError(
+            f"merged predecessor pull request #{predecessor['number']} leaves "
+            f"multiple plausible child-history boundaries: {detail}"
+        )
 
     raise MergedPredecessorLineageError(
         f"the original head {original_head} of merged predecessor pull request "
         f"#{predecessor['number']} is not an ancestor of {member['head_branch']!r}, "
         f"{exact_merge_detail}, and the complete frozen predecessor and child "
         "commit lists do not prove a unique shared predecessor boundary"
+    )
+
+
+def recover_native_stack_history_boundary(
+    workspace: Path,
+    member: dict[str, Any],
+    *,
+    current_base: str,
+    preflight_refs: Any,
+) -> str:
+    """Prove the one commit immediately below a native stack member's history."""
+    observed_base = member["base_sha"]
+    child_sha = member["head_sha"]
+    candidates: dict[str, list[str]] = {}
+
+    def record(candidate: str, proof: str) -> None:
+        candidates.setdefault(candidate, []).append(proof)
+
+    if is_ancestor(workspace, observed_base, child_sha):
+        record(observed_base, "observed base ancestry")
+
+    predecessor = member.get("merged_predecessor")
+    predecessor_error: WorkflowError | None = None
+    if predecessor is not None:
+        fetch_merged_predecessor(
+            workspace,
+            predecessor,
+            preflight_refs=preflight_refs,
+            role=f"predecessor-{member['number']}",
+        )
+        try:
+            boundary = recover_merged_predecessor_boundary(
+                workspace, member, predecessor
+            )
+        except AmbiguousHistoryBoundaryError:
+            raise
+        except MergedPredecessorLineageError as error:
+            predecessor_error = error
+        else:
+            record(boundary, "merged predecessor lineage")
+
+    recorded_commits = member.get("commits")
+    if (
+        predecessor is None
+        and member.get("commits_complete") is True
+        and isinstance(recorded_commits, list)
+        and recorded_commits
+    ):
+        merge_bases = [
+            line
+            for line in git(
+                workspace,
+                "merge-base",
+                "--all",
+                current_base,
+                child_sha,
+            ).splitlines()
+            if line
+        ]
+        if len(merge_bases) == 1:
+            boundary = merge_bases[0]
+            actual_commits = [
+                line
+                for line in git(
+                    workspace,
+                    "rev-list",
+                    "--reverse",
+                    "--topo-order",
+                    f"{boundary}..{child_sha}",
+                ).splitlines()
+                if line
+            ]
+            if actual_commits == recorded_commits:
+                record(boundary, "unique merge base and complete child range")
+
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if len(candidates) > 1:
+        detail = ", ".join(
+            f"{candidate} ({', '.join(proofs)})"
+            for candidate, proofs in sorted(candidates.items())
+        )
+        raise WorkflowError(
+            f"native stack member #{member['number']} has ambiguous child-history "
+            f"boundaries: {detail}"
+        )
+    if predecessor_error is not None:
+        raise predecessor_error
+    raise WorkflowError(
+        f"native stack member #{member['number']} has no proven child-history boundary"
     )
 
 
@@ -7791,12 +7917,12 @@ def native_stack_member_history(
     repo_root: Path,
     *,
     current_base: str,
-    retained_base: str,
+    history_boundary: str,
     head: str,
 ) -> tuple[str, list[str], list[dict[str, Any]]]:
-    if not is_ancestor(repo_root, retained_base, head):
+    if not is_ancestor(repo_root, history_boundary, head):
         raise WorkflowError(
-            f"retained direct-base snapshot {retained_base} is not an ancestor "
+            f"proven history boundary {history_boundary} is not an ancestor "
             f"of native stack head {head}"
         )
     merge_bases = [
@@ -7814,7 +7940,7 @@ def native_stack_member_history(
         raise WorkflowError(
             "native stack member has no unique common history with its current base"
         )
-    commits = first_parent_commits(repo_root, retained_base, head)
+    commits = first_parent_commits(repo_root, history_boundary, head)
     if not commits:
         raise WorkflowError("native stack member has an empty unique range")
     linear_commits = []
@@ -7887,7 +8013,7 @@ def native_stack_member_history(
                     "version": 1,
                 },
                 "current_base_sha": current_base,
-                "retained_base_sha": retained_base,
+                "history_boundary_sha": history_boundary,
                 "head_sha": head,
                 "direct_merge_base": merge_bases[0],
                 "first_parent_commits": commits,
@@ -8010,6 +8136,67 @@ def commit_identity(repo_root: Path, commit: str, *, linear: bool) -> dict[str, 
     }
 
 
+class PreflightRefStore:
+    def __init__(
+        self,
+        repo_root: Path,
+        remote: str,
+        iteration_id: str,
+    ) -> None:
+        safe_iteration = re.sub(r"[^A-Za-z0-9._-]", "-", iteration_id)
+        self.repo_root = repo_root
+        self.remote = remote
+        self.prefix = (
+            f"refs/pr-conflict-resolver/preflight/{safe_iteration}-"
+            f"{secrets.token_hex(8)}"
+        )
+        self.refs: list[str] = []
+
+    def fetch(
+        self,
+        source: str,
+        role: str,
+        *,
+        expected: str | None = None,
+    ) -> str:
+        safe_role = re.sub(r"[^A-Za-z0-9._-]", "-", role)
+        target = f"{self.prefix}/{safe_role}"
+        self.refs.append(target)
+        result = git_try(
+            self.repo_root,
+            "fetch",
+            "--no-tags",
+            self.remote,
+            f"+{source}:{target}",
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
+            raise WorkflowError(f"could not fetch {source}: {detail}")
+        actual = git(
+            self.repo_root,
+            "rev-parse",
+            "--verify",
+            target,
+        ).lower()
+        if expected is not None and actual != expected.lower():
+            raise WorkflowError(
+                f"fetched {source} at {actual}, expected frozen commit {expected}"
+            )
+        return actual
+
+    def cleanup(self) -> None:
+        failures = []
+        for ref in reversed(self.refs):
+            result = git_try(self.repo_root, "update-ref", "-d", ref)
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or "no output"
+                failures.append(f"{ref}: {detail}")
+        if failures:
+            raise WorkflowError(
+                "could not remove isolated preflight refs: " + "; ".join(failures)
+            )
+
+
 def fetch_preflight_ref(
     repo_root: Path, remote: str, source: str, expected: str
 ) -> None:
@@ -8052,7 +8239,7 @@ def native_stack_clearance_key(detection: dict[str, Any]) -> tuple[Any, ...]:
             (
                 stack_snapshot_key(scope),
                 tuple(
-                    (member.get("position"), member.get("state"), member.get("base_sha"))
+                    (member.get("position"), member.get("state"))
                     for member in scope["members"]
                 ),
             )
@@ -8072,7 +8259,6 @@ NATIVE_STACK_IDENTITY_KEYS = (
     "head_branch",
     "head_sha",
     "base_branch",
-    "base_sha",
     "state",
 )
 
@@ -8082,8 +8268,6 @@ def validate_native_stack_member_observation(
     member: dict[str, Any],
     invoked: dict[str, Any],
     target: dict[str, Any],
-    parent_sha: str,
-    observed_base_sha: str,
 ) -> None:
     if (
         current["number"] != member["number"]
@@ -8096,8 +8280,6 @@ def validate_native_stack_member_observation(
         or current["head_branch"] != member["head_branch"]
         or current["head_sha"] != member["head_sha"]
         or current["base_branch"] != member["base_branch"]
-        or current["base_sha"] != parent_sha
-        or observed_base_sha != parent_sha
         or (
             current["number"] == invoked["number"]
             and any(
@@ -8137,11 +8319,12 @@ def validate_native_stack_clearance_refresh(
         raise WorkflowError("native stack scope changed during clearance observation")
 
 
-def aligned_native_stack_clearance(
+def _aligned_native_stack_clearance(
     repo_root: Path,
     metadata: dict[str, Any],
     detection: dict[str, Any],
     stack_request: dict[str, Any] | None,
+    preflight_refs: PreflightRefStore,
 ) -> dict[str, Any] | None:
     """Prove a whole native stack needs neither conflict work nor a restack."""
     stack = detection["stack"]
@@ -8155,31 +8338,42 @@ def aligned_native_stack_clearance(
         require_authorized_stack(stack_request, metadata, stack)
     identity = conflict_preflight_identity(repo_root, metadata)
     remote = find_remote(repo_root, metadata["repo_name"], push=False)
-    trunk_sha = base_ref_tip(metadata["repo_name"], stack["trunk"])
-    fetch_preflight_ref(
-        repo_root, remote, f"refs/heads/{stack['trunk']}", trunk_sha
+    preflight_refs.remote = remote
+    trunk_sha = preflight_refs.fetch(
+        f"refs/heads/{stack['trunk']}",
+        "clearance-trunk",
     )
     observed = []
     members = []
     parent_sha = trunk_sha
     outside = external_stack_dependents(metadata, stack)
-    for member in stack["members"]:
+    for index, member in enumerate(stack["members"]):
         target = stack_member_target(metadata, member["number"])
         current = live_mergeability(target, expected_head=member["head_sha"])
         require_open_pull_request(current)
+        direct_base_sha = (
+            trunk_sha
+            if index == 0
+            else preflight_refs.fetch(
+                f"refs/heads/{current['base_branch']}",
+                f"clearance-direct-base-{current['number']}",
+            )
+        )
+        if direct_base_sha != parent_sha:
+            raise WorkflowError("native stack head or direct-base lease changed")
         validate_native_stack_member_observation(
             current,
             member,
             metadata,
             target,
-            parent_sha,
-            base_ref_tip(current["repo_name"], current["base_branch"]),
         )
-        fetch_preflight_ref(
-            repo_root, remote, f"refs/heads/{current['head_branch']}", current["head_sha"]
+        preflight_refs.fetch(
+            f"refs/pull/{current['number']}/head",
+            f"clearance-member-head-{current['number']}",
+            expected=current["head_sha"],
         )
         merge_base = git(
-            repo_root, "merge-base", "--all", parent_sha, current["head_sha"]
+            repo_root, "merge-base", "--all", direct_base_sha, current["head_sha"]
         )
         observed.append(current)
         members.append({
@@ -8188,7 +8382,7 @@ def aligned_native_stack_clearance(
             "head_ref": current["head_branch"],
             "head_sha": current["head_sha"],
             "direct_base_ref": current["base_branch"],
-            "direct_base_sha": parent_sha,
+            "direct_base_sha": direct_base_sha,
             "merge_base": merge_base,
             "mergeable": current["mergeable"],
         })
@@ -8205,7 +8399,6 @@ def aligned_native_stack_clearance(
                 for key in NATIVE_STACK_IDENTITY_KEYS
             )
             or refreshed.get("mergeable") != "MERGEABLE"
-            or base_ref_tip(current["repo_name"], current["base_branch"]) != current["base_sha"]
             or base_ref_tip(current["repo_name"], current["head_branch"]) != current["head_sha"]
         ):
             raise WorkflowError("native stack changed during clearance observation")
@@ -8234,7 +8427,47 @@ def aligned_native_stack_clearance(
     }
 
 
-def conflict_preflight(
+def aligned_native_stack_clearance(
+    repo_root: Path,
+    metadata: dict[str, Any],
+    detection: dict[str, Any],
+    stack_request: dict[str, Any] | None,
+    *,
+    preflight_refs: PreflightRefStore | None = None,
+) -> dict[str, Any] | None:
+    owned_refs = preflight_refs is None
+    refs = (
+        PreflightRefStore(
+            repo_root,
+            "",
+            f"clearance-{metadata['number']}",
+        )
+        if preflight_refs is None
+        else preflight_refs
+    )
+    failure: BaseException | None = None
+    try:
+        return _aligned_native_stack_clearance(
+            repo_root,
+            metadata,
+            detection,
+            stack_request,
+            refs,
+        )
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if owned_refs:
+            try:
+                refs.cleanup()
+            except WorkflowError as cleanup_error:
+                if failure is None:
+                    raise
+                failure.add_note(str(cleanup_error))
+
+
+def _conflict_preflight(
     repo_root: Path,
     target: dict[str, Any],
     *,
@@ -8245,6 +8478,7 @@ def conflict_preflight(
     iteration_budget: int,
     model: str,
     stack_request: dict[str, Any] | None = None,
+    preflight_refs: PreflightRefStore,
 ) -> dict[str, Any]:
     if stack_request is not None:
         current = metadata_for(target)
@@ -8257,17 +8491,15 @@ def conflict_preflight(
     require_clean_worktree(repo_root)
     identity = conflict_preflight_identity(repo_root, metadata)
     remote = find_remote(repo_root, metadata["repo_name"], push=False)
-    fetch_preflight_ref(
-        repo_root,
-        remote,
+    preflight_refs.remote = remote
+    preflight_refs.fetch(
         f"refs/pull/{metadata['number']}/head",
-        metadata["head_sha"],
+        "invoked-head",
+        expected=metadata["head_sha"],
     )
-    fetch_preflight_ref(
-        repo_root,
-        remote,
+    preflight_refs.fetch(
         f"refs/heads/{metadata['base_branch']}",
-        metadata["base_sha"],
+        "invoked-base",
     )
     detection = stack_membership(metadata)
     stack = detection["stack"]
@@ -8298,7 +8530,11 @@ def conflict_preflight(
         and (stack_request is None or stack_request["operation"] == "whole-stack")
     ):
         clearance = aligned_native_stack_clearance(
-            repo_root, metadata, detection, stack_request
+            repo_root,
+            metadata,
+            detection,
+            stack_request,
+            preflight_refs=preflight_refs,
         )
         if clearance is not None:
             return {
@@ -8347,13 +8583,21 @@ def conflict_preflight(
     if strategy == "native-stack":
         if stack is None:
             raise WorkflowError("native-stack strategy requires a native GitHub stack")
-        trunk_sha = base_ref_tip(metadata["repo_name"], stack["trunk"])
+        trunk_sha = preflight_refs.fetch(
+            f"refs/heads/{stack['trunk']}",
+            "trunk",
+        )
         members = []
         previous_ref = stack["trunk"]
         previous_sha = trunk_sha
-        for member in stack["members"]:
-            direct_base_sha = base_ref_tip(
-                metadata["repo_name"], member["base_branch"]
+        for index, member in enumerate(stack["members"]):
+            direct_base_sha = (
+                trunk_sha
+                if index == 0
+                else preflight_refs.fetch(
+                    f"refs/heads/{member['base_branch']}",
+                    f"direct-base-{member['number']}",
+                )
             )
             if (
                 member["base_branch"] != previous_ref
@@ -8362,13 +8606,17 @@ def conflict_preflight(
                 raise WorkflowError(
                     f"native stack member #{member['number']} has a stale direct base"
                 )
-            fetch_preflight_ref(
-                repo_root,
-                remote,
+            preflight_refs.fetch(
                 f"refs/pull/{member['number']}/head",
-                member["head_sha"],
+                f"member-head-{member['number']}",
+                expected=member["head_sha"],
             )
-            retained_base_sha = member["base_sha"]
+            history_boundary_sha = recover_native_stack_history_boundary(
+                repo_root,
+                member,
+                current_base=direct_base_sha,
+                preflight_refs=preflight_refs,
+            )
             try:
                 (
                     direct_merge_base,
@@ -8377,7 +8625,7 @@ def conflict_preflight(
                 ) = native_stack_member_history(
                     repo_root,
                     current_base=direct_base_sha,
-                    retained_base=retained_base_sha,
+                    history_boundary=history_boundary_sha,
                     head=member["head_sha"],
                 )
             except NativeStackNormalizationRequired as error:
@@ -8388,7 +8636,8 @@ def conflict_preflight(
                     "head_sha": member["head_sha"],
                     "direct_base_ref": member["base_branch"],
                     "direct_base_sha": direct_base_sha,
-                    "retained_base_sha": retained_base_sha,
+                    "observed_base_sha": member["base_sha"],
+                    "history_boundary_sha": history_boundary_sha,
                     "lease_sha": member["head_sha"],
                 }
                 error.manifest["target_pull_request"] = {
@@ -8407,7 +8656,7 @@ def conflict_preflight(
                             "head_ref": item["head_branch"],
                             "head_sha": item["head_sha"],
                             "direct_base_ref": item["base_branch"],
-                            "retained_base_sha": item["base_sha"],
+                            "observed_base_sha": item["base_sha"],
                         }
                         for item in stack["members"]
                     ],
@@ -8440,7 +8689,8 @@ def conflict_preflight(
                     "head_sha": member["head_sha"],
                     "direct_base_ref": member["base_branch"],
                     "direct_base_sha": direct_base_sha,
-                    "retained_base_sha": retained_base_sha,
+                    "observed_base_sha": member["base_sha"],
+                    "history_boundary_sha": history_boundary_sha,
                     "direct_merge_base": direct_merge_base,
                     "expected_new_parent": {
                         "role": (
@@ -8546,6 +8796,49 @@ def conflict_preflight(
         "request": request,
         **({"stack_request": stack_request} if stack_request is not None else {}),
     }
+
+
+def conflict_preflight(
+    repo_root: Path,
+    target: dict[str, Any],
+    *,
+    requested_strategy: str,
+    whole_stack: bool,
+    iteration_id: str,
+    iteration_number: int,
+    iteration_budget: int,
+    model: str,
+    stack_request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    preflight_refs = PreflightRefStore(
+        repo_root,
+        "",
+        iteration_id,
+    )
+    failure: BaseException | None = None
+    try:
+        return _conflict_preflight(
+            repo_root,
+            target,
+            requested_strategy=requested_strategy,
+            whole_stack=whole_stack,
+            iteration_id=iteration_id,
+            iteration_number=iteration_number,
+            iteration_budget=iteration_budget,
+            model=model,
+            stack_request=stack_request,
+            preflight_refs=preflight_refs,
+        )
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            preflight_refs.cleanup()
+        except WorkflowError as cleanup_error:
+            if failure is None:
+                raise
+            failure.add_note(str(cleanup_error))
 
 
 def build_conflict_prompt(preflight: dict[str, Any]) -> str:
@@ -8922,10 +9215,21 @@ def verify_native_stack_member_input(
     repo_root: Path,
     member: dict[str, Any],
 ) -> None:
+    if (
+        is_ancestor(
+            repo_root,
+            member["observed_base_sha"],
+            member["head_sha"],
+        )
+        and member["observed_base_sha"] != member["history_boundary_sha"]
+    ):
+        raise WorkflowError(
+            "native stack observed ancestry disagrees with its history boundary"
+        )
     merge_base, commits, sync_merges = native_stack_member_history(
         repo_root,
         current_base=member["direct_base_sha"],
-        retained_base=member["retained_base_sha"],
+        history_boundary=member["history_boundary_sha"],
         head=member["head_sha"],
     )
     if (
@@ -9330,24 +9634,11 @@ def require_live_conflict_guards(
                 index == 0
                 and trunk_advanced
                 and member["direct_base_ref"] == expected["trunk"]["ref"]
-                and commit_contains(
-                    request["repository"],
-                    member["direct_base_sha"],
-                    current_trunk_sha,
-                )
             )
             for index, member in enumerate(expected["members"])
         )
         if (
             stack is None
-            or (
-                trunk_advanced
-                and not commit_contains(
-                    request["repository"],
-                    expected["trunk"]["sha"],
-                    current_trunk_sha,
-                )
-            )
             or [
                 (
                     member["number"],
@@ -9367,7 +9658,7 @@ def require_live_conflict_guards(
                     (
                         current_trunk_sha
                         if index == 0 and trunk_advanced
-                        else member["retained_base_sha"]
+                        else member["observed_base_sha"]
                     ),
                 )
                 for index, member in enumerate(expected["members"])
@@ -9465,7 +9756,14 @@ def published_conflict_snapshot(
         invoked["base_sha"],
         metadata["base_sha"],
     ):
-        raise WorkflowError("published conflict base history was rewritten")
+        if commit_contains(
+            request["repository"],
+            invoked["base_sha"],
+            invoked["new_sha"],
+        ):
+            raise WorkflowError(
+                "published candidate topology attaches obsolete base history"
+            )
     base_advanced = direct_base_advanced or task.get("candidate_base_advanced") is True
     authorization = preflight.get("stack_request")
     return {
@@ -9521,6 +9819,18 @@ def publish_conflict_result(
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
     guarded = require_live_conflict_guards(repo_root, preflight)
+    if (
+        guarded["base_sha"] != invoked["base_sha"]
+        and not commit_contains(
+            request["repository"],
+            invoked["base_sha"],
+            guarded["base_sha"],
+        )
+        and is_ancestor(repo_root, invoked["base_sha"], invoked["new_sha"])
+    ):
+        raise WorkflowError(
+            "candidate topology attaches obsolete base history"
+        )
     task["candidate_base_advanced"] = (
         task.get("candidate_base_advanced") is True
         or guarded["_candidate_base_advanced"] is True

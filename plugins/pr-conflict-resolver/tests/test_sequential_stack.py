@@ -15,7 +15,7 @@ CLOUD = existing.CLOUD_MODULE
 
 
 class ReplayTaskBaseTest(unittest.TestCase):
-    def test_creation_and_collection_share_the_policy_10_task_base(self):
+    def test_creation_and_collection_share_the_policy_11_task_base(self):
         for strategy, base_key in (
             ("merge", "head_sha"),
             ("rebase", "base_sha"),
@@ -277,7 +277,8 @@ class SequentialStackTest(unittest.TestCase):
                 "head_sha": head,
                 "direct_base_ref": "main" if number == 6 else "lower",
                 "direct_base_sha": base,
-                "retained_base_sha": self.seed if number == 6 else base,
+                "observed_base_sha": self.seed if number == 6 else base,
+                "history_boundary_sha": self.seed if number == 6 else base,
                 "direct_merge_base": merge_base,
                 "expected_new_parent": {
                     "role": "trunk" if number == 6 else "member:6",
@@ -466,7 +467,14 @@ class SequentialStackTest(unittest.TestCase):
             return original_run(command, **kwargs)
 
         with (
-            mock.patch.object(MODULE, "require_live_conflict_guards"),
+            mock.patch.object(
+                MODULE,
+                "require_live_conflict_guards",
+                return_value={
+                    "base_sha": state["agent_task"]["code_refs"][0]["base_sha"],
+                    "_candidate_base_advanced": False,
+                },
+            ),
             mock.patch.object(MODULE, "remote_publication_heads", side_effect=self.publication_heads),
             mock.patch.object(MODULE, "find_remote", return_value="origin"),
             mock.patch.object(MODULE, "run", side_effect=run),
@@ -611,18 +619,28 @@ class PipelineConflictEntryTest(unittest.TestCase):
                 checkout_pr_branch=mock.DEFAULT,
                 conflict_preflight_identity=mock.DEFAULT,
                 find_remote=mock.DEFAULT,
-                fetch_preflight_ref=mock.DEFAULT,
                 stack_membership=mock.DEFAULT,
                 stack_relations=mock.DEFAULT,
                 repository_merge_methods=mock.DEFAULT,
                 base_ref_tip=mock.DEFAULT,
+                recover_native_stack_history_boundary=mock.DEFAULT,
                 native_stack_member_history=mock.DEFAULT,
                 merge_tree_conflicts=mock.DEFAULT,
                 ordered_commits=mock.DEFAULT,
                 commit_identity=mock.DEFAULT,
                 external_stack_dependents=mock.DEFAULT,
                 git=mock.DEFAULT,
-            ) as calls:
+            ) as calls, mock.patch.object(
+                MODULE.PreflightRefStore,
+                "fetch",
+                side_effect=lambda source, _role, expected=None: (
+                    expected
+                    or {
+                        "refs/heads/main": "base1",
+                        "refs/heads/v143": "aaa",
+                    }[source]
+                ),
+            ), mock.patch.object(MODULE.PreflightRefStore, "cleanup"):
                 calls["live_mergeability"].return_value = metadata
                 calls["stack_membership"].return_value = existing.native_stack_detection()
                 calls["stack_relations"].return_value = existing.NO_RELATIONS
@@ -631,6 +649,9 @@ class PipelineConflictEntryTest(unittest.TestCase):
                     "main": "base1",
                     "v143": "aaa",
                 }[ref]
+                calls["recover_native_stack_history_boundary"].side_effect = (
+                    lambda _root, member, **_options: member["base_sha"]
+                )
                 calls["native_stack_member_history"].side_effect = (
                     lambda _root, **values: (
                         "base1",
