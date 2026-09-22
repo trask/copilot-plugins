@@ -19,7 +19,7 @@ Launch the bundled stack helper through its foreground execution route, then rep
 
 Accept one starting pull request as a GitHub PR URL, `owner/repo#number`, or a bare PR number. A bare number resolves against the current workspace repository. Do not ask the user for a stack number or member list.
 
-The helper reads the live native stack and selects the starting pull request plus every descendant in current stack order. The starting pull request is the fixed suffix boundary. Draft and non-draft members are included, but predecessors are not. A pull request outside a native stack, a missing member, malformed topology, topology drift, reordered members, or selection drift stops the run before mutation.
+The helper reads the live native stack and selects the open starting pull request plus every open descendant in current stack order. The starting pull request is the fixed suffix boundary. Draft and non-draft open members are included, but predecessors and inactive descendants are not. The helper still freezes the complete native topology, including inactive members, as source evidence. A pull request outside a native stack, an inactive or missing starting member, malformed topology, topology drift, reordered members, or selection drift stops the run before mutation.
 
 ## Controller execution
 

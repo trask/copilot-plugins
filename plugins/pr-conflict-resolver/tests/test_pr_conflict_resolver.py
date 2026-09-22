@@ -1004,6 +1004,40 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         )
         self.assertTrue(parsed.whole_stack)
 
+    def test_run_parser_exposes_only_target_and_strategy(self):
+        parser = MODULE.build_parser()
+        parsed = parser.parse_args(
+            ["run", "7", "--strategy", "rebase"]
+        )
+        self.assertIs(parsed.function, MODULE.command_run)
+        self.assertEqual("7", parsed.target)
+        self.assertEqual("rebase", parsed.strategy)
+        for obsolete in (
+            "--repo-root",
+            "--state",
+            "--model",
+            "--whole-stack",
+            "--stack-request",
+            "--pipeline-run",
+        ):
+            with self.subTest(obsolete=obsolete), self.assertRaises(SystemExit):
+                parser.parse_args(["run", "7", obsolete, "value"])
+
+    def test_run_derives_private_execution_arguments(self):
+        args = MODULE.build_parser().parse_args(["run", "owner/repo#7"])
+        with mock.patch.object(MODULE, "command_agent_task") as command:
+            MODULE.command_run(args)
+
+        private = command.call_args.args[0]
+        self.assertEqual("owner/repo#7", private.target)
+        self.assertEqual("auto", private.strategy)
+        self.assertEqual("sol", private.model)
+        self.assertEqual(3, private.max_iterations)
+        self.assertFalse(private.whole_stack)
+        self.assertIsNone(private.repo_root)
+        self.assertIsNone(private.state)
+        self.assertIsNone(private.pipeline_run)
+
     def test_agent_task_parser_rejects_non_sol_models(self):
         with self.assertRaises(SystemExit):
             MODULE.build_parser().parse_args(
@@ -5867,18 +5901,18 @@ class FetchReferenceTest(unittest.TestCase):
 
 
 class CheckoutTest(unittest.TestCase):
-    def checkout(self, branches):
+    def checkout(self, git_results):
         """Run the checkout with `git` answering the branch readings in turn."""
         with mock.patch.object(MODULE, "run") as runner, mock.patch.object(
-            MODULE, "git", side_effect=[*branches, "head1"]
+            MODULE, "git", side_effect=git_results
         ):
             attached = MODULE.checkout_pr_branch(
                 Path("."), MODULE.parse_target("owner/repo#7"), pr_metadata()
             )
-        return attached, runner.call_args[0][0]
+        return attached, runner
 
     def test_a_worktree_elsewhere_detaches_onto_the_head(self):
-        attached, command = self.checkout(["other", ""])
+        attached, runner = self.checkout(["other", "head1", "", "head1"])
         self.assertFalse(attached)
         self.assertEqual(
             [
@@ -5888,20 +5922,22 @@ class CheckoutTest(unittest.TestCase):
                 "https://github.com/owner/repo/pull/7",
                 "--detach",
             ],
-            command,
+            runner.call_args[0][0],
         )
 
-    def test_a_worktree_already_holding_the_branch_keeps_it(self):
-        attached, command = self.checkout(["feature", "feature"])
+    def test_an_exact_attached_checkout_is_reused(self):
+        attached, runner = self.checkout(["feature", "head1"])
         self.assertTrue(attached)
-        self.assertEqual(
-            ["gh", "pr", "checkout", "https://github.com/owner/repo/pull/7"],
-            command,
-        )
+        runner.assert_not_called()
+
+    def test_an_exact_detached_checkout_is_reused(self):
+        attached, runner = self.checkout(["", "head1"])
+        self.assertFalse(attached)
+        runner.assert_not_called()
 
     def test_landing_on_some_other_branch_is_refused(self):
         with mock.patch.object(MODULE, "run"), mock.patch.object(
-            MODULE, "git", side_effect=["other", "unrelated", "head1"]
+            MODULE, "git", side_effect=["other", "head1", "unrelated", "head1"]
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "branch mismatch"):
                 MODULE.checkout_pr_branch(
@@ -5910,7 +5946,7 @@ class CheckoutTest(unittest.TestCase):
 
     def test_local_work_ahead_of_the_pull_request_head_is_refused(self):
         with mock.patch.object(MODULE, "run"), mock.patch.object(
-            MODULE, "git", side_effect=["feature", "feature", "local9"]
+            MODULE, "git", side_effect=["feature", "local9", "feature", "local9"]
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "HEAD mismatch"):
                 MODULE.checkout_pr_branch(

@@ -223,6 +223,27 @@ class TargetSelectionTest(unittest.TestCase):
         )
         self.assertEqual([13], selected["pullRequests"])
 
+    def test_selection_skips_inactive_descendants_but_freezes_full_topology(self):
+        live = stack(members=(9, 10, 11, 12))
+        live["members"][1]["state"] = "MERGED"
+        selected = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 9), live
+        )
+
+        self.assertEqual([9, 11, 12], selected["pullRequests"])
+        self.assertEqual(
+            [9, 10, 11, 12],
+            [member["number"] for member in selected["sourceStack"]["members"]],
+        )
+
+    def test_rejects_an_inactive_starting_pull_request(self):
+        live = stack()
+        live["members"][1]["state"] = "MERGED"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not an open"):
+            MODULE.selection_from_stack(
+                COMMON.target_for("owner/repo", 12), live
+            )
+
     def test_rejects_a_pull_request_without_a_native_stack(self):
         with self.assertRaisesRegex(
             MODULE.WorkflowError, "not a member of a native stack"
@@ -424,6 +445,21 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual("ready", result["result"])
         self.assertEqual([11, 12], [member["number"] for member in result["selected"]])
         self.assertEqual({True, False}, {m["is_draft"] for m in result["selected"]})
+
+    def test_an_inactive_descendant_stays_out_of_the_frozen_selection(self):
+        live = stack(members=(9, 10, 11, 12))
+        live["members"][2]["state"] = "MERGED"
+        selected = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 10), live
+        )
+
+        result = MODULE.validate_selection(selected, live)
+
+        self.assertEqual("ready", result["result"])
+        self.assertEqual(
+            [10, 12],
+            [member["number"] for member in result["selected"]],
+        )
 
     def test_a_changed_stack_stops_the_run(self):
         cases = {

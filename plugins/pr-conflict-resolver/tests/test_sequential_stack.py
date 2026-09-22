@@ -694,7 +694,7 @@ class PipelineConflictEntryTest(unittest.TestCase):
                 mock.sentinel.runner, mock.sentinel.snapshot, request, {},
             )
 
-    def test_pipeline_native_scope_clears_mergeable_but_refuses_conflict(self):
+    def test_pipeline_native_scope_clears_mergeable_and_prepares_complete_conflict(self):
         for mergeable in ("MERGEABLE", "CONFLICTING"):
             metadata = existing.pr_metadata()
             metadata["mergeable"] = mergeable
@@ -709,9 +709,41 @@ class PipelineConflictEntryTest(unittest.TestCase):
                 fetch_preflight_ref=mock.DEFAULT,
                 stack_membership=mock.DEFAULT,
                 stack_relations=mock.DEFAULT,
+                repository_merge_methods=mock.DEFAULT,
+                base_ref_tip=mock.DEFAULT,
+                native_stack_member_history=mock.DEFAULT,
+                merge_tree_conflicts=mock.DEFAULT,
+                ordered_commits=mock.DEFAULT,
+                commit_identity=mock.DEFAULT,
+                external_stack_dependents=mock.DEFAULT,
+                git=mock.DEFAULT,
             ) as calls:
                 calls["live_mergeability"].return_value = metadata
                 calls["stack_membership"].return_value = existing.native_stack_detection()
+                calls["stack_relations"].return_value = existing.NO_RELATIONS
+                calls["repository_merge_methods"].return_value = existing.ALL_MERGE_METHODS
+                calls["base_ref_tip"].side_effect = lambda _repo, ref: {
+                    "main": "base1",
+                    "v143": "aaa",
+                }[ref]
+                calls["native_stack_member_history"].side_effect = (
+                    lambda _root, **values: (
+                        "base1",
+                        [values["head"]],
+                        [],
+                    )
+                )
+                calls["merge_tree_conflicts"].return_value = []
+                calls["ordered_commits"].return_value = []
+                calls["commit_identity"].side_effect = lambda _root, sha, **_options: {
+                    "sha": sha,
+                    "subject": "Change",
+                    "trailers": [],
+                    "patch_sha256": "a" * 64,
+                    "paths": ["file.txt"],
+                }
+                calls["external_stack_dependents"].return_value = []
+                calls["git"].return_value = "merge-base"
                 args = {
                     "requested_strategy": "auto",
                     "whole_stack": False,
@@ -719,12 +751,17 @@ class PipelineConflictEntryTest(unittest.TestCase):
                     "iteration_number": 1,
                     "iteration_budget": 3,
                     "model": "gpt-5.6-sol",
-                    "allow_native_stack": False,
                 }
+                result = MODULE.conflict_preflight(Path("repo"), {}, **args)
                 if mergeable == "MERGEABLE":
-                    result = MODULE.conflict_preflight(Path("repo"), {}, **args)
                     self.assertTrue(result["already_mergeable"])
                 else:
-                    with self.assertRaisesRegex(MODULE.WorkflowError, "outside the pipeline scope"):
-                        MODULE.conflict_preflight(Path("repo"), {}, **args)
-                calls["stack_relations"].assert_not_called()
+                    self.assertFalse(result["already_mergeable"])
+                    self.assertEqual("native-stack", result["strategy"])
+                    self.assertEqual(
+                        [19483, 7],
+                        [
+                            member["pr_number"]
+                            for member in result["request"]["native_stack"]["members"]
+                        ],
+                    )

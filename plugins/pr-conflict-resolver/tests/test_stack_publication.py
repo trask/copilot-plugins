@@ -48,6 +48,114 @@ def write_authorization(root, stack, *, fixed=11, selected=None, operation="desc
     return request, request_path, state_path, owner_path
 
 
+class ResolverOwnedAuthorizationTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.state_path = self.root / "resolver-state.json"
+        self.stack = existing.native_stack_detection()["stack"]
+        self.preflight = {
+            "strategy": "native-stack",
+            "repository_root": str(self.repo),
+            "pr": existing.pr_metadata(),
+            "stack": copy.deepcopy(self.stack),
+        }
+        self.state = {
+            "version": MODULE.STATE_VERSION,
+            "agent_task": {
+                "run_id": "resolver-run",
+                "status": "preparing",
+            },
+        }
+
+    def authorize(self, pipeline=None):
+        return MODULE.authorize_resolver_native_stack(
+            self.state_path,
+            self.state,
+            self.preflight,
+            run_id="resolver-run",
+            pipeline_owner=pipeline,
+        )
+
+    def test_resolver_owns_complete_stack_authorization(self):
+        pipeline = {"run": "pipeline-run", "iteration": 1, "budget": 2}
+        request = self.authorize(pipeline)
+        self.assertEqual("pr-conflict-resolver", request["owner"]["kind"])
+        self.assertEqual([19483, 7], request["selected"])
+        self.assertEqual(pipeline, request["owner"]["pipeline"])
+        self.assertEqual(
+            MODULE.stack_snapshot_fingerprint(self.stack),
+            request["source_snapshot"],
+        )
+        recorded = MODULE.load_state(self.state_path)
+        request_file = recorded["stack_request_files"][request["request_id"]]
+        self.assertEqual(
+            request,
+            json.loads(Path(request_file).read_text(encoding="utf-8")),
+        )
+        MODULE.require_authorized_stack(
+            request,
+            self.preflight["pr"],
+            self.stack,
+        )
+
+    def test_resolver_authorizes_current_members_when_history_has_inactive_members(self):
+        historical = copy.deepcopy(self.stack)
+        historical["members"].insert(
+            0,
+            {
+                "position": -1,
+                "number": 19,
+                "head_branch": "merged",
+                "base_branch": "main",
+                "mergeable": "MERGEABLE",
+                "head_sha": "merged-head",
+                "base_sha": "merged-base",
+                "state": "MERGED",
+            },
+        )
+        self.stack["source_stack"] = historical
+        self.preflight["stack"] = copy.deepcopy(self.stack)
+
+        request = self.authorize()
+
+        self.assertEqual([19483, 7], request["selected"])
+        MODULE.require_authorized_stack(
+            request,
+            self.preflight["pr"],
+            self.preflight["stack"],
+        )
+
+    def test_owner_or_pipeline_drift_blocks_authorization(self):
+        request = self.authorize(
+            {"run": "pipeline-run", "iteration": 1, "budget": 2}
+        )
+        state = MODULE.load_state(self.state_path)
+        state["pipeline_owner"]["iteration"] = 2
+        MODULE.save_state(self.state_path, state)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "active authorized run"):
+            MODULE.require_authorized_stack(
+                request,
+                self.preflight["pr"],
+                self.stack,
+            )
+
+    def test_completed_resolver_cannot_reuse_authorization(self):
+        request = self.authorize()
+        state = MODULE.load_state(self.state_path)
+        state["agent_task"]["status"] = "completed"
+        MODULE.save_state(self.state_path, state)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "active authorized run"):
+            MODULE.require_authorized_stack(
+                request,
+                self.preflight["pr"],
+                self.stack,
+            )
+
+
 class StackPublicationTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()

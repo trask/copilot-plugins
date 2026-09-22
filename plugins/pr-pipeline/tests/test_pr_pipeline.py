@@ -3258,6 +3258,37 @@ class SweepTest(unittest.TestCase):
             self.launched,
         )
 
+    def test_nonzero_stage_exit_reports_the_recorded_task_error(self):
+        original_run = self.run_stage
+        original_inspect = self.inspect
+        task_error = (
+            "source_snapshot_mismatch: remote source changed before publication"
+        )
+
+        def fail_conflict(entry, *args, **kwargs):
+            result = original_run(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CONFLICT:
+                result["returncode"] = 1
+                self.clear_at[entry["stage"]] = None
+            return result
+
+        def inspect(entry, *args, **kwargs):
+            result = original_inspect(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CONFLICT and self.launched:
+                result["status"] = {
+                    "agent_task": {"status": "blocked", "error": task_error}
+                }
+            return result
+
+        MODULE.run_stage.side_effect = fail_conflict
+        MODULE.inspect_stage.side_effect = inspect
+
+        result = self.execute()
+        self.assertEqual("stage_execution_failed", result["reason"])
+        self.assertEqual(task_error, result["detail"])
+        self.assertEqual(task_error, result["detail"])
+        self.assertNotIn(".log", result["detail"])
+
     def test_failed_coordinator_cannot_clear_a_stage_even_with_a_current_marker(self):
         def fail_after_marker(entry, *args, **kwargs):
             result = self.run_stage(entry, *args, **kwargs)

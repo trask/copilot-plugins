@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -2230,7 +2231,7 @@ def attached_to_other_branch(repo_root: Path, head_branch: str) -> str | None:
 def checkout_pr_branch(
     repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
 ) -> bool:
-    """Put this worktree on the pull request's head commit, detaching to get there.
+    """Put this worktree on the pull request's exact head commit.
 
     Resolving a conflict commits onto the head branch through the push refspec,
     not through the branch name this worktree carries, so a detached head serves
@@ -2238,12 +2239,17 @@ def checkout_pr_branch(
     cannot: git refuses to check a branch out in two worktrees of one repository,
     and the session worktree that opened the pull request is usually still
     holding it, so attaching would fail exactly when a conflict needs resolving.
-    The branch is kept only when this worktree already holds it.
+    An exact attached or detached checkout needs no GitHub CLI checkout.
 
     Returns whether the worktree stayed attached to the head branch.
     """
     current_branch = git(repo_root, "branch", "--show-current")
     on_pr_branch = current_branch == metadata["head_branch"]
+    local_head = git(repo_root, "rev-parse", "HEAD")
+    if current_branch in {"", metadata["head_branch"]} and (
+        local_head == metadata["head_sha"]
+    ):
+        return on_pr_branch
     command = ["gh", "pr", "checkout", target["pr_url"]]
     if not on_pr_branch:
         command.append("--detach")
@@ -6218,6 +6224,26 @@ def require_stack_request_owner(request: dict[str, Any]) -> None:
             and kickoff.get("pullRequests") == request["selected"]
             and recorded.get("topology_fingerprint") == request["topology_fingerprint"]
         )
+    elif owner["kind"] == "pr-conflict-resolver":
+        task = recorded.get("agent_task") or {}
+        active = (
+            recorded.get("repository", "").lower() == request["repository"]
+            and [member["number"] for member in recorded.get("members", [])]
+            == request["selected"]
+            and recorded.get("authorized_topology")
+            == request["topology_fingerprint"]
+            and task.get("run_id") == owner["run_id"]
+            and task.get("status")
+            in {
+                "preparing",
+                "dispatching",
+                "running",
+                "verified",
+                "publishing",
+                "published_pending_verification",
+            }
+            and recorded.get("pipeline_owner") == owner.get("pipeline")
+        )
     else:
         active = (
             recorded.get("status") == "active"
@@ -6258,7 +6284,8 @@ def load_stack_request(
         or re.fullmatch(r"[^/\s]+/[^/\s]+", request["repository"]) is None
         or request["repository"] != request["repository"].lower()
         or not isinstance(owner, dict)
-        or owner.get("kind") not in {"pr-stack-pipeline", "native_stack"}
+        or owner.get("kind")
+        not in {"pr-stack-pipeline", "pr-conflict-resolver", "native_stack"}
         or not isinstance(owner.get("run_id"), str)
         or not owner["run_id"]
         or (run_id is not None and owner["run_id"] != run_id)
@@ -6302,9 +6329,17 @@ def load_stack_request(
     numbers = [member["number"] for member in members]
     if (
         len(set(numbers)) != len(numbers)
-        or selected != (
-            numbers[-len(selected):] if owner["kind"] == "pr-stack-pipeline"
-            else [member["number"] for member in members if member.get("state") == "OPEN"]
+        or selected
+        != (
+            numbers[-len(selected):]
+            if owner["kind"] == "pr-stack-pipeline"
+            else numbers
+            if owner["kind"] == "pr-conflict-resolver"
+            else [
+                member["number"]
+                for member in members
+                if member.get("state") == "OPEN"
+            ]
         )
         or (operation == "whole-stack" and selected != numbers)
         or request.get("topology_fingerprint") != stack_topology_fingerprint(source)
@@ -6322,7 +6357,13 @@ def require_authorized_stack(
     request: dict[str, Any], pr: dict[str, Any], stack: dict[str, Any] | None,
 ) -> None:
     require_stack_request_owner(request)
-    source = stack.get("source_stack", stack) if stack is not None else None
+    source = None
+    if stack is not None:
+        source = (
+            stack
+            if request["owner"]["kind"] == "pr-conflict-resolver"
+            else stack.get("source_stack", stack)
+        )
     targets = [request["fixed_pr"]]
     if (
         request["operation"] == "descendant-propagation"
@@ -6342,6 +6383,89 @@ def require_authorized_stack(
 def stack_snapshot_fingerprint(stack: dict[str, Any]) -> str:
     encoded = json.dumps(stack_snapshot_key(stack), separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def authorize_resolver_native_stack(
+    state_path: Path,
+    state: dict[str, Any],
+    preflight: dict[str, Any],
+    *,
+    run_id: str,
+    pipeline_owner: dict[str, Any] | None,
+) -> dict[str, Any]:
+    stack = preflight.get("stack")
+    pr = preflight.get("pr")
+    if (
+        preflight.get("strategy") != "native-stack"
+        or not isinstance(stack, dict)
+        or not isinstance(pr, dict)
+    ):
+        raise WorkflowError("resolver stack authorization requires native-stack preflight")
+    source = copy.deepcopy(stack)
+    selected = [member["number"] for member in source["members"]]
+    if not selected or pr.get("number") not in selected:
+        raise WorkflowError("resolver stack authorization lost the invoked pull request")
+    state_path = state_path.resolve()
+    request_path = state_path.with_name(
+        f"{state_path.stem}--{run_id}--stack-request.json"
+    )
+    require_external_path(request_path, Path(preflight["repository_root"]))
+    owner = {
+        "kind": "pr-conflict-resolver",
+        "run_id": run_id,
+        "state": str(state_path),
+        "cancellation": None,
+        "pipeline": pipeline_owner,
+    }
+    if _EXECUTION is not None:
+        cancellation = _EXECUTION.record.get("cancel")
+        if isinstance(cancellation, str) and Path(cancellation).is_absolute():
+            owner["cancellation"] = cancellation
+    request = {
+        "schema": {
+            "id": "github.copilot.stack-publication-request",
+            "version": 1,
+        },
+        "operation": "whole-stack",
+        "request_id": f"{run_id}-whole-stack",
+        "request_sha256": "",
+        "owner": owner,
+        "repository": pr["repo_name"].lower(),
+        "selected": selected,
+        "topology_fingerprint": stack_topology_fingerprint(source),
+        "source_stack": source,
+        "source_snapshot": stack_snapshot_fingerprint(source),
+        "fixed_pr": pr["number"],
+        "fixed_head": pr["head_sha"],
+        "state": str(state_path),
+    }
+    request["request_sha256"] = request_digest(request)
+    atomic_write_text(request_path, canonical_json(request) + "\n")
+    state.update(
+        {
+            "kind": "pr-conflict-resolver",
+            "run_id": run_id,
+            "repository": request["repository"],
+            "members": copy.deepcopy(source["members"]),
+            "authorized_topology": request["topology_fingerprint"],
+            "authorized_source_snapshot": request["source_snapshot"],
+            "pipeline_owner": pipeline_owner,
+            "stack_owner_pid": os.getpid(),
+            "stack_owner_recorded_at": time.time(),
+        }
+    )
+    state.setdefault("stack_requests", {})[request["request_id"]] = request[
+        "request_sha256"
+    ]
+    state.setdefault("stack_request_files", {})[request["request_id"]] = str(
+        request_path
+    )
+    save_state(state_path, state)
+    return load_stack_request(
+        str(request_path),
+        operation="whole-stack",
+        run_id=run_id,
+    )
 
 
 def propagated_stack_fingerprint(
@@ -7960,7 +8084,6 @@ def conflict_preflight(
     iteration_number: int,
     iteration_budget: int,
     model: str,
-    allow_native_stack: bool = True,
     stack_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if stack_request is not None:
@@ -8009,11 +8132,6 @@ def conflict_preflight(
             "pr": metadata,
             "strategy": None,
         }
-    if stack is not None and not allow_native_stack:
-        raise WorkflowError(
-            "native-stack publication is outside the pipeline scope; "
-            "full-stack authorization requires --whole-stack"
-        )
     if (
         stack is not None and whole_stack and requested_strategy == "auto"
         and metadata["mergeable"] == "MERGEABLE"
@@ -9472,6 +9590,16 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             "budget": iteration_budget,
         },
     }
+    pipeline_owner = (
+        {
+            "run": args.pipeline_run,
+            "iteration": args.pipeline_iteration,
+            "budget": args.pipeline_max_iterations,
+        }
+        if args.pipeline_run is not None
+        else None
+    )
+    state["pipeline_owner"] = pipeline_owner
     save_state(state_path, state)
     try:
         preflight = conflict_preflight(
@@ -9484,11 +9612,6 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             iteration_budget=iteration_budget,
             model=model,
             **({"stack_request": authorization} if authorization is not None else {}),
-            **(
-                {"allow_native_stack": args.whole_stack}
-                if getattr(args, "command", None) == "pipeline"
-                else {}
-            ),
         )
     except NativeStackNormalizationRequired as error:
         task = state["agent_task"]
@@ -9545,6 +9668,15 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             prior_managed_attempts,
         )
         return
+    if preflight["strategy"] == "native-stack" and authorization is None:
+        authorization = authorize_resolver_native_stack(
+            state_path,
+            state,
+            preflight,
+            run_id=run_id,
+            pipeline_owner=pipeline_owner,
+        )
+        preflight["stack_request"] = authorization
     request_path = state_path.with_name(
         f"{state_path.stem}--{run_id}--request.json"
     )
@@ -9567,6 +9699,8 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     state["agent_task"] = {
         "run_id": run_id,
         "invocation_id": invocation_id,
+        "run_id": run_id,
+        "invocation_id": invocation_id,
         "status": "dispatching",
         "model": model,
         "policy": CONFLICT_POLICY,
@@ -9578,6 +9712,15 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             str(request_path),
             str(prompt_path),
             str(result_path),
+            *(
+                [
+                    state["stack_request_files"][
+                        authorization["request_id"]
+                    ]
+                ]
+                if authorization is not None
+                else []
+            ),
         ],
     }
     save_state(state_path, state)
@@ -9919,7 +10062,9 @@ def revalidate_pipeline_conflict(
         raise WorkflowError("pipeline non-default base has no native stack")
     members = [metadata]
     frozen = state.get("pipeline_native_scope")
-    if binding["whole_stack"] and (stack is not None or frozen is not None):
+    if stack_request is not None and frozen is None:
+        raise WorkflowError("pipeline native stack scope changed")
+    if frozen is not None:
         if (
             stack is None
             or not isinstance(frozen, dict)
@@ -9985,7 +10130,7 @@ def revalidate_pipeline_conflict(
             or base_ref_tip(current["repo_name"], current["base_branch"]) != current["base_sha"]
         ):
             raise WorkflowError("pipeline head or live base changed during revalidation")
-    if binding["whole_stack"] and stack is not None:
+    if frozen is not None and stack is not None:
         invoked = next((member for member in members if member["number"] == metadata["number"]), None)
         if invoked is None or any(
             invoked.get(key) != metadata.get(key)
@@ -10045,13 +10190,15 @@ def command_pipeline(args: argparse.Namespace) -> int:
                 if state_path.is_file():
                     state = load_state(state_path)
                     state["pipeline"] = binding
-                    if binding["whole_stack"]:
-                        request = (
-                            (state.get("agent_task") or {}).get("preflight") or {}
-                        ).get("request") or {}
-                        state["pipeline_native_scope"] = (
-                            state.get("native_stack_clearance") or request.get("native_stack")
-                        )
+                    request = (
+                        (state.get("agent_task") or {}).get("preflight") or {}
+                    ).get("request") or {}
+                    native_scope = (
+                        state.get("native_stack_clearance")
+                        or request.get("native_stack")
+                    )
+                    if native_scope is not None:
+                        state["pipeline_native_scope"] = native_scope
                     save_state(state_path, state)
             else:
                 revalidate_pipeline_conflict(state_path, previous, binding, authorization)
@@ -10086,9 +10233,40 @@ def command_pipeline(args: argparse.Namespace) -> int:
         lock_path.unlink(missing_ok=True)
 
 
+def command_run(args: argparse.Namespace) -> None:
+    args.repo_root = None
+    args.state = None
+    args.whole_stack = False
+    args.stack_request = None
+    args.model = "sol"
+    args.max_iterations = 3
+    args.pipeline_run = None
+    args.pipeline_iteration = None
+    args.pipeline_max_iterations = None
+    args.new_invocation = False
+    args.invocation_run = None
+    args.expected_state_sha256 = None
+    command_agent_task(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run = subparsers.add_parser(
+        "run",
+        help="resolve one pull request with a fresh self-contained invocation",
+    )
+    run.add_argument(
+        "target",
+        nargs="?",
+        help=(
+            "PR URL, owner/repo#number, or a bare number; omit only from a "
+            "worktree attached to the pull request branch"
+        ),
+    )
+    run.add_argument("--strategy", choices=list(STRATEGIES), default="auto")
+    run.set_defaults(function=command_run)
 
     agent_task = subparsers.add_parser(
         "agent-task",
@@ -10180,8 +10358,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command not in {
-            "agent-task", "pipeline", "status", "cleanup", "abort", "escalate",
-            "descendant-propagate",
+            "run", "agent-task", "pipeline", "status", "cleanup", "abort",
+            "escalate", "descendant-propagate",
         }:
             raise WorkflowError(
                 f"legacy command {args.command!r} is disabled; start a fresh "
@@ -10252,11 +10430,12 @@ def _load_execution():
 
 
 def execution_main():
-    commands = ('agent-task', 'pipeline', 'descendant-propagate')
+    commands = ('run', 'agent-task', 'pipeline', 'descendant-propagate')
     arguments = sys.argv[1:]
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
         "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or os.environ.get("COPILOT_AGENT_SESSION_ID")
         or arguments and arguments[0] in {"execution-status", "execution-cancel"}
     )
     if not selected or not enabled:

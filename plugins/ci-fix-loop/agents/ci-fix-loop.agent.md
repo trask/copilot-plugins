@@ -33,9 +33,9 @@ ci_fix_loop="$copilot_home/installed-plugins/trask-plugins/ci-fix-loop/scripts/c
 python3 "$ci_fix_loop" run "<PR target>"
 ```
 
-Replace only `<PR target>`. Do not add flags or invoke another helper.
+Replace `<PR target>` in the examples. When the user explicitly requests source-only execution or forbids CI reruns, append `--github-mutation-policy source-only`. Otherwise add no flags and invoke no other helper. Source-only still permits verified fix commits but forbids workflow reruns.
 
-Use the official execution tool once with exactly `mode: async` and `detach: true`. Do not add shell backgrounding or retry a denied or failed launch. Tool acknowledgement is not workflow completion.
+Use the official execution tool once with `mode: async`. Set `detach: true` only when the user explicitly asks the run to continue after client exit; otherwise leave it false. Do not add shell backgrounding or retry a denied or failed launch. Tool acknowledgement is not workflow completion.
 
 Run it once. If observation is lost, use the same installed helper prefix with `execution-status`, synchronously and without arguments. Use `execution-cancel` the same way only when the user explicitly asks to stop the run. Never repeat the launch.
 

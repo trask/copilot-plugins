@@ -100,21 +100,25 @@ SEALED_CI_FIX_RESULT_KEYS = {
     "outcome_sha256",
     "state_identity",
 }
-SEALED_CI_FIX_MUTATION_POLICY = {
-    "id": "allow",
-    "allowed": [
+def sealed_ci_fix_mutation_policy(policy: str) -> dict[str, Any]:
+    allowed = [
         "create_managed_agent_task",
         "push_verified_fix_commits",
-        "github_workflow_rerun",
-    ],
-    "forbidden": [
+    ]
+    forbidden = [
         "github_comments",
         "github_reviews",
         "github_review_threads",
         "github_labels",
         "github_pull_request_metadata",
-    ],
-}
+    ]
+    if policy == "allow":
+        allowed.append("github_workflow_rerun")
+    elif policy == "source-only":
+        forbidden.append("github_workflow_rerun")
+    else:
+        raise WorkflowError(f"unsupported GitHub mutation policy: {policy}")
+    return {"id": policy, "allowed": allowed, "forbidden": forbidden}
 COMMAND_RESULT_SCHEMAS = {
     "stack-start": "github.copilot.ci-fix-loop-stack-start-result.v1",
     "loop": "github.copilot.ci-fix-loop-loop-result.v1",
@@ -9668,6 +9672,7 @@ def sealed_ci_fix_artifact(
     snapshot: dict[str, Any],
     invocation_id: str,
     owner_session_id: str,
+    github_mutation_policy: str = "allow",
 ) -> dict[str, Any]:
     if re.fullmatch(
         r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
@@ -9701,7 +9706,9 @@ def sealed_ci_fix_artifact(
             "model": "gpt-5.6-sol",
             "fresh_invocation": True,
             "topology": "single_pull_request",
-            "github_mutation_policy": SEALED_CI_FIX_MUTATION_POLICY,
+            "github_mutation_policy": sealed_ci_fix_mutation_policy(
+                github_mutation_policy
+            ),
             "limits": sealed_ci_fix_limits(),
             "initial_snapshot": snapshot,
             "initial_snapshot_sha256": canonical_json_sha256(snapshot),
@@ -9796,7 +9803,9 @@ def load_sealed_ci_fix_artifact(
         or request.get("fresh_invocation") is not True
         or request.get("topology") != "single_pull_request"
         or request.get("github_mutation_policy")
-        != SEALED_CI_FIX_MUTATION_POLICY
+        != sealed_ci_fix_mutation_policy(
+            str((request.get("github_mutation_policy") or {}).get("id") or "")
+        )
         or request.get("limits") != sealed_ci_fix_limits()
         or not isinstance(request.get("initial_snapshot"), dict)
         or request["initial_snapshot"].get("schema")
@@ -10013,6 +10022,7 @@ def create_sealed_ci_fix_invocation(
     repo_root: Path,
     target: dict[str, Any],
     owner_session_id: str,
+    github_mutation_policy: str = "allow",
 ) -> Path:
     invocation_id = uuid.uuid4().hex
     artifact_path = sealed_ci_fix_invocation_path(
@@ -10042,6 +10052,7 @@ def create_sealed_ci_fix_invocation(
         snapshot=snapshot,
         invocation_id=invocation_id,
         owner_session_id=owner_session_id,
+        github_mutation_policy=github_mutation_policy,
     )
     for output in artifact["outputs"].values():
         path = sealed_ci_fix_session_path(
@@ -10075,6 +10086,7 @@ def command_run(args: argparse.Namespace) -> None:
         repo_root=repo_root,
         target=target,
         owner_session_id=owner_session_id,
+        github_mutation_policy=getattr(args, "github_mutation_policy", "allow"),
     )
     consume_sealed_ci_fix_invocation(artifact_path)
 
@@ -10129,7 +10141,7 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
     stage = "identity_pass_1"
     previous_policy = ACTIVE_GITHUB_MUTATION_POLICY
     try:
-        ACTIVE_GITHUB_MUTATION_POLICY = "allow"
+        ACTIVE_GITHUB_MUTATION_POLICY = request["github_mutation_policy"]["id"]
         expected_snapshot = request["initial_snapshot"]
         for pass_number in (1, 2):
             live = sealed_ci_fix_live_snapshot(
@@ -10165,7 +10177,7 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
             "workflow": loop_result["outcome"],
             "result_file": str(result_path),
             "state": str(state_path),
-            "github_mutation_policy": "allow",
+            "github_mutation_policy": request["github_mutation_policy"]["id"],
         }
         terminal = finish_sealed_ci_fix_result(
             result_path=result_path,
@@ -10187,7 +10199,7 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
             "error": str(error),
             "result_file": str(result_path),
             "state": str(state_path),
-            "github_mutation_policy": "allow",
+            "github_mutation_policy": request["github_mutation_policy"]["id"],
         }
         finish_sealed_ci_fix_result(
             result_path=result_path,
@@ -13689,6 +13701,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_command.add_argument(
         "target",
         help="GitHub PR URL, owner/repo#number, or PR number in this repository",
+    )
+    run_command.add_argument(
+        "--github-mutation-policy",
+        choices=("allow", "source-only"),
+        default="allow",
     )
     run_command.set_defaults(function=command_run)
 

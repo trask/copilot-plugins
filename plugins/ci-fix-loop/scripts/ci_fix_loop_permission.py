@@ -57,6 +57,13 @@ def split_arguments(tool_name: str, command: str) -> list[str] | None:
 def command_allowed(tokens: list[str]) -> bool:
     if len(tokens) == 2 and tokens[0] == "run":
         return TARGET_PATTERN.fullmatch(tokens[1]) is not None
+    if (
+        len(tokens) == 4
+        and tokens[0] == "run"
+        and TARGET_PATTERN.fullmatch(tokens[1]) is not None
+        and tokens[2:] == ["--github-mutation-policy", "source-only"]
+    ):
+        return True
     return len(tokens) == 1 and tokens[0] in EXECUTION_CONTROL_COMMANDS
 
 
@@ -87,7 +94,10 @@ def admission_allowed(payload: Any) -> bool:
         return False
     launch = tokens[0] == "run"
     if launch:
-        if tool_input.get("mode") != "async" or tool_input.get("detach") is not True:
+        if (
+            tool_input.get("mode") != "async"
+            or not isinstance(tool_input.get("detach", False), bool)
+        ):
             return False
     elif (
         tool_input.get("mode", "sync") != "sync"

@@ -1141,6 +1141,17 @@ def run_pipeline(
             runs.append(record)
             report_event(report, "stage_finished", run_id=run_id, **record)
             if launched.get("returncode") != 0:
+                failure = common.stage_failure_summary(after)
+                blocker = stage_blocker(
+                    after,
+                    after_launch=True,
+                    conflict_strategy=conflict_strategy,
+                )
+                execution_detail = (
+                    failure.get("error")
+                    or (blocker[1] if blocker is not None else None)
+                    or launched.get("error")
+                )
                 return blocked_result(
                     pr=current_pr,
                     run_id=run_id,
@@ -1149,8 +1160,13 @@ def run_pipeline(
                     stage=entry["stage"],
                     reason="stage_execution_failed",
                     detail=(
-                        f"{entry['stage']} exited with code "
-                        f"{launched.get('returncode')}; see {launched.get('log_path')}"
+                        execution_detail
+                        if isinstance(execution_detail, str) and execution_detail
+                        else (
+                            f"{entry['stage']} exited with code "
+                            f"{launched.get('returncode')}; "
+                            f"see {launched.get('log_path')}"
+                        )
                     ),
                     stage_result=after,
                 )
@@ -1402,6 +1418,7 @@ def execution_main():
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
         "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or os.environ.get("COPILOT_AGENT_SESSION_ID")
         or arguments and arguments[0] in {"execution-status", "execution-cancel"}
     )
     if not selected or not enabled:

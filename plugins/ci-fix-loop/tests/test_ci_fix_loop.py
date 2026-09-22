@@ -114,10 +114,20 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                     self.payload(command, cwd=str(cwd))
                 )
             )
+            attached = self.payload(command, cwd=str(cwd))
+            attached["toolInput"]["detach"] = False
+            self.assertTrue(PERMISSION_MODULE.admission_allowed(attached))
+            source_only = self.powershell_command(
+                "run owner/repo#7 --github-mutation-policy source-only"
+            )
+            self.assertTrue(
+                PERMISSION_MODULE.admission_allowed(
+                    self.payload(source_only, cwd=str(cwd))
+                )
+            )
             for metadata in (
                 {"command": command},
                 {"command": command, "mode": "sync", "detach": True},
-                {"command": command, "mode": "async", "detach": False},
                 {"command": command, "mode": "async", "detach": "true"},
                 {"command": command, "mode": "async", "detach": True, "isBackground": True},
                 {"command": command, "mode": "async", "detach": True, "shellId": "../foreign"},

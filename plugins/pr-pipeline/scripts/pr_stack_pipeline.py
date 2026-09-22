@@ -847,7 +847,16 @@ def selection_from_stack(
         raise WorkflowError(
             f"pull request #{target['number']} is missing from its native stack"
         )
-    selected = numbers[numbers.index(target["number"]):]
+    start = stack["members"][numbers.index(target["number"])]
+    if start.get("state") != "OPEN":
+        raise WorkflowError(
+            f"pull request #{target['number']} is not an open native-stack member"
+        )
+    selected = [
+        member["number"]
+        for member in stack["members"][numbers.index(target["number"]):]
+        if member.get("state") == "OPEN"
+    ]
     source_stack, source_snapshot = stack_source_identity(stack)
     return {
         "repository": target["repo_name"],
@@ -896,7 +905,17 @@ def validate_selection(
             "detail": f"#{start} is no longer in stack {kickoff['stackNumber']}",
         }
     index = numbers.index(start)
-    suffix = stack["members"][index:]
+    suffix = [
+        member
+        for member in stack["members"][index:]
+        if member.get("state") == "OPEN"
+    ]
+    if stack["members"][index].get("state") != "OPEN":
+        return {
+            "result": "stopped",
+            "reason": "start_is_not_open",
+            "detail": f"#{start} is no longer an open native-stack member",
+        }
     if [member["number"] for member in suffix] != kickoff["pullRequests"]:
         return {
             "result": "stopped",
@@ -4376,6 +4395,7 @@ def execution_main():
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (
         "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
+        or os.environ.get("COPILOT_AGENT_SESSION_ID")
         or arguments and arguments[0] in {"execution-status", "execution-cancel"}
     )
     if not selected or not enabled:
