@@ -3463,7 +3463,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.64", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.65", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -3475,8 +3475,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             frontmatter,
         )
         self.assertIn('run "<PR target>"', invocation)
-        self.assertIn("Replace only `<PR target>`", invocation)
-        self.assertIn("Do not add flags", invocation)
+        self.assertIn("Replace `<PR target>`", invocation)
+        self.assertIn("Otherwise add no flags", invocation)
 
     def test_agent_never_retries_the_run_command(self):
         instructions = AGENT.read_text(encoding="utf-8")

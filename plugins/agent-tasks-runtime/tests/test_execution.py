@@ -240,8 +240,40 @@ class ExecutionTest(unittest.TestCase):
         result = EXECUTION.status(self.handle)
         self.assertTrue(result["terminal"])
         self.assertEqual("incomplete", result["workflow_result"]["result"])
+        presentation = result["presentation"]
+        self.assertEqual("text/markdown", presentation["media_type"])
+        self.assertIn("Result: `incomplete`", presentation["text"])
+        self.assertIn('"pending_comments": [', presentation["text"])
+        self.assertEqual(
+            hashlib.sha256(presentation["text"].encode("utf-8")).hexdigest(),
+            presentation["sha256"],
+        )
         self.assertNotIn("all_ci_passed", result)
         self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_large_terminal_presentation_is_one_verified_markdown_artifact(self):
+        context = self.context()
+        context.emit({"result": "complete", "detail": "x" * 5000})
+        result = context.finish(0)
+
+        presentation = result["presentation"]
+        self.assertEqual("text/markdown", presentation["media_type"])
+        self.assertNotIn("text", presentation)
+        path = Path(presentation["path"])
+        self.assertEqual(context.directory / "presentation.md", path)
+        self.assertEqual(
+            presentation["sha256"],
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        self.assertIn('"detail": "xxxxxxxx', path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [str(path)],
+            [
+                item["path"]
+                for item in result["retained_evidence"]
+                if item.get("path") == str(path)
+            ],
+        )
 
     def test_missing_result_is_not_success(self):
         context = self.context()

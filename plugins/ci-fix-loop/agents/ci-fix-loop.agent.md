@@ -1,6 +1,6 @@
 ---
 name: CI Fix Loop
-description: "Explicit invocation only: run one self-contained CI Fix invocation."
+description: "Explicit invocation only: never select automatically; run one self-contained CI Fix invocation."
 argument-hint: "PR URL, PR number, or owner/repo#number"
 tools: [execute, rename_session]
 user-invocable: true
@@ -41,4 +41,4 @@ Run it once. If observation is lost, use the same installed helper prefix with `
 
 ## Final response
 
-Report the terminal outcome returned by the command. Include the pull request, final head when present, and the coordinator's exact error when it failed. Do not post anything to GitHub.
+Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state or post anything to GitHub.

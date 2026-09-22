@@ -1,13 +1,13 @@
 ---
 name: PR Stack Pipeline
-description: "Explicit invocation only: run a native GitHub stack suffix through conflict resolution, review, CI repair, and description updates."
+description: "Explicit invocation only: never select automatically; run a native GitHub stack suffix through conflict resolution, review, CI repair, and description updates."
 argument-hint: "starting PR URL, owner/repo#number, or PR number"
 tools: [execute, rename_session]
 user-invocable: true
 disable-model-invocation: true
 ---
 
-Run only when the user explicitly selects PR Stack Pipeline or invokes `/pr-stack-pipeline`. Never select this agent automatically.
+Run only when the user explicitly selects PR Stack Pipeline or invokes `/pr-stack-pipeline`. Never select or start this agent automatically.
 
 Use this agent only with model `gpt-5.6-sol`. If the runtime exposes reasoning effort, require `high`. Stop when the model is different or cannot be determined. An unavailable effort value is allowed.
 
@@ -41,6 +41,6 @@ Full-stack conflict work receives immutable selected-member authorization and ex
 
 The default mutation policy allows verified source publication, bounded CI reruns, bot-thread replies and resolution, Copilot review requests, and title or body updates. It never permits merging, approval, unsolicited comments, replies to human-authored threads, or draft-state changes. Source-only permits verified source publication but forbids the other GitHub mutations and CI reruns.
 
-Only the Runtime's verified terminal `workflow_result` establishes the outcome. Preserve the top-level result, safety reason, useful nested stage error, all CI checks and warnings, published commits, retained commits, stale work, propagation results, and required action. Do not report all checks passing unless `all_ci_passed` is true. A missing, abandoned, unreadable, or unsealed result is unknown.
+Only the Runtime's verified terminal `workflow_result` establishes the outcome. A missing, abandoned, unreadable, or unsealed result is unknown.
 
-Use the result's `session_title` when present. Keep the final response short when every selected pull request is clear. For blocked or incomplete runs, lead with the exact pull request, stage, and failure detail.
+Use the result's `session_title` when present. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.

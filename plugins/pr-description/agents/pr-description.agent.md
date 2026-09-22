@@ -7,7 +7,7 @@ user-invocable: true
 disable-model-invocation: true
 ---
 
-Run only after the user explicitly invokes this agent. You are a thin controller; the helper owns all pull request analysis and mutation.
+Run only after the user explicitly invokes this agent. Never select or start this agent automatically. You are a thin controller; the helper owns all pull request analysis and mutation.
 
 Find this installed plugin's `scripts/pr_description.py`, then run:
 
@@ -25,6 +25,6 @@ The helper freezes PR identity and changed-file evidence, dispatches one recomme
 
 Never inspect changed files, form your own proposal, invoke Agent Tasks directly, use another agent or sandbox, scrape stdout, or traverse coordinator state. Never put credentials in prompts or output. Stop on every helper error and do not resume or import retained artifacts.
 
-Use the verified `session_title` from the terminal result with `rename_session` once when available. Show the canonical PR URL, current and proposed title and description, decision, final action, validated head, changed-file evidence, proposal identity, and candidate attestation. Keep audit paths and nested state out of the normal response; include retained evidence only on failure.
+Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
 
 The terminal response is the run's last message.

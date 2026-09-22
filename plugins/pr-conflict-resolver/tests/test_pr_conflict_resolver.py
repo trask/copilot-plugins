@@ -937,7 +937,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "7ef0afbda783e506b9c56141c5bb23ace7beb086d0ad04df935684beaca053b8",
+            "383e626298ce822c829ed4fded9d5e155dbcd6b73c15e9799c35bc31ba4afd50",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -1887,10 +1887,10 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual("conflict_preflight_interrupted", task["error"]["code"])
 
     def test_agent_contract_documents_invocation_local_budget(self):
-        self.assertIn("invocation-local state", self.instructions)
-        self.assertIn("`--max-iterations <count>`", self.instructions)
-        self.assertIn("prior results", self.instructions)
-        self.assertIn("never seed execution", self.instructions)
+        self.assertIn("three-attempt limit", self.instructions)
+        self.assertIn("Stale work remains retained evidence", self.instructions)
+        self.assertIn("consumes its attempt", self.instructions)
+        self.assertIn("never adopted into a new run", self.instructions)
 
 
     def test_success_result_requires_exact_request_and_task_identity(self):
@@ -2080,29 +2080,22 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         )
 
     def test_agent_contract_forbids_local_and_replacement_execution(self):
-        self.assertIn("thin control-plane coordinator", self.instructions)
-        self.assertIn("Never import managed helper internals", self.instructions)
-        self.assertIn("Never call Agent Tasks APIs directly", self.instructions)
-        self.assertIn("Never scrape helper stdout", self.instructions)
-        self.assertIn(
-            "There is no resume, prepared-task adoption, owner replacement, or "
-            "malformed-result replacement route",
-            self.instructions,
-        )
-        self.assertIn(
-            "Only the current `agent-task`, `pipeline`, `status`, `abort`, "
-            "`escalate`, `cleanup`, and controller-owned descendant propagation "
-            "routes are available",
-            self.instructions,
-        )
-        self.assertIn("lost publication response never invokes cloud", self.instructions)
+        self.assertIn("Run the bundled helper once", self.instructions)
+        self.assertIn("sends semantic conflict work to the pinned hosted worker", self.instructions)
+        self.assertIn("never adopted into a new run", self.instructions)
+        self.assertIn("must not merge or approve pull requests", self.instructions)
+        self.assertIn("local conflict-resolution fallback", self.instructions)
+        self.assertNotIn("--execution-handle", self.instructions)
+        self.assertNotIn("--repo-root", self.instructions)
+        self.assertNotIn("--state", self.instructions)
 
     def test_agent_contract_pins_all_three_strategies_and_artifact_separation(self):
-        self.assertIn("<merge|rebase|native-stack>", self.instructions)
-        self.assertIn("[frozen head, frozen base]", self.instructions)
-        self.assertIn("exact `--force-with-lease`", self.instructions)
+        self.assertIn("`--strategy merge`", self.instructions)
+        self.assertIn("`--strategy rebase`", self.instructions)
+        self.assertIn("complete native stack", self.instructions)
+        self.assertIn("exact branch leases", self.instructions)
         self.assertIn("one atomic push", self.instructions)
-        self.assertIn("Artifact commits never reach user branches", self.instructions)
+        self.assertIn("publishes only the accepted code commits", self.instructions)
 
     def test_every_production_subprocess_path_uses_windows_no_window(self):
         script = SCRIPT.read_text(encoding="utf-8")

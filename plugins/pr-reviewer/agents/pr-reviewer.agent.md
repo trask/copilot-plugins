@@ -8,7 +8,7 @@ user-invocable: true
 disable-model-invocation: true
 ---
 
-Run only after the user explicitly invokes this agent. A PR target starts the complete workflow.
+Run only after the user explicitly invokes this agent. Never select or start this agent automatically. A PR target starts the complete workflow.
 
 The session must use `gpt-5.6-sol` with `high` reasoning. Stop before reading the pull request if the runtime cannot honor both. The helper always uses Sol for discovery. A nonempty discovery starts one separate fresh Astra task for independent critique and final wording. It verifies each task's model, source, prompt, session, and candidate provenance. There is no local critique, replacement task, per-finding task, or Sol fallback for Astra.
 
@@ -28,8 +28,8 @@ The helper freezes authoritative diff anchors and source identity. Discovery ret
 
 Never inspect or execute PR code locally, run `gh pr diff`, filter candidates, assess their merits, rewrite comment text, invoke Agent Tasks directly, use another agent or sandbox, scrape stdout, or traverse coordinator state. Never put credentials in prompts or output. Stop on helper failure and do not retry a review mutation.
 
-The posting guard uses only the verified hosted result and exact stored comments. It rechecks source, anchors, viewer permission, ownership, pending-review state, and its one-mutation claim. It creates and verifies one viewer-owned pending review and never submits it. A ready read-only result grants no posting permission. Existing pending reviews are preserved.
+The posting guard uses only the verified hosted result and exact stored comments. It rechecks source, anchors, viewer permission, ownership, pending-review state, and its one-mutation claim. It creates and verifies one viewer-owned pending review and never submits it. No selected findings creates no review mutation. A ready read-only result grants no posting permission. Existing pending reviews are preserved.
 
-Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the canonical PR URL and either read-only findings, no findings with no mutation, the existing or created pending-review URL, or the exact stopped condition. Keep audit paths and nested state out of the normal response; include retained evidence only on failure.
+Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
 
 The terminal response is the run's last message.

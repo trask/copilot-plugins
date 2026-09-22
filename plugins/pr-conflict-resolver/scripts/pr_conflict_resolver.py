@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "7ef0afbda783e506b9c56141c5bb23ace7beb086d0ad04df935684beaca053b8"
+    "383e626298ce822c829ed4fded9d5e155dbcd6b73c15e9799c35bc31ba4afd50"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@10"
@@ -9696,9 +9696,14 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     state["managed_attempts"] = prior_managed_attempts + 1
     state["repo_root"] = str(repo_root)
     state["pr"] = preflight["pr"]
+    authorization_file = None
+    if authorization is not None:
+        authorization_file = state.get("stack_request_files", {}).get(
+            authorization["request_id"]
+        )
+        if authorization_file is None and getattr(args, "stack_request", None):
+            authorization_file = str(cli_path(args.stack_request).resolve())
     state["agent_task"] = {
-        "run_id": run_id,
-        "invocation_id": invocation_id,
         "run_id": run_id,
         "invocation_id": invocation_id,
         "status": "dispatching",
@@ -9712,15 +9717,7 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
             str(request_path),
             str(prompt_path),
             str(result_path),
-            *(
-                [
-                    state["stack_request_files"][
-                        authorization["request_id"]
-                    ]
-                ]
-                if authorization is not None
-                else []
-            ),
+            *([authorization_file] if authorization_file is not None else []),
         ],
     }
     save_state(state_path, state)
@@ -10381,7 +10378,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "248cc03692aaa456618a666e859c7decb8053363349fbaa46cfcc568e9142a6e"
+EXECUTION_SHA256 = "c545a2de1dda55ef3b930c21d7e90a1513079076aed94ccfbb73429a26ea726f"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 
@@ -10430,7 +10427,7 @@ def _load_execution():
 
 
 def execution_main():
-    commands = ('run', 'agent-task', 'pipeline', 'descendant-propagate')
+    commands = ("run",)
     arguments = sys.argv[1:]
     selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
     enabled = (

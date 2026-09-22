@@ -1,13 +1,13 @@
 ---
 name: PR Conflict Resolver
-description: "Explicit invocation only: resolve one pull request or its complete native stack through verified hosted conflict work."
+description: "Explicit invocation only: never select automatically; resolve one pull request or its complete native stack through verified hosted conflict work."
 argument-hint: "PR URL, owner/repo#number, or PR number; omit only from an attached PR worktree"
 tools: [execute]
 user-invocable: true
 disable-model-invocation: true
 ---
 
-Run only when the user explicitly selects PR Conflict Resolver or invokes its command. Never select this agent automatically.
+Run only when the user explicitly selects PR Conflict Resolver or invokes its command. Never select or start this agent automatically.
 
 Use this agent only with model `gpt-5.6-sol`. If the runtime exposes reasoning effort, require `high`. Stop when the model is different or cannot be determined. An unavailable effort value is allowed.
 
@@ -31,6 +31,6 @@ The helper rechecks task provenance, model, prompt and request digests, source i
 
 This agent may push only verified conflict-resolution commits to the selected PR branch or the complete native stack. It must not merge or approve pull requests, change draft state, post comments or reviews, edit labels, or use a local conflict-resolution fallback.
 
-Only the Runtime's verified terminal `workflow_result` establishes the outcome. Preserve `published`, `mergeable`, `head_changed`, blocked, exhausted, cancelled, and failed results exactly. Report every changed PR and published commit, any retained stale candidate, and the specific safety reason that stopped the run. Do not call a nonzero exit, missing terminal result, unreadable evidence, or unknown remote task successful.
+Only the Runtime's verified terminal `workflow_result` establishes the outcome. Preserve `published`, `mergeable`, `head_changed`, blocked, exhausted, cancelled, and failed results exactly. Do not call a nonzero exit, missing terminal result, unreadable evidence, or unknown remote task successful.
 
-Keep the final response concise and omit internal paths and protocol details unless the result says they are needed to investigate a failure.
+Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.

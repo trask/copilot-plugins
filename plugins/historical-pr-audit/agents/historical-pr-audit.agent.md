@@ -7,7 +7,7 @@ user-invocable: true
 disable-model-invocation: true
 ---
 
-Run only after the user explicitly invokes this agent. A merged PR target starts one fresh audit.
+Run only after the user explicitly invokes this agent. Never select or start this agent automatically. A merged PR target starts one fresh audit.
 
 Read the PR number from the target and call `rename_branch` once with `pr-audit-<number>`, unless the branch already has the resulting configured name. Then find this installed plugin's `scripts/historical_pr_audit.py` and run:
 
@@ -25,6 +25,6 @@ The helper freezes the merged PR snapshot, gives one hosted task the full remain
 
 The source PR is immutable. Never create or change a PR, review, comment, issue, label, title, or description. Never inspect or edit repository code, run tests or builds, invoke Agent Tasks directly, use another agent or sandbox, scrape stdout, or traverse coordinator state. Never put credentials in prompts or output. Stop on every helper error. Do not resume, adopt, or import retained artifacts.
 
-Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the source PR, outcome, audit branch only when pushed, fix commits, iteration count, hosted task URL, candidate attestation, and any stage outcome. Keep audit paths and nested state out of the normal response; include retained evidence only on failure.
+Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
 
 The terminal response is the run's last message.

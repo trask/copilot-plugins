@@ -22,6 +22,7 @@ PARENT_ENV = "TRASK_EXECUTION_PARENT"
 SESSION_ENV = "COPILOT_AGENT_SESSION_ID"
 IS_WINDOWS = os.name == "nt"
 FORCED_DRAINAGE_ERROR = "owned Windows job required forced drainage"
+PRESENTATION_INLINE_MAX_BYTES = 4096
 
 
 class ExecutionError(RuntimeError):
@@ -189,6 +190,48 @@ def write(path: Path, value: dict[str, Any], *, exclusive: bool = False) -> None
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def render_presentation(result: dict[str, Any]) -> str:
+    title = result.get("session_title")
+    if not isinstance(title, str) or not title.strip():
+        title = "Workflow result"
+    title = " ".join(title.split())[:240]
+    outcome = str(result.get("result", result.get("status", "unknown"))).replace(
+        "`", "'"
+    )
+    details = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+    return "\n".join(
+        [
+            f"# {title}",
+            "",
+            f"Result: `{outcome}`",
+            "",
+            "Verified result:",
+            "",
+            *(f"    {line}" for line in details.splitlines()),
+            "",
+        ]
+    )
+
+
+def write_presentation(context: "Execution") -> dict[str, Any] | None:
+    if context.root != context.handle or not isinstance(context.last_result, dict):
+        return None
+    text = render_presentation(context.last_result)
+    data = text.encode("utf-8")
+    presentation = {
+        "media_type": "text/markdown",
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if len(data) <= PRESENTATION_INLINE_MAX_BYTES:
+        return {**presentation, "text": text}
+    path = context.directory / "presentation.md"
+    with path.open("xb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return {**presentation, "path": str(path)}
 
 
 @contextmanager
@@ -1422,6 +1465,20 @@ class Execution:
 
         retained = distinct_evidence(retained, "path", "retained evidence")
         remote_tasks = distinct_evidence(remote_tasks, "evidence", "dispatch observations")
+        presentation = None
+        try:
+            presentation = write_presentation(self)
+            if presentation is not None and "path" in presentation:
+                retained.append(
+                    {
+                        "path": presentation["path"],
+                        "sha256": presentation["sha256"],
+                    }
+                )
+        except OSError as failure:
+            evidence_errors.append(
+                f"terminal presentation could not be written: {failure}"
+            )
         if evidence_errors or forced_cleanup_errors:
             code = 1
         outcome = (self.last_result or {}).get("result")
@@ -1444,6 +1501,7 @@ class Execution:
             "remote_status": "see_workflow_result" if confirmed else "unconfirmed",
             "remote_work_may_continue": not confirmed,
             "workflow_result": self.last_result,
+            "presentation": presentation,
             "domain_states": state_paths,
             "child_records": [str(source) for source in child_records],
             "launch_failures": self.launch_failures,

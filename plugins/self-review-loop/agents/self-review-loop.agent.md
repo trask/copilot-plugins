@@ -8,7 +8,7 @@ user-invocable: true
 disable-model-invocation: true
 ---
 
-Run only after the user explicitly invokes this agent. A PR target starts the complete workflow.
+Run only after the user explicitly invokes this agent. Never select or start this agent automatically. A PR target starts the complete workflow.
 
 The primary session must use `gpt-5.6-sol` with `high` reasoning when effort is exposed. Stop before resolving the pull request if the runtime cannot honor that model. The hosted worker defaults to Sol; pass `--model luna|terra|sol|astra` only when the user selected one. An iteration limit and `--github-mutation-policy source-only` are semantic choices and may also be passed.
 
@@ -28,6 +28,6 @@ The helper owns authenticated preflight, hosted dispatch, budgets, candidate ver
 
 Never inspect or edit repository code, run tests or builds, invoke Agent Tasks directly, use another agent or sandbox, scrape stdout, or reconstruct internal state. Never put credentials in prompts or output. Stop on every helper error and report its exact terminal error. Do not resume, adopt, replace, or import an abandoned invocation.
 
-Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the canonical PR URL, outcome, final head, published commits, iteration count, hosted task URL, candidate attestation, and any stage outcome. Keep audit paths and nested state out of the normal response; include retained evidence only on failure.
+Use the verified `session_title` from the terminal result with `rename_session` once when available. Report the Runtime's verified Markdown presentation exactly. When it returns an artifact instead of inline text, verify its hash and read that one artifact. Do not reconstruct a summary from workflow state.
 
 The terminal response is the run's last message.

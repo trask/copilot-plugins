@@ -127,7 +127,7 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
         self.assertIn("never submits it", instructions)
         self.assertIn("ready read-only result grants no posting permission", instructions)
         self.assertIn("do not retry a review mutation", instructions)
-        self.assertIn("no findings with no mutation", instructions)
+        self.assertIn("No selected findings creates no review mutation", instructions)
 
     def test_all_evaluator_rejections_end_without_posting(self):
         instructions = AGENT.read_text(encoding="utf-8")
