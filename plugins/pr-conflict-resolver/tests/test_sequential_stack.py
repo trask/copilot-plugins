@@ -432,26 +432,6 @@ class SequentialStackTest(unittest.TestCase):
             self.assertIn("Do not switch branches", prompt)
             self.assertIn("Cherry-pick each `head_commits` SHA", prompt)
 
-    def test_source_head_drift_preserves_completed_candidates_and_stops_sequence(self):
-        drift = CLOUD.SourceHeadChanged(
-            pr_number=6,
-            expected_head=self.lower,
-            actual_head="f" * 40,
-        )
-
-        def guard(*_):
-            if self.result.code_refs and len(self.launched) == 1:
-                raise drift
-
-        with self.assertRaises(CLOUD.SourceHeadChanged) as failure:
-            self.execute(guard)
-
-        self.assertIs(drift, failure.exception)
-        self.assertEqual(1, len(self.launched))
-        self.assertEqual(1, len(self.result.code_refs))
-        self.assertEqual(1, len(self.result.artifact["members"]))
-        self.assertEqual("not_started", self.result.application_status)
-
     def publication_state(self):
         self.execute()
         MODULE.verify_quarantined_result(

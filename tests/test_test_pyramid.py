@@ -96,10 +96,45 @@ FAIL_CLOSED_COVERAGE = {
         "DetachedCandidateCheckoutTest",
         "test_detached_candidate_rejects_head_drift",
     ),
+    "runtime detached checkout initial mismatch": (
+        "plugins/agent-tasks-runtime/tests/test_cloud_task.py",
+        "DetachedCandidateCheckoutTest",
+        "test_detached_candidate_cannot_align_a_different_head",
+    ),
+    "runtime detached checkout preconditions": (
+        "plugins/agent-tasks-runtime/tests/test_cloud_task.py",
+        "DetachedCandidateCheckoutTest",
+        "test_detached_candidate_rejects_in_progress_operations",
+    ),
+    "runtime detached checkout cleanliness": (
+        "plugins/agent-tasks-runtime/tests/test_cloud_task.py",
+        "DetachedCandidateCheckoutTest",
+        "test_detached_candidate_rejects_dirty_worktrees",
+    ),
+    "runtime detached checkout branch drift": (
+        "plugins/agent-tasks-runtime/tests/test_cloud_task.py",
+        "DetachedCandidateCheckoutTest",
+        "test_detached_candidate_rejects_branch_drift",
+    ),
     "test suppression detection": (
         "plugins/ci-fix-loop/tests/test_ci_fix_loop.py",
         "CommitSuppressionTest",
         "test_reports_a_skip_added_to_a_test_that_was_running",
+    ),
+    "deleted test detection": (
+        "plugins/ci-fix-loop/tests/test_ci_fix_loop.py",
+        "CommitSuppressionTest",
+        "test_reports_a_deleted_test_file",
+    ),
+    "born skipped test detection": (
+        "plugins/ci-fix-loop/tests/test_ci_fix_loop.py",
+        "CommitSuppressionTest",
+        "test_a_new_test_file_that_is_born_skipped_is_reported",
+    ),
+    "native ancestry process launch": (
+        "plugins/pr-conflict-resolver/tests/test_native_stack_noop.py",
+        "NativeStackNoopTest",
+        "test_noop_ancestry_subprocess_uses_windows_launch_helper",
     ),
     "hosted review task envelope drift": (
         "plugins/copilot-review-loop/tests/test_hosted_review_candidate.py",
@@ -158,26 +193,12 @@ class TestPyramidContractTest(unittest.TestCase):
         for branch, (path, class_name, method) in FAIL_CLOSED_COVERAGE.items():
             with self.subTest(branch=branch):
                 self.assertIn(method, self.methods(path, class_name))
-                nodeid = f"{path}::{class_name}::{method}"
-                self.assertNotEqual(
-                    "legacy_e2e",
-                    conftest.pyramid_marker(nodeid),
-                    f"{branch} is excluded from required validation",
-                )
 
-    def test_each_legacy_family_retains_a_fast_git_sentinel(self):
-        for prefix in conftest.LEGACY_E2E_PREFIXES:
-            if "HostedDispatcherOwnershipTest" in prefix:
-                continue
-            with self.subTest(prefix=prefix):
-                self.assertTrue(
-                    any(nodeid.startswith(prefix) for nodeid in conftest.GIT_E2E_SENTINELS)
-                )
-
-    def test_windows_kernel_coverage_has_one_owner(self):
+    def test_windows_kernel_coverage_is_explicit(self):
         self.assertEqual(
             (
                 "plugins/agent-tasks-runtime/tests/test_execution.py::WindowsRealProcessTest::",
+                "plugins/copilot-review-loop/tests/test_hosted_review_candidate.py::HostedDispatcherOwnershipTest::test_native_windows_timeout_reaps_owned_descendant",
             ),
             conftest.WINDOWS_E2E_PREFIXES,
         )

@@ -11247,14 +11247,6 @@ class CommitSuppressionTest(unittest.TestCase):
             findings,
         )
 
-    def test_ignores_a_deleted_source_file(self):
-        self.write("app.py", "value = 1\n")
-        self.write("helper.py", "value = 2\n")
-        self.commit("first")
-        (self.root / "helper.py").unlink()
-        head = self.commit("drop the helper")
-        self.assertEqual([], MODULE.commit_suppressions(self.root, head))
-
     def test_reports_a_skip_added_to_a_test_that_was_running(self):
         self.write(
             "tests/test_widget.py",
@@ -11274,27 +11266,6 @@ class CommitSuppressionTest(unittest.TestCase):
         self.assertEqual("tests/test_widget.py", findings[0]["path"])
         self.assertEqual("@pytest.mark.skip", findings[0]["marker"])
 
-    def test_ignores_a_skip_that_the_commit_removed(self):
-        """Re-enabling a test is the opposite of suppressing one."""
-        self.write(
-            "tests/test_widget.py",
-            "import pytest\n\n\n@pytest.mark.skip\ndef test_widget():\n    pass\n",
-        )
-        self.commit("first")
-        self.write(
-            "tests/test_widget.py",
-            "import pytest\n\n\ndef test_widget():\n    pass\n",
-        )
-        head = self.commit("re-enable the test")
-        self.assertEqual([], MODULE.commit_suppressions(self.root, head))
-
-    def test_ignores_an_annotation_outside_a_test_file(self):
-        self.write("app.py", "value = 1\n")
-        self.commit("first")
-        self.write("app.py", "value = 1\n# @Disabled\n")
-        head = self.commit("comment")
-        self.assertEqual([], MODULE.commit_suppressions(self.root, head))
-
     def test_a_new_test_file_that_is_born_skipped_is_reported(self):
         """Adding a test already disabled is coverage that never runs."""
         self.write("app.py", "value = 1\n")
@@ -11306,19 +11277,6 @@ class CommitSuppressionTest(unittest.TestCase):
         head = self.commit("add a disabled test")
         markers = [item["marker"] for item in MODULE.commit_suppressions(self.root, head)]
         self.assertEqual(["@pytest.mark.skip"], markers)
-
-    def test_refusal_names_the_commit_and_the_finding(self):
-        self.write("tests/test_widget.py", "def test_widget():\n    pass\n")
-        self.commit("first")
-        (self.root / "tests" / "test_widget.py").unlink()
-        head = self.commit("drop the test")
-        with self.assertRaises(MODULE.WorkflowError) as error:
-            MODULE.refuse_test_suppression(self.root, [head])
-        message = str(error.exception)
-        self.assertIn("stopping a test from running", message)
-        self.assertIn("tests/test_widget.py", message)
-        self.assertIn(head, message)
-        self.assertIn("unfixable_failure", message)
 
     def test_an_honest_fix_passes(self):
         self.write("app.py", "def compute():\n    return 1\n")

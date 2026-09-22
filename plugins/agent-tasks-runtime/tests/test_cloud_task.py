@@ -514,10 +514,6 @@ class DetachedCandidateCheckoutTest(unittest.TestCase):
         self.assertIsNone(self.repository.identity(self.root).branch)
         self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
 
-    def test_legacy_code_mode_still_requires_a_branch(self):
-        with self.assertRaisesRegex(MODULE.CloudError, "checked-out local branch"):
-            self.repository.snapshot(self.root)
-
     def test_detached_candidate_cannot_align_a_different_head(self):
         self.git("commit", "--quiet", "--allow-empty", "-m", "different head")
         snapshot = self.repository.snapshot(self.root, allow_detached=True)

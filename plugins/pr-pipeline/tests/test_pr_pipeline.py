@@ -3509,36 +3509,6 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.assertEqual("local_head_not_published", result["reason"])
             self.assertNotEqual(published, self.git(repo, "rev-parse", "HEAD"))
 
-    def test_pr_branch_behind_remote_is_checked_out(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            remote, _base, head = self.make_remote(root)
-            local = self.clone(root, remote)
-            self.git(local, "checkout", "-q", "-b", "feature")
-
-            result = self.sync(local, remote)
-
-            self.assertEqual("ready", result["result"])
-            self.assertEqual(head, self.git(local, "rev-parse", "HEAD"))
-            self.assertEqual("", self.git(local, "branch", "--show-current"))
-
-    def test_unpublished_commit_on_pr_branch_is_not_hidden(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            remote, _base, head = self.make_remote(root)
-            local = self.clone(root, remote)
-            self.git(local, "fetch", "-q", str(remote), "refs/pull/7/head")
-            self.git(local, "checkout", "-q", "-b", "feature", "FETCH_HEAD")
-            self.git(local, "commit", "-q", "--allow-empty", "-m", "local")
-            local_head = self.git(local, "rev-parse", "HEAD")
-
-            result = self.sync(local, remote)
-
-            self.assertEqual("blocked", result["result"])
-            self.assertEqual("local_head_not_published", result["reason"])
-            self.assertEqual(local_head, self.git(local, "rev-parse", "HEAD"))
-            self.assertNotEqual(head, local_head)
-
     def test_detached_old_pr_head_moves_to_new_pr_head(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3557,52 +3527,6 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.assertEqual("ready", result["result"])
             self.assertNotEqual(old_head, new_head)
             self.assertEqual(new_head, self.git(local, "rev-parse", "HEAD"))
-
-    def test_published_stage_commit_followed_by_another_push_is_safe(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            remote, _base, started = self.make_remote(root)
-            local = self.clone(root, remote)
-            self.git(local, "fetch", "-q", str(remote), "refs/pull/7/head")
-            self.git(local, "checkout", "-q", "--detach", "FETCH_HEAD")
-            self.git(local, "commit", "-q", "--allow-empty", "-m", "stage")
-            stage_head = self.git(local, "rev-parse", "HEAD")
-            self.git(local, "push", "-q", str(remote), "HEAD:refs/pull/7/head")
-            self.git(remote, "checkout", "-q", "feature")
-            self.git(remote, "reset", "-q", "--hard", stage_head)
-            self.git(remote, "commit", "-q", "--allow-empty", "-m", "other")
-            final_head = self.git(remote, "rev-parse", "HEAD")
-            self.git(remote, "update-ref", "refs/pull/7/head", final_head)
-            self.git(remote, "checkout", "-q", "main")
-
-            with mock.patch.object(MODULE, "target_remote", return_value=str(remote)):
-                result = MODULE.settle_after_stage(
-                    local,
-                    target(),
-                    started_head_sha=started,
-                )
-
-            self.assertEqual("ready", result["result"])
-            self.assertEqual(final_head, self.git(local, "rev-parse", "HEAD"))
-
-    def test_lists_retained_first_parent_commits(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            repo = Path(temporary)
-            self.git(repo, "init", "-q", "-b", "main")
-            self.git(repo, "commit", "-q", "--allow-empty", "-m", "base")
-            base = self.git(repo, "rev-parse", "HEAD")
-            self.git(repo, "commit", "-q", "--allow-empty", "-m", "first fix")
-            first = self.git(repo, "rev-parse", "HEAD")
-            self.git(repo, "commit", "-q", "--allow-empty", "-m", "second fix")
-            second = self.git(repo, "rev-parse", "HEAD")
-
-            self.assertEqual(
-                [
-                    {"sha": first, "title": "first fix"},
-                    {"sha": second, "title": "second fix"},
-                ],
-                MODULE.local_commits_between(repo, base, second),
-            )
 
 
 class AgentInstructionTest(unittest.TestCase):

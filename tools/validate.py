@@ -55,7 +55,7 @@ def main() -> int:
             f"--dist={distribution}",
             "--tb=short",
             "-m",
-            "not legacy_e2e and not windows_e2e",
+            "not windows_e2e",
         )
         if result or os.name != "nt":
             return result
@@ -66,16 +66,7 @@ def main() -> int:
             "-m",
             "windows_e2e",
         )
-    if mode == "legacy":
-        return run_pytest(
-            "-n",
-            "4",
-            "--dist=load",
-            "--tb=short",
-            "-m",
-            "legacy_e2e",
-        )
-    print("usage: python tools/validate.py [fast|legacy|full]", file=sys.stderr)
+    print("usage: python tools/validate.py [fast|full]", file=sys.stderr)
     return 2
 
 

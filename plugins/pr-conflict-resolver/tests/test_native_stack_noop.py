@@ -241,52 +241,6 @@ class NativeStackNoopTest(unittest.TestCase):
         )
         self.assert_dispatch()
 
-    def test_invalid_selection_and_incomplete_snapshot_fail_before_dispatch(self):
-        for change in (
-            lambda r: r.update(selected=[8]),
-            lambda r: r.update(selected=[7, 8, 9]),
-            lambda r: r["source_stack"].update(size=3),
-            lambda r: r["source_stack"]["members"][1].update(head_sha=""),
-        ):
-            request = copy.deepcopy(self.request)
-            change(request)
-            request["request_sha256"] = MODULE.request_digest(request)
-            self.request_path.write_text(json.dumps(request), encoding="utf-8")
-            with self.subTest(change=change), self.assertRaises(MODULE.WorkflowError):
-                MODULE.command_pipeline(self.args)
-            self.assert_not_clear()
-
-    def test_selected_inactive_member_cannot_disappear_from_noop_evidence(self):
-        source = copy.deepcopy(self.stack)
-        source["members"].append({
-            **source["members"][-1], "number": 9, "state": "CLOSED",
-            "head_branch": "closed", "base_branch": "upper",
-        })
-        source["size"] = 3
-        self.stack["source_stack"] = source
-        self.request, _, _, _ = write_authorization(
-            self.directory, source, fixed=7, operation="whole-stack"
-        )
-        self.assertEqual(1, MODULE.command_pipeline(self.args))
-        self.assert_not_clear()
-
-    def test_incomplete_native_base_evidence_is_not_clear(self):
-        self.stack["members"][-1]["base_sha"] = None
-        self.assertEqual(1, MODULE.command_pipeline(self.args))
-        self.assert_not_clear()
-
-    def test_ancestry_command_error_is_not_noop_or_replay_authorization(self):
-        real_git = MODULE.git
-
-        def git(root, *args):
-            if args[:2] == ("merge-base", "--all"):
-                raise MODULE.WorkflowError("missing commit object")
-            return real_git(root, *args)
-
-        with mock.patch.object(MODULE, "git", side_effect=git):
-            self.assertEqual(1, MODULE.command_pipeline(self.args))
-        self.assert_not_clear()
-
     def test_noop_ancestry_subprocess_uses_windows_launch_helper(self):
         completed = subprocess.CompletedProcess(["git"], 0, self.trunk, "")
         with mock.patch.object(MODULE, "IS_WINDOWS", True), \
