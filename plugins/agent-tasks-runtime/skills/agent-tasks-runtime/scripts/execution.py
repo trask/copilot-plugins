@@ -805,11 +805,35 @@ class OwnedProcess:
         return self.terminate_tree()
 
     def verify_execution(self, code: int) -> None:
-        if code == 0 and self.launch_receipt.get("requires_execution_result"):
-            result = status(Path(self.launch_receipt["handle"]))
+        if self.launch_receipt.get("requires_execution_result"):
+            handle = Path(self.launch_receipt["handle"])
+            if not handle.is_file():
+                receipt = read(self.record)
+                failure = {
+                    "result": "execution_bootstrap_failed",
+                    "child_record": str(self.record),
+                    "handle": str(handle),
+                    "exit_code": code,
+                    "command_sha256": receipt.get("command_sha256"),
+                    "captured_output": receipt.get("captured_output", {}),
+                }
+                write(self.record, {
+                    **receipt,
+                    "lifecycle": "bootstrap_failed",
+                    "bootstrap_failed_at": time.time(),
+                    "bootstrap_failure": failure,
+                })
+                self.launch_receipt = read(self.record)
+                raise ExecutionError(
+                    "required child execution handle was not created"
+                )
+            result = status(handle)
             if (
                 result.get("terminal") is not True or result.get("exit_code") != code
-                or result.get("local_status") != "finished"
+                or (
+                    code == 0
+                    and result.get("local_status") != "finished"
+                )
                 or result.get("local_children_drained") is not True
                 or result.get("run_id") != self.launch_receipt["run_id"]
                 or not same_process(result.get("owner", {}), self.launch_receipt["process_identity"])
@@ -1199,6 +1223,18 @@ class Execution:
                     stream = (self.directory / f"child-{sequence}-{name}.log").open("wb")
                     streams.append(stream)
                     options[name] = stream
+            captured_output = {
+                name: str(path)
+                for name in ("stdout", "stderr")
+                if isinstance(
+                    path := getattr(options.get(name), "name", None),
+                    str,
+                )
+            }
+            write(record, {
+                **read(record),
+                "captured_output": captured_output,
+            })
         except BaseException as failure:
             for stream in streams:
                 stream.close()
@@ -1470,6 +1506,7 @@ class Execution:
         retained = []
         remote_tasks = []
         evidence_errors = list(child_errors)
+        bootstrap_failures = []
         records = [self.record]
         child_executions = {}
         child_remote_uncertain = False
@@ -1519,6 +1556,55 @@ class Execution:
             try:
                 record = read(source)
                 lifecycle = record.get("lifecycle")
+                if lifecycle == "bootstrap_failed":
+                    if (
+                        record.get("schema") != SCHEMA
+                        or record.get("root") != str(self.root)
+                        or record.get("run_id") != self.run_id
+                        or not isinstance(record.get("handle"), str)
+                        or not isinstance(record.get("command_sha256"), str)
+                        or not isinstance(record.get("bootstrap_failure"), dict)
+                    ):
+                        raise ExecutionError(
+                            "failed child bootstrap receipt belongs to a different execution"
+                        )
+                    retained.append({
+                        "path": str(source),
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    })
+                    for output in record.get("captured_output", {}).values():
+                        output_path = Path(output)
+                        if output_path.is_file():
+                            retained.append({
+                                "path": str(output_path),
+                                "sha256": hashlib.sha256(
+                                    output_path.read_bytes()
+                                ).hexdigest(),
+                            })
+                    bootstrap_failures.append(record["bootstrap_failure"])
+                    evidence_errors.append(
+                        f"required child execution bootstrap failed: {source}"
+                    )
+                    if record.get("local_drained") is not True:
+                        evidence_errors.append(
+                            f"failed child bootstrap did not drain locally: {source}"
+                        )
+                    result_file = record.get("result_file")
+                    if isinstance(result_file, str):
+                        dispatch = Path(result_file + ".dispatch.json")
+                        if dispatch.is_file():
+                            observation = read(dispatch)
+                            retained.append({
+                                "path": str(dispatch),
+                                "sha256": hashlib.sha256(
+                                    dispatch.read_bytes()
+                                ).hexdigest(),
+                            })
+                            remote_tasks.append({
+                                **observation,
+                                "evidence": str(dispatch),
+                            })
+                    continue
                 if lifecycle == "launch_failed":
                     if (
                         record.get("schema") != SCHEMA
@@ -1566,6 +1652,15 @@ class Execution:
                 evidence_errors.append(f"{source}: {failure}")
         for handle in sorted(child_executions.keys() - bound_children):
             evidence_errors.append(f"child execution has no verified launch receipt: {handle}")
+        if (
+            bootstrap_failures
+            and (self.last_result or {}).get("result") not in self.terminal_results
+        ):
+            self.emit({
+                "result": "execution_bootstrap_failed",
+                "session_title": "Execution bootstrap failed",
+                "failures": bootstrap_failures,
+            })
 
         def distinct_evidence(items: list[dict[str, Any]], path_key: str,
                               label: str) -> list[dict[str, Any]]:
@@ -1966,7 +2061,10 @@ def entrypoint(main: Callable[[], int], namespace: dict[str, Any], *,
     ):
         raise ExecutionError("--execution-handle is not supported")
     controls = {"execution-status", "execution-cancel"}
-    if not arguments or arguments[0] not in {*commands, *controls}:
+    if (
+        not os.environ.get(PARENT_ENV)
+        and (not arguments or arguments[0] not in {*commands, *controls})
+    ):
         return main()
     return controller_main(
         main, namespace, handle=sealed_handle, run_id=run_id, commands=commands

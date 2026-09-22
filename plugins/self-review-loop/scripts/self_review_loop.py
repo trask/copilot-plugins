@@ -78,7 +78,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fbc08016f0ecf3d7ebf24f50d494f94dfa409bedd514e6d5d27a9541972d6ae0"
+    "609f83e9c2cf7534ced8b54183b31b860ba34e91b22327a48a217f6c288021de"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -3670,7 +3670,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "published",
     "nothing_to_publish",
 })
-EXECUTION_SHA256 = "d61d298d15687181eaef3dfd98f83cd62c6222a95ceb262d2336fba3a1d1a828"
+EXECUTION_SHA256 = "27fa66f9d2245e984771bb215d0d24e86747dc6aaa75e01e120c400d1e91ab77"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 
@@ -3736,7 +3736,11 @@ def execution_main():
         and any(flag in arguments for flag in standalone_internal)
     ):
         return main()
-    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    selected = (
+        os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments
+        and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    )
     enabled = (
         os.environ.get("COPILOT_AGENT_SESSION_ID")
         or os.environ.get("TRASK_EXECUTION_PARENT")

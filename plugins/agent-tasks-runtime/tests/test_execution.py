@@ -231,6 +231,36 @@ class ExecutionTest(unittest.TestCase):
         ):
             self.assertEqual(17, EXECUTION.entrypoint(main, namespace, commands=("run",)))
 
+    def test_parent_managed_command_routes_without_agent_allowlist_entry(self):
+        namespace = {}
+        with (
+            mock.patch.dict(
+                EXECUTION.os.environ,
+                {EXECUTION.PARENT_ENV: str(self.root / "request.json")},
+                clear=True,
+            ),
+            mock.patch.object(
+                sys, "argv", ["controller.py", "pipeline", "owner/repo#1"]
+            ),
+            mock.patch.object(
+                EXECUTION, "controller_main", return_value=23
+            ) as controller,
+        ):
+            self.assertEqual(
+                23,
+                EXECUTION.entrypoint(
+                    lambda: 17, namespace, commands=("run",)
+                ),
+            )
+
+        controller.assert_called_once_with(
+            mock.ANY,
+            namespace,
+            handle=None,
+            run_id=None,
+            commands=("run",),
+        )
+
     def test_execution_artifacts_cannot_enter_an_explicit_target_checkout(self):
         target = self.root / "target"
         target.mkdir()
@@ -2336,10 +2366,74 @@ class ExecutionTest(unittest.TestCase):
         EXECUTION.write(record, {
             "process_identity": IDENTITY, "requires_execution_result": True,
             "handle": str(self.root / "missing-handle.json"), "run_id": "root",
+            "captured_output": {},
         })
         child = EXECUTION.OwnedProcess(mock.Mock(pid=123), None, record, [])
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaisesRegex(
+            EXECUTION.ExecutionError,
+            "required child execution handle was not created",
+        ):
             child.verify_execution(0)
+        receipt = EXECUTION.read(record)
+        self.assertEqual("bootstrap_failed", receipt["lifecycle"])
+        self.assertEqual(
+            "execution_bootstrap_failed",
+            receipt["bootstrap_failure"]["result"],
+        )
+        self.assertEqual(0, receipt["bootstrap_failure"]["exit_code"])
+
+    def test_bootstrap_failed_child_replaces_nonterminal_progress_result(self):
+        context = self.context()
+        record = context.directory / "child-bootstrap.json"
+        output = context.directory / "stage.log"
+        output.write_text("runtime unavailable\n", encoding="utf-8")
+        result_file = context.directory / "stage-result.json"
+        dispatch = Path(str(result_file) + ".dispatch.json")
+        EXECUTION.write(dispatch, {
+            "schema": "github.copilot.dispatch-observation.v1",
+            "remote_status": "active",
+            "task": {"id": "task-bootstrap", "state": "in_progress"},
+        })
+        failure = {
+            "result": "execution_bootstrap_failed",
+            "child_record": str(record),
+            "handle": str(context.directory / "missing-handle.json"),
+            "exit_code": 0,
+            "command_sha256": "command",
+            "captured_output": {"stdout": str(output)},
+        }
+        EXECUTION.write(record, {
+            "schema": EXECUTION.SCHEMA,
+            "root": str(context.root),
+            "run_id": context.run_id,
+            "lifecycle": "bootstrap_failed",
+            "process_identity": IDENTITY,
+            "handle": failure["handle"],
+            "command_sha256": "command",
+            "requires_execution_result": True,
+            "local_drained": True,
+            "captured_output": failure["captured_output"],
+            "result_file": str(result_file),
+            "bootstrap_failure": failure,
+        })
+        context.emit({"event": "stage_started", "stage": "pr-conflict-resolver"})
+
+        result = context.finish(1, "required child execution handle was not created")
+
+        self.assertEqual(
+            "execution_bootstrap_failed",
+            result["workflow_result"]["result"],
+        )
+        self.assertEqual([failure], result["workflow_result"]["failures"])
+        self.assertTrue(result["remote_work_may_continue"])
+        retained = {item["path"] for item in result["retained_evidence"]}
+        self.assertIn(str(record), retained)
+        self.assertIn(str(output), retained)
+        self.assertIn(str(dispatch), retained)
+        self.assertEqual(
+            ["task-bootstrap"],
+            [item["task"]["id"] for item in result["remote_tasks"]],
+        )
 
     def test_denied_child_owner_fails_without_fallback_or_resume(self):
         context = self.context()

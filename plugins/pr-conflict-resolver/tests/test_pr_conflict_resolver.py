@@ -937,7 +937,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "9e4bfc2017fa3efa5e481364d8a311619e8a624020ece87ba355d3f19f18ae6e",
+            "ddb7a1c90f964ed86b405523973f32a636c11d9c45fa364f407fe9b7b8d286c0",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -4508,6 +4508,39 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
         self.assertEqual("error", result["status"])
         self.assertEqual(
             "execution_runtime_unavailable", result["error"]["code"]
+        )
+
+
+class ExecutionRoutingTest(unittest.TestCase):
+    def test_pipeline_child_uses_runtime_entrypoint(self):
+        runtime = mock.Mock()
+        runtime.entrypoint.return_value = 17
+        parent = "C:\\session\\request.json"
+        with (
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"TRASK_EXECUTION_PARENT": parent},
+                clear=True,
+            ),
+            mock.patch.object(
+                MODULE.sys,
+                "argv",
+                [
+                    "pr_conflict_resolver.py",
+                    "pipeline",
+                    "owner/repo#1",
+                ],
+            ),
+            mock.patch.object(
+                MODULE, "_load_execution", return_value=runtime
+            ),
+        ):
+            self.assertEqual(17, MODULE.execution_main())
+
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main,
+            MODULE.__dict__,
+            commands=("run",),
         )
 
 

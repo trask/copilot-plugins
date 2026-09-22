@@ -1377,7 +1377,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "complete",
     "incomplete",
 })
-EXECUTION_SHA256 = "d61d298d15687181eaef3dfd98f83cd62c6222a95ceb262d2336fba3a1d1a828"
+EXECUTION_SHA256 = "27fa66f9d2245e984771bb215d0d24e86747dc6aaa75e01e120c400d1e91ab77"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 
@@ -1426,7 +1426,11 @@ def _load_execution():
 def execution_main():
     commands = ('run',)
     arguments = sys.argv[1:]
-    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    selected = (
+        os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments
+        and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    )
     enabled = (
         "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
         or os.environ.get("COPILOT_AGENT_SESSION_ID")

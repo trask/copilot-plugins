@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "9e4bfc2017fa3efa5e481364d8a311619e8a624020ece87ba355d3f19f18ae6e"
+    "ddb7a1c90f964ed86b405523973f32a636c11d9c45fa364f407fe9b7b8d286c0"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@10"
@@ -10537,7 +10537,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "d61d298d15687181eaef3dfd98f83cd62c6222a95ceb262d2336fba3a1d1a828"
+EXECUTION_SHA256 = "27fa66f9d2245e984771bb215d0d24e86747dc6aaa75e01e120c400d1e91ab77"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 
@@ -10588,7 +10588,11 @@ def _load_execution():
 def execution_main():
     commands = ("run",)
     arguments = sys.argv[1:]
-    selected = arguments and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    selected = (
+        os.environ.get("TRASK_EXECUTION_PARENT")
+        or arguments
+        and arguments[0] in {*commands, "execution-status", "execution-cancel"}
+    )
     enabled = (
         "--execution-handle" in arguments or os.environ.get("TRASK_EXECUTION_PARENT")
         or os.environ.get("COPILOT_AGENT_SESSION_ID")
