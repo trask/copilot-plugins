@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "GitHub Copilot plugins by Trask Stalnaker",
-    "version": "2.2.21"
+    "version": "2.2.22"
   },
   "plugins": [
     {
@@ -17,43 +17,43 @@
     {
       "name": "pr-reviewer",
       "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-      "version": "1.8.29",
+      "version": "1.8.30",
       "source": "./plugins/pr-reviewer"
     },
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.1.91",
+      "version": "1.1.92",
       "source": "./plugins/copilot-review-loop"
     },
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.3.67",
+      "version": "1.3.68",
       "source": "./plugins/self-review-loop"
     },
     {
       "name": "pr-description",
       "description": "Review and update a pull request title and description through a managed GitHub Agent Task.",
-      "version": "1.0.88",
+      "version": "1.0.89",
       "source": "./plugins/pr-description"
     },
     {
       "name": "pr-pipeline",
       "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
-      "version": "1.5.58",
+      "version": "1.5.59",
       "source": "./plugins/pr-pipeline"
     },
     {
       "name": "pr-conflict-resolver",
       "description": "Resolve the merge conflicts on a pull request in one pass by keeping both sides' intent, then push the resolution.",
-      "version": "1.1.58",
+      "version": "1.1.59",
       "source": "./plugins/pr-conflict-resolver"
     },
     {
       "name": "ci-fix-loop",
       "description": "Run one sealed, stateless CI repair invocation against a frozen pull request head.",
-      "version": "1.6.78",
+      "version": "1.6.79",
       "source": "./plugins/ci-fix-loop"
     },
     {

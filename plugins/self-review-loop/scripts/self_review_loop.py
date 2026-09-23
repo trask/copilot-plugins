@@ -3468,10 +3468,11 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
             return payload
         if report["outcome"] == "incomplete":
             raise WorkflowError("hosted Self Review is incomplete; candidate not imported")
-        base_advanced = False if publication_resume else require_live_pr_snapshot(
-            pr, live_before_import, expected_head=pr["head_sha"],
-            allow_linear_base_advance=True,
-        )
+        if not publication_resume:
+            require_live_pr_snapshot(
+                pr, live_before_import, expected_head=pr["head_sha"],
+                allow_linear_base_advance=True,
+            )
         current = load_state(state_path)
         task_state = current["agent_task"]
         task_state.pop("report", None)
@@ -3663,7 +3664,6 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
                 target, pr, expected_head=published_head,
                 allow_linear_base_advance=True,
             )
-        base_advanced = base_advanced or final_live["base_sha"] != pr["base_sha"]
         current["pr"] = {**pr, **final_live}
         for _ in range(report["iterations_used"]):
             charge_iteration(current)
@@ -3680,10 +3680,9 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
         review = current["review"]
         review["status"] = (
             "resolved"
-            if report["outcome"] == "cleared" and not base_advanced
+            if report["outcome"] == "cleared"
             else "completed"
             if report["outcome"] == "continue"
-            or (report["outcome"] == "cleared" and base_advanced)
             else "max_iterations_reached"
         )
         review["published_head_sha"] = published_head
@@ -3694,17 +3693,10 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
         }
         review["candidate_commit_count"] = len(remote["commits"])
         review["coordinator_report"] = coordinator_report
-        if report["outcome"] == "cleared" and not base_advanced:
+        if report["outcome"] == "cleared":
             review["outcome"] = "clean"
             review["clean_at_head_sha"] = published_head
-            review["clean_at_base_sha"] = pr["base_sha"]
-        elif report["outcome"] == "cleared":
-            review["outcome"] = "base_advanced"
-            review["clearance_stale"] = True
-            review["reviewed_base_sha"] = pr["base_sha"]
-            review["current_base_sha"] = final_live["base_sha"]
-            review["clean_at_head_sha"] = None
-            review["clean_at_base_sha"] = None
+            review["clean_at_base_sha"] = final_live["base_sha"]
         else:
             review["outcome"] = "exhausted"
         if report["outcome"] == "continue":
@@ -3721,7 +3713,6 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
         save_state(state_path, current)
         if (
             report["outcome"] == "cleared"
-            and not base_advanced
             and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
         ):
             publish_shared_state(
@@ -3767,11 +3758,7 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
             "commits": all_commits,
             "tasks": all_tasks,
             "iterations": current["iterations"],
-            "outcome": (
-                "continue"
-                if report["outcome"] == "cleared" and base_advanced
-                else report["outcome"]
-            ),
+            "outcome": report["outcome"],
             **stage_outcome_fields(current),
             **(
                 {"stage_outcome": "max_iterations_reached"}

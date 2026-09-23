@@ -3489,7 +3489,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.78", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.79", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -6594,19 +6594,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual(1, state["iterations"])
         apply.assert_not_called()
 
-    def test_linear_base_advance_retries_current_ci_without_resetting_budget(self):
+    def test_linear_base_advance_keeps_completed_diagnosis(self):
         payload, state, apply = self.hosted_diagnosis_flow(
             "transient",
             base_changed=True,
         )
 
-        self.assertEqual("ci_changed", payload["result"])
-        self.assertEqual("base_advanced", payload["outcome"])
-        self.assertTrue(state["agent_task"]["clearance_stale"])
-        self.assertEqual(self.base, state["agent_task"]["observed_base_sha"])
-        self.assertEqual("7" * 40, state["agent_task"]["current_base_sha"])
+        self.assertEqual("rerun", payload["result"])
+        self.assertEqual("rerun", payload["outcome"])
+        self.assertFalse(state["agent_task"].get("clearance_stale", False))
         self.assertEqual(1, state["iterations"])
-        self.assertIsNone(MODULE.stage_outcome(state))
         apply.assert_called_once()
 
     def test_managed_fix_publishes_only_the_verified_fix_commit(self):

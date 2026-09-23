@@ -352,6 +352,45 @@ class GenericCiDiagnosisTest(unittest.TestCase):
         self.assertEqual("current", fields["warning_verification"]["result"])
         self.assertNotIn("stage_outcome", fields)
 
+    def test_warning_verification_ignores_target_branch_tip_movement(self):
+        state = self.warning_state()
+        state["pr"] = {**self.pr, "base_sha": "3" * 40}
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
+            mock.patch.object(MODULE, "metadata_for", return_value=state["pr"]),
+            mock.patch.object(MODULE, "fetch_rollup", return_value=(self.pr["head_sha"], self.checks)),
+            mock.patch.object(MODULE, "ci_run_identity", return_value=self.run),
+            mock.patch.object(MODULE, "commit_contains", return_value=True),
+        ):
+            fields = MODULE.verify_ci_warning_snapshot(state)
+        self.assertEqual("current", fields["warning_verification"]["result"])
+        self.assertEqual("warning", MODULE.stage_outcome(state))
+
+    def test_green_verification_ignores_target_branch_tip_movement(self):
+        passed_run = {**self.run, "conclusion": "success"}
+        checks = [
+            {**check, "class": "passed", "conclusion": "SUCCESS"}
+            for check in self.checks
+        ]
+        state = {
+            "pr": {**self.pr, "base_sha": "3" * 40},
+            "outcome": "green",
+            "clean_at_head_sha": self.pr["head_sha"],
+            "clean_at_base_sha": self.pr["base_sha"],
+            "green_snapshot_sha256": MODULE.ci_warning_snapshot_sha256(
+                self.pr, checks, {"11": passed_run},
+            ),
+        }
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
+            mock.patch.object(MODULE, "metadata_for", return_value=state["pr"]),
+            mock.patch.object(MODULE, "fetch_rollup", return_value=(self.pr["head_sha"], checks)),
+            mock.patch.object(MODULE, "ci_run_identity", return_value=passed_run),
+            mock.patch.object(MODULE, "commit_contains", return_value=True),
+        ):
+            fields = MODULE.verify_ci_clearance_snapshot(state)
+        self.assertEqual("current", fields["clearance_verification"]["result"])
+
     def test_new_changed_pending_or_removed_checks_invalidate_warnings(self):
         state = self.warning_state()
         snapshots = [
@@ -437,8 +476,8 @@ class GenericCiDiagnosisTest(unittest.TestCase):
         fields = MODULE.stage_outcome_fields(state)
         self.assertEqual("warning", fields["stage_outcome"])
         self.assertFalse(fields["all_ci_passed"])
-        for field in ("warning_at_head_sha", "warning_at_base_sha"):
-            changed = {**state, field: "f" * 40}
+        for field, value in (("warning_at_head_sha", "f" * 40), ("warning_at_base_sha", None)):
+            changed = {**state, field: value}
             self.assertIsNone(MODULE.stage_outcome(changed))
         self.assertIsNone(MODULE.stage_outcome({**state, "ci_warnings": []}))
 

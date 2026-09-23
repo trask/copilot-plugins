@@ -2215,7 +2215,6 @@ def recommendation_semantic_snapshot(
         "source": {
             **stable_pr_fields(pr),
             "head_sha": pr["head_sha"],
-            "base_sha": pr["base"]["sha"],
             "viewer": preflight["viewer"],
             "changed_files": preflight["changed_files"],
         },
@@ -2985,6 +2984,10 @@ def clearance_snapshot(state: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def clearance_identity(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in snapshot.items() if key != "base_sha"}
+
+
 def verify_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     """Compare a completed validation with live inputs without changing state."""
     task = state.get("agent_task") or {}
@@ -3008,9 +3011,14 @@ def verify_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     require_tools()
     live = agent_task_preflight(Path(state["repo_root"]), target_from_state(state))
     observed = clearance_snapshot(live)
-    expected_hash = canonical_json_sha256(expected)
-    observed_hash = canonical_json_sha256(observed) if observed is not None else None
-    current = observed is not None and expected == observed
+    expected_identity = clearance_identity(expected)
+    observed_identity = clearance_identity(observed) if observed is not None else None
+    expected_hash = canonical_json_sha256(expected_identity)
+    observed_hash = (
+        canonical_json_sha256(observed_identity)
+        if observed_identity is not None else None
+    )
+    current = expected_identity == observed_identity
     return {
         "result": "current" if current else "stale",
         "reason": (
@@ -3030,7 +3038,8 @@ def record_clearance_snapshot(
     validation = state.get("validation") or {}
     if (
         expected is None
-        or expected != observed
+        or observed is None
+        or clearance_identity(expected) != clearance_identity(observed)
         or recorded_validated_head_sha(state) != expected["head_sha"]
         or validation.get("run_id") != state.get("run_id")
         or validation.get("mode") not in {"applied", "no_change"}
@@ -3040,7 +3049,7 @@ def record_clearance_snapshot(
             "description inputs changed or could not be verified after validation; "
             "no reusable clearance was recorded"
         )
-    validation["clearance_snapshot"] = observed
+    validation["clearance_snapshot"] = expected
 
 
 def command_status(args: argparse.Namespace) -> None:

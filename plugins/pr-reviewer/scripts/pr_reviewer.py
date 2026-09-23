@@ -1794,7 +1794,9 @@ def run_hosted_review_phase(
     state.setdefault("phases", []).append(phase_state)
     state["agent_task"] = phase_state
     save_run_state(state_path, state)
-    ensure_snapshot_unchanged(pr, f"before hosted {phase}")
+    ensure_snapshot_unchanged(
+        pr, f"before hosted {phase}", allow_linear_base_advance=True
+    )
     process = run([
         sys.executable, str(helper), "--report", "--model", model_alias,
         "--pr", pr["url"], "--prompt-file", str(prompt_path),
@@ -1853,7 +1855,7 @@ def run_hosted_review_phase(
     observed = ensure_snapshot_unchanged(
         pr,
         f"after hosted {phase}",
-        allow_linear_base_advance=phase == "discovery",
+        allow_linear_base_advance=True,
     )
     if not isinstance(observed, dict):
         observed = pr
@@ -2168,7 +2170,7 @@ def command_post(args: argparse.Namespace, *, result_sink=None) -> None:
             "the one-mutation guard is already set and no viewer-owned pending "
             "review was found; inspect the recorded recovery state"
         )
-    if not same_snapshot(state["pr"], pr):
+    if not same_candidate_snapshot(state["pr"], pr):
         raise WorkflowError("live pull request state changed after check")
     if viewer.casefold() != str(state["viewer"]["login"]).casefold():
         raise WorkflowError("authenticated viewer changed since check")
@@ -2206,7 +2208,8 @@ def command_post(args: argparse.Namespace, *, result_sink=None) -> None:
     payload = {"commit_id": pr["head_sha"], "comments": comments}
     endpoint = f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews"
     ensure_snapshot_unchanged(
-        state["pr"], "immediately before claiming the mutation guard"
+        state["pr"], "immediately before claiming the mutation guard",
+        allow_linear_base_advance=True,
     )
     claim_mutation(state_path, state)
     created = gh_json(

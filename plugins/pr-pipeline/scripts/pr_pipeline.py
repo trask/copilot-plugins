@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "511e54e8524958ff4f1b7cc201ee5949d369ca77b6a23464174053a2dc3ee252"
+COMMON_SHA256 = "0b0ad38c9264aae92bc8c4932ad0dfb940e7efe386e1c3361fa32013bf30c3ad"
 
 
 def load_common() -> Any:
@@ -268,7 +268,6 @@ def clean_ci_evidence(payload: dict[str, Any]) -> bool:
         ci.get("clear") is True
         and ci.get("clearance_kind") == "stage_result"
         and ci.get("clear_at_head_sha") == head
-        and ci.get("clear_at_base_sha") == base
         and common.current_ci_clearance_verification(status.get("clearance_verification"))
         and status.get("outcome") == "green"
         and run_status.get("head_sha") == head
@@ -276,7 +275,7 @@ def clean_ci_evidence(payload: dict[str, Any]) -> bool:
         and run_status.get("reason") == "all_checks_passed"
         and coordinator.get("status") == "ready"
         and coordinator.get("head_sha") == head
-        and coordinator.get("base_sha") == base
+        and coordinator.get("base_sha") == ci.get("clear_at_base_sha")
     )
 
 
@@ -938,7 +937,6 @@ def blocked_result(
             [last_ci]
             if last_ci
             and last_ci.get("clear_at_head_sha") == pr.get("head_sha")
-            and last_ci.get("clear_at_base_sha") == pr.get("base_sha")
             else []
         )
     if common.ci_warning_fields(current_stages):

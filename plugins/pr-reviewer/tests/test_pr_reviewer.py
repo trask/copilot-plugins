@@ -1243,6 +1243,8 @@ class ManagedCoordinatorTest(unittest.TestCase):
         incomplete=False,
         source_drift=False,
         base_advance=False,
+        critique_base_advance=False,
+        base_before_critique=False,
     ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -1316,6 +1318,18 @@ class ManagedCoordinatorTest(unittest.TestCase):
             if base_advance
             else None
         )
+        actual_snapshots = (
+            [self.pr, self.pr, advanced_pr, advanced_pr]
+            if base_before_critique
+            else [self.pr, self.pr, self.pr, advanced_pr]
+        )
+        snapshot_guard = (
+            mock.patch.object(MODULE, "resolve_pr", side_effect=actual_snapshots)
+            if critique_base_advance or base_before_critique
+            else mock.patch.object(
+                MODULE, "ensure_snapshot_unchanged", side_effect=snapshot_check
+            )
+        )
         initial_preflight = (
             self.pr, "viewer", MODULE.parse_unified_diff(DIFF),
             None, None, [], [], DIFF,
@@ -1340,11 +1354,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "state_path_for", return_value=state_path),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
             mock.patch.object(MODULE, "load_cloud_task_runtime", return_value=runtime),
-            mock.patch.object(
-                MODULE,
-                "ensure_snapshot_unchanged",
-                side_effect=snapshot_check,
-            ),
+            snapshot_guard,
             mock.patch.object(
                 MODULE,
                 "live_base_contains",
@@ -1404,6 +1414,19 @@ class ManagedCoordinatorTest(unittest.TestCase):
         self.assertEqual("base_advanced", payload["reason"])
         self.assertTrue(state["agent_task"]["clearance_stale"])
         self.assertEqual("not_attempted", state["mutation"]["status"])
+
+    def test_base_advance_during_critique_preserves_anchored_findings(self):
+        for before in (False, True):
+            with self.subTest(before_critique=before):
+                commands, state, payload = self.hosted_check(
+                    nonempty=True, critique_base_advance=not before,
+                    base_before_critique=before,
+                )
+                self.assertEqual(2, len(commands))
+                self.assertEqual("ready", payload["result"])
+                self.assertEqual(self.pr["base"]["sha"], state["pr"]["base"]["sha"])
+                self.assertEqual("3" * 40, state["phases"][-1]["observed_pr"]["base"]["sha"])
+                self.assertEqual(1, len(payload["comments"]))
 
     def test_check_failure_preserves_recovery_state_without_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1749,7 +1772,7 @@ class GuardedPostingTest(unittest.TestCase):
     def test_rejects_stale_identity_and_changed_candidate_anchor(self):
         self.write_state()
         self.write_comments()
-        changed = {**self.pr, "base": {**self.pr["base"], "sha": "9" * 40}}
+        changed = {**self.pr, "base": {**self.pr["base"], "ref": "other"}}
         with mock.patch.object(
             MODULE,
             "preflight",
@@ -1792,7 +1815,7 @@ class GuardedPostingTest(unittest.TestCase):
         changes = {
             "base": {
                 **self.pr,
-                "base": {**self.pr["base"], "sha": "9" * 40},
+                "base": {**self.pr["base"], "ref": "other"},
             },
             "draft": {**self.pr, "is_draft": True},
             "open": {**self.pr, "state": "closed"},
@@ -1832,6 +1855,67 @@ class GuardedPostingTest(unittest.TestCase):
 
                 claim.assert_not_called()
                 gh_json.assert_not_called()
+
+    def test_post_accepts_linear_base_advance_at_preflight_and_final_recheck(self):
+        self.write_state()
+        self.write_comments()
+        advanced = {
+            **self.pr, "base": {**self.pr["base"], "sha": "3" * 40},
+        }
+        later = {
+            **advanced, "base": {**advanced["base"], "sha": "4" * 40},
+        }
+        review = {"id": 9, "html_url": f"{self.pr['pr_url']}#pullrequestreview-9"}
+        with (
+            mock.patch.object(MODULE, "preflight", return_value=(
+                advanced, "viewer", self.anchors, None, None, [], [], DIFF,
+            )),
+            mock.patch.object(MODULE, "resolve_pr", return_value=later),
+            mock.patch.object(MODULE, "live_base_contains", return_value=True) as contains,
+            mock.patch.object(MODULE, "gh_json", return_value=review) as gh_json,
+            mock.patch.object(MODULE, "verify_created_review", return_value=review),
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_post(self.args())
+        self.assertEqual("created_pending_review", emit.call_args.args[0]["result"])
+        self.assertEqual(self.pr["head_sha"], gh_json.call_args.kwargs["input_payload"]["commit_id"])
+        self.assertEqual(2, contains.call_count)
+
+    def test_post_rejects_non_linear_base_advance_before_mutation(self):
+        self.write_state()
+        self.write_comments()
+        advanced = {
+            **self.pr, "base": {**self.pr["base"], "sha": "3" * 40},
+        }
+        with (
+            mock.patch.object(MODULE, "preflight", return_value=(
+                advanced, "viewer", self.anchors, None, None, [], [], DIFF,
+            )),
+            mock.patch.object(MODULE, "live_base_contains", return_value=False),
+            mock.patch.object(MODULE, "claim_mutation") as claim,
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "live pull request state"):
+                MODULE.command_post(self.args())
+        claim.assert_not_called()
+
+    def test_post_rejects_lost_comment_anchor_after_linear_base_advance(self):
+        self.write_state()
+        self.write_comments()
+        advanced = {
+            **self.pr, "base": {**self.pr["base"], "sha": "3" * 40},
+        }
+        anchors = MODULE.parse_unified_diff(DIFF)
+        anchors["src/one.py"]["RIGHT"].pop(2)
+        with (
+            mock.patch.object(MODULE, "preflight", return_value=(
+                advanced, "viewer", anchors, None, None, [], [], DIFF,
+            )),
+            mock.patch.object(MODULE, "live_base_contains", return_value=True),
+            mock.patch.object(MODULE, "claim_mutation") as claim,
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "anchor is not a changed"):
+                MODULE.command_post(self.args())
+        claim.assert_not_called()
 
     def test_created_but_unverified_state_is_persisted(self):
         self.write_state()

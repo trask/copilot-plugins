@@ -74,7 +74,6 @@ class ClearanceSnapshotTest(unittest.TestCase):
         original = copy.deepcopy(self.live)
         mutations = {
             "head": lambda live: live["pr"]["head"].update(sha="9" * 40),
-            "base": lambda live: live["pr"]["base"].update(sha="9" * 40),
             "unknown base": lambda live: live["pr"]["base"].pop("sha"),
             "base ref": lambda live: live["pr"]["base"].update(ref="other"),
             "head ref": lambda live: live["pr"]["head"].update(ref="other"),
@@ -108,13 +107,16 @@ class ClearanceSnapshotTest(unittest.TestCase):
             mutate(self.state)
             self.assertEqual("unverified", MODULE.verify_clearance_snapshot(self.state)["result"])
 
-    def test_capture_rejects_moved_base_without_writing_identity(self):
+    def test_capture_accepts_moved_base_and_retains_pinned_provenance(self):
+        pinned = self.state["pr"]["base"]["sha"]
         self.live["pr"]["base"]["sha"] = "9" * 40
-        with self.assertRaisesRegex(MODULE.WorkflowError, "inputs changed"):
-            self.record()
-        self.assertNotIn("clearance_snapshot", self.state["validation"])
+        self.record()
+        self.assertEqual(pinned, self.state["validation"]["clearance_snapshot"]["base_sha"])
+        result = MODULE.verify_clearance_snapshot(self.state)
+        self.assertEqual("current", result["result"])
+        self.assertEqual(result["expected_snapshot_sha256"], result["observed_snapshot_sha256"])
 
-    def test_live_base_binding_ignores_stale_reported_base_but_rejects_tip_movement(self):
+    def test_live_base_binding_ignores_stale_reported_base_and_tip_movement(self):
         initial = copy.deepcopy(self.live)
         tip = initial["pr"]["base"]["sha"]
         reported = "8" * 40
@@ -152,11 +154,13 @@ class ClearanceSnapshotTest(unittest.TestCase):
             self.record()
             self.assertEqual("current", MODULE.verify_clearance_snapshot(self.state)["result"])
             tip = "9" * 40
-            self.assertEqual("stale", MODULE.verify_clearance_snapshot(self.state)["result"])
+            self.assertEqual("current", MODULE.verify_clearance_snapshot(self.state)["result"])
             del self.state["validation"]["clearance_snapshot"]
-            with self.assertRaisesRegex(MODULE.WorkflowError, "inputs changed"):
-                self.record()
-            self.assertNotIn("clearance_snapshot", self.state["validation"])
+            self.record()
+            self.assertEqual(
+                initial["pr"]["base"]["sha"],
+                self.state["validation"]["clearance_snapshot"]["base_sha"],
+            )
 
     def test_status_exports_run_position_and_verification_without_writes(self):
         self.record()

@@ -143,7 +143,6 @@ class DescriptionReuseTest(StackFixture):
             "model changed": lambda prior, receipt: receipt["agent_task"].update(model="gpt-6-astra"),
             "local model": lambda prior, receipt: receipt["agent_task"].update(model="gpt-6-sol"),
             "policy changed": lambda prior, receipt: receipt["agent_task"].update(github_mutation_policy="source-only"),
-            "old base": lambda prior, receipt: receipt["pr"]["base"].update(sha="8" * 40),
             "unknown base": lambda prior, receipt: receipt["pr"]["base"].pop("sha"),
             "changed metadata": lambda prior, receipt: receipt["clearance_verification"].update(result="stale"),
             "unknown metadata": lambda prior, receipt: receipt.pop("clearance_verification"),

@@ -75,6 +75,7 @@ class BaseDriftPublicationTest(unittest.TestCase):
                 "request": {
                     "request_id": "request-1",
                     "repository": "owner/repo",
+                    "strategy": "merge",
                     "pull_request": {
                         "number": 7,
                         "head_sha": "2" * 40,
@@ -91,7 +92,7 @@ class BaseDriftPublicationTest(unittest.TestCase):
             "published_heads": [new_head],
         }
 
-    def test_linear_base_advance_keeps_candidate_but_stales_clearance(self):
+    def test_linear_base_advance_keeps_candidate_and_live_mergeability(self):
         task = self.task()
         metadata = {
             "head_sha": "3" * 40,
@@ -99,11 +100,13 @@ class BaseDriftPublicationTest(unittest.TestCase):
         }
         with mock.patch.object(
             MODULE, "commit_contains", return_value=True
-        ) as contains:
+        ) as contains, mock.patch.object(
+            MODULE, "classify_mergeability", return_value="mergeable"
+        ):
             publication = MODULE.published_conflict_snapshot(task, metadata)
 
-        self.assertTrue(publication["clearance_stale"])
-        self.assertEqual("unknown", publication["mergeability"])
+        self.assertFalse(publication["clearance_stale"])
+        self.assertEqual("mergeable", publication["mergeability"])
         self.assertEqual("1" * 40, publication["candidate_base_sha"])
         self.assertEqual("4" * 40, publication["current_base_sha"])
         contains.assert_called_once_with(
@@ -136,10 +139,13 @@ class BaseDriftPublicationTest(unittest.TestCase):
             MODULE,
             "commit_contains",
             side_effect=[False, False],
+        ), mock.patch.object(
+            MODULE, "classify_mergeability", return_value="conflicting"
         ):
             publication = MODULE.published_conflict_snapshot(task, metadata)
 
-        self.assertTrue(publication["clearance_stale"])
+        self.assertFalse(publication["clearance_stale"])
+        self.assertEqual("conflicting", publication["mergeability"])
 
     def test_exact_current_base_can_record_clearance(self):
         task = self.task()

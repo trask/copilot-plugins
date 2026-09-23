@@ -590,7 +590,7 @@ class StackFixture(unittest.TestCase):
             "stage": entry["stage"],
             "clear": clear,
             "clear_at_head_sha": head_sha if clear else None,
-            "clear_at_base_sha": None,
+            "clear_at_base_sha": base_sha if clear and entry["stage"] == MODULE.STAGE_CONFLICT else None,
             "outcome": "cleared" if clear else "completed" if completed else "carried",
             "reason": None if clear else "completed" if completed else "carried",
             "installed": True,
@@ -1026,8 +1026,8 @@ class StackRunTest(StackFixture):
             ),
             (
                 {**current, "attempt": {"base_sha": "c" * 40}},
-                False,
-                "clearance_is_for_an_older_base",
+                True,
+                None,
             ),
         ]
         for payload, clear, reason in cases:
@@ -2635,14 +2635,14 @@ class CiWarningTest(StackFixture):
         self.assertEqual([11], [request["number"] for request in self.launcher.started])
         self.assertEqual("e" * 40, result["ci_warnings"][0]["head_sha"])
 
-    def test_stale_warning_base_requires_fresh_workers(self):
+    def test_warning_base_advance_does_not_repeat_workers(self):
         for number in (11, 12, 13):
             self.record_warning(number)
         self.launcher.on_start = self.complete_worker
         pipeline = self.pipeline(base_tip=lambda *_: "e" * 40)
         result = pipeline.run_ci_phase(2, self.stack["members"])
         self.assertTrue(result["clear"])
-        self.assertEqual([11, 12, 13], [request["number"] for request in self.launcher.started])
+        self.assertEqual([], self.launcher.started)
         self.assertEqual({"e" * 40}, {warning["base_sha"] for warning in result["ci_warnings"]})
 
     def test_predecessor_warning_base_movement_blocks_the_next_member(self):
@@ -2665,13 +2665,13 @@ class CiWarningTest(StackFixture):
         self.assertEqual(12, result["blocked"]["number"])
         self.assertEqual([], self.launcher.started)
 
-    def test_stale_warning_snapshot_is_not_complete(self):
+    def test_warning_base_marker_is_provenance_not_snapshot_invalidation(self):
         self.clear_everything()
         self.record_warning(11, base="e" * 40)
         result = self.pipeline().final_snapshot()
-        self.assertEqual("incomplete", result["result"])
-        self.assertNotIn("ci_warnings", result)
-        self.assertEqual([MODULE.STAGE_CI], result["pull_requests"][0]["uncleared"])
+        self.assertEqual("complete", result["result"])
+        self.assertEqual(BASE, result["ci_warnings"][0]["base_sha"])
+        self.assertEqual([], result["pull_requests"][0]["uncleared"])
 
     def test_warning_snapshot_that_moves_does_not_report_current_warnings(self):
         self.clear_everything()

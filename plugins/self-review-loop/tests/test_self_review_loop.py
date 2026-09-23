@@ -2090,7 +2090,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.67")
+        self.assertEqual(plugin["version"], "1.3.68")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2723,6 +2723,27 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual("", state["agent_task"]["preflight"]["identity"]["branch"])
             self.assertEqual(state["pr"]["head_sha"], MODULE.recorded_clean_at_head_sha(state))
             self.assertEqual(1, len(state["managed_task_history"]))
+
+    def test_clean_pass_survives_target_branch_advance(self):
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            original_run = MODULE.run.side_effect
+
+            def advance_base(command, **kwargs):
+                result = original_run(command, **kwargs)
+                if "--result-file" in command:
+                    self.pipeline_live["base_sha"] = "8" * 40
+                return result
+
+            with (
+                mock.patch.object(MODULE, "run", side_effect=advance_base),
+                mock.patch.object(MODULE, "gh_json", return_value={"status": "ahead"}),
+            ):
+                MODULE.command_pipeline(args)
+            self.assertEqual(1, len(commands))
+            self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual("clean", state["review"]["outcome"])
+            self.assertEqual("8" * 40, state["review"]["clean_at_base_sha"])
 
     def test_later_task_failure_preserves_published_pass_without_clearance(self):
         with self.pipeline_run() as (args, commands, emitted):

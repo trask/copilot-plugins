@@ -120,19 +120,26 @@ class PublicationOutcomeTest(unittest.TestCase):
         self.assertIsNone(MODULE.stage_outcome(MODULE.load_state(self.path)))
         self.mocks["git_try"].assert_not_called()
 
-    def test_stale_base_preserves_evidence_without_terminal_clearance(self):
-        self.metadata["base_sha"] = "e" * 40
+    def test_forward_base_move_preserves_resolution_and_live_mergeability(self):
+        self.metadata.update(base_sha="e" * 40, mergeable="MERGEABLE")
         evidence = self.root / "candidate.json"
         evidence.write_text("retained", encoding="utf-8")
         self.state["agent_task"]["recovery_files"] = [str(evidence)]
         result = MODULE.publish_conflict_result(self.path, self.state)
-        self.assertTrue(result["clearance_stale"])
-        self.assertEqual("completed", result["stage_outcome"])
+        self.assertFalse(result["clearance_stale"])
+        self.assertEqual("cleared", result["stage_outcome"])
         self.assertEqual("retained", evidence.read_text(encoding="utf-8"))
         self.assertEqual(
-            "completed",
+            "cleared",
             MODULE.stage_outcome(MODULE.load_state(self.path)),
         )
+        self.assertEqual("c" * 40, MODULE.cleared_head_sha(self.state))
+
+    def test_forward_base_move_does_not_hide_a_new_conflict(self):
+        self.metadata.update(base_sha="e" * 40, mergeable="CONFLICTING")
+        result = self.publish()
+        self.assertFalse(result["clearance_stale"])
+        self.assertEqual("completed", result["stage_outcome"])
         self.assertIsNone(MODULE.cleared_head_sha(self.state))
 
     def test_partial_or_failed_push_never_records_clearance(self):

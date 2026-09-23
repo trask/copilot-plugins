@@ -9935,6 +9935,7 @@ def published_conflict_snapshot(
                 "published candidate topology attaches obsolete base history"
             )
     base_advanced = direct_base_advanced or task.get("candidate_base_advanced") is True
+    stack_base_stale = base_advanced and request["strategy"] == "native-stack"
     authorization = preflight.get("stack_request")
     return {
         "request_id": request["request_id"],
@@ -9943,7 +9944,7 @@ def published_conflict_snapshot(
         "invoked_pr": request["pull_request"]["number"],
         "candidate_base_sha": invoked["base_sha"],
         "current_base_sha": metadata["base_sha"],
-        "clearance_stale": base_advanced,
+        "clearance_stale": stack_base_stale,
         "members": [
             {
                 "number": item["pr_number"], "head_sha": item["new_sha"],
@@ -9962,7 +9963,7 @@ def published_conflict_snapshot(
         ),
         "mergeability": (
             "unknown"
-            if base_advanced
+            if stack_base_stale
             else classify_mergeability(metadata, expected_head=invoked["new_sha"])
         ),
     }

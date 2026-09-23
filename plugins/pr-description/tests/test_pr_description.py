@@ -671,7 +671,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.88")
+        self.assertEqual(plugin["version"], "1.0.89")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1703,6 +1703,93 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(body, snapshot["body"])
         self.assertEqual("applied", state["validation"]["mode"])
         self.assertEqual("Current body", state["agent_task"]["preflight"]["pr"]["body"])
+
+    def test_hosted_keep_survives_base_advance_and_later_sweep_reuses_clearance(self):
+        report = self.proposal_report()
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+        live = copy.deepcopy(self.preflight)
+        pinned_base = live["pr"]["base"]["sha"]
+
+        def run(command, **kwargs):
+            self.helper_commands.append(command)
+            result_path = Path(command[command.index("--result-file") + 1])
+            prompt_path = Path(command[command.index("--prompt-file") + 1])
+            result_path.write_text(
+                json.dumps(result_with_prompt_identity(
+                    self.result(report), self.preflight,
+                    prompt_path.read_text(encoding="utf-8"),
+                )),
+                encoding="utf-8",
+            )
+            live["pr"]["base"]["sha"] = "9" * 40
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                if patcher.attribute not in {"run", "agent_task_preflight", "validate_no_change"}:
+                    stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=run))
+            stack.enter_context(mock.patch.object(
+                MODULE, "agent_task_preflight", side_effect=lambda *_: copy.deepcopy(live)
+            ))
+            MODULE.command_pipeline(args)
+            state = MODULE.load_run_state(Path(args.state))
+            self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+            self.assertEqual(pinned_base, state["pr"]["base"]["sha"])
+            self.assertNotIn("base_sha", state["agent_task"]["semantic_snapshot"]["source"])
+            self.assertEqual(pinned_base, state["agent_task"]["preflight"]["pr"]["base"]["sha"])
+            self.assertEqual(pinned_base, state["validation"]["clearance_snapshot"]["base_sha"])
+            self.assertEqual("current", MODULE.verify_clearance_snapshot(state)["result"])
+            live["pr"]["base"]["sha"] = "8" * 40
+            args.pipeline_iteration = 2
+            with self.assertRaisesRegex(MODULE.WorkflowError, "already evaluated"):
+                MODULE.command_pipeline(args)
+            self.assertEqual("current", MODULE.verify_clearance_snapshot(state)["result"])
+        self.assertEqual(1, len(self.helper_commands))
+
+    def test_applied_metadata_survives_base_advance_before_clearance_capture(self):
+        report = self.proposal_report(
+            decision="replace", title="Better title", body="Better body"
+        )
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+        args.github_mutation_policy = "allow"
+        live = copy.deepcopy(self.preflight)
+        pinned_base = live["pr"]["base"]["sha"]
+
+        def update(_path, _state, proposal):
+            live["pr"].update(title=proposal["title"], body=proposal["body"])
+            live["pr"]["base"]["sha"] = "9" * 40
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                if patcher.attribute not in {"metadata_for", "agent_task_preflight"}:
+                    stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(
+                MODULE, "agent_task_preflight", side_effect=lambda *_: copy.deepcopy(live)
+            ))
+            stack.enter_context(mock.patch.object(
+                MODULE, "metadata_for", side_effect=lambda *_: pr_metadata(
+                    head_sha=live["pr"]["head_sha"],
+                    title=live["pr"]["title"],
+                    body=live["pr"]["body"],
+                )
+            ))
+            publish = stack.enter_context(
+                mock.patch.object(MODULE, "update_pr", side_effect=update)
+            )
+            MODULE.command_pipeline(args)
+            state = MODULE.load_run_state(Path(args.state))
+            self.assertEqual("current", MODULE.verify_clearance_snapshot(state)["result"])
+        publish.assert_called_once()
+        self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+        self.assertEqual(pinned_base, state["validation"]["clearance_snapshot"]["base_sha"])
+        self.assertEqual("applied", state["validation"]["mode"])
 
     def test_later_sweep_cli_keep_rechecks_changed_head_with_a_fresh_task(self):
         report = self.proposal_report()

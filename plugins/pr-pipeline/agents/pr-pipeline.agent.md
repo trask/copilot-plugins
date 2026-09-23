@@ -57,7 +57,7 @@ Each deterministic stage coordinator owns its hosted tasks and fixed allowance. 
 
 Conflict Resolver decides whether the selected PR needs complete native-stack work. It discovers the stack and creates its own run-bound authorization. PR Pipeline does not pass stack membership, `--whole-stack`, or a stack request.
 
-The helper rejects stale heads, stale bases, unreadable state, active children after a coordinator exits, unverified source publication, and missing terminal evidence. Stale hosted work remains retained evidence and consumes its attempt. Review exhaustion stays uncleared. CI warnings clear only when the CI coordinator proves they are unrelated or pre-existing at the exact current head and base. Unknown failures never clear.
+The helper rejects stale heads, unsafe stack topology, unreadable state, active children after a coordinator exits, unverified source publication, and missing terminal evidence. Target-branch tip movement alone does not reject verified work or force another hosted pass. Stale hosted work remains retained evidence and consumes its attempt. Review exhaustion stays uncleared. CI warnings clear only when the CI coordinator verifies the check snapshot at the current head. Unknown failures never clear.
 
 The default mutation policy allows verified source publication, bounded CI reruns, bot-thread replies and resolution, Copilot review requests, and title or body updates. It never permits merging, approval, unsolicited comments, replies to human-authored threads, or draft-state changes. Source-only permits verified source publication but forbids the other GitHub mutations and CI reruns.
 

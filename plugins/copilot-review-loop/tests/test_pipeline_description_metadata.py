@@ -103,6 +103,11 @@ class PipelineDescriptionMetadataTest(unittest.TestCase):
         self.assertEqual("Original body", self.previous["pr"]["body"])
         self.assertEqual("Updated body", self.preflight["pr"]["body"])
 
+    def test_description_receipt_remains_valid_after_target_branch_advances(self):
+        self.write()
+        self.preflight["pr"]["base_sha"] = "e" * 40
+        self.verify()
+
     def test_missing_description_does_not_allow_metadata_change(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "source identity changed"):
             self.verify()

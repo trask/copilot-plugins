@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "511e54e8524958ff4f1b7cc201ee5949d369ca77b6a23464174053a2dc3ee252"
+COMMON_SHA256 = "0b0ad38c9264aae92bc8c4932ad0dfb940e7efe386e1c3361fa32013bf30c3ad"
 
 
 def load_common() -> Any:
@@ -3400,6 +3400,15 @@ class StackPipeline:
                 else self.inspect(entry, target, member["head_sha"], base_sha)
                 for entry in STAGES
             ]
+            if whole_stack and member["base_branch"] != opening["stack"]["trunk"]:
+                conflict = next(
+                    stage for stage in stages if stage["stage"] == STAGE_CONFLICT
+                )
+                if conflict["clear"] and conflict["clear_at_base_sha"] != base_sha:
+                    conflict.update(
+                        clear=False, clearance_kind=None,
+                        reason="clearance_is_for_an_older_base",
+                    )
             for stage in stages:
                 stage["identity"] = (
                     "current"

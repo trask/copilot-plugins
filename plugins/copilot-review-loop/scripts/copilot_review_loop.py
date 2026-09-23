@@ -6949,10 +6949,15 @@ def github_fingerprint_from_snapshot(
 def github_decision_fingerprint(
     target: dict[str, Any],
     preflight: dict[str, Any],
+    *,
+    allow_linear_base_advance: bool = False,
 ) -> dict[str, str]:
     pr = preflight["pr"]
     actual = metadata_for(target)
-    require_live_pr_snapshot(pr, actual, expected_head=pr["head_sha"])
+    base_advanced = require_live_pr_snapshot(
+        pr, actual, expected_head=pr["head_sha"],
+        allow_linear_base_advance=allow_linear_base_advance,
+    )
     require_live_comments(preflight)
     threads, _ = fetch_copilot_threads(
         pr["upstream_owner"], pr["upstream_repo"], pr["number"]
@@ -6966,8 +6971,11 @@ def github_decision_fingerprint(
     base_ref = remote_head(
         pr["upstream_owner"], pr["upstream_repo"], pr["base_branch"]
     )
-    if head_ref != pr["head_sha"] or base_ref != pr["base_sha"]:
+    if head_ref != pr["head_sha"] or base_ref != actual["base_sha"]:
         raise WorkflowError("live pull request refs drifted from the frozen preflight")
+    if base_advanced:
+        actual = {**actual, "base_sha": pr["base_sha"]}
+        base_ref = pr["base_sha"]
     return github_fingerprint_from_snapshot(
         actual,
         threads=threads,
@@ -7566,7 +7574,9 @@ def run_hosted_decision_worker(
         or sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256
         or local_source_owner_fingerprint(local_source_fingerprint(repo_root))
         != local_source_owner_fingerprint(before_source)
-        or github_decision_fingerprint(target, preflight) != before_github
+        or github_decision_fingerprint(
+            target, preflight, allow_linear_base_advance=True,
+        ) != before_github
     ):
         raise WorkflowError("hosted review changed its pinned source, GitHub, or dispatch identity")
     remote, paths = validate_hosted_candidate(
@@ -8535,7 +8545,7 @@ def description_metadata_matches_pipeline_sweep(
         and pr.get("body") == snapshot.get("body") == live["body"]
         and pr.get("head_sha") == snapshot.get("head_sha") == live["head_sha"]
         and head.get("sha") == live["head_sha"]
-        and base_ref.get("sha") == snapshot.get("base_sha") == live["base_sha"]
+        and base_ref.get("sha") == snapshot.get("base_sha")
         and snapshot.get("number") == pr.get("number") == old["number"]
         and snapshot.get("repo_name") == pr.get("repo_name") == old["repo_name"]
         and snapshot.get("url") == pr.get("url") == live["pr_url"]
@@ -9081,7 +9091,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
         remote = hosted_bundle["remote"]
         task_state.update({
             "source_after": local_source_fingerprint(repo_root),
-            "github_after": github_decision_fingerprint(target, preflight),
+            "github_after": github_decision_fingerprint(
+                target, preflight, allow_linear_base_advance=True,
+            ),
             "completion": result["completion"],
             "candidate": result["candidate"],
             "decision_sha256": sha256_file(decision_path),

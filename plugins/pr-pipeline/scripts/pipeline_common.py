@@ -1746,7 +1746,8 @@ def inspect_stage(
         base_marker_path = ("warning_at_base_sha",)
         base_marker = string_at(payload, base_marker_path)
         warning_is_valid = (
-            "clean_at_head_sha" in payload
+            marker is not None
+            and "clean_at_head_sha" in payload
             and payload["clean_at_head_sha"] is None
             and payload.get("warning_at_head_sha") == marker
             and payload.get("warning_at_base_sha") == base_marker
@@ -1755,7 +1756,13 @@ def inspect_stage(
         )
     head_is_clear = marker == head_sha
     base_is_clear = base_marker_path is None or (
-        base_sha is not None and base_marker == base_sha
+        base_marker is not None
+        and re.fullmatch(r"[0-9a-f]{40}", base_marker) is not None
+        and (
+            entry["stage"] != STAGE_CONFLICT
+            or not isinstance(payload.get("native_stack_clearance"), dict)
+            or base_marker == base_sha
+        )
     )
     policy_skip_is_valid = True
     if outcome == "skipped" and skip_marker_path is not None:
@@ -1790,8 +1797,7 @@ def inspect_stage(
             and policy_skip.get("repo_name") == target["repo_name"]
             and policy_skip.get("number") == target["number"]
             and policy_skip.get("head_sha") == head_sha
-            and base_sha is not None
-            and policy_skip.get("base_sha") == base_sha
+            and isinstance(policy_skip.get("base_sha"), str)
             and isinstance(policy_skip.get("head_repository"), str)
             and bool(policy_skip["head_repository"])
             and isinstance(policy_skip.get("head_branch"), str)
@@ -1809,7 +1815,7 @@ def inspect_stage(
             and pr.get("repo_name") == target["repo_name"]
             and pr.get("number") == target["number"]
             and pr.get("head_sha") == head_sha
-            and pr.get("base_sha") == base_sha
+            and pr.get("base_sha") == policy_skip.get("base_sha")
             and pr.get("head_repository")
             == policy_skip["head_repository"]
             and pr.get("head_branch") == policy_skip["head_branch"]
@@ -1872,16 +1878,22 @@ def inspect_stage(
         reason = status.get("reason") or "status_unavailable"
     elif marker and not head_is_clear:
         reason = "clearance_is_for_an_older_head"
+    elif outcome == "skipped" and not policy_skip_is_valid:
+        reason = "policy_skip_not_verified"
+    elif outcome == "warning" and not warning_is_valid:
+        reason = "ci_warning_not_verified"
     elif (
-        base_marker_path is not None
+        entry["stage"] == STAGE_CONFLICT
+        and isinstance(payload.get("native_stack_clearance"), dict)
         and base_marker is not None
         and base_marker != base_sha
     ):
         reason = "clearance_is_for_an_older_base"
-    elif outcome == "skipped" and not policy_skip_is_valid:
-        reason = "policy_skip_not_verified"
-    elif outcome == "warning":
-        reason = "ci_warning_not_verified"
+    elif (
+        base_marker_path is not None and not base_is_clear
+        and (outcome in CLEARING_OUTCOMES or outcome == "warning")
+    ):
+        reason = "clearance_base_marker_unavailable"
     elif entry["stage"] == STAGE_CI and outcome in CLEARING_OUTCOMES:
         reason = "ci_clearance_not_verified"
     elif entry["stage"] == STAGE_DESCRIPTION and outcome == "cleared":

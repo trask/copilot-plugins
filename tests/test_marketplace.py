@@ -34,14 +34,14 @@ CONFLICT_HELPER_SHA256 = (
 )
 EXPECTED_PACKAGE_VERSIONS = {
     "agent-tasks-runtime": "1.0.36",
-    "ci-fix-loop": "1.6.78",
-    "copilot-review-loop": "1.1.91",
+    "ci-fix-loop": "1.6.79",
+    "copilot-review-loop": "1.1.92",
     "historical-pr-audit": "1.1.40",
-    "pr-conflict-resolver": "1.1.58",
-    "pr-description": "1.0.88",
-    "pr-pipeline": "1.5.58",
-    "pr-reviewer": "1.8.29",
-    "self-review-loop": "1.3.67",
+    "pr-conflict-resolver": "1.1.59",
+    "pr-description": "1.0.89",
+    "pr-pipeline": "1.5.59",
+    "pr-reviewer": "1.8.30",
+    "self-review-loop": "1.3.68",
 }
 
 

@@ -1874,7 +1874,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.91")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.92")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -5361,6 +5361,48 @@ class MetadataTest(unittest.TestCase):
         self.assertEqual("1" * 40, fingerprint["head_ref_sha"])
         self.assertEqual("2" * 40, fingerprint["base_ref_sha"])
         self.assertRegex(fingerprint["pr_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_hosted_fingerprint_ignores_only_forward_base_tip_movement(self):
+        target = MODULE.parse_target("owner/repo#42")
+        pr = {
+            "number": 42, "repo_name": "owner/repo",
+            "title": "Review", "body": "Description", "state": "OPEN",
+            "is_draft": False, "head_owner": "owner", "head_repo": "repo",
+            "head_branch": "feature", "head_sha": "1" * 40,
+            "base_branch": "main", "base_sha": "2" * 40,
+            "upstream_owner": "owner", "upstream_repo": "repo",
+        }
+        live = dict(pr)
+        refs = [pr["head_sha"], pr["base_sha"]]
+        with (
+            mock.patch.object(MODULE, "metadata_for", side_effect=lambda _: dict(live)),
+            mock.patch.object(MODULE, "require_live_comments"),
+            mock.patch.object(MODULE, "fetch_copilot_threads", return_value=([], None)),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
+            mock.patch.object(MODULE, "remote_head", side_effect=lambda *_: refs.pop(0)),
+            mock.patch.object(MODULE, "live_base_contains", return_value=True) as contains,
+        ):
+            before = MODULE.github_decision_fingerprint(target, {"pr": pr})
+            live["base_sha"] = "3" * 40
+            refs[:] = [pr["head_sha"], live["base_sha"]]
+            after = MODULE.github_decision_fingerprint(
+                target, {"pr": pr}, allow_linear_base_advance=True,
+            )
+            self.assertEqual(before, after)
+            contains.assert_called_once_with("owner/repo", pr["base_sha"], live["base_sha"])
+            live["title"] = "Changed"
+            refs[:] = [pr["head_sha"], live["base_sha"]]
+            with self.assertRaisesRegex(MODULE.WorkflowError, "drifted"):
+                MODULE.github_decision_fingerprint(
+                    target, {"pr": pr}, allow_linear_base_advance=True,
+                )
+            live["title"] = pr["title"]
+            refs[:] = [pr["head_sha"], live["base_sha"]]
+            with mock.patch.object(MODULE, "live_base_contains", return_value=False):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "drifted"):
+                    MODULE.github_decision_fingerprint(
+                        target, {"pr": pr}, allow_linear_base_advance=True,
+                    )
 
     def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
         target = MODULE.parse_target("owner/repo#42")

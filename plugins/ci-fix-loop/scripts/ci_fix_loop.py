@@ -6865,10 +6865,8 @@ def agent_task_preflight(
             f"status checks belong to {live_head}, not pinned head {pr['head_sha']}"
         )
     refreshed = metadata_for(target)
-    if refreshed["head_sha"].lower() != pr["head_sha"] or refreshed["base_sha"].lower() != pr[
-        "base_sha"
-    ]:
-        raise WorkflowError("pull request head or base changed during check preflight")
+    if refreshed["head_sha"].lower() != pr["head_sha"]:
+        raise WorkflowError("pull request head changed during check preflight")
     decision = decide(
         checks,
         now=dt.datetime.now(dt.timezone.utc),
@@ -8771,13 +8769,15 @@ def verify_ci_warning_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         return stale
     require_live_pr_snapshot(
         {**pr, "title": live.get("title"), "body": live.get("body")},
-        live, expected_head=pr["head_sha"],
+        live, expected_head=pr["head_sha"], allow_linear_base_advance=True,
     )
     head, checks = fetch_rollup(live)
     if head.lower() != pr["head_sha"]:
         raise WorkflowError("pull request head changed while verifying CI warnings")
     runs = ci_snapshot_runs(live, checks)
-    observed = ci_warning_snapshot_sha256(live, checks, runs)
+    observed = ci_warning_snapshot_sha256(
+        {**live, "base_sha": state["warning_at_base_sha"]}, checks, runs,
+    )
     current = observed == expected and all(run["status"] == "completed" for run in runs.values())
     fields: dict[str, Any] = {"warning_verification": {
         "result": "current" if current else "stale",
@@ -8817,16 +8817,17 @@ def verify_ci_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         return stale
     require_live_pr_snapshot(
         {**pr, "title": live.get("title"), "body": live.get("body")},
-        live, expected_head=pr["head_sha"],
+        live, expected_head=pr["head_sha"], allow_linear_base_advance=True,
     )
     head, checks = fetch_rollup(live)
     if head.lower() != pr["head_sha"]:
         raise WorkflowError("pull request head changed while verifying CI clearance")
     runs = ci_snapshot_runs(live, checks)
-    observed = ci_warning_snapshot_sha256(live, checks, runs)
+    observed = ci_warning_snapshot_sha256(
+        {**live, "base_sha": state["clean_at_base_sha"]}, checks, runs,
+    )
     current = (
         observed == expected
-        and state.get("clean_at_base_sha") == live["base_sha"]
         and state.get("clean_at_head_sha") == head.lower()
         and all(
             run["status"] == "completed" and run["conclusion"] in {"success", "neutral", "skipped"}
@@ -11340,16 +11341,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
 
         run_state = state["run"]
         state["pr"] = final_live
-        if base_advanced:
-            task_state["clearance_stale"] = True
-            task_state["observed_base_sha"] = pr["base_sha"]
-            task_state["current_base_sha"] = final_live["base_sha"]
-            state["outcome"] = None
-            state["clean_at_head_sha"] = None
-            state["clean_at_base_sha"] = None
-            state["warning_at_head_sha"] = None
-            state["warning_at_base_sha"] = None
-            state.pop("ci_warnings", None)
         if diagnoses is not None:
             run_state["diagnoses"] = diagnoses
             state.setdefault("history", []).extend({
@@ -11360,8 +11351,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "task_id": remote["task_id"],
                 **item,
             } for item in diagnoses)
-            if report["outcome"] == "warning" and not base_advanced:
-                require_live_check_snapshot(preflight)
+            if report["outcome"] == "warning":
+                if not base_advanced:
+                    require_live_check_snapshot(preflight)
                 warning_runs = snapshot["workflow_runs"]
                 require_diagnosable_ci_runs(
                     snapshot["rollup"], warning_runs,
@@ -11376,7 +11368,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 state["warning_snapshot_sha256"] = ci_warning_snapshot_sha256(
                     pr, snapshot["rollup"], warning_runs,
                 )
-            elif report["outcome"] == "unfixable" and not base_advanced:
+            elif report["outcome"] == "unfixable":
                 state["escalation"] = {
                     "reason": "unfixable_failure",
                     "detail": "hosted diagnosis did not establish a scoped fix or a safe retry",
@@ -11443,9 +11435,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             dict.fromkeys(cleanup_paths),
             preserve=bool(getattr(args, "preserve_artifacts", False)),
         )
-        result_name = (
-            "published" if remote["commits"] else "ci_changed"
-        ) if base_advanced else {
+        result_name = {
             "candidate": "published",
             "fixed": "published",
             "no_change": "nothing_to_publish",
@@ -11462,9 +11452,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "head_sha": published_head,
                 "commits": remote["commits"],
                 "iterations": state["iterations"],
-                "outcome": (
-                    "base_advanced" if base_advanced else report["outcome"]
-                ),
+                "outcome": report["outcome"],
                 "action_checks": [
                     item["check_key"] for item in diagnoses or []
                     if item["diagnosis"] == "transient"
@@ -13786,7 +13774,8 @@ def stage_outcome(state: dict[str, Any]) -> str | None:
         and state.get("clean_at_head_sha") is None
         and state.get("ci_warnings")
         and state.get("warning_at_head_sha") == (state.get("pr") or {}).get("head_sha")
-        and state.get("warning_at_base_sha") == (state.get("pr") or {}).get("base_sha")
+        and isinstance(state.get("warning_at_base_sha"), str)
+        and SHA_PATTERN.fullmatch(state["warning_at_base_sha"]) is not None
     ):
         return "warning"
     if outcome == "no_checks":

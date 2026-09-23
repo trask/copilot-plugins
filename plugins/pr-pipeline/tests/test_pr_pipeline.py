@@ -1003,16 +1003,15 @@ class MarkerTest(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.assertTrue(self.status(stage, payload)["clear"])
 
-    def test_current_head_still_requires_current_base_and_ci_snapshot(self):
+    def test_current_head_clearance_survives_base_tip_movement_but_needs_ci_snapshot(self):
         for stage, payload in (
             (MODULE.STAGE_COPILOT_REVIEW, {"clean_at_head_sha": HEAD, "clean_at_base_sha": BASE}),
             (MODULE.STAGE_SELF_REVIEW, {"review": {"clean_at_head_sha": HEAD, "clean_at_base_sha": BASE}}),
             (MODULE.STAGE_CI, ci_green_payload()),
         ):
             with self.subTest(stage=stage):
-                stale = self.status(stage, payload, base_sha=NEXT_HEAD)
-                self.assertFalse(stale["clear"])
-                self.assertEqual("clearance_is_for_an_older_base", stale["reason"])
+                current = self.status(stage, payload, base_sha=NEXT_HEAD)
+                self.assertTrue(current["clear"])
         cached = ci_green_payload()
         del cached["clearance_verification"]
         self.assertFalse(self.status(MODULE.STAGE_CI, cached)["clear"])
@@ -1066,14 +1065,11 @@ class MarkerTest(unittest.TestCase):
                 self.assertEqual(payload["ci_warnings"], result["status"]["ci_warnings"])
                 self.assertIsNone(payload["clean_at_head_sha"])
 
-    def test_ci_warning_markers_must_match_both_live_revisions(self):
+    def test_ci_warning_requires_head_and_base_evidence_not_current_base_tip(self):
         for head, base, inspected_base, reason in (
             (NEXT_HEAD, BASE, BASE, "clearance_is_for_an_older_head"),
-            (HEAD, NEXT_BASE, BASE, "clearance_is_for_an_older_base"),
-            (HEAD, BASE, NEXT_BASE, "clearance_is_for_an_older_base"),
             (None, BASE, BASE, "ci_warning_not_verified"),
-            (HEAD, None, BASE, "ci_warning_not_verified"),
-            (HEAD, BASE, None, "clearance_is_for_an_older_base"),
+            (HEAD, None, BASE, "clearance_base_marker_unavailable"),
             (" " + HEAD, BASE, BASE, "ci_warning_not_verified"),
             (HEAD, BASE + " ", BASE, "ci_warning_not_verified"),
         ):
@@ -1085,6 +1081,9 @@ class MarkerTest(unittest.TestCase):
                 self.assertEqual(reason, result["reason"])
                 self.assertNotIn("all_ci_passed", result)
                 self.assertIsNone(result["clearance_kind"])
+        self.assertTrue(
+            self.status(MODULE.STAGE_CI, ci_warning_payload(), NEXT_BASE)["clear"]
+        )
 
     def test_ci_warning_requires_well_formed_diagnoses_and_evidence(self):
         valid = ci_warning_payload()
@@ -1424,7 +1423,7 @@ class MarkerTest(unittest.TestCase):
                     )
                     self.assertFalse(result["clear"])
                     self.assertEqual(
-                        "clearance_is_for_an_older_base" if name == "base" else "policy_skip_not_verified",
+                        "policy_skip_not_verified",
                         result["reason"],
                     )
         finally:
@@ -1467,7 +1466,7 @@ class MarkerTest(unittest.TestCase):
         self.assertFalse(result["clear"])
         self.assertEqual("clearance_is_for_an_older_head", result["reason"])
 
-    def test_conflict_clearance_for_an_older_base_is_not_clear(self):
+    def test_conflict_clearance_is_head_bound_across_base_movement(self):
         result = self.status(
             MODULE.STAGE_CONFLICT,
             {
@@ -1476,8 +1475,7 @@ class MarkerTest(unittest.TestCase):
             },
             NEXT_BASE,
         )
-        self.assertFalse(result["clear"])
-        self.assertEqual("clearance_is_for_an_older_base", result["reason"])
+        self.assertTrue(result["clear"])
         self.assertEqual(BASE, result["clear_at_base_sha"])
 
     def test_missing_conflict_state_is_not_mislabeled_as_an_older_base(self):
@@ -2427,17 +2425,17 @@ class SweepTest(unittest.TestCase):
         self.assertEqual("complete", result["result"])
         self.assertEqual(2, result["sweeps"])
         self.assertEqual(
-            [(MODULE.STAGE_CI, 1), (MODULE.STAGE_CI, 2)],
+            [(MODULE.STAGE_CI, 1)] + ([(MODULE.STAGE_CI, 2)] if revision == "head" else []),
             [item for item in self.launched if item[0] == MODULE.STAGE_CI],
         )
         ci = next(stage for stage in result["stages"] if stage["stage"] == MODULE.STAGE_CI)
         self.assertEqual(self.sync_heads[-1], ci["clear_at_head_sha"])
-        self.assertEqual(self.base_sha, ci["clear_at_base_sha"])
+        self.assertEqual(BASE if revision == "base" else self.base_sha, ci["clear_at_base_sha"])
 
     def test_head_movement_requires_fresh_ci_warning_work(self):
         self.assert_ci_warning_refreshed_after_movement("head")
 
-    def test_base_movement_requires_fresh_ci_warning_work(self):
+    def test_base_movement_does_not_repeat_ci_warning_work(self):
         self.assert_ci_warning_refreshed_after_movement("base")
 
     def test_ci_warning_does_not_hide_a_later_stage_failure(self):
