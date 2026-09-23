@@ -384,6 +384,29 @@ class WindowsSubprocessTest(unittest.TestCase):
             [mock.call(timeout=10), mock.call()], process.wait.call_args_list
         )
 
+    def test_stage_monitor_preserves_progress_failure_during_forced_drainage(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.terminate_tree.side_effect = RuntimeError(
+            "owned Windows job required forced drainage"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                mock.patch.object(MODULE.common, "_EXECUTION", object()),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "TypeError: duplicate progress field; local drainage: "
+                    "owned Windows job required forced drainage",
+                ),
+            ):
+                MODULE.common.run_monitored(
+                    ["copilot"], cwd=root, log_path=root / "stage.log",
+                    progress=mock.Mock(side_effect=TypeError("duplicate progress field")),
+                    start=mock.Mock(return_value=process),
+                )
+        process.terminate_tree.assert_called_once_with(timeout=10.0)
+
     def test_windows_owned_process_terminates_the_job_before_reaping(self):
         process = mock.Mock()
         process.pid = 123
@@ -1998,6 +2021,7 @@ class RunStageStateIsolationTest(unittest.TestCase):
                     "phase": "hosted_task",
                     "hosted_task_state": "in_progress",
                     "hosted_task_id": "task-one",
+                    "elapsed_seconds": 999,
                 },
             ),
             mock.patch.object(
@@ -2016,6 +2040,7 @@ class RunStageStateIsolationTest(unittest.TestCase):
             )
 
         self.assertEqual("in_progress", events[0]["hosted_task_state"])
+        self.assertNotEqual(999, events[0]["elapsed_seconds"])
         transition = MODULE.progress_transition(events[0])
         self.assertIn(
             "conflict resolution hosted task in progress",
@@ -3825,6 +3850,23 @@ class CommandOutputTest(unittest.TestCase):
         self.assertEqual("pipeline_finished", event["event"])
         self.assertEqual("error", event["result"])
         self.assertEqual("broken", event["error"])
+
+    def test_unexpected_progress_error_is_a_terminal_json_event(self):
+        output = StringIO()
+        with (
+            mock.patch.object(MODULE, "require_tools", side_effect=TypeError("duplicate progress field")),
+            mock.patch.object(
+                __import__("sys"), "argv", ["pr_pipeline.py", "run", "owner/repo#7"]
+            ),
+            redirect_stdout(output),
+        ):
+            result = MODULE.main()
+
+        self.assertEqual(1, result)
+        event = json.loads(output.getvalue())
+        self.assertEqual("pipeline_finished", event["event"])
+        self.assertEqual("error", event["result"])
+        self.assertEqual("duplicate progress field", event["error"])
 
 
 class BoundedCommandTest(unittest.TestCase):

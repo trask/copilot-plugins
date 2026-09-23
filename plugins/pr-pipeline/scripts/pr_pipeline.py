@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "49dd5b88a61fefc19d4f0705ef10aeff6c32ec6d68604eb654b28b28bc3d4994"
+COMMON_SHA256 = "2be44498221b42fafd30d6603caaa7cf6862b7cf188d55da62e492f0b5d3bd4c"
 
 
 def load_common() -> Any:
@@ -870,7 +870,10 @@ def run_stage(
             sweep=sweep,
             number=target["number"],
             elapsed_seconds=int(now - started_at),
-            **(current or {"phase": "running"}),
+            **{
+                key: value for key, value in (current or {"phase": "running"}).items()
+                if key != "elapsed_seconds"
+            },
         )
 
     result = common.run_monitored(
@@ -1790,7 +1793,7 @@ def main() -> int:
     try:
         args.function(args)
         return 0
-    except (WorkflowError, json.JSONDecodeError, OSError) as error:
+    except (json.JSONDecodeError, OSError, RuntimeError, TypeError) as error:
         report_run_error(args, str(error))
         return 1
     except KeyboardInterrupt:

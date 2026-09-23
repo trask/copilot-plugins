@@ -2180,9 +2180,14 @@ def run_monitored(
                 _EXECUTION.check_cancel()
             sleep(interval)
             progress()
-    except BaseException:
+    except BaseException as failure:
         if process.poll() is None:
-            terminate_process_tree(process)
+            try:
+                terminate_process_tree(process)
+            except (OSError, subprocess.SubprocessError, RuntimeError) as cleanup:
+                raise WorkflowError(
+                    f"{type(failure).__name__}: {failure}; local drainage: {cleanup}"
+                ) from failure
         raise
     result = {
         "returncode": process.wait(),
