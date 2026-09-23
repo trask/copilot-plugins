@@ -48,7 +48,10 @@ Domain state retains its original budgets and pending outcomes. Failed,
 cancelled or abandoned execution cannot be adopted by a new invocation.
 Failed, cancelled, missing or remotely unconfirmed child execution evidence
 keeps the root result unconfirmed, including when Pipeline reports `incomplete`
-or Stack Pipeline reports `partial`.
+or Stack Pipeline reports `partial`. A bounded Pipeline step may seal a
+`waiting` result while a known, request-bound hosted task is still active,
+provided every child finished and drained locally with verified dispatch
+evidence. This does not clear the stage or permit unknown dispatches.
 Terminal diagnostics retain identical evidence once per source path, in
 first-seen order. Conflicting hashes or observations keep their distinct
 versions and fail finalization; separate unknown task creations remain separate.
@@ -92,11 +95,15 @@ Ordinary code-candidate consumers require an open PR and current source identity
 
 Historical Audit explicitly supplies `--allow-merged-pr` with its trusted immutable merged-PR snapshot. This code-candidate exception requires `trask-pr-audit-<number>` at that exact historical head and dispatches from the immutable SHA. Worker output cannot enable it. It does not relax ordinary open-PR guards or permit report-recommendation consumers to use merged sources.
 
-Each call is fresh. The executable rejects task IDs, prior results, resume,
-monitor-only mode, dispatch-only mode and retired policy selectors before it
-resolves a repository or starts a task. Interrupted work remains immutable
-evidence. Conflict Resolver has its own pinned runtime and versioned request
-contract.
+Standalone calls are fresh. The executable rejects caller-supplied task IDs,
+prior results, generic resume or monitor modes, and retired policy selectors
+before resolving a repository or starting a task. Pipeline-scoped dispatch and
+observe instead bind an exact run, agent session, source and request to a
+checkpoint beside the result path. Pending calls return a confirmed task
+identity without writing the final version-5 result; observation checks that
+same task once per call and writes the final result only after completion.
+Interrupted work remains immutable evidence outside that bound Pipeline run.
+Conflict Resolver has its own pinned runtime and versioned request contract.
 
 ## Consumer APIs
 

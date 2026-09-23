@@ -164,7 +164,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa74322811f6f4546bc271450ab5a30e4c25f96724b6e6a7666e5ee07e7c220a"
+    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -662,12 +662,14 @@ def run_owned_local_worker(
     timeout: float = LOCAL_DECISION_TIMEOUT_SECONDS,
     environment: dict[str, str] | None = None,
     description: str = "local Copilot decision process",
+    require_execution: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     if _EXECUTION is not None:
         return _EXECUTION.run(
             command, cwd=str(cwd), input=input_text, timeout=timeout,
             env=environment, text=True, encoding="utf-8",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            **({"require_execution": True} if require_execution else {}),
         )
     options = {} if environment is None else {"environment": environment}
     process, owner = popen_owned_local_worker(command, cwd=cwd, **options)
@@ -828,7 +830,13 @@ def parse_timestamp(value: str) -> dt.datetime:
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+_BOUNDED_CAPTURE: list[list[dict[str, Any]]] = []
+
+
 def emit(payload: Any) -> None:
+    if _BOUNDED_CAPTURE:
+        _BOUNDED_CAPTURE[-1].append(payload)
+        return
     if _EXECUTION is not None:
         _EXECUTION.emit(payload)
     print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
@@ -7431,7 +7439,7 @@ def run_hosted_decision_worker(
     prompt_path: Path, decision_path: Path, result_path: Path,
     canonical_path: Path, run_id: str, requested_model: str,
     before_source: dict[str, Any], before_github: dict[str, str],
-    helper: Path, timeout: float,
+    helper: Path, timeout: float, bounded_action: str | None = None,
 ) -> dict[str, Any]:
     runtime = load_candidate_runtime(helper)
     prompt = prompt_path.read_text(encoding="utf-8")
@@ -7446,16 +7454,87 @@ def run_hosted_decision_worker(
         "--pr", pr["pr_url"], "--prompt-file", str(prompt_path),
         "--result-file", str(result_path), "--policy", HOSTED_DECISION_POLICY,
     ]
-    process = run_owned_local_worker(
-        command, cwd=repo_root, input_text="", timeout=timeout,
-        environment=subprocess_environment(), description="hosted Agent Task dispatcher",
-    )
+    if bounded_action is not None:
+        command.extend([bounded_action, "--pipeline-run", run_id])
+    already_final = False
+    if bounded_action == "--pipeline-observe" and result_path.is_file():
+        try:
+            retained = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise WorkflowError("retained Agent Task result is invalid") from error
+        if isinstance(retained, dict) and retained.get("status") == "pending":
+            raise WorkflowError("pending Agent Task wrote a final result file")
+        already_final = isinstance(retained, dict)
+    process = None
+    children_before = len(_EXECUTION.children) if _EXECUTION is not None else None
+    if not already_final:
+        process = run_owned_local_worker(
+            command, cwd=repo_root, input_text="",
+            timeout=min(timeout, 85) if bounded_action is not None else timeout,
+            environment=subprocess_environment(), description="hosted Agent Task dispatcher",
+            require_execution=bounded_action is not None,
+        )
+    if bounded_action is not None:
+        if process is not None and process.returncode != 0:
+            raise WorkflowError(
+                f"bounded hosted Agent Task helper failed ({process.returncode}): "
+                f"{process.stderr.strip() or process.stdout.strip()}"
+            )
+        if _EXECUTION is not None and process is not None:
+            children = _EXECUTION.children[children_before:]
+            terminal = children[0].terminal_result if len(children) == 1 else None
+            if (
+                not isinstance(terminal, dict)
+                or terminal.get("exit_code") != process.returncode
+                or terminal.get("local_status") != "finished"
+                or not isinstance(terminal.get("workflow_result"), dict)
+            ):
+                raise WorkflowError("bounded Agent Task has no sealed execution result")
+            observation = terminal["workflow_result"]
+            if result_path.is_file():
+                try:
+                    final = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as error:
+                    raise WorkflowError("bounded Agent Task helper returned no valid observation") from error
+                if final != observation:
+                    raise WorkflowError("bounded Agent Task final result differs from sealed child")
+        else:
+            try:
+                observation = json.loads(
+                    result_path.read_text(encoding="utf-8")
+                    if result_path.is_file()
+                    else process.stdout if process is not None else ""
+                )
+            except (OSError, ValueError) as error:
+                raise WorkflowError("bounded Agent Task helper returned no valid observation") from error
+        if not isinstance(observation, dict) or not isinstance(observation.get("status"), str):
+            raise WorkflowError("bounded Agent Task helper returned an unexpected result")
+        if observation["status"] == "pending":
+            pipeline = observation.get("pipeline")
+            task = observation.get("task")
+            if (
+                observation.get("schema") != CANDIDATE_AGENT_TASK_RESULT_SCHEMA
+                or not isinstance(task, dict)
+                or not isinstance(task.get("id"), str)
+                or not task["id"]
+                or not isinstance(pipeline, dict)
+                or pipeline.get("run_id") != run_id
+                or pipeline.get("session_id") != os.environ.get("COPILOT_AGENT_SESSION_ID")
+                or not isinstance(pipeline.get("request_id"), str)
+                or not pipeline["request_id"]
+                or observation.get("candidate") is not None
+                or observation.get("completion") is not None
+            ):
+                raise WorkflowError("pending Agent Task has no matching dispatch identity")
+            if result_path.is_file():
+                raise WorkflowError("pending Agent Task wrote a final result file")
+            return {"status": "pending"}
     if not result_path.is_file():
         raise WorkflowError(
-            f"hosted Agent Task dispatcher exited {process.returncode} without a result"
+            f"hosted Agent Task dispatcher exited {process.returncode if process else 0} without a result"
         )
     result = load_agent_task_result(result_path)
-    if process.returncode != 0 or result.get("status") != "success":
+    if (process is not None and process.returncode != 0) or result.get("status") != "success":
         raise task_failure_from_result(result)
     if (
         sha256_file(prompt_path) != prompt_sha256
@@ -8156,8 +8235,175 @@ def command_pipeline(args: argparse.Namespace) -> None:
         or not 1 <= args.pipeline_iteration <= args.pipeline_max_iterations
     ):
         raise WorkflowError("pipeline requires a target, state, and valid run position")
+    if getattr(args, "bounded_step", False):
+        command_bounded_pipeline(args)
+        return
     args._pipeline_entry = True
     command_agent_task(args)
+
+
+def bounded_review_wait(args: argparse.Namespace, state_path: Path, reason: str) -> None:
+    args._bounded_waiting = True
+    emit({"result": "waiting", "state": str(state_path), "reason": reason})
+
+
+def bounded_review_observation(
+    args: argparse.Namespace, state_path: Path
+) -> bool:
+    state = load_state(state_path)
+    monitoring = state.get("monitoring") or {}
+    if monitoring.get("status") == "requesting":
+        visible = copilot_is_requested(state, monitoring["copilot_bot_id"])
+        if not visible:
+            pr = state["pr"]
+            visible = matching_review(
+                fetch_reviews(pr["upstream_owner"], pr["upstream_repo"], pr["number"]),
+                monitoring,
+            ) is not None
+        if visible:
+            monitoring["status"] = "requested"
+            save_state(state_path, state)
+        else:
+            bounded_review_wait(args, state_path, "review_request")
+            return True
+    if monitoring.get("status") not in {"requested", "running"}:
+        return False
+    pr = state["pr"]
+    live = metadata_for(parse_target(pr["pr_url"]))
+    if live["head_sha"] != monitoring["head_sha"]:
+        result = watcher_result(
+            state, {
+                "result": "head_changed",
+                "expected_head": monitoring["head_sha"],
+                "actual_head": live["head_sha"],
+            },
+        )
+        save_state(state_path, state)
+        emit(result)
+        return True
+    reviews = fetch_reviews(pr["upstream_owner"], pr["upstream_repo"], pr["number"])
+    review = matching_review(reviews, monitoring)
+    if review is None:
+        bounded_review_wait(args, state_path, "review_request")
+        return True
+    if str(review.get("state", "")).upper() == "DISMISSED":
+        result = watcher_result(state, {
+            "result": "review_dismissed",
+            "review_id": review["id"], "review_url": review["html_url"],
+        })
+        save_state(state_path, state)
+        emit(result)
+        return True
+    comments = gh_paginated(
+        f"repos/{pr['upstream_owner']}/{pr['upstream_repo']}/pulls/"
+        f"{pr['number']}/reviews/{review['id']}/comments?per_page=100"
+    )
+    suppressed = parse_suppressed_comments(review.get("body"))
+    clean = not comments and not suppressed
+    if clean:
+        state["clean_at_head_sha"] = monitoring["head_sha"]
+        state["clean_at_base_sha"] = state["pr"]["base_sha"]
+    watcher_result(state, {
+        "result": WATCHER_REVIEW_CLEAN if clean else WATCHER_REVIEW_COMMENTS,
+        "review_id": review["id"], "review_url": review["html_url"],
+        "comment_ids": [comment["id"] for comment in comments],
+        "suppressed_comment_count": len(suppressed),
+        "clean_at_head_sha": monitoring["head_sha"] if clean else None,
+    })
+    save_state(state_path, state)
+    if clean:
+        outcome = {
+            "result": "loop_completed", "state": str(state_path),
+            "head_sha": monitoring["head_sha"], "iterations": state["iterations"],
+            "stage_outcome": stage_outcome(state),
+            "watcher": state["monitoring"]["result"],
+        }
+        state["bounded_step"]["terminal"] = outcome
+        save_state(state_path, state)
+        emit(outcome)
+        return True
+    bounded_review_wait(args, state_path, "review_feedback")
+    return True
+
+
+def command_bounded_pipeline(args: argparse.Namespace) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state)
+    args._coordinator_state_path = state_path
+    args._coordinator_target = target
+    require_outside_repository(state_path, repo_root)
+    owner = {
+        "session_id": os.environ.get("COPILOT_AGENT_SESSION_ID"),
+        "pipeline_run": args.pipeline_run,
+        "pipeline_iteration": args.pipeline_iteration,
+        "pipeline_max_iterations": args.pipeline_max_iterations,
+        "model": args.model,
+        "github_mutation_policy": getattr(args, "github_mutation_policy", None),
+        "max_iterations": args.max_iterations,
+        "request_review_only": bool(getattr(args, "request_review_only", False)),
+        "target": target,
+        "repo_root": str(repo_root),
+        "state": str(state_path.resolve()),
+    }
+    if not isinstance(owner["session_id"], str) or not owner["session_id"]:
+        raise WorkflowError("bounded review pipeline requires COPILOT_AGENT_SESSION_ID")
+    state = load_state(state_path) if state_path.is_file() else {
+        "version": STATE_VERSION, "created_at": utc_now(), "iterations": 0,
+        "history": [],
+    }
+    bounded = state.get("bounded_step")
+    if isinstance(bounded, dict) and bounded.get("owner") != owner:
+        old = bounded.get("owner")
+        if (
+            not isinstance(old, dict)
+            or old.get("session_id") != owner["session_id"]
+            or old.get("pipeline_run") != args.pipeline_run
+            or old.get("pipeline_iteration", 0) >= args.pipeline_iteration
+            or bounded.get("terminal") is None
+        ):
+            raise WorkflowError("bounded review pipeline belongs to another session or run")
+        bounded = None
+    elif bounded is not None and not isinstance(bounded, dict):
+        raise WorkflowError("bounded review pipeline owner is malformed")
+    if bounded is None:
+        state["bounded_step"] = {"owner": owner}
+        save_state(state_path, state)
+    elif bounded.get("terminal") is not None:
+        emit(bounded["terminal"])
+        return
+    if bounded_review_observation(args, state_path):
+        return
+    old_scope = state.get("pipeline_budget")
+    args._pipeline_entry = (
+        isinstance(old_scope, dict)
+        and old_scope.get("iteration") != args.pipeline_iteration
+    )
+    captured: list[dict[str, Any]] = []
+    _BOUNDED_CAPTURE.append(captured)
+    try:
+        command_agent_task(args)
+    except WorkflowError as error:
+        if error.details.get("reason") == "bounded_wait":
+            bounded_review_wait(args, state_path, "review_feedback")
+        else:
+            raise
+    finally:
+        _BOUNDED_CAPTURE.pop()
+    if not captured:
+        raise WorkflowError("bounded review pipeline produced no result")
+    outcome = captured[-1]
+    if outcome.get("result") == "waiting":
+        args._bounded_waiting = True
+    elif outcome.get("result") in {
+        "loop_completed", "no_unresolved_comments", "max_iterations_reached",
+        SOURCE_ONLY_POLICY_SKIP_RESULT, "review_comments_pending_preparation",
+    }:
+        state = load_state(state_path)
+        state["bounded_step"]["terminal"] = outcome
+        save_state(state_path, state)
+    emit(outcome)
 
 
 def require_completed_pipeline_sweep(
@@ -8216,6 +8462,14 @@ def command_agent_task(args: argparse.Namespace) -> None:
     require_outside_repository(state_path, repo_root)
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
+    bounded = bool(getattr(args, "bounded_step", False))
+    resumed_task = (
+        existing.get("agent_task") if bounded and isinstance(existing, dict) else None
+    )
+    resuming = (
+        isinstance(resumed_task, dict)
+        and resumed_task.get("status") == "bounded_pending"
+    )
     previous_sweep = None
     if getattr(args, "_pipeline_entry", False):
         args._pipeline_entry = False
@@ -8245,7 +8499,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         existing.get("agent_task") if isinstance(existing, dict) else None
     )
     if (
-        isinstance(retained_task, dict)
+        not resuming and isinstance(retained_task, dict)
         and retained_task.get("status") not in {
             "completed",
             "consumed",
@@ -8261,7 +8515,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
     canonical_path: Path | None = None
 
     active = existing.get("agent_task") if isinstance(existing, dict) else None
-    if isinstance(active, dict) and active.get("status") not in {
+    if not resuming and isinstance(active, dict) and active.get("status") not in {
         "completed",
         "consumed",
         "superseded",
@@ -8271,7 +8525,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             "recovery is permitted"
         )
     monitoring = existing.get("monitoring") if isinstance(existing, dict) else None
-    if isinstance(monitoring, dict) and monitoring.get("status") in {
+    if not bounded and isinstance(monitoring, dict) and monitoring.get("status") in {
         "requested",
         "running",
     }:
@@ -8289,15 +8543,68 @@ def command_agent_task(args: argparse.Namespace) -> None:
         save_state(state_path, existing)
         continue_after_review_request(args, state_path)
         return
-    preflight = wait_for_stable_review_preflight(
-        args,
-        repo_root=repo_root,
-        target=target,
-        state_path=state_path,
-    )
+    if resuming:
+        preflight = resumed_task["preflight"]
+    elif bounded:
+        try:
+            preflight = agent_task_preflight(repo_root, target, allow_detached=True)
+        except WorkflowError as error:
+            if is_rate_limit_error(error):
+                raise WorkflowError("review feedback is not yet available", details={"reason": "bounded_wait"}) from error
+            raise
+        completed_review = (existing or {}).get("monitoring") or {}
+        completed_result = completed_review.get("result") or {}
+        if completed_result.get("result") == WATCHER_REVIEW_COMMENTS:
+            expected_ids = set(completed_result.get("comment_ids") or [])
+            observed_ids = {item["id"] for item in preflight["comments"]}
+            if (
+                not preflight["comments"]
+                or not expected_ids.issubset(observed_ids)
+                or sum(
+                    item.get("source") == "suppressed"
+                    for item in preflight["comments"]
+                ) < completed_result.get("suppressed_comment_count", 0)
+            ):
+                raise WorkflowError("review feedback is not yet visible", details={"reason": "bounded_wait"})
+        if preflight["comments"]:
+            identity = review_snapshot_sha256(preflight)
+            if identity in processed_review_snapshot_ids(existing or {}):
+                raise WorkflowError("review feedback is not yet available", details={"reason": "bounded_wait"})
+            coordinator = (existing or {}).get("coordinator") or {}
+            stable = coordinator.get("snapshot_sha256") == identity
+            polls = (
+                coordinator.get("stable_polls", 0) + 1
+                if stable else 1
+            )
+            stable_since = (
+                (existing or {}).get("bounded_step", {}).get("stable_since")
+                if stable else utc_now()
+            )
+            if not isinstance(stable_since, str):
+                stable_since = utc_now()
+            stable_ready = polls >= max(1, args.stability_polls) and (
+                dt.datetime.now(dt.timezone.utc) - parse_timestamp(stable_since)
+            ).total_seconds() >= max(0.0, float(getattr(args, "debounce_seconds", 0.0)))
+            update_review_coordinator(
+                state_path,
+                status="ready" if stable_ready else "stabilizing",
+                preflight=preflight, snapshot_sha256=identity, stable_polls=polls,
+            )
+            state_with_poll = load_state(state_path)
+            state_with_poll["bounded_step"]["stable_since"] = stable_since
+            save_state(state_path, state_with_poll)
+            if not stable_ready:
+                raise WorkflowError("review feedback is not yet stable", details={"reason": "bounded_wait"})
+    else:
+        preflight = wait_for_stable_review_preflight(
+            args,
+            repo_root=repo_root,
+            target=target,
+            state_path=state_path,
+        )
     existing = load_state(state_path) if state_path.is_file() else None
     if previous_sweep is not None:
-        if existing != previous_sweep:
+        if existing != previous_sweep and not bounded:
             raise WorkflowError("pipeline state changed during sweep preflight")
         previous_skip = previous_sweep.get("policy_skip")
         if (
@@ -8327,7 +8634,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
             repo_root, target, allow_detached=bool(args.pipeline_run)
         )
         clean_head = empty_queue_clearance_head(
-            None if previous_sweep is not None else existing,
+            None if previous_sweep is not None or (
+                bounded and existing is not None
+                and existing.get("pr") is None and existing.get("queue") is None
+            ) else existing,
             preflight, confirmation, target,
             allow_detached=bool(args.pipeline_run),
         )
@@ -8350,7 +8660,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             state_sha256=existing_sha256,
             pipeline_iteration=getattr(args, "pipeline_iteration", None),
         )
-    if policy_skip_head is not None:
+    if policy_skip_head is not None and not resuming:
         if previous_sweep is not None and (
             existing.get("agent_task") is not None
             or any(
@@ -8448,7 +8758,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         state["last_result"] = "ready"
         save_state(state_path, state)
         raise WorkflowError(SOURCE_ONLY_ACTIONABLE_REVIEW_ERROR)
-    if clean_head is not None:
+    if clean_head is not None and not resuming:
         state["clean_at_head_sha"] = clean_head
         state["clean_at_base_sha"] = pr["base_sha"]
         state["last_result"] = "no_unresolved_comments"
@@ -8479,7 +8789,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         return
-    if remaining <= 0:
+    if remaining <= 0 and not resuming:
         state["clean_at_head_sha"] = None
         state["clean_at_base_sha"] = None
         state["last_result"] = "max_iterations_reached"
@@ -8505,7 +8815,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         return
-    if not preflight["comments"]:
+    if not preflight["comments"] and not resuming:
         state["clean_at_head_sha"] = None
         state["clean_at_base_sha"] = None
         state["last_result"] = "review_required"
@@ -8532,7 +8842,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "iterations": state["iterations"],
             }
         )
-        continue_after_review_request(args, state_path)
+        if bounded:
+            bounded_review_wait(args, state_path, "review_request")
+        else:
+            continue_after_review_request(args, state_path)
         return
     if request_review_only:
         state["last_result"] = "review_comments_pending_preparation"
@@ -8555,7 +8868,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         return
-    run_id = secrets.token_hex(16)
+    run_id = resumed_task["run_id"] if resuming else secrets.token_hex(16)
     prompt_path = state_path.with_name(
         f"{state_path.stem}--{run_id}--hosted-decision-prompt.txt"
     )
@@ -8575,48 +8888,59 @@ def command_agent_task(args: argparse.Namespace) -> None:
         canonical_path,
     ):
         require_outside_repository(artifact, repo_root)
-        if artifact.exists():
+        if artifact.exists() and not resuming:
             raise WorkflowError(
                 "refusing to overwrite existing review decision artifact: "
                 f"{artifact}"
             )
-    state["agent_task"] = {
-        "status": "preparing",
-        "run_id": run_id,
-        "invocation_id": invocation_id,
-        "producer": "hosted",
-        "model": requested_model,
-        "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
-        "policy": HOSTED_DECISION_POLICY,
-        "remaining_iterations": remaining,
-        "preflight": preflight,
-        "prompt_file": str(prompt_path),
-        "result_file": str(result_path),
-        "decision_file": str(decision_path),
-        "canonical_report_file": str(canonical_path),
-        "started_at": utc_now(),
-    }
+    if not resuming:
+        state["agent_task"] = {
+            "status": "preparing",
+            "run_id": run_id,
+            "invocation_id": invocation_id,
+            "producer": "hosted",
+            "model": requested_model,
+            "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
+            "policy": HOSTED_DECISION_POLICY,
+            "remaining_iterations": remaining,
+            "preflight": preflight,
+            "prompt_file": str(prompt_path),
+            "result_file": str(result_path),
+            "decision_file": str(decision_path),
+            "canonical_report_file": str(canonical_path),
+            "started_at": utc_now(),
+        }
     set_stage_progress(state, "addressing_comments")
     save_state(state_path, state)
 
     task_state = state["agent_task"]
     try:
-        require_live_comments(preflight)
-        helper = discover_cloud_task()
-        prompt = build_worker_prompt(
-            preflight, request_id=task_state["run_id"], iteration_allowance=1,
-            prior_history=state.get("history") or [],
-        )
-        require_no_credentials(prompt, source="hosted Copilot review prompt")
-        atomic_write_text(prompt_path, prompt)
-        before_source = local_source_fingerprint(repo_root)
-        before_github = github_decision_fingerprint(target, preflight)
-        task_state.update({
-            "status": "running", "helper": str(helper),
-            "prompt_sha256": sha256_file(prompt_path),
-            "source_before": before_source, "github_before": before_github,
-        })
-        save_state(state_path, state)
+        if resuming:
+            helper = Path(task_state["helper"])
+            if sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256:
+                raise WorkflowError("pinned Agent Tasks helper changed during review")
+            if sha256_file(prompt_path) != task_state.get("prompt_sha256"):
+                raise WorkflowError("bounded review prompt changed")
+            before_source = task_state["source_before"]
+            before_github = task_state["github_before"]
+        else:
+            require_live_comments(preflight)
+            helper = discover_cloud_task()
+            prompt = build_worker_prompt(
+                preflight, request_id=task_state["run_id"], iteration_allowance=1,
+                prior_history=state.get("history") or [],
+            )
+            require_no_credentials(prompt, source="hosted Copilot review prompt")
+            atomic_write_text(prompt_path, prompt)
+            before_source = local_source_fingerprint(repo_root)
+            before_github = github_decision_fingerprint(target, preflight)
+            task_state.update({
+                "status": "bounded_pending" if bounded else "running",
+                "helper": str(helper),
+                "prompt_sha256": sha256_file(prompt_path),
+                "source_before": before_source, "github_before": before_github,
+            })
+            save_state(state_path, state)
         hosted_bundle = run_hosted_decision_worker(
             repo_root=repo_root, target=target, preflight=preflight,
             prompt_path=prompt_path, decision_path=decision_path,
@@ -8624,7 +8948,13 @@ def command_agent_task(args: argparse.Namespace) -> None:
             run_id=task_state["run_id"], requested_model=requested_model,
             before_source=before_source, before_github=before_github,
             helper=helper, timeout=getattr(args, "wait_timeout", DEFAULT_WATCH_TIMEOUT),
+            bounded_action=(
+                "--pipeline-observe" if resuming else "--pipeline-dispatch" if bounded else None
+            ),
         )
+        if hosted_bundle.get("status") == "pending":
+            bounded_review_wait(args, state_path, "hosted_decision")
+            return
         set_stage_progress(state, "validating")
         result = hosted_bundle["result"]
         remote = hosted_bundle["remote"]
@@ -8970,7 +9300,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "comments": report["comments"],
             }
         )
-        continue_after_review_request(args, state_path)
+        if bounded:
+            bounded_review_wait(args, state_path, "review_request")
+        else:
+            continue_after_review_request(args, state_path)
     except BaseException as error:
         current = load_state(state_path)
         current_task = current.get("agent_task")
@@ -9210,6 +9543,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_ITERATIONS,
     )
     pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--bounded-step", action="store_true")
     pipeline.add_argument("--pipeline-iteration", type=int, required=True)
     pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
     pipeline.add_argument(
@@ -9307,7 +9641,10 @@ def main() -> int:
             command_pipeline(args)
         else:
             args.function(args)
-        if args.command in {"agent-task", "pipeline"}:
+        if args.command in {"agent-task", "pipeline"} and not (
+            args.command == "pipeline" and getattr(args, "bounded_step", False)
+            and getattr(args, "_bounded_waiting", False)
+        ):
             require_terminal_agent_task_clearance(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
@@ -9337,7 +9674,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "source_changed",
     "review_comments_pending_preparation",
 })
-EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
+EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 
@@ -9398,6 +9735,7 @@ def execution_main():
         "--pipeline-iteration",
         "--pipeline-max-iterations",
         "--pipeline-run",
+        "--bounded-step",
         "--poll-jitter",
         "--poll-max-interval",
         "--preserve-artifacts",

@@ -2155,6 +2155,83 @@ class SweepTest(unittest.TestCase):
             self.launched,
         )
 
+    def test_bounded_calls_wait_without_restarting_the_stage(self):
+        original_stage = self.run_stage
+        observations = 0
+        checkpoints = []
+
+        def bounded_stage(entry, *arguments, **options):
+            nonlocal observations
+            self.assertTrue(options.pop("bounded"))
+            if entry["stage"] == MODULE.STAGE_CONFLICT and observations < 4:
+                observations += 1
+                return {"returncode": 0, "waiting": True, "wait_seconds": 60}
+            return original_stage(entry, *arguments, **options)
+
+        def checkpoint(value):
+            checkpoints.append(json.loads(json.dumps(value)))
+
+        with mock.patch.object(MODULE, "run_stage", side_effect=bounded_stage):
+            outcome = MODULE.run_pipeline(
+                target(), self.repo, models=MODULE.stage_models(None), effort="high",
+                run_id=PIPELINE_RUN, report=self.events.append,
+                checkpoint=checkpoint,
+            )
+            for _ in range(20):
+                if outcome["result"] not in {"waiting", "continue"}:
+                    break
+                outcome = MODULE.run_pipeline(
+                    target(), self.repo, models=MODULE.stage_models(None), effort="high",
+                    run_id=PIPELINE_RUN, report=self.events.append,
+                    cursor=checkpoints[-1], checkpoint=checkpoint,
+                )
+
+        self.assertEqual("complete", outcome["result"])
+        self.assertEqual(4, observations)
+        self.assertEqual([(stage, 1) for stage in MODULE.STAGE_NAMES], self.launched)
+        self.assertEqual(
+            1,
+            sum(event["event"] == "stage_started" and
+                event["stage"] == MODULE.STAGE_CONFLICT for event in self.events),
+        )
+        self.assertEqual(1, sum(event["event"] == "pipeline_started" for event in self.events))
+
+    def test_bounded_calls_keep_the_second_sweep_and_one_run_identity(self):
+        original_stage = self.run_stage
+        checkpoints = []
+        next_head = "b" * 40
+
+        def bounded_stage(entry, *arguments, **options):
+            self.assertTrue(options.pop("bounded"))
+            result = original_stage(entry, *arguments, **options)
+            if entry["stage"] == MODULE.STAGE_DESCRIPTION and options["sweep"] == 1:
+                self.sync_heads[-1] = next_head
+            return result
+
+        def checkpoint(value):
+            checkpoints.append(json.loads(json.dumps(value)))
+
+        with mock.patch.object(MODULE, "run_stage", side_effect=bounded_stage):
+            outcome = MODULE.run_pipeline(
+                target(), self.repo, models=MODULE.stage_models(None), effort="high",
+                run_id=PIPELINE_RUN, checkpoint=checkpoint,
+            )
+            for _ in range(20):
+                if outcome["result"] not in {"continue", "waiting"}:
+                    break
+                outcome = MODULE.run_pipeline(
+                    target(), self.repo, models=MODULE.stage_models(None), effort="high",
+                    run_id=PIPELINE_RUN, cursor=checkpoints[-1], checkpoint=checkpoint,
+                )
+
+        self.assertEqual("complete", outcome["result"])
+        self.assertEqual(2, outcome["sweeps"])
+        self.assertEqual({PIPELINE_RUN}, {call["run_id"] for call in self.launch_calls})
+        self.assertEqual(
+            [(stage, sweep) for sweep in (1, 2) for stage in MODULE.STAGE_NAMES],
+            self.launched,
+        )
+
     def enable_ci_warnings(self):
         self.warning_payload = None
         launch = self.run_stage
@@ -3644,7 +3721,7 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("An unavailable effort value is allowed", text)
         self.assertIn("cannot be determined", text)
 
-    def test_agent_uses_one_synchronous_terminal_controller(self):
+    def test_agent_drives_bounded_steps_without_background_processes(self):
         text = AGENT.read_text(encoding="utf-8")
         self.assertIn("copilot plugin list --json", text)
         self.assertIn(
@@ -3653,12 +3730,15 @@ class AgentInstructionTest(unittest.TestCase):
         )
         self.assertIn("at most two sweeps", text)
         self.assertIn("Sweeps never reset a stage budget", text)
-        self.assertIn("Invoke the helper synchronously", text)
+        self.assertIn('start "<target>"', text)
+        self.assertIn('advance "<target>" --run-id "<run_id>"', text)
+        self.assertIn("Invoke each helper call synchronously", text)
         self.assertIn(
-            "Do not send a user-visible response while the command is running",
+            "Do not send a user-visible response while a command is running",
             text,
         )
-        self.assertIn("There is no intermediate user-visible outcome", text)
+        self.assertIn("Keep doing this without asking the user to resume", text)
+        self.assertIn("Do not use asynchronous mode, background execution", text)
         self.assertNotIn("execution-status", text)
         self.assertNotIn("execution-cancel", text)
         self.assertNotIn("execution tool's asynchronous mode", text)
@@ -3746,18 +3826,149 @@ class CommandOutputTest(unittest.TestCase):
         self.assertEqual("error", event["result"])
         self.assertEqual("broken", event["error"])
 
+
+class BoundedCommandTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        patch = mock.patch.object(MODULE, "copilot_home", return_value=Path(temporary.name))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.session = mock.patch.dict(
+            MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "session-one"}
+        )
+        self.session.start()
+        self.addCleanup(self.session.stop)
+        self.tools = [
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=Path("C:/repo")),
+            mock.patch.object(MODULE, "resolve_target", return_value=target()),
+        ]
+        for patch in self.tools:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def start(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            MODULE.command_start(
+                MODULE.build_parser().parse_args(["start", "owner/repo#7"])
+            )
+        return json.loads(output.getvalue())
+
+    def test_start_and_advance_are_bound_to_one_session(self):
+        started = self.start()
+        state_path = Path(started["state"])
+        self.assertEqual("continue", started["result"])
+
+        def wait(_target, _repo, *, cursor, checkpoint, **_options):
+            self.assertIsNone(cursor)
+            checkpoint({"sweep": 1, "stage_index": 0, "pending_stage": {
+                "phase": "waiting", "stage_index": 0,
+            }})
+            return {"result": "waiting", "run_id": started["run_id"],
+                    "stage": MODULE.STAGE_CONFLICT, "wait_seconds": 60}
+
+        args = MODULE.build_parser().parse_args([
+            "advance", "owner/repo#7", "--run-id", started["run_id"],
+        ])
+        output = StringIO()
+        with mock.patch.object(MODULE, "run_pipeline", side_effect=wait), redirect_stdout(output):
+            MODULE.command_advance(args)
+        self.assertEqual("waiting", json.loads(output.getvalue())["result"])
+        self.assertEqual("waiting", json.loads(state_path.read_text())["status"])
+        with mock.patch.dict(
+            MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "another-session"}
+        ), self.assertRaisesRegex(MODULE.WorkflowError, "another session"):
+            MODULE.command_advance(args)
+
+    def test_failed_step_cannot_be_advanced_again(self):
+        started = self.start()
+        args = MODULE.build_parser().parse_args([
+            "advance", "owner/repo#7", "--run-id", started["run_id"],
+        ])
+
+        def interrupted(_target, _repo, *, checkpoint, **_options):
+            checkpoint({"sweep": 1, "stage_index": 0, "pending_stage": {
+                "phase": "executing", "stage_index": 0,
+            }})
+            raise MODULE.WorkflowError("stage interrupted")
+
+        with mock.patch.object(MODULE, "run_pipeline", side_effect=interrupted):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "stage interrupted"):
+                MODULE.command_advance(args)
+        self.assertEqual(
+            "blocked", json.loads(Path(started["state"]).read_text())["status"]
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "cannot advance"):
+            MODULE.command_advance(args)
+
+    def test_next_step_requires_the_previous_root_to_have_sealed_success(self):
+        state = {"previous_execution": {"root": "C:/record/handle.json", "run_id": "root-one"}}
+        runtime = mock.Mock()
+        runtime.status.return_value = {
+            "run_id": "root-one", "terminal": True, "exit_code": 0,
+            "local_status": "finished", "local_children_drained": True,
+            "workflow_result": {"result": "waiting"},
+        }
+        with (
+            mock.patch.object(MODULE.common, "_EXECUTION", object()),
+            mock.patch.dict(
+                MODULE.sys.modules, {"_trask_foreground_execution": runtime}
+            ),
+        ):
+            MODULE.require_finished_step(state)
+            runtime.status.return_value["local_status"] = "failed"
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "did not finish safely"
+            ):
+                MODULE.require_finished_step(state)
+
+    def test_bounded_stage_requires_a_sealed_structured_result(self):
+        with mock.patch.object(
+            MODULE.common, "run_monitored",
+            return_value={"returncode": 0, "child_terminal_result": {
+                "workflow_result": {"result": "waiting", "wait_seconds": 60},
+            }},
+        ):
+            stage = MODULE.run_stage(
+                MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-5.6-sol",
+                effort="high", run_id="a" * 32, sweep=1, bounded=True,
+            )
+        self.assertTrue(stage["waiting"])
+        self.assertEqual(60, stage["wait_seconds"])
+
+    def test_step_deadline_is_shorter_than_the_outer_execution_limit(self):
+        def monitor(_command, *, progress, **_options):
+            progress()
+
+        with (
+            mock.patch.object(
+                MODULE.time, "monotonic",
+                side_effect=[0.0, MODULE.STEP_DEADLINE_SECONDS],
+            ),
+            mock.patch.object(MODULE.common, "run_monitored", side_effect=monitor),
+            self.assertRaisesRegex(
+                MODULE.WorkflowError, "exceeded the bounded step deadline"
+            ),
+        ):
+            MODULE.run_stage(
+                MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-5.6-sol",
+                effort="high", run_id="a" * 32, sweep=1, bounded=True,
+            )
+
 class ParserTest(unittest.TestCase):
-    def test_only_run_is_a_pipeline_command(self):
+    def test_pipeline_exposes_bounded_session_commands(self):
         parser = MODULE.build_parser()
         action = next(
             action
             for action in parser._actions
             if isinstance(action, __import__("argparse")._SubParsersAction)
         )
-        self.assertEqual({"run"}, set(action.choices))
+        self.assertEqual({"run", "start", "advance"}, set(action.choices))
 
     def test_removed_commands_fail_before_side_effects(self):
-        for command in ("start", "watch", "cancel"):
+        for command in ("watch", "cancel"):
             side_effect = mock.Mock()
             with (
                 self.subTest(command=command),
@@ -3783,7 +3994,9 @@ class ParserTest(unittest.TestCase):
             mock.patch.object(MODULE, "_load_execution", return_value=runtime),
         ):
             self.assertEqual(17, MODULE.execution_main())
-        runtime.entrypoint.assert_called_once_with(MODULE.main, MODULE.__dict__, commands=("run",))
+        runtime.entrypoint.assert_called_once_with(
+            MODULE.main, MODULE.__dict__, commands=("run", "start", "advance")
+        )
 
     def test_session_owned_run_uses_the_runtime_entrypoint(self):
         runtime = mock.Mock()
@@ -3799,7 +4012,7 @@ class ParserTest(unittest.TestCase):
         ):
             self.assertEqual(17, MODULE.execution_main())
         runtime.entrypoint.assert_called_once_with(
-            MODULE.main, MODULE.__dict__, commands=("run",)
+            MODULE.main, MODULE.__dict__, commands=("run", "start", "advance")
         )
 
 

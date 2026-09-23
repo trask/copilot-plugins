@@ -43,6 +43,21 @@ sys.modules[RUNTIME_SPEC.name] = RUNTIME
 RUNTIME_SPEC.loader.exec_module(RUNTIME)
 
 
+def pending_task_stdout(run_id, session_id, state="in_progress"):
+    return json.dumps({
+        "schema": MODULE.AGENT_TASK_RESULT_SCHEMA,
+        "status": "pending",
+        "pipeline": {
+            "run_id": run_id,
+            "session_id": session_id,
+            "request_id": "request-1",
+        },
+        "task": {"id": "task-1", "state": state},
+        "candidate": None,
+        "completion": None,
+    })
+
+
 class WindowsSubprocessTest(unittest.TestCase):
     def test_embedded_loaders_accept_current_runtime_sources(self):
         cloud = MODULE.load_cloud_task_runtime(RUNTIME_SCRIPT)
@@ -86,6 +101,79 @@ class WindowsSubprocessTest(unittest.TestCase):
             MODULE.run(["git"])
 
         self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
+
+    def test_bounded_run_limits_subprocess_time(self):
+        completed = MODULE.subprocess.CompletedProcess(["git"], 0, "", "")
+        with (
+            mock.patch.object(MODULE, "_BOUNDED_DEADLINE", MODULE.time.monotonic() + 110),
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed) as subprocess_run,
+        ):
+            MODULE.run(["git"])
+        self.assertGreater(subprocess_run.call_args.kwargs["timeout"], 0)
+        self.assertLess(subprocess_run.call_args.kwargs["timeout"], 90)
+
+    def test_bounded_pipeline_deadline_precedes_parent_limit(self):
+        args = MODULE.build_parser().parse_args([
+            "pipeline", "owner/repo#7", "--state", "state.json",
+            "--pipeline-run", "a" * 32, "--pipeline-iteration", "1",
+            "--pipeline-max-iterations", "2", "--bounded-step",
+        ])
+        deadlines = []
+        original = MODULE._BOUNDED_DEADLINE
+
+        def check_deadline(_args):
+            deadlines.append(MODULE._BOUNDED_DEADLINE - MODULE.time.monotonic())
+
+        with (
+            mock.patch.dict(MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "session"}),
+            mock.patch.object(MODULE, "command_agent_task", side_effect=check_deadline),
+        ):
+            MODULE.command_pipeline(args)
+        self.assertEqual(len(deadlines), 1)
+        self.assertGreater(deadlines[0], 80)
+        self.assertLess(deadlines[0], 90)
+        self.assertEqual(MODULE._BOUNDED_DEADLINE, original)
+
+    def test_pending_checkpoint_cannot_claim_a_final_result(self):
+        process = MODULE.subprocess.CompletedProcess(
+            ["cloud_task"], 0, pending_task_stdout("a" * 32, "session"), ""
+        )
+        with mock.patch.object(MODULE.Path, "exists", return_value=True):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "final result file"):
+                MODULE.bounded_description_pending(
+                    process, Path("result.json"),
+                    pipeline_run="a" * 32, session_id="session",
+                )
+
+    def test_pending_checkpoint_must_match_session_and_run(self):
+        process = MODULE.subprocess.CompletedProcess(
+            ["cloud_task"], 0, pending_task_stdout("a" * 32, "other"), ""
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "identity or schema"):
+            MODULE.bounded_description_pending(
+                process, Path("result.json"),
+                pipeline_run="a" * 32, session_id="session",
+            )
+
+    def test_pending_checkpoint_requires_active_task(self):
+        process = MODULE.subprocess.CompletedProcess(
+            ["cloud_task"], 0,
+            pending_task_stdout("a" * 32, "session", "completed"), "",
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "identity or schema"):
+            MODULE.bounded_description_pending(
+                process, Path("result.json"),
+                pipeline_run="a" * 32, session_id="session",
+            )
+        queued = MODULE.subprocess.CompletedProcess(
+            ["cloud_task"], 0,
+            pending_task_stdout("a" * 32, "session", "queued"), "",
+        )
+        with mock.patch.object(MODULE.Path, "exists", return_value=False):
+            self.assertTrue(MODULE.bounded_description_pending(
+                queued, Path("result.json"),
+                pipeline_run="a" * 32, session_id="session",
+            ))
 
 
 def pr_metadata(**overrides):
@@ -548,7 +636,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.82")
+        self.assertEqual(plugin["version"], "1.0.83")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1174,6 +1262,155 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ]
         )
 
+    def test_bounded_pipeline_observes_one_task_and_rejects_foreign_session(self):
+        report = self.proposal_report()
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+        args.pipeline_run = "a" * 32
+        args.bounded_step = True
+        patches = tuple(p for p in patches if p.attribute != "run")
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append(command)
+            if len(commands) < 4:
+                if len(commands) == 1:
+                    result_path = Path(command[command.index("--result-file") + 1])
+                    result_path.with_name(
+                        result_path.name + ".pipeline.json"
+                    ).write_text("{}", encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    command, 0, pending_task_stdout(args.pipeline_run, "session-one"), ""
+                )
+            result = self.result(report)
+            prompt = Path(command[command.index("--prompt-file") + 1])
+            result = result_with_prompt_identity(
+                result, self.preflight, prompt.read_text(encoding="utf-8")
+            )
+            self.last_runtime_result = result
+            Path(command[command.index("--result-file") + 1]).write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.dict(
+                MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "session-one"}
+            ))
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=run))
+            apply = stack.enter_context(mock.patch.object(MODULE, "apply_proposal"))
+            for _ in range(3):
+                MODULE.command_pipeline(args)
+                self.assertEqual("waiting", emitted[-1]["result"])
+                self.assertNotIn("stage_outcome", emitted[-1])
+            retained = MODULE.load_run_state(Path(args.state))
+            self.assertEqual("running", retained["agent_task"]["status"])
+            self.assertEqual(1, len(list(self.directory.glob("*--agent-task-prompt.txt"))))
+            self.assertFalse(Path(retained["agent_task"]["result_file"]).exists())
+            with mock.patch.dict(
+                MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "session-two"}
+            ):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "different inputs or session"):
+                    MODULE.command_pipeline(args)
+            with mock.patch.object(args, "model", "terra"):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "different inputs or session"):
+                    MODULE.command_pipeline(args)
+            with mock.patch.object(args, "pipeline_iteration", 2):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "different inputs or session"):
+                    MODULE.command_pipeline(args)
+            self.assertEqual(3, len(commands))
+            MODULE.command_pipeline(args)
+            self.assertEqual("waiting", emitted[-1]["result"])
+            self.assertEqual(
+                "result_ready",
+                MODULE.load_run_state(Path(args.state))["agent_task"]["status"],
+            )
+            MODULE.command_pipeline(args)
+            self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+            completed = MODULE.load_run_state(Path(args.state))["agent_task"]
+            self.assertEqual("completed", completed["status"])
+            self.assertTrue(any(
+                item["path"].endswith(".pipeline.json")
+                for item in completed["preserved_artifacts"]
+            ))
+            apply.assert_not_called()
+        self.assertIn("--pipeline-dispatch", commands[0])
+        self.assertTrue(all("--pipeline-observe" in cmd for cmd in commands[1:]))
+        self.assertTrue(all("--report" in cmd for cmd in commands))
+
+    def test_bounded_pipeline_requires_session_and_hex_run(self):
+        args = self.pipeline_arguments()
+        args.bounded_step = True
+        with mock.patch.dict(
+            MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "session"}
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "32 lowercase hex"):
+                MODULE.command_pipeline(args)
+        args.pipeline_run = "a" * 32
+        with mock.patch.dict(MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": ""}):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "COPILOT_AGENT_SESSION_ID"):
+                MODULE.command_pipeline(args)
+
+    def test_bounded_pipeline_detects_source_drift_after_observation(self):
+        report = self.proposal_report()
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        patches = tuple(
+            patcher for patcher in patches
+            if patcher.attribute not in {"run", "metadata_for"}
+        )
+        args = self.pipeline_arguments()
+        args.pipeline_run = "c" * 32
+        args.bounded_step = True
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append(command)
+            if len(commands) == 1:
+                result_path = Path(command[command.index("--result-file") + 1])
+                result_path.with_name(
+                    result_path.name + ".pipeline.json"
+                ).write_text("{}", encoding="utf-8")
+                return subprocess.CompletedProcess(
+                    command, 0,
+                    pending_task_stdout(args.pipeline_run, "description-session"), "",
+                )
+            prompt = Path(command[command.index("--prompt-file") + 1])
+            result = result_with_prompt_identity(
+                self.result(report), self.preflight, prompt.read_text(encoding="utf-8")
+            )
+            self.last_runtime_result = result
+            Path(command[command.index("--result-file") + 1]).write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            stack.enter_context(mock.patch.dict(
+                MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "description-session"}
+            ))
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=run))
+            stack.enter_context(mock.patch.object(
+                MODULE, "metadata_for", return_value=pr_metadata(head_sha="9" * 40)
+            ))
+            apply = stack.enter_context(mock.patch.object(MODULE, "apply_proposal"))
+            MODULE.command_pipeline(args)
+            self.assertEqual("waiting", emitted[-1]["result"])
+            MODULE.command_pipeline(args)
+            self.assertEqual("waiting", emitted[-1]["result"])
+            MODULE.command_pipeline(args)
+            self.assertEqual("head_changed", emitted[-1]["result"])
+            self.assertEqual("superseded", emitted[-1]["candidate_status"])
+            apply.assert_not_called()
+        self.assertEqual(2, len(commands))
+
     def test_pipeline_reuses_run_state_for_a_completed_changed_head_sweep(self):
         report = self.proposal_report()
         patches, emitted, _ = self.command_patches(
@@ -1522,7 +1759,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "fa74322811f6f4546bc271450ab5a30e4c25f96724b6e6a7666e5ee07e7c220a",
+            "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(

@@ -5,7 +5,7 @@ Ask Copilot: **Show the PR Pipeline execution topology.**
 ```mermaid
 flowchart LR
     agent["PR Pipeline agent<br/>local session"]
-    scheduler["PR Pipeline scheduler<br/>foreground controller"]
+    scheduler["PR Pipeline scheduler<br/>bounded foreground steps"]
     agent --> scheduler
 
     subgraph pipeline["Five-stage pipeline"]
@@ -28,7 +28,7 @@ flowchart LR
 
 The scheduler runs these stages in order. A second sweep starts when the head or base changed during the first sweep and at least one stage is not clear at the final revisions. On unchanged revisions, it also starts when the sole uncleared stage is CI and fresh verification shows that its green or warning snapshot changed; no other unchanged-stage result starts another sweep. Once Conflict Resolver records a mechanically valid result for the current head and base, or GitHub already reports the pull request mergeable, that stage is clear. A completed hosted resolution is not launched again in the same Pipeline run. A later sweep can refresh mergeability-only or CI snapshot clearance at the current head and live base without resetting the stage budget.
 
-Every stage is an installed Python coordinator subprocess. No model translates its command or exit status. Each coordinator waits for child completion and consumes its own configured iteration allowance. That allowance belongs to the entire run and is neither reset nor multiplied by sweeps. A nonzero exit or unfinished child blocks the Pipeline even if a clearance marker exists. An interrupted run is abandoned; a later invocation starts from the beginning.
+Every stage is an installed Python coordinator. The PR Pipeline custom agent calls `start` once and then calls `advance` in the same Copilot session until the run finishes. Each call completes one bounded step and returns `continue`, `waiting`, or a final result. When hosted work is active, the stage records its exact identity and the agent makes a later observation call; no local process needs to wait for the hosted task. No model translates a stage's command or exit status into clearance. Each coordinator consumes its own configured iteration allowance across the whole run. A nonzero exit or unfinished child blocks the Pipeline even if a clearance marker exists. An interrupted session leaves its run incomplete; a later session starts a fresh run, not an automatic continuation.
 
 Verified Review exhaustion is terminal `carried`, not clean. Pending feedback and spent allowance remain in its status while Self Review, CI and Description continue. Later sweeps cannot turn exhaustion into another allowance. The final result stays incomplete or partial while Review remains unresolved.
 
@@ -46,27 +46,34 @@ On a later native pass, an unchanged member reuses Description only when this ru
 
 ## Foreground ownership
 
-The agent entrypoints use `run <target>` with the shared, source-pinned Runtime
-execution library. Runtime derives a fresh root record in the current Copilot
-session. `execution-status` reads the sole live root, or the latest unambiguous
+The custom agent uses `start <target>`, then `advance <target> --run-id <id>`
+through the shared, source-pinned Runtime execution library. Every call has
+a fresh execution root; the pipeline run ID and its stage state remain bound
+to the original Copilot agent session. The agent reads the sealed result of
+each call, waits only between calls, and advances without asking for another
+user instruction. The original synchronous `run <target>` command remains
+available for standalone compatibility but is not the custom agent's route.
+`execution-status` reads the sole live root, or the latest unambiguous
 terminal root, for this session and helper. `execution-cancel` requests local
 cancellation only when exactly one matching live root exists. Neither observer
 disconnection nor tool-shell exit establishes cancellation or completion.
 
-Stage sequencing remains in these schedulers. Children inherit the root run
-identity, bind their own process generations and write their own readiness.
-Output and results are file-backed. An unfinished or unverified child blocks
-completion. Cancelled or failed runs retain task identities and spent budgets
-rather than starting a replacement. Hosted tasks may continue after local
-cancellation.
+Stage sequencing remains in these schedulers. Children inherit each step's
+execution identity, bind their own process generations and write their own
+readiness. Output and results are file-backed. A sealed `waiting` step means
+the local step finished, not that its stage cleared; the next call observes
+the exact pending task and validates its result before publication. An
+unfinished or unverified child blocks completion. Cancelled or failed steps
+retain task identities and spent budgets rather than starting a replacement.
+Hosted tasks may continue after local cancellation.
 
 Both Pipeline and Conflict require the shared Runtime execution library;
 Conflict retains its dedicated hosted backend. No app-native Stop integration,
 automatic recovery, app-shutdown survival or remote cancellation is promised.
-The agent does not need to stay active.
-Foreground roots create their own run ID. They reject caller-supplied execution
-handles and run IDs, so a fresh invocation cannot point the scheduler at old
-stage paths.
+The agent session must stay active to advance the Pipeline. Foreground roots
+create their own execution identities and reject caller-supplied execution
+handles. `advance` accepts only the Pipeline run ID bound to that session;
+it cannot adopt an earlier execution root.
 
 ## Terminal reporting
 
@@ -117,7 +124,7 @@ Required workflow-specific semantic outputs remain untrusted input checked by th
 | CI Fix | Candidate publication is pending. Only trusted GitHub checks and statuses bound to the exact published source SHA can record green. A coordinator-verified diagnosis of unrelated or pre-existing failures can instead clear orchestration with CI warnings at the exact head and base, never a clean marker. Unknown failures remain uncleared. The coordinator uses bounded polling and never runs candidate Gradle, Maven, tests, or builds locally. |
 | PR Description | A keep result clears without mutation. A replacement applies only when GitHub mutation policy is `allow`. Under `source-only`, the helper keeps the proposal but does not change title or body, so the stage remains uncleared. |
 
-The caller freezes `--github-mutation-policy` at `run`. Both single-PR and stack schedulers forward it to Copilot Review, Self Review, CI Fix, and PR Description. `allow` permits bounded, guarded failed-job reruns through CI Fix. `source-only` permits guarded source publication but forbids reruns, comments, reviews, thread changes, draft changes, title changes, body changes, and all other pull request metadata mutation. No policy permits empty commits as a rerun workaround.
+The caller freezes `--github-mutation-policy` at `start` (or `run` for the synchronous route). Both single-PR and stack schedulers forward it to Copilot Review, Self Review, CI Fix, and PR Description. `allow` permits bounded, guarded failed-job reruns through CI Fix. `source-only` permits guarded source publication but forbids reruns, comments, reviews, thread changes, draft changes, title changes, body changes, and all other pull request metadata mutation. No policy permits empty commits as a rerun workaround.
 
 CI warning clearance requires `stage_outcome: "warning"`, `clean_at_head_sha: null`, exact `warning_at_head_sha` and `warning_at_base_sha` markers, and a nonempty `ci_warnings` list. Each entry names its `check_key`, `name`, `diagnosis` of `unrelated` or `pre_existing`, nonempty `reason`, and nonempty string `evidence` list. The CI coordinator derives these warnings from a fresh completed hosted task. Pipeline reads only its run-bound status envelope, never a hosted report or an old task.
 

@@ -56,6 +56,7 @@ WorkflowError = common.WorkflowError
 
 MAX_SWEEPS = 2
 STAGE_HEARTBEAT_SECONDS = 60.0
+STEP_DEADLINE_SECONDS = 90.0
 CI_SNAPSHOT_CHANGED_REASONS = {
     "clearance_verification": "ci_snapshot_changed",
     "warning_verification": "ci_warning_snapshot_changed",
@@ -151,6 +152,75 @@ def run_directory_for(target: dict[str, Any], run_id: str) -> Path:
 
 def run_result_path(target: dict[str, Any], run_id: str) -> Path:
     return run_directory_for(target, run_id) / "result.json"
+
+
+def run_state_path(target: dict[str, Any], run_id: str) -> Path:
+    return run_directory_for(target, run_id) / "state.json"
+
+
+def require_session_id() -> str:
+    session_id = os.environ.get("COPILOT_AGENT_SESSION_ID")
+    if not session_id or re.fullmatch(r"[A-Za-z0-9_-]+", session_id) is None:
+        raise WorkflowError("bounded PR Pipeline requires a Copilot agent session")
+    return session_id
+
+
+def execution_identity() -> dict[str, str] | None:
+    execution = common._EXECUTION
+    if execution is None:
+        return None
+    return {"root": str(execution.root), "run_id": execution.run_id}
+
+
+def require_finished_step(state: dict[str, Any]) -> None:
+    identity = state.get("previous_execution")
+    if common._EXECUTION is None:
+        return
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(identity.get("root"), str)
+        or not isinstance(identity.get("run_id"), str)
+    ):
+        raise WorkflowError("previous pipeline step has no execution identity")
+    runtime = sys.modules.get("_trask_foreground_execution")
+    if runtime is None:
+        raise WorkflowError("previous pipeline step cannot be verified")
+    try:
+        prior = runtime.status(Path(identity["root"]))
+    except (OSError, ValueError, RuntimeError) as error:
+        raise WorkflowError(
+            f"previous pipeline step could not be verified: {error}"
+        ) from error
+    workflow = prior.get("workflow_result")
+    if (
+        prior.get("run_id") != identity["run_id"]
+        or prior.get("terminal") is not True
+        or prior.get("exit_code") != 0
+        or prior.get("local_status") != "finished"
+        or prior.get("local_children_drained") is not True
+        or not isinstance(workflow, dict)
+        or workflow.get("result") not in {"continue", "waiting"}
+    ):
+        raise WorkflowError("previous pipeline step did not finish safely")
+
+
+def save_run_state(path: Path, state: dict[str, Any]) -> None:
+    if common._EXECUTION is not None:
+        common._EXECUTION.record_state(path, state)
+    common.write_json_atomically(path, state)
+
+
+def load_run_state(path: Path, *, session_id: str) -> dict[str, Any]:
+    state = common.read_json(path)
+    if (
+        not isinstance(state, dict)
+        or state.get("schema") != 1
+        or state.get("session_id") != session_id
+        or state.get("status") not in {"active", "waiting", "blocked", "complete"}
+        or not isinstance(state.get("cursor"), dict)
+    ):
+        raise WorkflowError("bounded PR Pipeline state is missing or belongs to another session")
+    return state
 
 
 def serialized_size(payload: Any) -> int:
@@ -690,8 +760,11 @@ def stage_command(
     sweep: int,
     conflict_strategy: str = "auto",
     repo_root: Path | None = None,
+    bounded: bool = False,
 ) -> list[str]:
     arguments = pipeline_arguments(entry, run_id, sweep)
+    if bounded:
+        arguments.append("--bounded-step")
     arguments.extend(
         [
             "--state",
@@ -739,6 +812,7 @@ def run_stage(
     sweep: int,
     conflict_strategy: str = "auto",
     report: Callable[[dict[str, Any]], None] | None = None,
+    bounded: bool = False,
 ) -> dict[str, Any]:
     command = stage_command(
         entry,
@@ -749,6 +823,7 @@ def run_stage(
         sweep=sweep,
         conflict_strategy=conflict_strategy,
         repo_root=repo_root,
+        bounded=bounded,
     )
     log_path = stage_log_path(target, run_id, sweep, entry)
     last_signature: str | None = None
@@ -759,6 +834,10 @@ def run_stage(
     def progress() -> None:
         nonlocal last_reported_at, last_signature
         now = time.monotonic()
+        if bounded and now - started_at >= STEP_DEADLINE_SECONDS:
+            raise WorkflowError(
+                f"{entry['stage']} exceeded the bounded step deadline"
+            )
         current = common.stage_live_progress(
             entry,
             target,
@@ -794,12 +873,23 @@ def run_stage(
             **(current or {"phase": "running"}),
         )
 
-    return common.run_monitored(
+    result = common.run_monitored(
         command,
         cwd=repo_root,
         log_path=log_path,
         progress=progress,
     )
+    if bounded and result.get("returncode") == 0:
+        terminal = result.get("child_terminal_result")
+        workflow = terminal.get("workflow_result") if isinstance(terminal, dict) else None
+        if not isinstance(workflow, dict):
+            raise WorkflowError("bounded stage did not seal a structured result")
+        if workflow.get("result") == "waiting":
+            result["waiting"] = True
+            result["wait_seconds"] = workflow.get("wait_seconds", 30)
+        elif not isinstance(workflow.get("result"), str) or not workflow["result"]:
+            raise WorkflowError("bounded stage returned no structured result")
+    return result
 
 
 def blocked_result(
@@ -914,15 +1004,75 @@ def run_pipeline(
     run_id: str | None = None,
     conflict_strategy: str = "auto",
     report: Callable[[dict[str, Any]], None] | None = None,
+    cursor: dict[str, Any] | None = None,
+    checkpoint: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     run_id = run_id or uuid.uuid4().hex
-    runs: list[dict[str, Any]] = []
-    known_safe_head: str | None = None
-    completed_sweeps = 0
-    completed_conflict_resolution = False
-    report_event(report, "pipeline_started", run_id=run_id, target=target["pr_url"])
+    bounded = checkpoint is not None
+    runs: list[dict[str, Any]] = list(cursor.get("runs", [])) if cursor else []
+    known_safe_head: str | None = cursor.get("known_safe_head") if cursor else None
+    completed_sweeps = cursor.get("completed_sweeps", 0) if cursor else 0
+    completed_conflict_resolution = (
+        cursor.get("completed_conflict_resolution", False) if cursor else False
+    )
+    start_sweep = cursor.get("sweep", 1) if cursor else 1
+    start_stage_index = cursor.get("stage_index", 0) if cursor else 0
+    pending_stage = cursor.get("pending_stage") if cursor else None
 
-    for sweep in range(1, MAX_SWEEPS + 1):
+    def save_cursor(
+        *, sweep: int, stage_index: int, initialized: bool,
+        sweep_started_head: str | None = None,
+        sweep_started_base: str | None = None,
+        head_changed: bool = False, base_changed: bool = False,
+        pending: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = {
+            "sweep": sweep, "stage_index": stage_index, "initialized": initialized,
+            "sweep_started_head": sweep_started_head,
+            "sweep_started_base": sweep_started_base,
+            "head_changed": head_changed, "base_changed": base_changed,
+            "known_safe_head": known_safe_head,
+            "completed_sweeps": completed_sweeps,
+            "completed_conflict_resolution": completed_conflict_resolution,
+            "pending_stage": pending,
+            "runs": runs,
+        }
+        if checkpoint is not None:
+            checkpoint(current)
+        return current
+
+    def more_work(
+        *, sweep: int, stage_index: int, initialized: bool,
+        sweep_started_head: str, sweep_started_base: str,
+        head_changed: bool, base_changed: bool,
+        pending: dict[str, Any] | None = None,
+        wait_seconds: int | float | None = None,
+    ) -> dict[str, Any]:
+        current = save_cursor(
+            sweep=sweep, stage_index=stage_index, initialized=initialized,
+            sweep_started_head=sweep_started_head,
+            sweep_started_base=sweep_started_base,
+            head_changed=head_changed, base_changed=base_changed,
+            pending=pending,
+        )
+        outcome = {
+            "result": "waiting" if pending is not None else "continue",
+            "run_id": run_id, "sweep": sweep, "stage": STAGES[stage_index]["stage"]
+            if stage_index < len(STAGES) else None,
+            "head_sha": known_safe_head, "cursor": current,
+        }
+        if pending is not None:
+            outcome["wait_seconds"] = (
+                min(60, max(1, int(wait_seconds)))
+                if isinstance(wait_seconds, (int, float)) and wait_seconds > 0
+                else 30
+            )
+        return outcome
+
+    if cursor is None:
+        report_event(report, "pipeline_started", run_id=run_id, target=target["pr_url"])
+
+    for sweep in range(start_sweep, MAX_SWEEPS + 1):
         pr = read_pull_request(target)
         if pr["state"] != "OPEN":
             return blocked_result(
@@ -933,6 +1083,7 @@ def run_pipeline(
                 reason="pr_not_open",
                 detail=f"the pull request is {pr['state']}",
             )
+        previous_safe_head = known_safe_head
         synced = sync_worktree(
             repo_root,
             target,
@@ -949,19 +1100,32 @@ def run_pipeline(
                 detail=synced["detail"],
             )
         known_safe_head = synced["head_sha"]
-        sweep_started_head = known_safe_head
-        sweep_started_base = pr["base_sha"]
-        head_changed = False
-        base_changed = False
-        report_event(
-            report,
-            "sweep_started",
-            run_id=run_id,
-            sweep=sweep,
-            head_sha=sweep_started_head,
+        continuing_sweep = bool(
+            bounded and cursor is not None and sweep == start_sweep
+            and cursor.get("initialized")
         )
+        if continuing_sweep:
+            sweep_started_head = cursor["sweep_started_head"]
+            sweep_started_base = cursor["sweep_started_base"]
+            head_changed = (
+                cursor["head_changed"]
+                or previous_safe_head is not None
+                and known_safe_head != previous_safe_head
+            )
+            base_changed = cursor["base_changed"]
+        else:
+            sweep_started_head = known_safe_head
+            sweep_started_base = pr["base_sha"]
+            head_changed = False
+            base_changed = False
+            report_event(
+                report, "sweep_started", run_id=run_id,
+                sweep=sweep, head_sha=sweep_started_head,
+            )
 
-        for entry in STAGES:
+        for stage_index, entry in enumerate(STAGES):
+            if continuing_sweep and stage_index < start_stage_index:
+                continue
             pr = read_pull_request(target)
             if pr["state"] != "OPEN":
                 return blocked_result(
@@ -1002,7 +1166,14 @@ def run_pipeline(
                 if entry["stage"] == STAGE_CONFLICT
                 else None
             )
-            if before["clear"]:
+            resuming_stage = (
+                bounded and pending_stage is not None
+                and pending_stage.get("sweep") == sweep
+                and pending_stage.get("stage_index") == stage_index
+            )
+            if pending_stage is not None and not resuming_stage:
+                raise WorkflowError("bounded pipeline cursor does not match the pending stage")
+            if before["clear"] and not resuming_stage:
                 record = {
                     "stage": entry["stage"],
                     "sweep": sweep,
@@ -1021,11 +1192,20 @@ def run_pipeline(
                 }
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
+                if bounded:
+                    return more_work(
+                        sweep=sweep, stage_index=stage_index + 1,
+                        initialized=True, sweep_started_head=sweep_started_head,
+                        sweep_started_base=sweep_started_base,
+                        head_changed=head_changed, base_changed=base_changed,
+                    )
                 continue
-            blocker = stage_blocker(
-                before,
-                after_launch=False,
-                conflict_strategy=conflict_strategy,
+            blocker = (
+                None if resuming_stage else stage_blocker(
+                    before,
+                    after_launch=False,
+                    conflict_strategy=conflict_strategy,
+                )
             )
             if blocker is not None:
                 reason, detail = blocker
@@ -1039,7 +1219,10 @@ def run_pipeline(
                     detail=detail,
                     stage_result=before,
                 )
-            if entry["stage"] == STAGE_CONFLICT and completed_conflict_resolution:
+            if (
+                entry["stage"] == STAGE_CONFLICT
+                and completed_conflict_resolution and not resuming_stage
+            ):
                 record = {
                     "stage": entry["stage"],
                     "sweep": sweep,
@@ -1054,6 +1237,13 @@ def run_pipeline(
                 }
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
+                if bounded:
+                    return more_work(
+                        sweep=sweep, stage_index=stage_index + 1,
+                        initialized=True, sweep_started_head=sweep_started_head,
+                        sweep_started_base=sweep_started_base,
+                        head_changed=head_changed, base_changed=base_changed,
+                    )
                 continue
             if not before["installed"]:
                 record = {
@@ -1070,18 +1260,47 @@ def run_pipeline(
                 }
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
+                if bounded:
+                    return more_work(
+                        sweep=sweep, stage_index=stage_index + 1,
+                        initialized=True, sweep_started_head=sweep_started_head,
+                        sweep_started_base=sweep_started_base,
+                        head_changed=head_changed, base_changed=base_changed,
+                    )
                 continue
 
-            report_event(
-                report,
-                "stage_started",
-                run_id=run_id,
-                stage=entry["stage"],
-                sweep=sweep,
-                head_sha=current_head,
-                started_at=utc_now(),
-            )
-            commits_before = snapshot_pr_commits(target)
+            if resuming_stage:
+                commits_before = pending_stage["commits_before"]
+                started_head = pending_stage["started_head_sha"]
+                before_attempt_id = pending_stage.get("before_attempt_id")
+            else:
+                report_event(
+                    report,
+                    "stage_started",
+                    run_id=run_id,
+                    stage=entry["stage"],
+                    sweep=sweep,
+                    head_sha=current_head,
+                    started_at=utc_now(),
+                )
+                commits_before = snapshot_pr_commits(target)
+                started_head = current_head
+            if bounded:
+                pending_stage = {
+                    "sweep": sweep, "stage_index": stage_index,
+                    "started_head_sha": started_head,
+                    "commits_before": commits_before,
+                    "before_attempt_id": before_attempt_id,
+                    "phase": "executing",
+                }
+                save_cursor(
+                    sweep=sweep, stage_index=stage_index, initialized=True,
+                    sweep_started_head=sweep_started_head,
+                    sweep_started_base=sweep_started_base,
+                    head_changed=head_changed, base_changed=base_changed,
+                    pending=pending_stage,
+                )
+            stage_options: dict[str, Any] = {"bounded": True} if bounded else {}
             launched = run_stage(
                 entry,
                 target,
@@ -1092,11 +1311,25 @@ def run_pipeline(
                 sweep=sweep,
                 conflict_strategy=conflict_strategy,
                 report=report,
+                **stage_options,
             )
+            if bounded and launched.get("waiting") is True:
+                if launched.get("returncode") != 0:
+                    raise WorkflowError("bounded stage reported waiting with a failed execution")
+                pending_stage["phase"] = "waiting"
+                return more_work(
+                    sweep=sweep, stage_index=stage_index, initialized=True,
+                    sweep_started_head=sweep_started_head,
+                    sweep_started_base=sweep_started_base,
+                    head_changed=head_changed, base_changed=base_changed,
+                    pending=pending_stage,
+                    wait_seconds=launched.get("wait_seconds"),
+                )
+            pending_stage = None
             settled = settle_after_stage(
                 repo_root,
                 target,
-                started_head_sha=current_head,
+                started_head_sha=started_head,
             )
             commits_after = snapshot_pr_commits(target)
             published_commits, commit_tracking_errors, history_rewritten = commits_added(
@@ -1107,7 +1340,7 @@ def run_pipeline(
                 "sweep": sweep,
                 "action": "launched",
                 "model": models[entry["stage"]],
-                "started_head_sha": current_head,
+                "started_head_sha": started_head,
                 "published_commits": published_commits,
                 **launched,
             }
@@ -1119,7 +1352,7 @@ def run_pipeline(
                 local_head = settled.get("local_head_sha") or git_or_none(
                     repo_root, "rev-parse", "HEAD"
                 )
-                pr_head = settled.get("pr_head_sha") or current_head
+                pr_head = settled.get("pr_head_sha") or started_head
                 current_pr = read_pull_request(target)
                 stages = inspect_stages_for_run(
                     target, pr_head, current_pr["base_sha"], run_id
@@ -1131,7 +1364,7 @@ def run_pipeline(
                 retained_commits = [
                     commit
                     for commit in local_commits_between(
-                        repo_root, current_head, local_head
+                        repo_root, started_head, local_head
                     )
                     if commit["sha"] not in published_shas
                 ]
@@ -1172,7 +1405,7 @@ def run_pipeline(
 
             ended_head = settled["head_sha"]
             known_safe_head = ended_head
-            head_changed = head_changed or ended_head != current_head
+            head_changed = head_changed or ended_head != started_head
             current_pr = read_pull_request(target)
             after = inspect_stage_for_run(
                 entry,
@@ -1265,6 +1498,13 @@ def run_pipeline(
                 completed_conflict_resolution = (
                     bool(after_attempt_id) and after_attempt_id != before_attempt_id
                 )
+            if bounded:
+                return more_work(
+                    sweep=sweep, stage_index=stage_index + 1,
+                    initialized=True, sweep_started_head=sweep_started_head,
+                    sweep_started_base=sweep_started_base,
+                    head_changed=head_changed, base_changed=base_changed,
+                )
 
         completed_sweeps = sweep
         pr = read_pull_request(target)
@@ -1341,6 +1581,13 @@ def run_pipeline(
                 "runs": runs,
                 **common.ci_warning_fields(stages),
             }
+        if bounded:
+            return more_work(
+                sweep=sweep + 1, stage_index=0,
+                initialized=False, sweep_started_head=final_head,
+                sweep_started_base=pr["base_sha"],
+                head_changed=False, base_changed=False,
+            )
 
     raise WorkflowError("the pipeline ended without a result")
 
@@ -1376,6 +1623,112 @@ def command_run(args: argparse.Namespace) -> None:
     reporter({"event": "pipeline_finished", **result})
 
 
+def command_start(args: argparse.Namespace) -> None:
+    session_id = require_session_id()
+    require_tools()
+    repo_root = resolve_repo_root()
+    target = resolve_target(args.target, repo_root)
+    run_id = uuid.uuid4().hex
+    state_path = run_state_path(target, run_id)
+    if state_path.exists():
+        raise WorkflowError("new pipeline run state already exists")
+    state = {
+        "schema": 1, "run_id": run_id, "session_id": session_id,
+        "target": target, "repo_root": str(repo_root),
+        "models": stage_models(args.stage_model, args.effort),
+        "effort": args.effort, "conflict_strategy": args.conflict_strategy,
+        "github_mutation_policy": args.github_mutation_policy,
+        "status": "active", "cursor": {}, "created_at": utc_now(),
+        "previous_execution": execution_identity(),
+    }
+    save_run_state(state_path, state)
+    emit({
+        "result": "continue", "run_id": run_id, "target": target["pr_url"],
+        "state": str(state_path),
+    })
+
+
+def command_advance(args: argparse.Namespace) -> None:
+    session_id = require_session_id()
+    if common.RUN_ID_PATTERN.fullmatch(args.run_id) is None:
+        raise WorkflowError("invalid pipeline run ID")
+    require_tools()
+    repo_root = resolve_repo_root()
+    target = (
+        parse_target(args.target)
+        if "/" in args.target else resolve_target(args.target, repo_root)
+    )
+    state_path = run_state_path(target, args.run_id)
+    lock_path = state_path.with_name("step.lock")
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise WorkflowError("a pipeline step is already active or was interrupted") from None
+    try:
+        os.close(descriptor)
+        state = load_run_state(state_path, session_id=session_id)
+        if (
+            state["run_id"] != args.run_id
+            or state["target"] != target
+            or state["repo_root"] != str(repo_root)
+        ):
+            raise WorkflowError("pipeline run identity or checkout changed")
+        if state["status"] not in {"active", "waiting"}:
+            raise WorkflowError(f"pipeline run is {state['status']}; it cannot advance")
+        try:
+            require_finished_step(state)
+        except WorkflowError as error:
+            state["status"] = "blocked"
+            state["error"] = str(error)
+            save_run_state(state_path, state)
+            raise
+        previous = state["cursor"]
+        if isinstance(previous.get("pending_stage"), dict) and (
+            previous["pending_stage"].get("phase") != "waiting"
+        ):
+            raise WorkflowError("previous pipeline step did not finish safely")
+        reporter = ProgressReporter(
+            target=target, result_path=run_result_path(target, args.run_id)
+        )
+        common.ACTIVE_GITHUB_MUTATION_POLICY = state["github_mutation_policy"]
+
+        def checkpoint(cursor: dict[str, Any]) -> None:
+            state["cursor"] = cursor
+            state["previous_execution"] = execution_identity()
+            state["status"] = (
+                "waiting"
+                if isinstance(cursor.get("pending_stage"), dict)
+                and cursor["pending_stage"].get("phase") == "waiting"
+                else "active"
+            )
+            save_run_state(state_path, state)
+
+        try:
+            outcome = run_pipeline(
+                target, repo_root, models=state["models"],
+                effort=state["effort"], run_id=args.run_id,
+                conflict_strategy=state["conflict_strategy"], report=reporter,
+                cursor=previous if previous else None, checkpoint=checkpoint,
+            )
+        except BaseException as error:
+            state["status"] = "blocked"
+            state["error"] = str(error)
+            save_run_state(state_path, state)
+            raise
+        if outcome["result"] in {"continue", "waiting"}:
+            emit({
+                key: value for key, value in outcome.items() if key != "cursor"
+            })
+        else:
+            state["status"] = (
+                "complete" if outcome["result"] == "complete" else "blocked"
+            )
+            save_run_state(state_path, state)
+            reporter({"event": "pipeline_finished", **outcome})
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
 def report_run_error(args: argparse.Namespace, error: str) -> None:
     run_id = getattr(args, "run_id", None)
     if not isinstance(run_id, str) or not common.RUN_ID_PATTERN.fullmatch(run_id):
@@ -1398,34 +1751,37 @@ def report_run_error(args: argparse.Namespace, error: str) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    run_command = subparsers.add_parser(
-        "run", help="run up to two foreground sweeps over the five stages"
+    for name in ("run", "start"):
+        run_command = subparsers.add_parser(
+            name, help="run the five stages" if name == "run"
+            else "start one agent-driven bounded pipeline run"
+        )
+        run_command.add_argument(
+            "target", nargs="?",
+            help="PR URL, owner/repo#number, or PR number in the current repository",
+        )
+        run_command.add_argument(
+            "--stage-model", action="append",
+            help="pin one stage's model as <stage>=<model>; repeatable",
+        )
+        run_command.add_argument("--effort", default=DEFAULT_EFFORT)
+        run_command.add_argument(
+            "--conflict-strategy", choices=common.CONFLICT_STRATEGIES,
+            default="auto",
+        )
+        run_command.add_argument(
+            "--github-mutation-policy", choices=("allow", "source-only"),
+            default="allow",
+        )
+        run_command.set_defaults(
+            function=command_run if name == "run" else command_start
+        )
+    advance = subparsers.add_parser(
+        "advance", help="advance one bounded step of the current session's run"
     )
-    run_command.add_argument(
-        "target",
-        nargs="?",
-        help=(
-            "PR URL, owner/repo#number, or a bare number when the repository is "
-            "known; omit only from a branch attached to the pull request"
-        ),
-    )
-    run_command.add_argument(
-        "--stage-model",
-        action="append",
-        help="pin one stage's model as <stage>=<model>; repeatable",
-    )
-    run_command.add_argument("--effort", default=DEFAULT_EFFORT)
-    run_command.add_argument(
-        "--conflict-strategy",
-        choices=common.CONFLICT_STRATEGIES,
-        default="auto",
-    )
-    run_command.add_argument(
-        "--github-mutation-policy",
-        choices=("allow", "source-only"),
-        default="allow",
-    )
-    run_command.set_defaults(function=command_run)
+    advance.add_argument("target")
+    advance.add_argument("--run-id", required=True)
+    advance.set_defaults(function=command_advance)
     return parser
 
 
@@ -1446,8 +1802,10 @@ _EXECUTION = None
 EXECUTION_TERMINAL_RESULTS = frozenset({
     "complete",
     "incomplete",
+    "continue",
+    "waiting",
 })
-EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
+EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 
@@ -1494,7 +1852,7 @@ def _load_execution():
 
 
 def execution_main():
-    commands = ('run',)
+    commands = ('run', 'start', 'advance')
     arguments = sys.argv[1:]
     selected = (
         os.environ.get("TRASK_EXECUTION_PARENT")

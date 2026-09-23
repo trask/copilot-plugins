@@ -15,7 +15,8 @@ import sys
 import time
 import urllib.parse
 import uuid
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping, Sequence, TextIO
@@ -38,6 +39,16 @@ SUCCESS_STATES = {"completed"}
 ERROR_STATES = {"failed", "timed_out", "cancelled"}
 BLOCKED_STATES = {"waiting_for_user", "idle"}
 KNOWN_STATES = ACTIVE_STATES | SUCCESS_STATES | ERROR_STATES | BLOCKED_STATES
+PIPELINE_RUN_PATTERN = re.compile(r"\A[0-9a-f]{32}\Z")
+PIPELINE_CHECKPOINT_SCHEMA = {
+    "id": "github.copilot.agent-task-pipeline-checkpoint",
+    "version": 1,
+}
+PIPELINE_REQUEST_TIMEOUT_SECONDS = 45
+PIPELINE_STAGE_TIMEOUT_SECONDS = 70
+_PIPELINE_DEADLINE: ContextVar[float | None] = ContextVar(
+    "pipeline_deadline", default=None
+)
 SHA_PATTERN = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 OUTPUT_DIRECTORY = ".github/agent-task-output"
 OUTPUT_REPORT_PATH = f"{OUTPUT_DIRECTORY}/report.md"
@@ -206,6 +217,8 @@ class Options:
     policy: str | None = None
     allow_merged_pr: bool = False
     prompt_file: Path | None = None
+    pipeline_mode: str | None = None
+    pipeline_run: str | None = None
 
 
 @dataclass(frozen=True)
@@ -302,6 +315,7 @@ class ResultEnvelope:
     status: str = "error"
     error_code: str | None = None
     error_message: str | None = None
+    pipeline: Mapping[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         pull_request = None
@@ -319,7 +333,7 @@ class ResultEnvelope:
                     "head_sha",
                 )
             }
-        return {
+        payload = {
             "schema": {
                 "id": RESULT_SCHEMA_ID,
                 "version": CANDIDATE_RESULT_SCHEMA_VERSION,
@@ -366,6 +380,9 @@ class ResultEnvelope:
                 else None
             ),
         }
+        if self.pipeline is not None:
+            payload["pipeline"] = self.pipeline
+        return payload
 
 
 @dataclass
@@ -391,6 +408,8 @@ def parse_args(args: Sequence[str]) -> Options:
     pull_request: PrReference | None = None
     result_file: Path | None = None
     policy: str | None = None
+    pipeline_mode: str | None = None
+    pipeline_run: str | None = None
     prompt_start: int | None = None
     index = 0
     while index < len(args):
@@ -418,7 +437,18 @@ def parse_args(args: Sequence[str]) -> Options:
             allow_merged_pr = True
             index += 1
             continue
-        if token in {"--model", "--prompt-file", "--pr", "--result-file", "--policy"}:
+        if token in {"--pipeline-dispatch", "--pipeline-observe"}:
+            if pipeline_mode is not None:
+                raise CloudError(
+                    "exactly one pipeline stage is required", "pipeline_invalid"
+                )
+            pipeline_mode = token.removeprefix("--pipeline-")
+            index += 1
+            continue
+        if token in {
+            "--model", "--prompt-file", "--pr", "--result-file",
+            "--policy", "--pipeline-run",
+        }:
             if index + 1 >= len(args):
                 raise CloudError(f"{token} requires a value")
             value = args[index + 1]
@@ -428,6 +458,13 @@ def parse_args(args: Sequence[str]) -> Options:
                         f"unsupported model {value!r}; choose luna, terra, sol, or astra"
                     )
                 model_alias = value
+            elif token == "--pipeline-run":
+                if pipeline_run is not None or not PIPELINE_RUN_PATTERN.fullmatch(value):
+                    raise CloudError(
+                        "--pipeline-run requires one lowercase 32-character hex ID",
+                        "pipeline_invalid",
+                    )
+                pipeline_run = value
             elif token == "--prompt-file":
                 if prompt_file is not None:
                     raise CloudError("--prompt-file may be specified only once")
@@ -496,6 +533,11 @@ def parse_args(args: Sequence[str]) -> Options:
             "--allow-merged-pr is valid only for code candidates",
             "policy_rejected",
         )
+    if (pipeline_mode is None) != (pipeline_run is None):
+        raise CloudError(
+            "pipeline stages require --pipeline-run and a stage flag",
+            "pipeline_invalid",
+        )
     return Options(
         report=report,
         model=MODEL_IDS[model_alias],
@@ -506,6 +548,8 @@ def parse_args(args: Sequence[str]) -> Options:
         policy=policy,
         allow_merged_pr=allow_merged_pr,
         prompt_file=prompt_file,
+        pipeline_mode=pipeline_mode,
+        pipeline_run=pipeline_run,
     )
 
 def parse_pr_reference(value: str) -> PrReference:
@@ -674,12 +718,132 @@ def atomic_write_json(path: Path, data: Mapping[str, object]) -> None:
             "result_file_write_failed",
         ) from None
 
+def pipeline_checkpoint_path(result_path: Path) -> Path:
+    return result_path.with_name(result_path.name + ".pipeline.json")
+
+def pipeline_session_id() -> str:
+    value = os.environ.get("COPILOT_AGENT_SESSION_ID")
+    if not value or not value.strip() or value != value.strip():
+        raise CloudError(
+            "pipeline stage requires an exact agent session ID",
+            "pipeline_identity_mismatch",
+        )
+    return value
+
+def pipeline_identity(
+    options: Options,
+    root: Path,
+    repository: str,
+    pull_request: PullRequestSnapshot,
+    local: LocalIdentity,
+    submitted_prompt: str,
+) -> dict[str, object]:
+    return {
+        "session_id": pipeline_session_id(),
+        "run_id": options.pipeline_run,
+        "repository": repository,
+        "root": str(root.resolve()),
+        "result_file": str(options.result_file.resolve()),
+        "prompt_file": str(options.prompt_file.resolve()),
+        "prompt_sha256": hashlib.sha256(options.prompt.encode("utf-8")).hexdigest(),
+        "submitted_prompt_sha256": hashlib.sha256(
+            submitted_prompt.encode("utf-8")
+        ).hexdigest(),
+        "model": options.model,
+        "policy": policy_metadata(options),
+        "report": options.report,
+        "apply_with_report": options.apply_with_report,
+        "allow_merged_pr": options.allow_merged_pr,
+        "pr_reference": asdict(options.pull_request),
+        "pull_request": asdict(pull_request),
+        "local_identity": asdict(local),
+    }
+
+def reserve_pipeline_checkpoint(
+    path: Path, identity: Mapping[str, object], request_id: str
+) -> None:
+    checkpoint = {
+        "schema": PIPELINE_CHECKPOINT_SCHEMA,
+        "identity": identity,
+        "request_id": request_id,
+        "state": "dispatch_unknown",
+        "task_id": None,
+    }
+    try:
+        with path.open("x", encoding="utf-8", newline="\n") as stream:
+            json.dump(checkpoint, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        raise CloudError(
+            "pipeline dispatch already has a checkpoint; POST was not repeated",
+            "pipeline_duplicate_dispatch",
+        ) from None
+    except OSError as error:
+        raise CloudError(
+            f"cannot reserve pipeline dispatch: {error}",
+            "pipeline_checkpoint_invalid",
+        ) from None
+
+def load_pipeline_checkpoint(path: Path) -> dict[str, object]:
+    if path.is_symlink():
+        raise CloudError(
+            "pipeline checkpoint cannot be a symlink", "pipeline_checkpoint_invalid"
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        raise CloudError(
+            "pipeline checkpoint is missing or invalid", "pipeline_checkpoint_invalid"
+        ) from None
+    if (
+        not isinstance(data, dict)
+        or data.get("schema") != PIPELINE_CHECKPOINT_SCHEMA
+        or not isinstance(data.get("identity"), dict)
+        or not isinstance(data["identity"].get("session_id"), str)
+        or not data["identity"]["session_id"]
+        or not isinstance(data["identity"].get("run_id"), str)
+        or not PIPELINE_RUN_PATTERN.fullmatch(data["identity"]["run_id"])
+        or not isinstance(data.get("request_id"), str)
+        or not data["request_id"]
+        or data.get("state") != "dispatched"
+        or not isinstance(data.get("task_id"), str)
+        or not data["task_id"]
+    ):
+        raise CloudError(
+            "pipeline dispatch has no confirmed task identity",
+            "pipeline_checkpoint_invalid",
+        )
+    return data
+
+def set_pipeline_checkpoint_state(
+    path: Path, checkpoint: Mapping[str, object], state: str
+) -> None:
+    atomic_write_json(path, {**checkpoint, "state": state})
+
 def _result_path_from_argv(args: Sequence[str]) -> Path | None:
     for index, token in enumerate(args):
         if token == "--result-file" and index + 1 < len(args):
             path = Path(args[index + 1])
             return path if path.is_absolute() else None
     return None
+
+def pipeline_option_tokens(args: Sequence[str]) -> list[str]:
+    tokens = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--" or not token.startswith("-"):
+            break
+        tokens.append(token)
+        index += (
+            2 if token in {
+                "--model", "--pr", "--prompt-file", "--result-file",
+                "--policy", "--pipeline-run",
+            } else 1
+        )
+    return tokens
 
 def _creation_flags() -> int:
     if os.name != "nt":
@@ -692,9 +856,16 @@ def run_process(
     *,
     cwd: Path | None = None,
     input_text: str | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if _EXECUTION is not None:
         runner = _EXECUTION.run
+    deadline = _PIPELINE_DEADLINE.get()
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CloudError("pipeline stage exceeded its deadline", "pipeline_timeout")
+        timeout = min(timeout, remaining) if timeout is not None else remaining
     kwargs: dict[str, object] = {
         "capture_output": True,
         "text": True,
@@ -704,6 +875,8 @@ def run_process(
     }
     if input_text is not None:
         kwargs["input"] = input_text
+    if timeout is not None:
+        kwargs["timeout"] = timeout
     if os.name == "nt":
         kwargs["creationflags"] = _creation_flags()
     try:
@@ -715,6 +888,8 @@ def run_process(
         ) from None
     except OSError as error:
         raise CloudError(f"could not run {command[0]}: {error}") from None
+    except subprocess.TimeoutExpired:
+        raise CloudError(f"{command[0]} exceeded its request deadline", "api_timeout") from None
 
 def _command_error(command: Sequence[str], result: subprocess.CompletedProcess[str]) -> str:
     detail = result.stderr.strip() or result.stdout.strip()
@@ -1801,6 +1976,7 @@ class ApiClient:
         payload: Mapping[str, object] | None,
         expected_status: int,
         operation: str,
+        timeout: float | None = None,
     ) -> object:
         command = [
             "gh",
@@ -1818,7 +1994,7 @@ class ApiClient:
         if payload is not None:
             command.extend(["--input", "-"])
             input_text = json.dumps(payload, ensure_ascii=False)
-        result = run_process(self.runner, command, input_text=input_text)
+        result = run_process(self.runner, command, input_text=input_text, timeout=timeout)
         try:
             response = parse_http_response(result.stdout)
         except CloudError as error:
@@ -2627,13 +2803,29 @@ def execute(
     result: ResultEnvelope | None = None,
 ) -> int:
     progress = progress or Progress()
+    if options.result_file is None or options.pull_request is None:
+        raise AssertionError("candidate invocation lost required paths")
+    if options.pipeline_mode == "observe":
+        return execute_pipeline_observe(
+            options, cwd=cwd, runner=runner, sleep=sleep, wall_clock=wall_clock,
+            stderr=stderr, path_exists=path_exists, progress=progress, result=result,
+        )
     git = GitRepository(runner, path_exists)
     api = ApiClient(runner, sleep, wall_clock)
     report_only = (
         options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
     )
-    if options.result_file is None or options.pull_request is None:
-        raise AssertionError("candidate invocation lost required paths")
+    if options.pipeline_mode == "dispatch":
+        if (
+            pipeline_checkpoint_path(options.result_file).exists()
+            or options.result_file.exists()
+        ):
+            raise CloudError(
+                "pipeline dispatch already has a result or checkpoint; "
+                "POST was not repeated",
+                "pipeline_duplicate_dispatch",
+            )
+        pipeline_session_id()
     if result is not None:
         result.mode = mode_name(options)
         result.requested_model = options.model
@@ -2715,7 +2907,48 @@ def execute(
         raise AssertionError("Agent Task payload lost its prompt")
     if _EXECUTION is not None:
         _EXECUTION.record_dispatch(options.result_file, request_id, repository)
-    initial = start_task(api, repository, payload)
+    if options.pipeline_mode == "dispatch":
+        identity = pipeline_identity(
+            options, root, repository, pull_request, policy_identity, submitted_prompt,
+        )
+        checkpoint_path = pipeline_checkpoint_path(options.result_file)
+        reserve_pipeline_checkpoint(checkpoint_path, identity, request_id)
+        try:
+            initial = validate_task(
+                api._request_once(
+                    "POST",
+                    f"agents/repos/{repository}/tasks",
+                    payload=payload,
+                    expected_status=201,
+                    operation="start Agent Task",
+                    timeout=PIPELINE_REQUEST_TIMEOUT_SECONDS,
+                )
+            )
+        except (TransientApiError, CloudError) as error:
+            raise CloudError(
+                f"pipeline task creation is unconfirmed; POST will not be repeated: {error}",
+                "pipeline_dispatch_unknown",
+            ) from None
+        atomic_write_json(checkpoint_path, {
+            "schema": PIPELINE_CHECKPOINT_SCHEMA,
+            "identity": identity,
+            "request_id": request_id,
+            "state": (
+                "dispatched"
+                if initial["state"] in ACTIVE_STATES else "terminal_error"
+            ),
+            "task_id": initial["id"],
+        })
+        progress.task_id = str(initial["id"])
+        progress.last_state = str(initial["state"])
+        if progress.last_state not in ACTIVE_STATES:
+            raise CloudError(
+                f"Agent Task {progress.task_id} entered {progress.last_state} "
+                "before pipeline dispatch could confirm an active task",
+                "pipeline_dispatch_not_active",
+            )
+    else:
+        initial = start_task(api, repository, payload)
     if result is not None:
         result.task_id = str(initial["id"])
         result.task_state = str(initial["state"])
@@ -2734,6 +2967,15 @@ def execute(
                     "state": result.task_state,
                 },
             )
+    if options.pipeline_mode == "dispatch":
+        if result is not None:
+            result.status = "pending"
+            result.pipeline = {
+                "run_id": options.pipeline_run,
+                "session_id": identity["session_id"],
+                "request_id": request_id,
+            }
+        return 0
 
     final = monitor_task(
         api,
@@ -2749,6 +2991,33 @@ def execute(
         result.task_state = str(final["state"])
         link = final.get("html_url") or final.get("url")
         result.task_url = link if isinstance(link, str) and link else result.task_url
+    return collect_completed_task(
+        options, git=git, api=api, runner=runner, root=root,
+        repository=repository, pull_request=pull_request, snapshot=snapshot,
+        policy_identity=policy_identity, request_id=request_id,
+        task_id=str(initial["id"]), submitted_prompt=submitted_prompt,
+        final=final, result=result, stderr=stderr,
+    )
+
+def collect_completed_task(
+    options: Options,
+    *,
+    git: GitRepository,
+    api: ApiClient,
+    runner: Runner,
+    root: Path,
+    repository: str,
+    pull_request: PullRequestSnapshot,
+    snapshot: WorktreeSnapshot | None,
+    policy_identity: LocalIdentity,
+    request_id: str,
+    task_id: str,
+    submitted_prompt: str,
+    final: Mapping[str, object],
+    result: ResultEnvelope | None,
+    stderr: TextIO,
+) -> int:
+    report_only = options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
     refs = resolve_generated_refs(final)
     if result is not None:
         result.generated_branch = refs.head
@@ -2759,16 +3028,19 @@ def execute(
             f"recorded base was {expected_base}"
         )
 
-    validate_policy_before_mutation(
-        git,
-        policy_identity,
-        runner,
-        root,
-        repository,
-        options.pull_request,
-        pull_request,
-        allow_merged_pr=options.allow_merged_pr,
-    )
+    if options.pipeline_mode == "observe":
+        git.require_identity_unchanged(root, policy_identity)
+    else:
+        validate_policy_before_mutation(
+            git,
+            policy_identity,
+            runner,
+            root,
+            repository,
+            options.pull_request,
+            pull_request,
+            allow_merged_pr=options.allow_merged_pr,
+        )
     if options.allow_merged_pr:
         if snapshot is None:
             raise AssertionError("historical candidate lost its snapshot")
@@ -2786,7 +3058,7 @@ def execute(
     all_commits = git.cloud_commits(root, pull_request.head_sha, tracking_ref)
     completion = validate_fresh_completion(
         final,
-        expected_task_id=str(initial["id"]),
+        expected_task_id=task_id,
         repository=repository,
         requested_model=options.model,
         expected_prompt=submitted_prompt,
@@ -2840,6 +3112,215 @@ def execute(
     )
     return 0
 
+def validate_active_pipeline_task(
+    task: Mapping[str, object],
+    repository: str,
+    model: str,
+    prompt: str,
+    base_ref: str,
+) -> None:
+    task_repository = task.get("repository")
+    if isinstance(task_repository, dict):
+        name = next(
+            (
+                task_repository.get(field)
+                for field in ("full_name", "name_with_owner", "nameWithOwner")
+                if field in task_repository
+            ),
+            None,
+        )
+        if name is not None and (
+            not isinstance(name, str) or name.casefold() != repository.casefold()
+        ):
+            raise CloudError(
+                "active Agent Task repository does not match the request",
+                "task_identity_mismatch",
+            )
+    owner = task.get("owner")
+    if isinstance(owner, dict) and owner.get("login") is not None:
+        login = owner["login"]
+        if (
+            not isinstance(login, str)
+            or login.casefold() != repository.partition("/")[0].casefold()
+        ):
+            raise CloudError(
+                "active Agent Task owner does not match the request",
+                "task_identity_mismatch",
+            )
+    sessions = task.get("sessions")
+    if isinstance(sessions, list) and sessions:
+        if len(sessions) != 1 or not isinstance(sessions[0], dict):
+            raise CloudError(
+                "active Agent Task has conflicting sessions",
+                "task_identity_mismatch",
+            )
+        session = sessions[0]
+        if (
+            ("task_id" in session and session["task_id"] != task["id"])
+            or ("model" in session and session["model"] not in {
+                model, f"sweagent-capi:{model}",
+            })
+            or ("prompt" in session and session["prompt"] != prompt)
+            or (
+                "base_ref" in session
+                and _short_branch_ref(str(session["base_ref"]))
+                != _short_branch_ref(base_ref)
+            )
+        ):
+            raise CloudError(
+                "active Agent Task session does not match the request",
+                "task_identity_mismatch",
+            )
+
+def execute_pipeline_observe(
+    options: Options,
+    *,
+    cwd: Path,
+    runner: Runner,
+    sleep: Sleeper,
+    wall_clock: Clock,
+    stderr: TextIO,
+    path_exists: Callable[[Path], bool],
+    progress: Progress,
+    result: ResultEnvelope | None,
+) -> int:
+    if options.result_file is None or options.pull_request is None:
+        raise AssertionError("pipeline observation lost required paths")
+    checkpoint = load_pipeline_checkpoint(
+        pipeline_checkpoint_path(options.result_file)
+    )
+    if options.result_file.exists() or options.result_file.is_symlink():
+        raise CloudError(
+            "pipeline final result already exists", "pipeline_checkpoint_invalid"
+        )
+    git = GitRepository(runner, path_exists)
+    api = ApiClient(runner, sleep, wall_clock)
+    report_only = options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
+    snapshot = None if report_only else git.snapshot(cwd, allow_detached=True)
+    root = git.root(cwd) if snapshot is None else snapshot.root
+    repository = git.repository_name(root) if snapshot is None else snapshot.repository
+    validate_policy_before_post(options, root, options.result_file)
+    checkpoint_identity = checkpoint["identity"]
+    frozen = checkpoint_identity.get("pull_request")
+    if (
+        not isinstance(frozen, dict)
+        or set(frozen) != set(PullRequestSnapshot.__dataclass_fields__)
+    ):
+        raise CloudError(
+            "pipeline checkpoint has no frozen pull request",
+            "pipeline_checkpoint_invalid",
+        )
+    try:
+        pull_request = PullRequestSnapshot(**frozen)
+    except TypeError:
+        raise CloudError(
+            "pipeline checkpoint has an invalid pull request",
+            "pipeline_checkpoint_invalid",
+        ) from None
+    local = git.identity(root)
+    frozen_local = checkpoint_identity.get("local_identity")
+    if not isinstance(frozen_local, dict) or frozen_local != asdict(local):
+        raise CloudError(
+            "pipeline local source identity changed", "pipeline_identity_mismatch"
+        )
+    if snapshot is not None:
+        if options.allow_merged_pr:
+            if (
+                snapshot.branch != f"trask-pr-audit-{pull_request.number}"
+                or snapshot.head != pull_request.head_sha
+            ):
+                raise CloudError(
+                    "historical source identity changed", "pipeline_identity_mismatch"
+                )
+            git.require_historical_unchanged(snapshot, {snapshot.head})
+        else:
+            git.require_unchanged(snapshot)
+    submitted_prompt = task_payload(
+        options, OUTPUT_REPORT_PATH, pull_request
+    )["prompt"]
+    if not isinstance(submitted_prompt, str):
+        raise AssertionError("Agent Task payload lost its prompt")
+    identity = pipeline_identity(
+        options, root, repository, pull_request, local, submitted_prompt
+    )
+    if checkpoint["identity"] != identity:
+        raise CloudError(
+            "pipeline session, options or local source identity changed",
+            "pipeline_identity_mismatch",
+        )
+    request_id = str(checkpoint["request_id"])
+    task_id = str(checkpoint["task_id"])
+    progress.result_path = options.result_file
+    progress.request_id = request_id
+    progress.repository = repository
+    progress.task_id = task_id
+    if result is not None:
+        result.mode = mode_name(options)
+        result.requested_model = options.model
+        result.policy = policy_metadata(options)
+        result.repository = repository
+        result.pull_request = pull_request
+        result.request_id = request_id
+        result.final_local_head = local.head
+        result.application_status = "not_applicable" if report_only else "not_applied"
+        result.task_id = task_id
+        result.task_base_ref = task_base_ref(pull_request)
+        result.task_base_sha = pull_request.head_sha
+    checkpoint_path = pipeline_checkpoint_path(options.result_file)
+    set_pipeline_checkpoint_state(checkpoint_path, checkpoint, "observing")
+    encoded_id = urllib.parse.quote(task_id, safe="")
+    try:
+        current = validate_task(
+            api._request_once(
+                "GET",
+                f"agents/repos/{repository}/tasks/{encoded_id}",
+                payload=None,
+                expected_status=200,
+                operation=f"poll Agent Task {task_id}",
+                timeout=PIPELINE_REQUEST_TIMEOUT_SECONDS,
+            ),
+            task_id,
+        )
+    except TransientApiError as error:
+        raise CloudError(f"bounded Agent Task observation failed: {error}", "api_failure") from None
+    state = str(current["state"])
+    progress.last_state = state
+    if result is not None:
+        result.task_state = state
+        link = current.get("html_url") or current.get("url")
+        result.task_url = link if isinstance(link, str) and link else None
+    if _EXECUTION is not None:
+        _EXECUTION.record_dispatch(
+            options.result_file, request_id, repository,
+            {"id": task_id, "state": state, "url": result.task_url if result is not None else None},
+        )
+    if state in ACTIVE_STATES:
+        validate_active_pipeline_task(
+            current, repository, options.model, submitted_prompt,
+            task_base_ref(pull_request),
+        )
+        set_pipeline_checkpoint_state(checkpoint_path, checkpoint, "dispatched")
+        if result is not None:
+            result.status = "pending"
+            result.pipeline = {
+                "run_id": options.pipeline_run,
+                "session_id": identity["session_id"],
+                "request_id": request_id,
+            }
+        return 0
+    report_metadata(current, stderr)
+    if state not in SUCCESS_STATES:
+        set_pipeline_checkpoint_state(checkpoint_path, checkpoint, "terminal_error")
+        raise CloudError(f"Agent Task {task_id} ended in state {state}", "task_failed")
+    set_pipeline_checkpoint_state(checkpoint_path, checkpoint, "collecting")
+    return collect_completed_task(
+        options, git=git, api=api, runner=runner, root=root,
+        repository=repository, pull_request=pull_request, snapshot=snapshot,
+        policy_identity=local, request_id=request_id, task_id=task_id,
+        submitted_prompt=submitted_prompt, final=current,
+        result=result, stderr=stderr,
+    )
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -2853,25 +3334,39 @@ def main(
     path_exists: Callable[[Path], bool] = Path.exists,
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    option_tokens = pipeline_option_tokens(args)
+    pipeline_call = any(
+        option in option_tokens
+        for option in ("--pipeline-dispatch", "--pipeline-observe", "--pipeline-run")
+    )
     result_path = _result_path_from_argv(args)
     result = ResultEnvelope()
     progress = Progress()
     try:
         options = parse_args(args)
         result_path = options.result_file
-        code = execute(
-            options,
-            cwd=Path.cwd() if cwd is None else cwd,
-            runner=runner,
-            sleep=sleep,
-            wall_clock=wall_clock,
-            uuid_factory=uuid_factory,
-            stdout=stdout,
-            stderr=stderr,
-            path_exists=path_exists,
-            progress=progress,
-            result=result if result_path is not None else None,
+        token = (
+            _PIPELINE_DEADLINE.set(time.monotonic() + PIPELINE_STAGE_TIMEOUT_SECONDS)
+            if options.pipeline_mode is not None
+            else None
         )
+        try:
+            code = execute(
+                options,
+                cwd=Path.cwd() if cwd is None else cwd,
+                runner=runner,
+                sleep=sleep,
+                wall_clock=wall_clock,
+                uuid_factory=uuid_factory,
+                stdout=stdout,
+                stderr=stderr,
+                path_exists=path_exists,
+                progress=progress,
+                result=result if result_path is not None else None,
+            )
+        finally:
+            if token is not None:
+                _PIPELINE_DEADLINE.reset(token)
     except KeyboardInterrupt:
         result.status = "interrupted"
         result.error_code = "interrupted"
@@ -2942,6 +3437,26 @@ def main(
             result.error_message = result_error_message(str(error))
             result.application_status = "not_applied"
             code = 2
+    if pipeline_call:
+        completed_observation = (
+            "--pipeline-observe" in option_tokens
+            and progress.last_state == "completed"
+            and result_path is not None
+            and not result_path.exists()
+        )
+        if not completed_observation:
+            pending_or_error = result.as_dict()
+            if _EXECUTION is not None:
+                _EXECUTION.emit(pending_or_error)
+            print(
+                json.dumps(
+                    pending_or_error, ensure_ascii=False,
+                    separators=(",", ":"), sort_keys=True,
+                ),
+                file=stdout,
+                flush=True,
+            )
+            return code
     if result_path is not None:
         try:
             atomic_write_json(result_path, result.as_dict())
@@ -2952,7 +3467,7 @@ def main(
 
 
 _EXECUTION = None
-EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
+EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""
@@ -2992,7 +3507,11 @@ def execution_main():
     except BaseException as error:
         result_path = _result_path_from_argv(sys.argv[1:])
         message = result_error_message(f"{type(error).__name__}: {error}")
-        if result_path is not None and not result_path.exists():
+        pipeline_call = any(
+            token in pipeline_option_tokens(sys.argv[1:])
+            for token in ("--pipeline-dispatch", "--pipeline-observe", "--pipeline-run")
+        )
+        if result_path is not None and not result_path.exists() and not pipeline_call:
             result = ResultEnvelope(
                 status="error",
                 application_status="not_applied",
@@ -3003,6 +3522,14 @@ def execution_main():
                 atomic_write_json(result_path, result.as_dict())
             except CloudError as write_error:
                 print(f"error: {write_error}", file=sys.stderr)
+        elif pipeline_call:
+            result = ResultEnvelope(
+                status="error",
+                application_status="not_applied",
+                error_code="execution_runtime_unavailable",
+                error_message=message,
+            )
+            print(json.dumps(result.as_dict(), sort_keys=True), file=sys.stdout)
         print(f"error: {message}", file=sys.stderr)
         return 2
 

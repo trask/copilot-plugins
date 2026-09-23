@@ -100,6 +100,7 @@ REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
 OUTPUT_REPORT_PATH = ".github/agent-task-output/report.md"
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+_BOUNDED_DEADLINE: float | None = None
 
 
 class ConflictError(RuntimeError):
@@ -134,6 +135,9 @@ class Options:
     result_file: Path
     request: Mapping[str, object]
     prompt: str
+    bounded_phase: str | None = None
+    bounded_session: str | None = None
+    bounded_deadline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -945,6 +949,9 @@ def parse_args(args: Sequence[str]) -> Options:
         "--prompt-file",
         "--result-file",
         "--policy",
+        "--bounded-phase",
+        "--bounded-session",
+        "--bounded-deadline",
     }
     while index < len(args):
         token = args[index]
@@ -960,7 +967,9 @@ def parse_args(args: Sequence[str]) -> Options:
             raise ConflictError(f"{token} requires one value", "policy_rejected")
         values[token] = args[index + 1]
         index += 2
-    required = flags | options
+    required = flags | (options - {
+        "--bounded-phase", "--bounded-session", "--bounded-deadline",
+    })
     missing = sorted(required - values.keys())
     if missing:
         raise ConflictError(
@@ -1007,6 +1016,24 @@ def parse_args(args: Sequence[str]) -> Options:
         expected_policy=POLICY,
     )
     prompt = read_external_text(paths["--prompt-file"], "prompt file")
+    bounded = [values.get(key) for key in (
+        "--bounded-phase", "--bounded-session", "--bounded-deadline",
+    )]
+    if any(bounded) and not all(bounded):
+        raise ConflictError("bounded phase requires session and deadline", "policy_rejected")
+    if bounded:
+        if bounded[0] not in {"dispatch", "observe", "collect"}:
+            raise ConflictError("invalid bounded phase", "policy_rejected")
+        if not isinstance(bounded[1], str) or not ID_RE.fullmatch(bounded[1]):
+            raise ConflictError("invalid bounded session", "policy_rejected")
+        try:
+            deadline = float(bounded[2])
+        except (TypeError, ValueError):
+            raise ConflictError("invalid bounded deadline", "policy_rejected") from None
+        if not time.monotonic() < deadline <= time.monotonic() + 100:
+            raise ConflictError("bounded deadline is outside this call", "policy_rejected")
+    else:
+        deadline = None
     return Options(
         strategy,
         MODEL_IDS[alias],
@@ -1016,6 +1043,9 @@ def parse_args(args: Sequence[str]) -> Options:
         paths["--result-file"],
         request,
         prompt,
+        bounded[0],
+        bounded[1],
+        deadline,
     )
 
 
@@ -1068,8 +1098,17 @@ def run_process(
         kwargs["input"] = input_text
     if os.name == "nt":
         kwargs["creationflags"] = _creation_flags()
+    if _BOUNDED_DEADLINE is not None:
+        remaining = _BOUNDED_DEADLINE - time.monotonic()
+        if remaining <= 1:
+            raise ConflictError("bounded call deadline reached", "bounded_deadline")
+        kwargs["timeout"] = min(remaining - 1, 20)
     try:
         return runner(process_command, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise ConflictError(
+            f"{command[0]} exceeded the bounded call deadline", "bounded_deadline"
+        ) from None
     except UnicodeError as error:
         raise ConflictError(
             f"{command[0]} returned invalid UTF-8: {error}",
@@ -3483,6 +3522,59 @@ def record_native_stack_member_result(
         raise source_drift
 
 
+def stack_root_receipt(
+    options: Options, index: int, status: str, task: Mapping[str, object] | None,
+) -> None:
+    atomic_write_json(bounded_receipt_path(options), {
+        "session": options.bounded_session,
+        "request_id": options.request["request_id"],
+        "request_sha256": options.request["request_sha256"],
+        "repository": options.request["repository"],
+        "model": options.model,
+        "strategy": options.strategy,
+        "member_index": index,
+        "status": status,
+        "task": task,
+    })
+
+
+def completed_stack_member(
+    options: Options, member_options: Options, member: Mapping[str, object],
+    base_sha: str,
+) -> tuple[Mapping[str, object], Mapping[str, object], Mapping[str, object]]:
+    saved = read_json_file(member_options.result_file, "completed stack member")
+    receipt = bounded_receipt(member_options)
+    if not isinstance(saved, dict) or set(saved) != {
+        "task_response", "artifact", "code_ref",
+    } or receipt["status"] != "completed":
+        raise ConflictError("completed stack member evidence is invalid", "malformed_result")
+    response = validate_task(saved["task_response"], receipt["task"]["id"])
+    artifact = saved["artifact"]
+    code_ref = saved["code_ref"]
+    expected_request = {
+        "id": member_options.request["request_id"],
+        "sha256": member_options.request["request_sha256"],
+    }
+    if (
+        response["state"] != "completed"
+        or not isinstance(artifact, dict)
+        or artifact.get("request") != expected_request
+        or artifact.get("pr_number") != member["pr_number"]
+        or artifact.get("task", {}).get("id") != response["id"]
+        or artifact.get("task", {}).get("state") != "completed"
+        or artifact.get("task", {}).get("base_sha") != base_sha
+        or not isinstance(code_ref, dict)
+        or code_ref.get("role") != f"member:{member['pr_number']}"
+        or code_ref.get("pr_number") != member["pr_number"]
+        or code_ref.get("old_sha") != member["head_sha"]
+        or code_ref.get("base_sha") != base_sha
+        or code_ref.get("new_sha") != artifact.get("source_tip_sha")
+        or code_ref.get("ref") != artifact.get("branch")
+    ):
+        raise ConflictError("completed stack member identity mismatch", "malformed_result")
+    return response, artifact, code_ref
+
+
 def execute_native_stack(
     options: Options,
     snapshot: LocalSnapshot,
@@ -3498,7 +3590,8 @@ def execute_native_stack(
     artifacts: list[Mapping[str, object]] = []
     task_ids: set[str] = set()
     branches: set[str] = set()
-    for member in request["native_stack"]["members"]:
+    members = request["native_stack"]["members"]
+    for index, member in enumerate(members):
         require_target_fresh(runner, snapshot, request)
         require_local_unchanged(runner, snapshot)
         prove_native_stack_member_input(runner, snapshot.root, member)
@@ -3541,9 +3634,75 @@ def execute_native_stack(
             request=member_request,
             prompt=prompt,
         )
-        atomic_write_json(member_options.request_file, member_request)
-        member_options.prompt_file.write_text(prompt, encoding="utf-8")
-        initial = start_task(runner, snapshot, member_options)
+        if options.bounded_phase is not None and member_options.result_file.is_file():
+            response, artifact, code_ref = completed_stack_member(
+                options, member_options, member, base_sha,
+            )
+            task_id = response["id"]
+            if task_id in task_ids or artifact["branch"] in branches:
+                raise ConflictError("stack member task identity was reused", "task_failed")
+            task_ids.add(task_id)
+            branches.add(artifact["branch"])
+            code_refs.append(code_ref)
+            artifacts.append(artifact)
+            base_sha = code_ref["new_sha"]
+            result.task_id = progress.task_id = task_id
+            result.task_state = progress.task_state = "completed"
+            result.task_url = artifact["task"]["url"]
+            result.task_base_ref = result.task_base_sha = artifact["task"]["base_sha"]
+            result.code_refs = list(code_refs)
+            result.artifact = {"members": list(artifacts)}
+            continue
+        if options.bounded_phase is not None:
+            if options.bounded_phase == "dispatch":
+                if bounded_receipt_path(member_options).exists():
+                    raise ConflictError(
+                        "stack member dispatch already attempted", "ambiguous_dispatch"
+                    )
+                atomic_write_json(member_options.request_file, member_request)
+                member_options.prompt_file.write_text(prompt, encoding="utf-8")
+                receipt = {
+                    "session": options.bounded_session,
+                    "request_id": member_request["request_id"],
+                    "request_sha256": member_request["request_sha256"],
+                    "repository": request["repository"],
+                    "model": options.model,
+                    "strategy": "rebase",
+                    "status": "dispatching",
+                    "task": None,
+                }
+                atomic_write_json(bounded_receipt_path(member_options), receipt)
+                stack_root_receipt(options, index, "dispatching", None)
+                initial = start_task(runner, snapshot, member_options)
+                receipt.update(
+                    status="completed" if initial["state"] == "completed" else "active",
+                    task=initial,
+                )
+                atomic_write_json(bounded_receipt_path(member_options), receipt)
+                stack_root_receipt(options, index, receipt["status"], initial)
+            else:
+                receipt = bounded_receipt(member_options)
+                if receipt["status"] == "dispatching":
+                    raise ConflictError(
+                        "stack member POST has no confirmed task", "ambiguous_dispatch"
+                    )
+                initial = receipt["task"]
+                if options.bounded_phase == "collect" and receipt["status"] != "completed":
+                    raise ConflictError("stack member has not completed", "policy_rejected")
+                final = get_task(runner, snapshot, str(initial["id"]))
+                if receipt["status"] == "completed" and final["state"] != "completed":
+                    raise ConflictError("completed stack task changed state", "task_failed")
+                if options.bounded_phase == "observe":
+                    receipt.update(
+                        status="completed" if final["state"] == "completed" else "active",
+                        task=final,
+                    )
+                    atomic_write_json(bounded_receipt_path(member_options), receipt)
+                    stack_root_receipt(options, index, receipt["status"], final)
+        else:
+            atomic_write_json(member_options.request_file, member_request)
+            member_options.prompt_file.write_text(prompt, encoding="utf-8")
+            initial = start_task(runner, snapshot, member_options)
         task_id = str(initial["id"])
         if task_id in task_ids:
             raise ConflictError("stack task identity was reused", "task_failed")
@@ -3552,8 +3711,27 @@ def execute_native_stack(
         result.task_state = progress.task_state = str(initial["state"])
         result.task_url = task_link(initial)
         result.task_base_ref = result.task_base_sha = base_sha
-        atomic_write_json(options.result_file, result.as_dict())
-        final = monitor_task(runner, snapshot, initial, progress, sleep)
+        if options.bounded_phase is None:
+            atomic_write_json(options.result_file, result.as_dict())
+            final = monitor_task(runner, snapshot, initial, progress, sleep)
+        elif options.bounded_phase == "dispatch":
+            result.status = "waiting"
+            result.code_refs = []
+            result.artifact = None
+            return
+        elif options.bounded_phase == "observe":
+            result.task_state = progress.task_state = str(final["state"])
+            result.task_url = task_link(final) or result.task_url
+            if final["state"] in TERMINAL_STATES:
+                raise ConflictError(
+                    f"stack task {task_id} ended in state {final['state']}", "task_failed"
+                )
+            result.status = "waiting"
+            result.code_refs = []
+            result.artifact = None
+            return
+        elif final["state"] != "completed":
+            raise ConflictError("completed stack task changed state", "task_failed")
         result.task_state = str(final["state"])
         result.task_url = task_link(final) or result.task_url
         source_drift = None
@@ -3662,6 +3840,11 @@ def execute_native_stack(
             source_drift,
         )
         base_sha = tip
+        if options.bounded_phase is not None and index + 1 < len(members):
+            result.status = "waiting"
+            result.code_refs = []
+            result.artifact = None
+            return
     for artifact in artifacts:
         _, current_head = fetch_quarantined(
             runner,
@@ -3810,6 +3993,167 @@ def execute(
     return 0
 
 
+def bounded_receipt_path(options: Options) -> Path:
+    return options.result_file.with_name(options.result_file.name + ".dispatch.json")
+
+
+def bounded_receipt(options: Options) -> dict[str, object]:
+    path = bounded_receipt_path(options)
+    value = read_json_file(path, "bounded dispatch receipt")
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "session", "request_id", "request_sha256", "repository",
+            "model", "strategy", "status", "task",
+        }
+        or value["session"] != options.bounded_session
+        or value["request_id"] != options.request["request_id"]
+        or value["request_sha256"] != options.request["request_sha256"]
+        or value["repository"] != options.request["repository"]
+        or value["model"] != options.model
+        or value["strategy"] != options.strategy
+        or value["status"] not in {"dispatching", "active", "completed"}
+    ):
+        raise ConflictError("bounded dispatch receipt identity mismatch", "policy_rejected")
+    if value["status"] == "dispatching":
+        if value["task"] is not None:
+            raise ConflictError("dispatching receipt contains a task", "policy_rejected")
+    else:
+        validate_task(value["task"])
+    return value
+
+
+def execute_bounded(
+    options: Options,
+    *,
+    cwd: Path,
+    runner: Runner,
+    progress: Progress,
+    result: Result,
+) -> int:
+    if options.bounded_session != os.environ.get("COPILOT_AGENT_SESSION_ID"):
+        raise ConflictError("bounded session does not own this call", "policy_rejected")
+    request = options.request
+    snapshot = local_snapshot(
+        runner, cwd, control_root=options.result_file.parent.resolve(),
+        expected_repository=request["repository"],
+        expected_head=request["pull_request"]["head_sha"],
+        expected_branch=request["pull_request"]["head_ref"],
+        allow_detached=True,
+    )
+    for path in (options.request_file, options.prompt_file, options.result_file):
+        try:
+            path.resolve().relative_to(snapshot.root)
+        except ValueError:
+            pass
+        else:
+            raise ConflictError("bounded evidence must be outside the repository", "policy_rejected")
+    progress.result_path = options.result_file
+    progress.request_id = str(request["request_id"])
+    progress.repository = snapshot.repository
+    result.policy = POLICY
+    result.model = options.model
+    result.repository = snapshot.repository
+    result.strategy = options.strategy
+    result.request_id = str(request["request_id"])
+    result.request_sha256 = str(request["request_sha256"])
+    result.pull_request = pull_request_result(request)
+    path = bounded_receipt_path(options)
+    if request["strategy"] == "native-stack":
+        if options.bounded_phase == "dispatch" and not path.exists():
+            require_target_fresh(runner, snapshot, request)
+            require_local_unchanged(runner, snapshot)
+            if already_satisfied(runner, snapshot, request):
+                raise ConflictError("stack conflict was already satisfied", "stale_target")
+            fetch_pinned_inputs(runner, snapshot, request)
+            verify_frozen_ranges(runner, snapshot, request)
+        execute_native_stack(options, snapshot, runner, time.sleep, progress, result)
+        return 0
+    if options.bounded_phase == "dispatch":
+        if path.exists() or options.result_file.exists():
+            raise ConflictError(
+                "dispatch already attempted; task identity may be unknown",
+                "ambiguous_dispatch",
+            )
+        require_target_fresh(runner, snapshot, request)
+        require_local_unchanged(runner, snapshot)
+        fetch_pinned_inputs(runner, snapshot, request)
+        verify_frozen_ranges(runner, snapshot, request)
+        require_target_fresh(runner, snapshot, request)
+        require_local_unchanged(runner, snapshot)
+        if already_satisfied(runner, snapshot, request):
+            raise ConflictError("conflict was already satisfied before dispatch", "stale_target")
+        receipt = {
+            "session": options.bounded_session,
+            "request_id": request["request_id"],
+            "request_sha256": request["request_sha256"],
+            "repository": snapshot.repository,
+            "model": options.model,
+            "strategy": options.strategy,
+            "status": "dispatching",
+            "task": None,
+        }
+        atomic_write_json(path, receipt)
+        initial = start_task(runner, snapshot, options)
+        receipt.update(
+            status="completed" if initial["state"] == "completed" else "active",
+            task=initial,
+        )
+        atomic_write_json(path, receipt)
+    else:
+        receipt = bounded_receipt(options)
+        if receipt["status"] == "dispatching":
+            raise ConflictError(
+                "task creation has no confirmed identity; do not dispatch again",
+                "ambiguous_dispatch",
+            )
+        initial = receipt["task"]
+        if options.bounded_phase == "observe":
+            task = get_task(runner, snapshot, str(initial["id"]))
+            if receipt["status"] == "completed" and task["state"] != "completed":
+                raise ConflictError("completed task changed state", "task_failed")
+            receipt.update(
+                status="completed" if task["state"] == "completed" else "active",
+                task=task,
+            )
+            atomic_write_json(path, receipt)
+        else:
+            if receipt["status"] != "completed":
+                raise ConflictError("task has not completed", "policy_rejected")
+            task = get_task(runner, snapshot, str(initial["id"]))
+    task = initial if options.bounded_phase == "dispatch" else task
+    progress.task_id = result.task_id = str(task["id"])
+    progress.task_state = result.task_state = str(task["state"])
+    result.task_url = task_link(task)
+    result.task_base_ref = result.task_base_sha = task_base_sha(request)
+    if task["state"] in TERMINAL_STATES:
+        raise ConflictError(f"Agent Task {task['id']} ended in state {task['state']}", "task_failed")
+    if options.bounded_phase != "collect":
+        result.status = "waiting"
+        return 0
+    if task["state"] != "completed":
+        raise ConflictError("completed task changed state", "task_failed")
+    source_drift = None
+    try:
+        require_target_fresh(runner, snapshot, request)
+    except SourceHeadChanged as error:
+        source_drift = error
+    require_local_unchanged(runner, snapshot)
+    code_refs, artifact, validations = prove_generated(
+        runner, snapshot, request, task, result,
+    )
+    result.code_refs = list(code_refs)
+    result.artifact = artifact
+    result.validations = list(validations)
+    if source_drift is not None:
+        raise source_drift
+    require_target_fresh(runner, snapshot, request)
+    require_local_unchanged(runner, snapshot)
+    result.application_status = "quarantined_refs"
+    result.status = "success"
+    return 0
+
+
 def atomic_write_json(path: Path, data: Mapping[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
@@ -3854,6 +4198,7 @@ def main(
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
+    global _BOUNDED_DEADLINE
     args = list(sys.argv[1:] if argv is None else argv)
     result_path = result_path_from_args(args)
     result = Result()
@@ -3861,14 +4206,20 @@ def main(
     try:
         options = parse_args(args)
         result_path = options.result_file
-        exit_code = execute(
-            options,
-            cwd=Path.cwd() if cwd is None else cwd,
-            runner=runner,
-            sleep=sleep,
-            progress=progress,
-            result=result,
-        )
+        if getattr(options, "bounded_phase", None) is not None:
+            _BOUNDED_DEADLINE = options.bounded_deadline
+            try:
+                exit_code = execute_bounded(
+                    options, cwd=Path.cwd() if cwd is None else cwd,
+                    runner=runner, progress=progress, result=result,
+                )
+            finally:
+                _BOUNDED_DEADLINE = None
+        else:
+            exit_code = execute(
+                options, cwd=Path.cwd() if cwd is None else cwd,
+                runner=runner, sleep=sleep, progress=progress, result=result,
+            )
     except KeyboardInterrupt:
         result.status = "interrupted"
         result.task_id = progress.task_id
@@ -3946,7 +4297,7 @@ def main(
 
 
 _EXECUTION = None
-EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
+EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

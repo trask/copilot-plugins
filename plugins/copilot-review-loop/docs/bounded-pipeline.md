@@ -1,0 +1,5 @@
+# Bounded Pipeline calls
+
+PR Pipeline can add `--bounded-step` to the internal `pipeline` command. Repeat the same target, state path, pipeline run and position, model, policy, and `COPILOT_AGENT_SESSION_ID` until it returns a terminal result. Each call inspects review feedback once or dispatches or observes one hosted decision. `result: waiting` with exit code 0 means work remains pending. It is never review clearance.
+
+The hosted helper prints pending v5 JSON to stdout for direct CLI calls. Under managed execution, the coordinator reads pending JSON from the sealed child `workflow_result`. The helper keeps its checkpoint beside the result path and writes the final result file only after completion; the coordinator reads that file after the child exits successfully. The standalone `agent-task` command and `pipeline` without `--bounded-step` keep their synchronous behavior. If a hosted dispatch cannot be confirmed, the coordinator fails closed instead of sending the request again.

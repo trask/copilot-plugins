@@ -183,7 +183,7 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa74322811f6f4546bc271450ab5a30e4c25f96724b6e6a7666e5ee07e7c220a"
+    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -2082,6 +2082,247 @@ def validate_terminal_ci_fix_state(
     return payload
 
 
+def bounded_ci_rerun(
+    state_path: Path, preflight: dict[str, Any], result: dict[str, Any]
+) -> None:
+    task = result.get("task")
+    if not isinstance(task, dict) or not isinstance(task.get("id"), str):
+        raise WorkflowError("CI re-run result has no Agent Task identity")
+    checks = result.get("action_checks") or []
+    if not all(isinstance(check, str) for check in checks):
+        raise WorkflowError("CI re-run result has invalid check identities")
+    completed = prepare_pending_ci_rerun(state_path, preflight, result, checks)
+    state = load_state(state_path)
+    state["bounded_step"]["pending_rerun"] = {
+        "preflight": preflight, "result": result,
+    }
+    save_state(state_path, state)
+    for check in checks:
+        if check in completed:
+            continue
+        if result.get("attestation") == "dispatcher_candidate":
+            retry_diagnosed_ci(state_path, preflight, [check])
+        else:
+            rerun_result = capture_command(
+                command_rerun, argparse.Namespace(state=str(state_path), check=check)
+            )[-1]
+            if rerun_result["result"] == "no_rerun_support":
+                record_processed_ci_snapshot(state_path, preflight, result)
+                state = load_state(state_path)
+                state["bounded_step"].pop("pending_rerun", None)
+                state["bounded_step"]["terminal"] = rerun_result
+                save_state(state_path, state)
+                emit(rerun_result)
+                return
+            if rerun_result["result"] not in {"rerun_requested", "empty_commit_published"}:
+                raise WorkflowError("CI re-run returned an unexpected result")
+        record_completed_ci_rerun(state_path, check)
+        emit({"result": "waiting", "state": str(state_path), "reason": "rerun"})
+        return
+    record_processed_ci_snapshot(state_path, preflight, result)
+    state = load_state(state_path)
+    state["bounded_step"].pop("pending_rerun", None)
+    save_state(state_path, state)
+    emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+
+
+def run_bounded_cloud_helper(
+    command: list[str], repo_root: Path, result_path: Path
+) -> dict[str, Any]:
+    children_before = len(_EXECUTION.children) if _EXECUTION is not None else None
+    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
+        command, cwd=str(repo_root), text=True, encoding="utf-8",
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        env=subprocess_environment(), timeout=85,
+        **({"require_execution": True} if _EXECUTION is not None else {}),
+        **windows_no_window_options(),
+    )
+    if process.returncode != 0:
+        raise WorkflowError(
+            f"bounded Agent Task helper failed ({process.returncode}): "
+            f"{process.stderr.strip() or process.stdout.strip()}"
+        )
+    if _EXECUTION is not None:
+        children = _EXECUTION.children[children_before:]
+        terminal = children[0].terminal_result if len(children) == 1 else None
+        if (
+            not isinstance(terminal, dict)
+            or terminal.get("exit_code") != process.returncode
+            or terminal.get("local_status") != "finished"
+            or not isinstance(terminal.get("workflow_result"), dict)
+        ):
+            raise WorkflowError("bounded CI Agent Task has no sealed execution result")
+        payload = terminal["workflow_result"]
+        if result_path.is_file():
+            try:
+                final = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise WorkflowError("bounded Agent Task helper returned no valid observation") from error
+            if final != payload:
+                raise WorkflowError("bounded CI Agent Task final result differs from sealed child")
+    else:
+        try:
+            payload = json.loads(
+                result_path.read_text(encoding="utf-8")
+                if result_path.is_file() else process.stdout
+            )
+        except (OSError, ValueError) as error:
+            raise WorkflowError("bounded Agent Task helper returned no valid observation") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+        raise WorkflowError("bounded Agent Task helper returned an unexpected result")
+    if payload["status"] == "pending":
+        try:
+            run_id = command[command.index("--pipeline-run") + 1]
+        except (ValueError, IndexError) as error:
+            raise WorkflowError("bounded CI helper has no pipeline run") from error
+        task = payload.get("task")
+        pipeline = payload.get("pipeline")
+        if (
+            payload.get("schema") != CANDIDATE_AGENT_TASK_RESULT_SCHEMA
+            or not isinstance(task, dict)
+            or not isinstance(task.get("id"), str)
+            or not task["id"]
+            or not isinstance(pipeline, dict)
+            or pipeline.get("run_id") != run_id
+            or pipeline.get("session_id") != current_agent_session_id()
+            or not isinstance(pipeline.get("request_id"), str)
+            or not pipeline["request_id"]
+            or payload.get("candidate") is not None
+            or payload.get("completion") is not None
+            or result_path.is_file()
+        ):
+            raise WorkflowError("pending CI Agent Task has no matching dispatch identity")
+    return payload
+
+
+def command_bounded_pipeline(args: argparse.Namespace) -> None:
+    require_tools()
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state)
+    require_outside_repository(state_path, repo_root)
+    session_id = current_agent_session_id()
+    owner = {
+        "session_id": session_id,
+        "pipeline_run": args.pipeline_run,
+        "pipeline_iteration": args.pipeline_iteration,
+        "pipeline_max_iterations": args.pipeline_max_iterations,
+        "model": args.model,
+        "github_mutation_policy": args.github_mutation_policy,
+        "max_iterations": args.max_iterations,
+        "target": target,
+        "repo_root": str(repo_root),
+        "state": str(state_path.resolve()),
+    }
+    state = coordinator_file_state(state_path)
+    bounded = state.get("bounded_step")
+    if isinstance(bounded, dict) and bounded.get("owner") != owner:
+        previous = bounded.get("owner")
+        if (
+            not isinstance(previous, dict)
+            or previous.get("session_id") != session_id
+            or previous.get("pipeline_run") != args.pipeline_run
+            or previous.get("pipeline_iteration", 0) >= args.pipeline_iteration
+            or bounded.get("terminal") is None
+        ):
+            raise WorkflowError("bounded CI pipeline belongs to another session or run")
+        bounded = None
+    elif bounded is not None and not isinstance(bounded, dict):
+        raise WorkflowError("bounded CI pipeline owner is malformed")
+    if bounded is None:
+        bounded = {"owner": owner}
+        state["bounded_step"] = bounded
+        state.setdefault("reruns", {})
+        state.setdefault("escalation", None)
+        save_state(state_path, state)
+    if bounded.get("terminal") is not None:
+        emit(bounded["terminal"])
+        return
+    pending_task = state.get("agent_task")
+    if isinstance(pending_task, dict) and pending_task.get("status") == "bounded_pending":
+        preflight = pending_task["preflight"]
+        step_args = argparse.Namespace(**vars(args))
+        step_args._bounded_resume = True
+        result = capture_command(command_agent_task, step_args)[-1]
+    elif isinstance(bounded.get("pending_rerun"), dict):
+        preflight = bounded["pending_rerun"]["preflight"]
+        result = bounded["pending_rerun"]["result"]
+    else:
+        try:
+            preflight = agent_task_preflight(repo_root, target, state_path=state_path)
+        except WorkflowError as error:
+            if error.details.get("reason") == "ci_observation_changed" or is_rate_limit_error(error):
+                emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+                return
+            raise
+        snapshot = preflight["check_snapshot"]
+        current_logs = set(managed_task_log_paths({"preflight": preflight}))
+        recorded_logs = bounded.get("active_log_paths", [])
+        if not isinstance(recorded_logs, list) or any(
+            not isinstance(value, str) for value in recorded_logs
+        ):
+            raise WorkflowError("bounded CI log ownership is malformed")
+        previous_logs = {
+            Path(value) for value in recorded_logs
+        }
+        cleanup_superseded_preflight_logs(state_path, previous_logs - current_logs)
+        coordinator = state.get("coordinator") or {}
+        stable = coordinator.get("snapshot_sha256") == snapshot["sha256"]
+        polls = coordinator.get("stable_polls", 0) + 1 if stable else 1
+        stable_since = (
+            bounded.get("stable_since") if stable else utc_now()
+        )
+        if not isinstance(stable_since, str):
+            stable_since = utc_now()
+        update_coordinator_state(
+            state_path, status="stabilizing",
+            head_sha=snapshot["head_sha"], snapshot_sha256=snapshot["sha256"],
+            stable_polls=polls, detail=snapshot["decision"]["detail"],
+            check_snapshot=snapshot,
+        )
+        state = load_state(state_path)
+        state["bounded_step"]["stable_since"] = stable_since
+        state["bounded_step"]["active_log_paths"] = sorted(
+            str(path) for path in current_logs
+        )
+        save_state(state_path, state)
+        if (
+            not ci_preflight_is_stable_candidate(preflight)
+            or polls < max(1, args.stability_polls)
+            or (
+                dt.datetime.now(dt.timezone.utc) - parse_timestamp(stable_since)
+            ).total_seconds() < max(0.0, float(getattr(args, "debounce_seconds", 0.0)))
+            or snapshot["sha256"] in processed_ci_snapshot_ids(state)
+        ):
+            emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+            return
+        step_args = argparse.Namespace(**vars(args))
+        step_args._preflight = preflight
+        result = capture_command(command_agent_task, step_args)[-1]
+    if result["result"] == "waiting":
+        emit(result)
+        return
+    task = result.get("task")
+    has_task = isinstance(task, dict) and isinstance(task.get("id"), str)
+    if result["result"] in {"source_changed", "ci_changed", "published"}:
+        if has_task:
+            record_processed_ci_snapshot(state_path, preflight, result)
+        emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+        return
+    if result["result"] == "rerun":
+        bounded_ci_rerun(state_path, preflight, result)
+        return
+    if has_task:
+        record_processed_ci_snapshot(state_path, preflight, result)
+    if result["result"] == "snapshot_already_processed":
+        emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+        return
+    state = load_state(state_path)
+    state["bounded_step"]["terminal"] = result
+    save_state(state_path, state)
+    emit(result)
+
+
 def command_pipeline(args: argparse.Namespace) -> None:
     global ACTIVE_GITHUB_MUTATION_POLICY, ALLOW_DETACHED_CHECKOUT
 
@@ -2090,13 +2331,16 @@ def command_pipeline(args: argparse.Namespace) -> None:
     try:
         ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
         ALLOW_DETACHED_CHECKOUT = True
-        captured = capture_command(command_loop, args)
+        captured = capture_command(
+            command_bounded_pipeline if getattr(args, "bounded_step", False) else command_loop, args
+        )
         if len(captured) != 1:
             raise WorkflowError(
                 f"CI Fix pipeline returned {len(captured)} terminal results"
             )
         outcome = captured[0]
-        validate_terminal_ci_fix_state(args, outcome)
+        if outcome.get("result") != "waiting":
+            validate_terminal_ci_fix_state(args, outcome)
         emit(outcome)
     finally:
         ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
@@ -10258,14 +10502,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
     existing_task = existing.get("agent_task") if existing is not None else None
-    if not fresh_invocation_may_supersede_task(existing_task):
+    bounded_resume = bool(getattr(args, "_bounded_resume", False))
+    if bounded_resume and (
+        not getattr(args, "bounded_step", False)
+        or not isinstance(existing_task, dict)
+        or existing_task.get("status") != "bounded_pending"
+    ):
+        raise WorkflowError("bounded CI pipeline has no pending hosted task")
+    if not bounded_resume and not fresh_invocation_may_supersede_task(existing_task):
         raise WorkflowError(
             "an unfinished Agent Task already owns this state; no retry or "
             "recovery is permitted"
         )
     supplied_preflight = getattr(args, "_preflight", None)
     preflight = copy.deepcopy(
-        supplied_preflight
+        existing_task["preflight"] if bounded_resume else supplied_preflight
         or agent_task_preflight(
             repo_root,
             target,
@@ -10275,7 +10526,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             state_path=state_path,
         )
     )
-    if supplied_preflight is not None:
+    if supplied_preflight is not None and not bounded_resume:
         try:
             require_live_check_snapshot(preflight)
         except WorkflowError as error:
@@ -10299,7 +10550,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
     else:
         state = existing
         active_task = state.get("agent_task")
-        if not fresh_invocation_may_supersede_task(active_task):
+        if not bounded_resume and not fresh_invocation_may_supersede_task(active_task):
             raise WorkflowError(
                 "an unfinished Agent Task already owns this state; no retry or "
                 "recovery is permitted"
@@ -10345,7 +10596,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
     previous_head = previous_run.get("head_sha")
     if previous_head and previous_head != pr["head_sha"]:
         state["reruns"] = {}
-    state["run"] = {
+    if not bounded_resume:
+        state["run"] = {
         "id": f"pr-{pr['number']}-agent-task-{secrets.token_hex(8)}",
         "status": "active",
         "iteration": int(state.get("iterations", 0)) + 1,
@@ -10375,7 +10627,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         "budget_charge_key": None if scope is None else scope["_charge_key"],
         "budget_run_charge_key": None if scope is None else scope["_run_charge_key"],
     }
-    if decision["decision"] in {"green", "no_checks"}:
+    if not bounded_resume and decision["decision"] in {"green", "no_checks"}:
         require_live_pr_snapshot(pr, metadata_for(target), expected_head=pr["head_sha"])
         live_head, live_checks = fetch_rollup(pr)
         live_decision = decide(
@@ -10416,7 +10668,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         return
-    if decision["decision"] != "failures":
+    if not bounded_resume and decision["decision"] != "failures":
         if decision["decision"] == "escalate":
             state["escalation"] = {
                 "reason": decision["reason"],
@@ -10437,7 +10689,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         return
-    if decision.get("pending_checks"):
+    if not bounded_resume and decision.get("pending_checks"):
         save_state(state_path, state)
         emit(
             {
@@ -10454,7 +10706,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         return
     actionable = snapshot["failures"]
-    if exhausted:
+    if not bounded_resume and exhausted:
         state["escalation"] = {
             "reason": "max_iterations_reached",
             "detail": f"the {budget_scope} CI fix budget is exhausted",
@@ -10473,7 +10725,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         return
-    if not charge_iteration(state, state["run"]):
+    if not bounded_resume and not charge_iteration(state, state["run"]):
         save_state(state_path, state)
         emit(
             {
@@ -10486,7 +10738,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         return
     iteration_allowance = 1
-    run_id = secrets.token_hex(16)
+    run_id = existing_task["run_id"] if bounded_resume else secrets.token_hex(16)
     prompt_path = state_path.with_name(
         f"{state_path.stem}--{run_id}--agent-task-prompt.txt"
     )
@@ -10496,11 +10748,11 @@ def command_agent_task(args: argparse.Namespace) -> None:
     new_artifacts = [prompt_path, result_path]
     for artifact in new_artifacts:
         require_outside_repository(artifact, repo_root)
-        if artifact.exists():
+        if artifact.exists() and not bounded_resume:
             raise WorkflowError(
                 f"refusing to overwrite existing Agent Task artifact: {artifact}"
             )
-    task_record = {
+    task_record = existing_task if bounded_resume else {
         "status": "preparing",
         "run_id": run_id,
         "model": requested_model,
@@ -10512,66 +10764,103 @@ def command_agent_task(args: argparse.Namespace) -> None:
         "started_at": utc_now(),
     }
     state["agent_task"] = task_record
-    state["outcome"] = None
-    state["clean_at_head_sha"] = None
-    state["escalation"] = None
-    for key in ("ci_warnings", "warning_at_head_sha", "warning_at_base_sha", "warning_snapshot_sha256"):
-        state.pop(key, None)
+    if not bounded_resume:
+        state["outcome"] = None
+        state["clean_at_head_sha"] = None
+        state["escalation"] = None
+        for key in ("ci_warnings", "warning_at_head_sha", "warning_at_base_sha", "warning_snapshot_sha256"):
+            state.pop(key, None)
     save_state(state_path, state)
 
     pr = preflight["pr"]
     task_state = state["agent_task"]
     if not result_path.is_file():
         try:
-            task_state["phase"] = "controller_evidence"
-            save_state(state_path, state)
-            helper = discover_cloud_task()
-            prompt, ci_evidence = bounded_worker_prompt(
-                preflight, helper=helper,
-                iteration_allowance=iteration_allowance,
-                prior_history=state.get("history") or [],
-                requested_model=requested_model,
-            )
-            task_state["evidence_sha256"] = sha256_text(ci_evidence)
-            require_no_credentials(prompt, source="Agent Task prompt")
-            atomic_write_text(prompt_path, prompt)
-            command = [
-                sys.executable,
-                str(helper),
-                "--apply-with-report",
-                "--model",
-                args.model,
-                "--pr",
-                pr["pr_url"],
-                "--prompt-file",
-                str(prompt_path),
-                "--result-file",
-                str(result_path),
-                "--policy",
-                AGENT_TASK_POLICY,
-            ]
-            task_state["status"] = "running"
-            task_state["phase"] = "hosted_fix"
-            task_state["helper"] = str(helper)
-            save_state(state_path, state)
-            process = run_hosted_helper(
-                command,
-                repo_root=repo_root,
-                state_path=state_path,
-                run_id=task_state["run_id"],
-                preflight=preflight,
-                consumer_prompt=prompt,
-                requested_model=requested_model,
-                timeout=args.hosted_timeout,
-                discovery_interval=args.hosted_discovery_interval,
-            )
-            state = load_state(state_path)
-            task_state = state["agent_task"]
-            if not result_path.is_file():
-                raise WorkflowError(
-                    f"managed helper exited {process.returncode} without an atomic "
-                    "result file"
+            if bounded_resume:
+                helper = Path(task_state["helper"])
+                if sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256:
+                    raise WorkflowError("pinned Agent Tasks helper changed during CI repair")
+                prompt_path = Path(task_state["prompt_file"])
+                if sha256_file(prompt_path) != task_state.get("prompt_sha256"):
+                    raise WorkflowError("bounded CI repair prompt changed")
+                prompt = prompt_path.read_text(encoding="utf-8")
+                observation = run_bounded_cloud_helper(
+                    [
+                        sys.executable, str(helper), "--pipeline-observe",
+                        "--apply-with-report",
+                        "--pipeline-run", task_state["run_id"],
+                        "--model", args.model, "--pr", pr["pr_url"],
+                        "--prompt-file", str(prompt_path), "--result-file", str(result_path),
+                        "--policy", AGENT_TASK_POLICY,
+                    ], repo_root, result_path,
                 )
+                if observation.get("status") == "pending":
+                    emit({"result": "waiting", "state": str(state_path), "reason": "hosted_fix"})
+                    return
+                if not result_path.is_file():
+                    raise WorkflowError("bounded CI repair observation has no final result")
+            else:
+                task_state["phase"] = "controller_evidence"
+                save_state(state_path, state)
+                helper = discover_cloud_task()
+                prompt, ci_evidence = bounded_worker_prompt(
+                    preflight, helper=helper,
+                    iteration_allowance=iteration_allowance,
+                    prior_history=state.get("history") or [],
+                    requested_model=requested_model,
+                )
+                task_state["evidence_sha256"] = sha256_text(ci_evidence)
+                require_no_credentials(prompt, source="Agent Task prompt")
+                atomic_write_text(prompt_path, prompt)
+                command = [
+                    sys.executable,
+                    str(helper),
+                    "--apply-with-report",
+                    "--model",
+                    args.model,
+                    "--pr",
+                    pr["pr_url"],
+                    "--prompt-file",
+                    str(prompt_path),
+                    "--result-file",
+                    str(result_path),
+                    "--policy",
+                    AGENT_TASK_POLICY,
+                ]
+                if getattr(args, "bounded_step", False):
+                    command.extend(["--pipeline-dispatch", "--pipeline-run", run_id])
+                task_state["status"] = "bounded_pending" if getattr(args, "bounded_step", False) else "running"
+                task_state["phase"] = "hosted_fix"
+                task_state["helper"] = str(helper)
+                if getattr(args, "bounded_step", False):
+                    task_state["prompt_sha256"] = sha256_file(prompt_path)
+                save_state(state_path, state)
+                if getattr(args, "bounded_step", False):
+                    observation = run_bounded_cloud_helper(command, repo_root, result_path)
+                    if observation.get("status") == "pending":
+                        emit({"result": "waiting", "state": str(state_path), "reason": "hosted_fix"})
+                        return
+                    if not result_path.is_file():
+                        raise WorkflowError("bounded CI dispatch has no final result")
+                else:
+                    process = run_hosted_helper(
+                        command,
+                        repo_root=repo_root,
+                        state_path=state_path,
+                        run_id=task_state["run_id"],
+                        preflight=preflight,
+                        consumer_prompt=prompt,
+                        requested_model=requested_model,
+                        timeout=args.hosted_timeout,
+                        discovery_interval=args.hosted_discovery_interval,
+                    )
+                    state = load_state(state_path)
+                    task_state = state["agent_task"]
+                    if not result_path.is_file():
+                        raise WorkflowError(
+                            f"managed helper exited {process.returncode} without an atomic "
+                            "result file"
+                        )
         except BaseException as error:
             state = load_state(state_path)
             task_state = state["agent_task"]
@@ -10589,6 +10878,19 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if isinstance(error, WorkflowError):
                 error.details["state"] = str(state_path)
             raise
+    if bounded_resume and result_path.is_file():
+        try:
+            retained = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise WorkflowError("bounded CI repair result is invalid") from error
+        if isinstance(retained, dict) and retained.get("status") == "pending":
+            raise WorkflowError("pending CI Agent Task wrote a final result file")
+        helper = Path(task_state["helper"])
+        if sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256:
+            raise WorkflowError("pinned Agent Tasks helper changed during CI repair")
+        if sha256_file(prompt_path) != task_state.get("prompt_sha256"):
+            raise WorkflowError("bounded CI repair prompt changed")
+        prompt = prompt_path.read_text(encoding="utf-8")
     validated_hosted_result = False
     try:
         result = load_agent_task_result(result_path)
@@ -13915,6 +14217,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow guarded workflow reruns or restrict changes to verified source publication",
     )
     pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--bounded-step", action="store_true")
     pipeline.add_argument("--pipeline-iteration", type=int, required=True)
     pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
     pipeline.add_argument(
@@ -14260,7 +14563,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "sealed_ci_fix_completed",
     "complete",
 })
-EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
+EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

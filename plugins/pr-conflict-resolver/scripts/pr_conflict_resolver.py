@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "d1305cc844fe5955a8dc7b408d7d06003d1668721df4df571d17610ec7b9df43"
+    "f0f95255d3c454efafa3b5564f3f82f15d88cf25e0741f45824127804c891109"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@11"
@@ -104,6 +104,8 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CONFLICT_REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 CONFLICT_RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
 AGENT_TASK_OUTPUT_REPORT = ".github/agent-task-output/report.md"
+_BOUNDED_DEADLINE: float | None = None
+_BOUNDED_STACK_AUTH: tuple[Path, str] | None = None
 
 
 class WorkflowError(RuntimeError):
@@ -147,19 +149,31 @@ def run(
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
-        command,
-        cwd=str(cwd) if cwd else None,
-        input=input_text,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        env=env,
-        **windows_no_window_options(),
-    )
+    options: dict[str, Any] = {}
+    if _BOUNDED_DEADLINE is not None:
+        remaining = _BOUNDED_DEADLINE - time.monotonic()
+        if remaining <= 1:
+            raise WorkflowError("bounded pipeline call deadline reached")
+        options["timeout"] = (
+            remaining - 1 if command[0] == sys.executable else min(remaining - 1, 20)
+        )
+    try:
+        process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
+            command,
+            cwd=str(cwd) if cwd else None,
+            input=input_text,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=env,
+            **options,
+            **windows_no_window_options(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise WorkflowError(f"bounded command timed out: {command[0]}") from error
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
         raise WorkflowError(f"{' '.join(command)} failed ({process.returncode}): {detail}")
@@ -175,11 +189,18 @@ def git_try(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[str
 
 
 def git_bytes(repo_root: Path, *arguments: str) -> bytes | None:
+    options: dict[str, Any] = {}
+    if _BOUNDED_DEADLINE is not None:
+        remaining = _BOUNDED_DEADLINE - time.monotonic()
+        if remaining <= 1:
+            raise WorkflowError("bounded pipeline call deadline reached")
+        options["timeout"] = min(remaining - 1, 20)
     process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         ["git", "-C", str(repo_root), *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        **options,
         **windows_no_window_options(),
     )
     return process.stdout if process.returncode == 0 else None
@@ -6395,6 +6416,41 @@ def require_stack_request_owner(request: dict[str, Any]) -> None:
     owner = request["owner"]
     path = Path(owner["state"])
     recorded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(recorded, dict):
+        raise WorkflowError("stack request owner or run does not match")
+    owner_running = stack_owner_is_running(
+        recorded.get("stack_owner_pid"), recorded.get("stack_owner_recorded_at")
+    )
+    bound_owner_replay = False
+    if (
+        not owner_running
+        and _BOUNDED_STACK_AUTH is not None
+        and owner["kind"] in {"pr-conflict-resolver", "pr-stack-pipeline"}
+    ):
+        resolver_path, session = _BOUNDED_STACK_AUTH
+        resolver = load_state(resolver_path) if resolver_path.is_file() else {}
+        bounded = resolver.get("bounded_pipeline", {})
+        task = resolver.get("agent_task", {})
+        bound_owner_replay = (
+            os.environ.get("COPILOT_AGENT_SESSION_ID") == session
+            and bounded.get("session") == session
+            and (
+                task.get("run_id")
+                if owner["kind"] == "pr-conflict-resolver"
+                else bounded.get("binding", {}).get("run")
+            ) == owner["run_id"]
+            and bounded.get("stack_authorization_sha256") == request["request_sha256"]
+            and task.get("status") in {
+                "running", "verified", "publishing", "published_pending_verification",
+            }
+            and resolver.get("stack_requests", {}).get(request["request_id"])
+            == request["request_sha256"]
+        )
+        if owner["kind"] == "pr-conflict-resolver":
+            bound_owner_replay = (
+                bound_owner_replay and resolver_path.resolve() == path.resolve()
+            )
+        owner_running = bound_owner_replay
     if (
         not isinstance(recorded, dict)
         or recorded.get("run_id") != owner["run_id"]
@@ -6402,9 +6458,7 @@ def require_stack_request_owner(request: dict[str, Any]) -> None:
         or not isinstance(recorded.get("stack_requests"), dict)
         or recorded["stack_requests"].get(request["request_id"])
         != request["request_sha256"]
-        or not stack_owner_is_running(
-            recorded.get("stack_owner_pid"), recorded.get("stack_owner_recorded_at")
-        )
+        or not owner_running
     ):
         raise WorkflowError("stack request owner or run does not match")
     if owner["kind"] == "pr-stack-pipeline":
@@ -6648,6 +6702,10 @@ def authorize_resolver_native_stack(
     state.setdefault("stack_requests", {})[request["request_id"]] = request[
         "request_sha256"
     ]
+    if "bounded_pipeline" in state:
+        state["bounded_pipeline"]["stack_authorization_sha256"] = (
+            request["request_sha256"]
+        )
     state.setdefault("stack_request_files", {})[request["request_id"]] = str(
         request_path
     )
@@ -10227,6 +10285,21 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
         "history": [],
         "escalation": None,
     }
+    if getattr(args, "_bounded_session", None) is not None:
+        state["bounded_pipeline"] = {
+            "session": args._bounded_session,
+            "binding": args._bounded_binding,
+            "phase": "dispatch",
+        }
+        external_authorization = getattr(args, "_bounded_stack_authorization", None)
+        if external_authorization is not None:
+            state["bounded_pipeline"]["stack_authorization_sha256"] = (
+                external_authorization["request_sha256"]
+            )
+            state.setdefault("stack_requests", {})[
+                external_authorization["request_id"]
+            ] = external_authorization["request_sha256"]
+        state["pipeline"] = args._bounded_binding
     if replaced_task is not None:
         state.setdefault("managed_task_history", []).append(replaced_task)
     state["repo_root"] = str(repo_root)
@@ -10414,6 +10487,9 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     task["helper_command"] = command
     task["status"] = "running"
     save_state(state_path, state)
+    if getattr(args, "_bounded_session", None) is not None:
+        advance_bounded_conflict(state_path, state, args._bounded_session)
+        return
     try:
         process = run(command, cwd=repo_root, check=False)
     except OSError as error:
@@ -10798,7 +10874,317 @@ def revalidate_pipeline_conflict(
     )
 
 
+def advance_bounded_conflict(
+    state_path: Path, state: dict[str, Any], session: str,
+) -> None:
+    task = state["agent_task"]
+    bounded = state["bounded_pipeline"]
+    phase = bounded["phase"]
+    if phase not in {"dispatch", "observe", "collect"}:
+        raise WorkflowError("bounded conflict phase is invalid")
+    preflight = task["preflight"]
+    request = preflight["request"]
+    if request.get("model") != MODEL_ALIASES["sol"]:
+        raise WorkflowError("bounded conflict model changed")
+    expected_command = [
+        sys.executable, str(discover_conflict_task()),
+        "--conflict-with-report", "--strategy", preflight["strategy"],
+        "--request-file", task["request_file"],
+        "--prompt-file", task["prompt_file"],
+        "--result-file", task["result_file"],
+        "--policy", CONFLICT_POLICY,
+        "--pr", preflight["pr"]["pr_url"],
+        "--model", "sol",
+    ]
+    if task.get("helper_command") != expected_command:
+        raise WorkflowError("bounded conflict helper command changed")
+    for name in ("request_file", "prompt_file", "result_file"):
+        require_external_path(Path(task[name]), Path(state["repo_root"]))
+    bounded["inflight"] = True
+    save_state(state_path, state)
+    command = [
+        *task["helper_command"], "--bounded-phase", phase,
+        "--bounded-session", session, "--bounded-deadline", str(_BOUNDED_DEADLINE),
+    ]
+    process = run(command, cwd=Path(state["repo_root"]), check=False)
+    result_path = Path(task["result_file"])
+    if not result_path.is_file():
+        raise WorkflowError("bounded conflict helper did not write a result")
+    result = load_conflict_result(result_path)
+    identity = {
+        "model": request["model"], "policy": CONFLICT_POLICY_IDENTITY,
+        "repository": request["repository"], "mode": "conflict_with_report",
+        "strategy": request["strategy"],
+        "request": {"id": request["request_id"], "sha256": request["request_sha256"]},
+        "pull_request": request["pull_request"],
+    }
+    if any(result.get(key) != value for key, value in identity.items()):
+        raise WorkflowError("bounded conflict result identity mismatch")
+    receipt_path = result_path.with_name(result_path.name + ".dispatch.json")
+    receipt = (
+        json.loads(receipt_path.read_text(encoding="utf-8"))
+        if receipt_path.is_file() else None
+    )
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("session") != session
+        or receipt.get("request_id") != request["request_id"]
+        or receipt.get("request_sha256") != request["request_sha256"]
+        or receipt.get("repository") != request["repository"]
+        or receipt.get("model") != request["model"]
+        or receipt.get("strategy") != request["strategy"]
+    ):
+        raise WorkflowError("bounded conflict dispatch receipt is missing or mismatched")
+    remote_task = receipt.get("task")
+    result_task = result.get("task")
+    task_id = remote_task.get("id") if isinstance(remote_task, dict) else None
+    native = request["strategy"] == "native-stack"
+    member_index = receipt.get("member_index") if native else None
+    prior_member_index = bounded.get("member_index", 0)
+    member_ids = bounded.setdefault("member_task_ids", {}) if native else {}
+    if native and (
+        type(member_index) is not int
+        or member_index != prior_member_index
+        or not 0 <= member_index < len(request["native_stack"]["members"])
+        or (phase == "dispatch" and str(member_index) in member_ids)
+        or (
+            phase in {"observe", "collect"}
+            and member_ids.get(str(member_index)) != task_id
+        )
+    ):
+        raise WorkflowError("bounded stack member position or task identity changed")
+    if task_id is not None and (
+        not isinstance(result_task, dict)
+        or result_task.get("id") != task_id
+        or (
+            task.get("task_id") is not None
+            and (not native or phase != "dispatch")
+            and task["task_id"] != task_id
+        )
+    ):
+        raise WorkflowError("bounded conflict task identity changed")
+    if result.get("status") == "waiting":
+        if (
+            process.returncode != 0
+            or not task_id
+            or receipt.get("status") not in {"active", "completed"}
+            or result.get("error") is not None
+            or result_task.get("state") not in {"queued", "in_progress", "completed"}
+            or result_task.get("state") != remote_task.get("state")
+            or result.get("application") != {"status": "not_started"}
+            or result.get("generated") != {"artifact": None, "code_refs": []}
+        ):
+            raise WorkflowError("bounded conflict waiting result is invalid")
+        task["task_id"] = task_id
+        task["task_id_status"] = "known"
+        if native:
+            member_ids[str(member_index)] = task_id
+        if native and phase == "collect":
+            if member_index + 1 >= len(request["native_stack"]["members"]):
+                raise WorkflowError("final stack member did not produce a final result")
+            bounded["member_index"] = member_index + 1
+            bounded["phase"] = "dispatch"
+        else:
+            bounded["phase"] = "collect" if remote_task["state"] == "completed" else "observe"
+        bounded["inflight"] = False
+        save_state(state_path, state)
+        emit({
+            "result": "waiting", "state": str(state_path),
+            "task_id": task_id, "task_state": remote_task["state"],
+        })
+        return
+    task["result"] = result
+    bounded["inflight"] = False
+    if (
+        process.returncode != 0
+        and isinstance(result.get("error"), dict)
+        and result["error"].get("code") == "source_head_changed"
+    ):
+        emit(record_source_head_changed(state_path, state, result))
+        return
+    if process.returncode != 0 or result.get("status") != "success":
+        error = result.get("error")
+        code = error.get("code") if isinstance(error, dict) else "unknown"
+        known = bool(task_id)
+        ambiguous = receipt.get("status") == "dispatching" or code == "ambiguous_dispatch"
+        task["status"] = "interrupted" if known or ambiguous else "failed"
+        task["task_id"] = task_id
+        task["task_id_status"] = "known" if known else (
+            "unknown" if ambiguous else "not_created"
+        )
+        task["error"] = error
+        save_state(state_path, state)
+        emit({
+            "result": "invocation_abandoned" if task["status"] == "interrupted"
+            else "task_creation_failed",
+            "state": str(state_path), "task_id": task_id,
+            "task_id_status": task["task_id_status"], "error": error,
+            "audit_files": task["audit_files"], "stage_outcome": "escalated",
+        })
+        return
+    if phase != "collect" or receipt.get("status") != "completed":
+        raise WorkflowError("bounded conflict success did not follow completed task observation")
+    code_refs, artifact = validate_conflict_result_identity(result, request)
+    verify_quarantined_result(Path(state["repo_root"]), request, code_refs, artifact)
+    require_live_conflict_guards(Path(state["repo_root"]), task["preflight"])
+    task.update(code_refs=code_refs, artifact=artifact, status="verified")
+    save_state(state_path, state)
+    emit(publish_conflict_result(state_path, state))
+
+
+def command_bounded_pipeline(args: argparse.Namespace) -> int:
+    global _BOUNDED_DEADLINE, _BOUNDED_STACK_AUTH
+    session = os.environ.get("COPILOT_AGENT_SESSION_ID")
+    if not session or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", session):
+        raise WorkflowError("bounded pipeline requires COPILOT_AGENT_SESSION_ID")
+    if not args.state or not args.pipeline_run or not args.repo_root:
+        raise WorkflowError("pipeline requires --state, --pipeline-run, and --repo-root")
+    state_path = cli_path(args.state)
+    require_external_path(state_path, cli_path(args.repo_root).resolve())
+    _BOUNDED_STACK_AUTH = (state_path, session)
+    try:
+        if args.pipeline_iteration is None and args.pipeline_max_iterations is None:
+            args.pipeline_iteration = 1
+            args.pipeline_max_iterations = args.max_iterations
+        binding = pipeline_conflict_binding(args)
+        if args.whole_stack:
+            authorization = load_stack_request(
+                args.stack_request, operation="whole-stack", run_id=args.pipeline_run
+            )
+            current = metadata_for(parse_target(binding["target"]))
+            require_authorized_stack(
+                authorization, current, stack_membership(current).get("stack")
+            )
+            args._bounded_stack_authorization = authorization
+    except BaseException:
+        _BOUNDED_STACK_AUTH = None
+        raise
+    options = {
+        "target": args.target, "repo_root": args.repo_root,
+        "state": str(state_path), "max_iterations": args.max_iterations,
+        "stack_request": args.stack_request,
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    try:
+        lock = lock_path.open("x", encoding="utf-8")
+    except FileExistsError:
+        _BOUNDED_STACK_AUTH = None
+        raise WorkflowError("another invocation owns the pipeline state") from None
+    started = False
+    _BOUNDED_DEADLINE = time.monotonic() + 90
+    try:
+        with lock:
+            previous = load_state(state_path) if state_path.exists() else None
+            if previous is not None:
+                bounded = previous.get("bounded_pipeline")
+                if (
+                    not isinstance(bounded, dict)
+                    or bounded.get("session") != session
+                    or not isinstance(bounded.get("binding"), dict)
+                    or bounded.get("options") != options
+                ):
+                    raise WorkflowError("bounded state belongs to another session or execution")
+                prior_binding = bounded["binding"]
+                if binding != prior_binding:
+                    if (
+                        binding.get("iteration") == prior_binding.get("iteration")
+                        or any(binding.get(key) != value for key, value in prior_binding.items()
+                               if key != "iteration")
+                    ):
+                        raise WorkflowError("bounded pipeline options changed")
+                    require_later_conflict_sweep(previous, binding)
+                elif previous.get("pipeline") != binding:
+                    raise WorkflowError("bounded pipeline state identity changed")
+                if (
+                    args.expected_state_sha256 is not None
+                    and args.expected_state_sha256 != bounded.get("expected_state_sha256")
+                ):
+                    raise WorkflowError("bounded expected-state option changed")
+            elif args.expected_state_sha256 is not None:
+                raise WorkflowError("expected state does not exist")
+            lock.write(str(os.getpid()))
+            lock.flush()
+            started = True
+            if previous is None:
+                args._bounded_session = session
+                args._bounded_binding = binding
+                command_agent_task(args)
+                state = load_state(state_path)
+                state["bounded_pipeline"]["options"] = options
+                state["bounded_pipeline"]["expected_state_sha256"] = args.expected_state_sha256
+                save_state(state_path, state)
+            elif binding != previous["bounded_pipeline"]["binding"]:
+                revalidate_pipeline_conflict(state_path, previous, binding)
+                state = load_state(state_path)
+                state["bounded_pipeline"]["binding"] = binding
+                save_state(state_path, state)
+            elif previous["agent_task"]["status"] == "running":
+                checkpoint = previous["bounded_pipeline"]
+                stack_dispatch = (
+                    checkpoint["phase"] == "dispatch"
+                    and previous["agent_task"]["preflight"]["strategy"] == "native-stack"
+                    and type(checkpoint.get("member_index")) is int
+                    and checkpoint["member_index"] > 0
+                    and set(checkpoint.get("member_task_ids", {}))
+                    == {str(index) for index in range(checkpoint["member_index"])}
+                )
+                if (
+                    (checkpoint["phase"] == "dispatch" and not stack_dispatch)
+                    or checkpoint.get("inflight") is not False
+                ):
+                    raise WorkflowError(
+                        "prior bounded execution did not finish; remote work cannot be adopted"
+                    )
+                advance_bounded_conflict(state_path, previous, session)
+            elif previous["agent_task"]["status"] == "completed":
+                emit({
+                    "result": previous["last_result"], "state": str(state_path),
+                    "stage_outcome": stage_outcome(previous),
+                })
+            else:
+                raise WorkflowError("bounded task is not resumable")
+        state = load_state(state_path)
+        return 0 if (
+            state["agent_task"]["status"] == "running"
+            and state["bounded_pipeline"].get("inflight") is False
+            and (
+                state["bounded_pipeline"]["phase"] in {"observe", "collect"}
+                or (
+                    state["bounded_pipeline"]["phase"] == "dispatch"
+                    and state["bounded_pipeline"].get("member_index", 0) > 0
+                )
+            )
+        ) or (
+            state["agent_task"]["status"] == "completed"
+            and state.get("last_result") in {"published", "mergeable"}
+        ) else 1
+    except (WorkflowError, json.JSONDecodeError, OSError, KeyboardInterrupt,
+            subprocess.TimeoutExpired) as error:
+        if started and state_path.is_file():
+            state = load_state(state_path)
+            task = state.get("agent_task")
+            if isinstance(task, dict) and task.get("status") not in {"completed", "interrupted"}:
+                task["status"] = "interrupted"
+                task["task_id_status"] = "known" if task.get("task_id") else "unknown"
+                task["error"] = {
+                    "code": "bounded_pipeline_failed",
+                    "message": str(error) or "bounded invocation interrupted",
+                }
+                save_state(state_path, state)
+        if isinstance(error, KeyboardInterrupt):
+            emit({"result": "invocation_abandoned", "state": str(state_path)})
+            return 1
+        raise
+    finally:
+        _BOUNDED_DEADLINE = None
+        _BOUNDED_STACK_AUTH = None
+        lock_path.unlink(missing_ok=True)
+
+
 def command_pipeline(args: argparse.Namespace) -> int:
+    if getattr(args, "bounded_step", False):
+        return command_bounded_pipeline(args)
     if not args.state or not args.pipeline_run or not args.repo_root:
         raise WorkflowError("pipeline requires --state, --pipeline-run, and --repo-root")
     state_path = cli_path(args.state)
@@ -10946,6 +11332,7 @@ def build_parser() -> argparse.ArgumentParser:
     invocation.add_argument("--new-invocation", action="store_true")
     invocation.add_argument("--invocation-run")
     agent_task.add_argument("--expected-state-sha256")
+    agent_task.add_argument("--bounded-step", action="store_true")
     agent_task.set_defaults(function=command_agent_task)
 
     abort = subparsers.add_parser(
@@ -11018,6 +11405,8 @@ def main() -> int:
             )
         if args.command == "pipeline":
             return command_pipeline(args)
+        if args.command == "agent-task" and args.bounded_step:
+            raise WorkflowError("--bounded-step is only supported by pipeline")
         args.function(args)
         return 0
     except (WorkflowError, json.JSONDecodeError, OSError) as error:
@@ -11032,7 +11421,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
+EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

@@ -414,6 +414,47 @@ def same_process(expected: dict[str, Any], observed: dict[str, Any] | None) -> b
     )
 
 
+def verified_pending_child(terminal: dict[str, Any]) -> bool:
+    workflow = terminal.get("workflow_result")
+    if (
+        not isinstance(workflow, dict)
+        or workflow.get("result") not in {None, "waiting"}
+        or workflow.get("status") not in {None, "pending"}
+        or (
+            workflow.get("result") is None
+            and workflow.get("status") is None
+        )
+    ):
+        return False
+    observations = terminal.get("remote_tasks")
+    if not isinstance(observations, list) or not observations:
+        return False
+    task_ids = set()
+    active = False
+    for observation in observations:
+        if not isinstance(observation, dict):
+            return False
+        task = observation.get("task")
+        task_id = task.get("id") if isinstance(task, dict) else None
+        if (
+            observation.get("schema") != "github.copilot.dispatch-observation.v1"
+            or observation.get("remote_status") not in {"active", "terminal"}
+            or not isinstance(observation.get("request_id"), str)
+            or not observation["request_id"]
+            or not isinstance(task_id, str) or not task_id
+        ):
+            return False
+        task_ids.add(task_id)
+        active = active or observation["remote_status"] == "active"
+    workflow_task = workflow.get("task")
+    if "task" in workflow:
+        if not isinstance(workflow_task, dict) or workflow_task.get("id") not in task_ids:
+            return False
+    elif workflow.get("status") == "pending":
+        return False
+    return active
+
+
 def require_owner(expected: dict[str, Any]) -> None:
     observed = process_identity(expected["pid"])
     if not same_process(expected, observed) or not observed["running"]:
@@ -1631,7 +1672,14 @@ class Execution:
                     or terminal.get("exit_code") != 0
                     or terminal.get("local_status") != "finished"
                     or terminal.get("local_children_drained") is not True
-                    or terminal.get("remote_work_may_continue") is not False
+                    or (
+                        terminal.get("remote_work_may_continue") is not False
+                        and not (
+                            isinstance(self.last_result, dict)
+                            and self.last_result.get("result") == "waiting"
+                            and verified_pending_child(terminal)
+                        )
+                    )
                 ):
                     raise ExecutionError("child execution is unfinished, failed, cancelled, or remotely unconfirmed")
             except (OSError, ValueError, KeyError, ExecutionError) as failure:

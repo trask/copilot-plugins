@@ -78,7 +78,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa74322811f6f4546bc271450ab5a30e4c25f96724b6e6a7666e5ee07e7c220a"
+    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -138,6 +138,18 @@ def subprocess_environment() -> dict[str, str]:
     return environment
 
 
+_BOUNDED_DEADLINE: float | None = None
+
+
+def bounded_subprocess_timeout() -> dict[str, float]:
+    if _BOUNDED_DEADLINE is None:
+        return {}
+    remaining = _BOUNDED_DEADLINE - time.monotonic() - 5
+    if remaining <= 0:
+        raise WorkflowError("bounded pipeline call exceeded its subprocess allowance")
+    return {"timeout": min(remaining, 85)}
+
+
 def run(
     command: list[str],
     *,
@@ -145,18 +157,22 @@ def run(
     input_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
-        command,
-        cwd=str(cwd) if cwd else None,
-        input=input_text,
-        text=True,
-        encoding="utf-8",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        env=subprocess_environment(),
-        **windows_no_window_options(),
-    )
+    try:
+        process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
+            command,
+            cwd=str(cwd) if cwd else None,
+            input=input_text,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=subprocess_environment(),
+            **bounded_subprocess_timeout(),
+            **windows_no_window_options(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise WorkflowError("bounded pipeline subprocess exceeded its time limit") from error
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
         raise WorkflowError(f"{' '.join(command)} failed ({process.returncode}): {detail}")
@@ -170,16 +186,20 @@ def run_bytes(
     input_bytes: bytes | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
-    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
-        command,
-        cwd=str(cwd) if cwd else None,
-        input=input_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        env=subprocess_environment(),
-        **windows_no_window_options(),
-    )
+    try:
+        process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
+            command,
+            cwd=str(cwd) if cwd else None,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=subprocess_environment(),
+            **bounded_subprocess_timeout(),
+            **windows_no_window_options(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise WorkflowError("bounded pipeline subprocess exceeded its time limit") from error
     if check and process.returncode != 0:
         detail = (
             process.stderr.decode("utf-8", errors="replace").strip()
@@ -2777,10 +2797,75 @@ def command_pipeline(args: argparse.Namespace) -> None:
         or args.max_iterations < 1
     ):
         raise WorkflowError("pipeline requires a target, state, and valid run position")
+    if getattr(args, "bounded_step", False):
+        if not re.fullmatch(r"[0-9a-f]{32}", args.pipeline_run):
+            raise WorkflowError("bounded pipeline run must be 32 lowercase hex characters")
+        session_id = os.environ.get("COPILOT_AGENT_SESSION_ID")
+        if not session_id or session_id != session_id.strip():
+            raise WorkflowError("bounded pipeline requires COPILOT_AGENT_SESSION_ID")
     args._pipeline = True
     args._pipeline_entry = True
-    result = command_agent_task(args)
+    global _BOUNDED_DEADLINE
+    previous_deadline = _BOUNDED_DEADLINE
+    if getattr(args, "bounded_step", False):
+        _BOUNDED_DEADLINE = time.monotonic() + 85
+    try:
+        result = command_agent_task(args)
+    finally:
+        _BOUNDED_DEADLINE = previous_deadline
     emit({**result, "tasks": [result["task"]] if result.get("task") else []})
+
+
+def bounded_review_binding(
+    args: argparse.Namespace, state_path: Path, target: dict[str, Any], repo_root: Path,
+) -> dict[str, Any]:
+    return {
+        "session_id": os.environ["COPILOT_AGENT_SESSION_ID"],
+        "state": str(state_path.resolve()),
+        "repo_root": str(repo_root),
+        "target": target,
+        "pipeline_run": args.pipeline_run,
+        "pipeline_iteration": args.pipeline_iteration,
+        "pipeline_max_iterations": args.pipeline_max_iterations,
+        "max_iterations": args.max_iterations,
+        "model": MODEL_ALIASES[args.model],
+        "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
+        "preserve_artifacts": bool(args.preserve_artifacts),
+    }
+
+
+def bounded_review_pending(
+    process: subprocess.CompletedProcess[str], result_path: Path,
+    *, pipeline_run: str, session_id: str,
+) -> bool:
+    if process.returncode != 0:
+        return False
+    try:
+        payload = parse_strict_json(process.stdout, description="cloud task checkpoint")
+    except WorkflowError:
+        return False
+    if not isinstance(payload, dict) or payload.get("status") != "pending":
+        return False
+    pipeline = payload.get("pipeline")
+    task = payload.get("task")
+    if (
+        payload.get("schema") != CANDIDATE_AGENT_TASK_RESULT_SCHEMA
+        or not isinstance(pipeline, dict)
+        or pipeline.get("run_id") != pipeline_run
+        or pipeline.get("session_id") != session_id
+        or not isinstance(pipeline.get("request_id"), str)
+        or not pipeline["request_id"]
+        or not isinstance(task, dict)
+        or not isinstance(task.get("id"), str)
+        or not task["id"]
+        or task.get("state") not in {"queued", "in_progress"}
+        or payload.get("candidate") is not None
+        or payload.get("completion") is not None
+    ):
+        raise WorkflowError("pending cloud task identity or schema changed")
+    if result_path.exists():
+        raise WorkflowError("pending cloud task has a final result file")
+    return True
 
 
 def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -2796,11 +2881,27 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
     requested_model = MODEL_ALIASES[args.model]
     existing = load_state(state_path) if state_path.is_file() else None
     pipeline_mode = bool(getattr(args, "_pipeline", False))
+    bounded = pipeline_mode and bool(getattr(args, "bounded_step", False))
+    binding = (
+        bounded_review_binding(args, state_path, target, repo_root)
+        if bounded else None
+    )
+    resumed = None
+    if bounded and existing is not None:
+        retained = existing.get("agent_task") or {}
+        if retained.get("status") in {
+            "running", "result_ready", "published_pending_verification",
+        }:
+            if retained.get("bounded_binding") != binding:
+                raise WorkflowError(
+                    "bounded pipeline task belongs to different inputs or session"
+                )
+            resumed = existing
     if pipeline_mode and existing is not None:
         if (existing.get("pr") or {}).get("pr_url") != target["pr_url"]:
             raise WorkflowError("pipeline state belongs to a different pull request")
         active_task = existing.get("agent_task") or {}
-        if (
+        if resumed is None and (
             active_task.get("status") not in {"completed", "superseded"}
             or (active_task.get("task") or {}).get("state") != "completed"
         ):
@@ -2812,7 +2913,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             raise WorkflowError("pipeline state belongs to a different run")
         if recorded_budget.get("max_iterations") != args.max_iterations:
             raise WorkflowError("pipeline review iteration budget changed")
-        if getattr(args, "_pipeline_entry", False):
+        if getattr(args, "_pipeline_entry", False) and resumed is None:
             previous_iteration = recorded_budget.get("iteration")
             if (
                 type(previous_iteration) is not int
@@ -2827,13 +2928,18 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
     active_task = (
         existing.get("agent_task") if isinstance(existing, dict) else None
     )
-    preflight = (
+    preflight = resumed["agent_task"]["preflight"] if resumed is not None else (
         agent_task_preflight(repo_root, target, allow_detached=True)
         if pipeline_mode
         else agent_task_preflight(repo_root, target)
     )
     pr = preflight["pr"]
-    if pipeline_mode and existing is not None and getattr(args, "_pipeline_entry", False):
+    if (
+        pipeline_mode
+        and existing is not None
+        and getattr(args, "_pipeline_entry", False)
+        and resumed is None
+    ):
         if load_state(state_path) != existing:
             raise WorkflowError("pipeline state changed during sweep preflight")
         if any(
@@ -2856,7 +2962,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
     else:
         state = existing
         active_task = state.get("agent_task")
-        if isinstance(active_task, dict) and active_task.get("status") not in {
+        if resumed is None and isinstance(active_task, dict) and active_task.get("status") not in {
             "completed",
             "consumed",
             "superseded",
@@ -2865,7 +2971,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 "an unfinished Agent Task already owns this state; no retry or "
                 "recovery is permitted"
             )
-        if isinstance(active_task, dict) and active_task.get("status") == "superseded":
+        if resumed is None and isinstance(active_task, dict) and active_task.get("status") == "superseded":
             state.setdefault("managed_task_history", []).append(
                 copy.deepcopy(active_task)
             )
@@ -2878,150 +2984,253 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
     max_iterations = args.max_iterations
     if max_iterations < 1:
         raise WorkflowError("--max-iterations must be positive")
-    state["pr"] = pr
-    state["repo_root"] = str(repo_root)
-    migrate_budget_counters(state)
-    pipeline = pipeline_scope(state, args)
-    if pipeline is None:
-        spent = int(state.get("iterations", 0))
-        invocation = {
-            "run": secrets.token_hex(16),
-            "iteration": None,
-            "baseline": spent,
-            "run_baseline": spent,
-        }
-        budget_scope = "invocation"
-        state["invocation_budget"] = invocation
-        scope = invocation
+    if resumed is not None:
+        task = state["agent_task"]
+        run_id = task["run_id"]
+        prompt_path = Path(task["prompt_file"])
+        result_path = Path(task["result_file"])
+        checkpoint_path = result_path.with_name(result_path.name + ".pipeline.json")
+        if (
+            prompt_path != state_path.with_name(
+                f"{state_path.stem}--{run_id}--agent-task-prompt.txt"
+            )
+            or result_path != state_path.with_name(
+                f"{state_path.stem}--{run_id}--agent-task-result.json"
+            )
+            or task.get("preflight", {}).get("pr", {}).get("pr_url") != target["pr_url"]
+        ):
+            raise WorkflowError(
+                "bounded pipeline task artifact or PR identity changed"
+            )
+        for artifact in (prompt_path, result_path, checkpoint_path):
+            require_outside_repository(artifact, repo_root)
+        if (
+            task.get("model") != requested_model
+            or task.get("github_mutation_policy") != ACTIVE_GITHUB_MUTATION_POLICY
+            or task.get("policy") != AGENT_TASK_POLICY
+            or task.get("allowed_iterations", 0) < 1
+            or state.get("pipeline_budget", {}).get("iteration") != args.pipeline_iteration
+            or not prompt_path.is_file()
+            or prompt_path.is_symlink()
+            or result_path.is_symlink()
+            or not checkpoint_path.is_file()
+            or checkpoint_path.is_symlink()
+            or sha256_file(prompt_path) != task.get("prompt_sha256")
+            or (
+                task["status"] in {"result_ready", "published_pending_verification"}
+                and not result_path.is_file()
+            )
+        ):
+            raise WorkflowError("bounded pipeline task artifacts or pinned input changed")
+        prompt = build_worker_prompt(
+            preflight, max_iterations=task["allowed_iterations"],
+            prior_history=state.get("history") or [],
+        )
+        if prompt_path.read_text(encoding="utf-8") != prompt:
+            raise WorkflowError("bounded pipeline task prompt changed")
+        allowed_iterations = task["allowed_iterations"]
+        clear_shared_state_on_apply = task["clear_shared_state_on_apply"]
     else:
-        budget_scope = "pipeline"
+        prompt = None
+    if resumed is None:
+        state["pr"] = pr
+        state["repo_root"] = str(repo_root)
+        migrate_budget_counters(state)
+        pipeline = pipeline_scope(state, args)
+        if pipeline is None:
+            spent = int(state.get("iterations", 0))
+            invocation = {
+                "run": secrets.token_hex(16),
+                "iteration": None,
+                "baseline": spent,
+                "run_baseline": spent,
+            }
+            budget_scope = "invocation"
+            state["invocation_budget"] = invocation
+            scope = invocation
+        else:
+            budget_scope = "pipeline"
+            if pipeline_mode:
+                pipeline["max_iterations"] = max_iterations
+            state["pipeline_budget"] = pipeline
+            scope = pipeline
+        state["budget_scope"] = budget_scope
+        scope = scoped_budget(state, budget_scope, scope)
+        absolute_cap = absolute_iteration_cap(
+            pipeline, max_iterations, args.pipeline_max_iterations,
+        )
         if pipeline_mode:
-            pipeline["max_iterations"] = max_iterations
-        state["pipeline_budget"] = pipeline
-        scope = pipeline
-    state["budget_scope"] = budget_scope
-    scope = scoped_budget(state, budget_scope, scope)
-    absolute_cap = absolute_iteration_cap(
-        pipeline,
-        max_iterations,
-        args.pipeline_max_iterations,
-    )
-    if pipeline_mode:
-        absolute_cap = max_iterations
-    iteration_spent, run_spent = budget_spent(state, scope)
-    remaining = max_iterations - iteration_spent
-    if absolute_cap is not None:
-        remaining = min(remaining, absolute_cap - run_spent)
-    if remaining <= 0:
+            absolute_cap = max_iterations
+        iteration_spent, run_spent = budget_spent(state, scope)
+        remaining = max_iterations - iteration_spent
+        if absolute_cap is not None:
+            remaining = min(remaining, absolute_cap - run_spent)
+        if remaining <= 0:
+            state["review"] = {
+                "id": f"pr-{pr['number']}-agent-task-cap",
+                "status": "max_iterations_reached",
+                "outcome": "budget_exhausted",
+                "iteration": int(state.get("iterations", 0)) + 1,
+                "head_sha": pr["head_sha"],
+                "candidates": [],
+                "batches": [],
+            }
+            save_state(state_path, state)
+            payload = {
+                "result": "max_iterations_reached",
+                "state": str(state_path),
+                "pr": pr["pr_url"],
+                "pr_number": pr["number"],
+                "pr_title": pr["title"],
+                "session_title": f"Self Review Loop: {pr['number']} - {pr['title']}",
+                "head_sha": pr["head_sha"],
+                "iterations": state["iterations"],
+                "outcome": "max_iterations_reached",
+                "stage_outcome": "max_iterations_reached",
+            }
+            if not pipeline_mode:
+                emit(payload)
+            return payload
+        allowed_iterations = remaining
+        run_id = secrets.token_hex(16)
+        prompt_path = state_path.with_name(
+            f"{state_path.stem}--{run_id}--agent-task-prompt.txt"
+        )
+        result_path = state_path.with_name(
+            f"{state_path.stem}--{run_id}--agent-task-result.json"
+        )
+        checkpoint_path = result_path.with_name(result_path.name + ".pipeline.json")
+        for artifact in (
+            prompt_path, result_path, *([checkpoint_path] if bounded else []),
+        ):
+            require_outside_repository(artifact, repo_root)
+            if artifact.exists():
+                raise WorkflowError(
+                    f"refusing to overwrite existing Agent Task artifact: {artifact}"
+                )
+        clear_shared_state_on_apply = (
+            existing is None or previous_clean_at_head_sha is not None
+        )
         state["review"] = {
-            "id": f"pr-{pr['number']}-agent-task-cap",
-            "status": "max_iterations_reached",
-            "outcome": "budget_exhausted",
+            "id": f"pr-{pr['number']}-agent-task-{run_id}",
+            "status": "active",
             "iteration": int(state.get("iterations", 0)) + 1,
             "head_sha": pr["head_sha"],
             "candidates": [],
             "batches": [],
         }
-        save_state(state_path, state)
-        payload = {
-            "result": "max_iterations_reached",
-            "state": str(state_path),
-            "pr": pr["pr_url"],
-            "pr_number": pr["number"],
-            "pr_title": pr["title"],
-            "session_title": f"Self Review Loop: {pr['number']} - {pr['title']}",
-            "head_sha": pr["head_sha"],
-            "iterations": state["iterations"],
-            "outcome": "max_iterations_reached",
-            "stage_outcome": "max_iterations_reached",
+        state["agent_task"] = {
+            "status": "preparing",
+            "run_id": run_id,
+            "model": requested_model,
+            "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
+            "policy": AGENT_TASK_POLICY,
+            "allowed_iterations": allowed_iterations,
+            "reserved_iterations": allowed_iterations,
+            "preflight": preflight,
+            "prompt_file": str(prompt_path),
+            "result_file": str(result_path),
+            "clear_shared_state_on_apply": clear_shared_state_on_apply,
+            "started_at": utc_now(),
+            **({"bounded_binding": binding} if bounded else {}),
         }
-        if not pipeline_mode:
-            emit(payload)
-        return payload
-    allowed_iterations = remaining
-    run_id = secrets.token_hex(16)
-    prompt_path = state_path.with_name(
-        f"{state_path.stem}--{run_id}--agent-task-prompt.txt"
-    )
-    result_path = state_path.with_name(
-        f"{state_path.stem}--{run_id}--agent-task-result.json"
-    )
-    for artifact in (prompt_path, result_path):
-        require_outside_repository(artifact, repo_root)
-        if artifact.exists():
-            raise WorkflowError(
-                f"refusing to overwrite existing Agent Task artifact: {artifact}"
-            )
-    clear_shared_state_on_apply = (
-        existing is None or previous_clean_at_head_sha is not None
-    )
-    state["review"] = {
-        "id": f"pr-{pr['number']}-agent-task-{run_id}",
-        "status": "active",
-        "iteration": int(state.get("iterations", 0)) + 1,
-        "head_sha": pr["head_sha"],
-        "candidates": [],
-        "batches": [],
-    }
-    state["agent_task"] = {
-        "status": "preparing",
-        "run_id": run_id,
-        "model": requested_model,
-        "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
-        "policy": AGENT_TASK_POLICY,
-        "allowed_iterations": allowed_iterations,
-        "reserved_iterations": allowed_iterations,
-        "preflight": preflight,
-        "prompt_file": str(prompt_path),
-        "result_file": str(result_path),
-        "clear_shared_state_on_apply": clear_shared_state_on_apply,
-        "started_at": utc_now(),
-    }
-    save_state(state_path, state)
-    if (
-        clear_shared_state_on_apply
-        and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
-    ):
-        publish_shared_state(
-            pr,
-            section="self_review",
-            field="clean_at_head_sha",
-            value=None,
-            updated_at=state["updated_at"],
-        )
-        state["agent_task"]["shared_state_cleared"] = True
         save_state(state_path, state)
+        if (
+            clear_shared_state_on_apply
+            and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
+        ):
+            publish_shared_state(
+                pr,
+                section="self_review",
+                field="clean_at_head_sha",
+                value=None,
+                updated_at=state["updated_at"],
+            )
+            state["agent_task"]["shared_state_cleared"] = True
+            save_state(state_path, state)
     try:
         helper = discover_cloud_task()
         prompt = build_worker_prompt(
-            preflight,
-            max_iterations=allowed_iterations,
+            preflight, max_iterations=allowed_iterations,
             prior_history=state.get("history") or [],
         )
         require_no_credentials(prompt, source="Agent Task prompt")
-        atomic_write_text(prompt_path, prompt)
-        state["agent_task"]["status"] = "running"
-        state["agent_task"]["helper"] = str(helper)
-        save_state(state_path, state)
-        process = run(
-            [
-                sys.executable,
-                str(helper),
-                "--apply-with-report",
-                "--model",
-                args.model,
-                "--pr",
-                pr["pr_url"],
-                "--prompt-file",
-                str(prompt_path),
-                "--result-file",
-                str(result_path),
-                "--policy",
-                AGENT_TASK_POLICY,
-            ],
-            cwd=repo_root,
-            check=False,
-        )
+        if resumed is None:
+            atomic_write_text(prompt_path, prompt)
+            state["agent_task"]["status"] = "running"
+            state["agent_task"]["helper"] = str(helper)
+            if bounded:
+                state["agent_task"]["prompt_sha256"] = sha256_file(prompt_path)
+            save_state(state_path, state)
+        elif state["agent_task"].get("helper") != str(helper):
+            raise WorkflowError("bounded pipeline task helper changed")
+        if (
+            resumed is not None
+            and state["agent_task"]["status"] in {
+                "result_ready", "published_pending_verification",
+            }
+        ):
+            process = subprocess.CompletedProcess([], 0, "", "")
+        else:
+            process = run(
+                [
+                    sys.executable,
+                    str(helper),
+                    "--apply-with-report",
+                    *(
+                        ["--pipeline-observe" if resumed is not None else "--pipeline-dispatch"]
+                        if bounded else []
+                    ),
+                    *(["--pipeline-run", args.pipeline_run] if bounded else []),
+                    "--model",
+                    args.model,
+                    "--pr",
+                    pr["pr_url"],
+                    "--prompt-file",
+                    str(prompt_path),
+                    "--result-file",
+                    str(result_path),
+                    "--policy",
+                    AGENT_TASK_POLICY,
+                ],
+                cwd=repo_root,
+                check=False,
+            )
+        if bounded and state["agent_task"]["status"] != "published_pending_verification":
+            pending = bounded_review_pending(
+                process, result_path,
+                pipeline_run=args.pipeline_run,
+                session_id=binding["session_id"],
+            )
+            if (
+                resumed is None
+                and not pending
+                and (process.returncode == 0 or not result_path.is_file())
+            ):
+                raise WorkflowError("bounded dispatch did not return a pending checkpoint")
+            if pending:
+                if not checkpoint_path.is_file():
+                    raise WorkflowError("pending cloud task has no checkpoint")
+                return {
+                    "result": "waiting", "state": str(state_path),
+                    "pr": pr["pr_url"], "pr_number": pr["number"],
+                    "pipeline_run": args.pipeline_run,
+                    "pipeline_iteration": args.pipeline_iteration,
+                }
+            if (
+                resumed is not None
+                and state["agent_task"]["status"] == "running"
+                and process.returncode == 0
+                and result_path.is_file()
+            ):
+                state["agent_task"]["status"] = "result_ready"
+                save_state(state_path, state)
+                return {
+                    "result": "waiting", "state": str(state_path),
+                    "pr": pr["pr_url"], "pr_number": pr["number"],
+                    "pipeline_run": args.pipeline_run,
+                    "pipeline_iteration": args.pipeline_iteration,
+                }
         if not result_path.is_file():
             raise WorkflowError(
                 f"managed helper exited {process.returncode} without an atomic "
@@ -3040,6 +3249,11 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         result = load_agent_task_result(result_path)
         result_sha256 = sha256_file(result_path)
         state = load_state(state_path)
+        publication_resume = (
+            bounded
+            and resumed is not None
+            and state["agent_task"]["status"] == "published_pending_verification"
+        )
         state["agent_task"].update(
             {
                 "task": result.get("task"),
@@ -3119,7 +3333,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         state["agent_task"]["review_outcome"] = report
         save_state(state_path, state)
         live_before_import = metadata_for(target)
-        if same_ref_forward_head_drift(pr, live_before_import):
+        if not publication_resume and same_ref_forward_head_drift(pr, live_before_import):
             current = load_state(state_path)
             task_state = current["agent_task"]
             task_state.update(
@@ -3180,10 +3394,8 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             return payload
         if report["outcome"] == "incomplete":
             raise WorkflowError("hosted Self Review is incomplete; candidate not imported")
-        base_advanced = require_live_pr_snapshot(
-            pr,
-            live_before_import,
-            expected_head=pr["head_sha"],
+        base_advanced = False if publication_resume else require_live_pr_snapshot(
+            pr, live_before_import, expected_head=pr["head_sha"],
             allow_linear_base_advance=True,
         )
         current = load_state(state_path)
@@ -3198,55 +3410,62 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             {"commit": commit, "paths": paths_by_commit[commit]}
             for commit in remote["commits"]
         ]
-        current["agent_task"].update(
-            {
-                "status": "validated_pending_import",
-                "task_id": remote["task_id"],
-                "task_url": remote["task_url"],
-                "generated_branch": remote["generated_branch"],
-                "generated_head": remote["generated_head"],
-                "ordered_commits": remote["commits"],
-                "structural_attestation": True,
-                "result_sha256": result_sha256,
-                "paths_by_commit": paths_checkpoint,
-                "outcome": report["outcome"],
-                "iterations_used": report["iterations_used"],
-                "validated_at": utc_now(),
-                "candidate_manifest": remote["candidate_manifest"],
-                "completion": remote["completion"],
-                "report_evidence": remote["report_evidence"],
-                "coordinator_report": coordinator_report,
-            }
-        )
-        save_state(state_path, current)
-        if (
-            task_state.get("clear_shared_state_on_apply")
-            and not task_state.get("shared_state_cleared")
-            and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
-        ):
-            publish_shared_state(
-                pr,
-                section="self_review",
-                field="clean_at_head_sha",
-                value=None,
-                updated_at=current["updated_at"],
+        if not publication_resume:
+            current["agent_task"].update(
+                {
+                    "status": "validated_pending_import",
+                    "task_id": remote["task_id"],
+                    "task_url": remote["task_url"],
+                    "generated_branch": remote["generated_branch"],
+                    "generated_head": remote["generated_head"],
+                    "ordered_commits": remote["commits"],
+                    "structural_attestation": True,
+                    "result_sha256": result_sha256,
+                    "paths_by_commit": paths_checkpoint,
+                    "outcome": report["outcome"],
+                    "iterations_used": report["iterations_used"],
+                    "validated_at": utc_now(),
+                    "candidate_manifest": remote["candidate_manifest"],
+                    "completion": remote["completion"],
+                    "report_evidence": remote["report_evidence"],
+                    "coordinator_report": coordinator_report,
+                }
             )
-            task_state["shared_state_cleared"] = True
             save_state(state_path, current)
-        imported = apply_verified_candidate_import(
-            repo_root,
-            helper=helper,
-            requested_model=requested_model,
-            prompt=prompt,
-            result_path=result_path,
-            result_sha256=result_sha256,
-            preflight=preflight,
-            remote=remote,
-        )
-        current["agent_task"]["status"] = "validated"
-        current["agent_task"]["imported"] = imported
-        current["agent_task"]["imported_head_sha"] = remote["final_local_head"]
-        save_state(state_path, current)
+            if (
+                task_state.get("clear_shared_state_on_apply")
+                and not task_state.get("shared_state_cleared")
+                and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
+            ):
+                publish_shared_state(
+                    pr,
+                    section="self_review",
+                    field="clean_at_head_sha",
+                    value=None,
+                    updated_at=current["updated_at"],
+                )
+                task_state["shared_state_cleared"] = True
+                save_state(state_path, current)
+            imported = apply_verified_candidate_import(
+                repo_root,
+                helper=helper,
+                requested_model=requested_model,
+                prompt=prompt,
+                result_path=result_path,
+                result_sha256=result_sha256,
+                preflight=preflight,
+                remote=remote,
+            )
+            current["agent_task"]["status"] = "validated"
+            current["agent_task"]["imported"] = imported
+            current["agent_task"]["imported_head_sha"] = remote["final_local_head"]
+            save_state(state_path, current)
+        elif (
+            task_state.get("result_sha256") != result_sha256
+            or task_state.get("imported_head_sha") != remote["final_local_head"]
+            or not task_state.get("imported")
+        ):
+            raise WorkflowError("publication checkpoint does not match verified candidate")
         if current["agent_task"].get("confirmed_remote_head_sha") not in {
             None,
             remote["final_local_head"],
@@ -3276,7 +3495,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 expected_head=live["head_sha"],
                 allow_linear_base_advance=True,
             )
-            if remote["commits"]:
+            if remote["commits"] and not publication_resume:
                 branch_head = remote_head(
                     pr["head_owner"], pr["head_repo"], pr["head_branch"]
                 )
@@ -3301,12 +3520,28 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                             f"HEAD:{pr['head_branch']}",
                         ]
                     )
-                pushed_head = wait_for_remote_head(
-                    pr["head_owner"],
-                    pr["head_repo"],
-                    pr["head_branch"],
-                    remote["final_local_head"],
+                if bounded:
+                    current["agent_task"]["publication_source_head_sha"] = pr["head_sha"]
+                    current["agent_task"]["status"] = "published_pending_verification"
+                    save_state(state_path, current)
+            if remote["commits"]:
+                pushed_head = (
+                    remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"])
+                    if bounded
+                    else wait_for_remote_head(
+                        pr["head_owner"],
+                        pr["head_repo"],
+                        pr["head_branch"],
+                        remote["final_local_head"],
+                    )
                 )
+                if bounded and pushed_head in {None, pr["head_sha"]}:
+                    return {
+                        "result": "waiting", "state": str(state_path),
+                        "pr": pr["pr_url"], "pr_number": pr["number"],
+                        "pipeline_run": args.pipeline_run,
+                        "pipeline_iteration": args.pipeline_iteration,
+                    }
                 if pushed_head != remote["final_local_head"]:
                     raise WorkflowError(
                         "published head does not match the verified imported head"
@@ -3316,12 +3551,11 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 current["agent_task"]["publication_source_head_sha"] = pr["head_sha"]
                 current["agent_task"]["status"] = "published_pending_verification"
                 save_state(state_path, current)
-                wait_for_live_pr_snapshot(
-                    target,
-                    pr,
-                    expected_head=published_head,
-                    allow_linear_base_advance=True,
-                )
+                if not bounded:
+                    wait_for_live_pr_snapshot(
+                        target, pr, expected_head=published_head,
+                        allow_linear_base_advance=True,
+                    )
             else:
                 published_head = pr["head_sha"]
             current["agent_task"]["published_head_sha"] = published_head
@@ -3335,12 +3569,26 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 raise WorkflowError(
                     "published pull request head moved before finalization"
                 )
-        final_live = wait_for_live_pr_snapshot(
-            target,
-            pr,
-            expected_head=published_head,
-            allow_linear_base_advance=True,
-        )
+        if bounded:
+            final_live = metadata_for(target)
+            if final_live["head_sha"] == pr["head_sha"] and published_head != pr["head_sha"]:
+                current["agent_task"]["status"] = "published_pending_verification"
+                save_state(state_path, current)
+                return {
+                    "result": "waiting", "state": str(state_path),
+                    "pr": pr["pr_url"], "pr_number": pr["number"],
+                    "pipeline_run": args.pipeline_run,
+                    "pipeline_iteration": args.pipeline_iteration,
+                }
+            require_live_pr_snapshot(
+                pr, final_live, expected_head=published_head,
+                allow_linear_base_advance=True,
+            )
+        else:
+            final_live = wait_for_live_pr_snapshot(
+                target, pr, expected_head=published_head,
+                allow_linear_base_advance=True,
+            )
         base_advanced = base_advanced or final_live["base_sha"] != pr["base_sha"]
         current["pr"] = {**pr, **final_live}
         for _ in range(report["iterations_used"]):
@@ -3398,7 +3646,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             )
         finalize_agent_task_artifacts(
             current["agent_task"],
-            {prompt_path, result_path},
+            {prompt_path, result_path, *([checkpoint_path] if bounded else [])},
             preserve=bool(getattr(args, "preserve_artifacts", False)),
             report_content=report_content,
         )
@@ -3701,6 +3949,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_ITERATIONS,
     )
     pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--bounded-step", action="store_true")
     pipeline.add_argument("--pipeline-iteration", type=int, required=True)
     pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
     pipeline.add_argument(
@@ -3748,7 +3997,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "published",
     "nothing_to_publish",
 })
-EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
+EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 
@@ -3804,6 +4053,7 @@ def execution_main():
         "--pipeline-iteration",
         "--pipeline-max-iterations",
         "--pipeline-run",
+        "--bounded-step",
         "--preserve-artifacts",
         "--repo-root",
         "--state",

@@ -114,6 +114,31 @@ class ExecutionTest(unittest.TestCase):
         })
         return handle, result_path, state, record
 
+    def pending_child_evidence(self, context, *, directory=None, name="stage", waiting=False):
+        handle, result_path, state, record = self.child_evidence(
+            context, directory=directory, name=name
+        )
+        dispatch = result_path.with_name(result_path.name + ".dispatch.json")
+        observation = EXECUTION.read(dispatch)
+        observation["remote_status"] = "active"
+        observation["task"]["state"] = "queued"
+        observation["history"][-1]["remote_status"] = "active"
+        observation["history"][-1]["task"]["state"] = "queued"
+        EXECUTION.write(dispatch, observation)
+        child = EXECUTION.read(result_path)
+        child["remote_work_may_continue"] = True
+        child["workflow_result"] = (
+            {"result": "waiting"} if waiting
+            else {"status": "pending", "task": {"id": f"task-{name}"}}
+        )
+        child["remote_tasks"] = [{**observation, "evidence": str(dispatch)}]
+        EXECUTION.write(result_path, child)
+        EXECUTION.write(handle, {
+            **EXECUTION.read(handle),
+            "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+        })
+        return handle, result_path, state, record
+
     def test_fresh_handle_cannot_be_reused(self):
         self.context()
         before = self.handle.read_bytes()
@@ -2183,6 +2208,86 @@ class ExecutionTest(unittest.TestCase):
                         self.assertIn(str(result_path), [item["path"] for item in result["retained_evidence"]])
                         self.assertIn("task-stage", [item["task"]["id"] for item in result["remote_tasks"]])
                         following = EXECUTION.Execution(directory / "following.json", command=["python"])
+
+    def test_confirmed_pending_task_can_finish_a_bounded_step(self):
+        context = EXECUTION.Execution(
+            self.handle, command=["python"], terminal_results=frozenset({"waiting"})
+        )
+        self.pending_child_evidence(context)
+
+        context.emit({"result": "waiting"})
+        result = context.finish(0)
+
+        self.assertEqual(0, result["exit_code"])
+        self.assertEqual("finished", result["local_status"])
+        self.assertTrue(result["remote_work_may_continue"])
+        self.assertEqual("active", result["remote_tasks"][0]["remote_status"])
+
+    def test_nested_pending_task_can_finish_a_bounded_step(self):
+        context = EXECUTION.Execution(
+            self.handle, command=["python"], terminal_results=frozenset({"waiting"})
+        )
+        _, stage_result, _, _ = self.pending_child_evidence(context, waiting=True)
+        self.pending_child_evidence(
+            context, directory=stage_result.parent, name="hosted"
+        )
+
+        context.emit({"result": "waiting"})
+        result = context.finish(0)
+
+        self.assertEqual(0, result["exit_code"])
+        self.assertEqual("finished", result["local_status"])
+        self.assertTrue(result["remote_work_may_continue"])
+        self.assertEqual(
+            {"task-stage", "task-hosted"},
+            {item["task"]["id"] for item in result["remote_tasks"]},
+        )
+
+    def test_unknown_or_mismatched_pending_task_cannot_finish_a_step(self):
+        for defect in (
+            "unknown", "missing_id", "missing_request", "wrong_id",
+            "completed_outcome", "failed_child",
+        ):
+            with self.subTest(defect=defect):
+                directory = self.root / defect
+                context = EXECUTION.Execution(
+                    directory / "root.json", command=["python"],
+                    terminal_results=frozenset({"waiting", "complete"}),
+                )
+                handle, result_path, _, _ = self.child_evidence(context)
+                dispatch = result_path.with_name(result_path.name + ".dispatch.json")
+                observation = EXECUTION.read(dispatch)
+                observation["remote_status"] = (
+                    "unknown" if defect == "unknown" else "active"
+                )
+                if defect == "missing_id":
+                    observation["task"] = None
+                elif defect == "missing_request":
+                    observation["request_id"] = None
+                EXECUTION.write(dispatch, observation)
+                child = EXECUTION.read(result_path)
+                child["remote_work_may_continue"] = True
+                child["workflow_result"] = {
+                    "status": "pending",
+                    "task": {"id": "different" if defect == "wrong_id" else "task-stage"},
+                }
+                child["remote_tasks"] = [{**observation, "evidence": str(dispatch)}]
+                if defect == "failed_child":
+                    child["exit_code"] = 1
+                    child["local_status"] = "failed"
+                EXECUTION.write(result_path, child)
+                EXECUTION.write(handle, {
+                    **EXECUTION.read(handle),
+                    "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                })
+                context.emit({
+                    "result": "complete" if defect == "completed_outcome" else "waiting"
+                })
+
+                result = context.finish(0)
+
+                self.assertEqual(1, result["exit_code"])
+                self.assertEqual("failed", result["local_status"])
 
     def test_missing_malformed_stale_or_unsealed_child_evidence_cannot_complete(self):
         for defect in ("missing_handle", "missing_result", "missing_receipt", "malformed",

@@ -56,7 +56,7 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa74322811f6f4546bc271450ab5a30e4c25f96724b6e6a7666e5ee07e7c220a"
+    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -112,6 +112,18 @@ def subprocess_environment() -> dict[str, str]:
     return environment
 
 
+_BOUNDED_DEADLINE: float | None = None
+
+
+def bounded_subprocess_timeout() -> dict[str, float]:
+    if _BOUNDED_DEADLINE is None:
+        return {}
+    remaining = _BOUNDED_DEADLINE - time.monotonic() - 5
+    if remaining <= 0:
+        raise WorkflowError("bounded pipeline call exceeded its subprocess allowance")
+    return {"timeout": min(remaining, 85)}
+
+
 def run(
     command: list[str],
     *,
@@ -119,18 +131,22 @@ def run(
     input_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
-        command,
-        cwd=str(cwd) if cwd else None,
-        input=input_text,
-        text=True,
-        encoding="utf-8",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        env=subprocess_environment(),
-        **windows_no_window_options(),
-    )
+    try:
+        process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
+            command,
+            cwd=str(cwd) if cwd else None,
+            input=input_text,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=subprocess_environment(),
+            **bounded_subprocess_timeout(),
+            **windows_no_window_options(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise WorkflowError("bounded pipeline subprocess exceeded its time limit") from error
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
         raise WorkflowError(
@@ -2253,8 +2269,73 @@ def command_pipeline(args: argparse.Namespace) -> None:
         or args.pipeline_max_iterations < args.pipeline_iteration
     ):
         raise WorkflowError("pipeline requires a target, state, and valid run position")
+    if getattr(args, "bounded_step", False):
+        if not re.fullmatch(r"[0-9a-f]{32}", args.pipeline_run):
+            raise WorkflowError("bounded pipeline run must be 32 lowercase hex characters")
+        session_id = os.environ.get("COPILOT_AGENT_SESSION_ID")
+        if not session_id or session_id != session_id.strip():
+            raise WorkflowError("bounded pipeline requires COPILOT_AGENT_SESSION_ID")
     args._pipeline = True
-    command_agent_task(args)
+    global _BOUNDED_DEADLINE
+    previous_deadline = _BOUNDED_DEADLINE
+    if getattr(args, "bounded_step", False):
+        _BOUNDED_DEADLINE = time.monotonic() + 85
+    try:
+        command_agent_task(args)
+    finally:
+        _BOUNDED_DEADLINE = previous_deadline
+
+
+def bounded_description_binding(
+    args: argparse.Namespace, path: Path, target: dict[str, Any], repo_root: Path,
+    github_mutation_policy: str,
+) -> dict[str, Any]:
+    return {
+        "session_id": os.environ["COPILOT_AGENT_SESSION_ID"],
+        "state": str(path.resolve()),
+        "repo_root": str(repo_root),
+        "target": target,
+        "pipeline_run": args.pipeline_run,
+        "pipeline_iteration": args.pipeline_iteration,
+        "pipeline_max_iterations": args.pipeline_max_iterations,
+        "model": MODEL_ALIASES[args.model],
+        "github_mutation_policy": github_mutation_policy,
+        "preserve_artifacts": bool(args.preserve_artifacts),
+    }
+
+
+def bounded_description_pending(
+    process: subprocess.CompletedProcess[str], result_path: Path,
+    *, pipeline_run: str, session_id: str,
+) -> bool:
+    if process.returncode != 0:
+        return False
+    try:
+        payload = parse_strict_json(process.stdout, description="cloud task checkpoint")
+    except WorkflowError:
+        return False
+    if not isinstance(payload, dict) or payload.get("status") != "pending":
+        return False
+    pipeline = payload.get("pipeline")
+    task = payload.get("task")
+    if (
+        payload.get("schema") != AGENT_TASK_RESULT_SCHEMA
+        or not isinstance(pipeline, dict)
+        or pipeline.get("run_id") != pipeline_run
+        or pipeline.get("session_id") != session_id
+        or not isinstance(pipeline.get("request_id"), str)
+        or not pipeline["request_id"]
+        or not isinstance(task, dict)
+        or not isinstance(task.get("id"), str)
+        or not task["id"]
+        or task.get("state") not in {"queued", "in_progress"}
+        or payload.get("candidate") is not None
+        or payload.get("completion") is not None
+    ):
+        raise WorkflowError("pending cloud task identity or schema changed")
+    if result_path.exists():
+        raise WorkflowError("pending cloud task has a final result file")
+    return True
 
 
 def command_agent_task(args: argparse.Namespace) -> None:
@@ -2275,38 +2356,59 @@ def command_agent_task(args: argparse.Namespace) -> None:
     if path.resolve() == index_path.resolve():
         raise WorkflowError("invocation state must not replace the PR audit index")
     pipeline_mode = bool(getattr(args, "_pipeline", False))
+    bounded = pipeline_mode and bool(getattr(args, "bounded_step", False))
+    binding = (
+        bounded_description_binding(args, path, target, repo_root, github_mutation_policy)
+        if bounded else None
+    )
     previous = None
+    resumed = None
     if path.exists():
         if not pipeline_mode:
             raise WorkflowError(
                 f"invocation state already exists and is audit-only: {path}"
             )
         previous = load_run_state(path)
-        if target_from_state(previous) != target:
-            raise WorkflowError("pipeline state belongs to a different pull request")
-        if previous.get("pipeline_run") != args.pipeline_run:
-            raise WorkflowError("pipeline state belongs to a different run")
-        prior_iteration = previous.get("pipeline_iteration")
-        if (
-            type(prior_iteration) is not int
-            or not 1 <= prior_iteration < args.pipeline_iteration
-            or previous.get("pipeline_max_iterations") != args.pipeline_max_iterations
-        ):
-            raise WorkflowError("pipeline state requires a later sweep in the same run")
         prior_task = previous.get("agent_task") or {}
-        if (
-            prior_task.get("status") not in {"completed", "head_changed"}
-            or (prior_task.get("task") or {}).get("state") != "completed"
-        ):
-            raise WorkflowError(
-                "pipeline state is unfinished audit evidence; start a fresh run"
-            )
-        if prior_task.get("github_mutation_policy") != github_mutation_policy:
-            raise WorkflowError("pipeline GitHub mutation policy changed")
-        if prior_task.get("model") != MODEL_ALIASES[args.model]:
-            raise WorkflowError("pipeline worker model changed")
-    preflight = agent_task_preflight(repo_root, target)
-    preflight["changed_files"] = pull_request_file_paths(preflight)
+        if bounded and prior_task.get("status") in {"running", "result_ready"}:
+            if prior_task.get("bounded_binding") != binding:
+                raise WorkflowError(
+                    "bounded pipeline task belongs to different inputs or session"
+                )
+            resumed = previous
+            previous = None
+        if resumed is not None:
+            run_id = resumed["run_id"]
+        else:
+            if target_from_state(previous) != target:
+                raise WorkflowError("pipeline state belongs to a different pull request")
+            if previous.get("pipeline_run") != args.pipeline_run:
+                raise WorkflowError("pipeline state belongs to a different run")
+            prior_iteration = previous.get("pipeline_iteration")
+            if (
+                type(prior_iteration) is not int
+                or not 1 <= prior_iteration < args.pipeline_iteration
+                or previous.get("pipeline_max_iterations") != args.pipeline_max_iterations
+            ):
+                raise WorkflowError("pipeline state requires a later sweep in the same run")
+            if (
+                prior_task.get("status") not in {"completed", "head_changed"}
+                or (prior_task.get("task") or {}).get("state") != "completed"
+            ):
+                raise WorkflowError(
+                    "pipeline state is unfinished audit evidence; start a fresh run"
+                )
+            if prior_task.get("github_mutation_policy") != github_mutation_policy:
+                raise WorkflowError("pipeline GitHub mutation policy changed")
+            if prior_task.get("model") != MODEL_ALIASES[args.model]:
+                raise WorkflowError("pipeline worker model changed")
+    preflight = (
+        resumed["agent_task"]["preflight"]
+        if resumed is not None
+        else agent_task_preflight(repo_root, target)
+    )
+    if resumed is None:
+        preflight["changed_files"] = pull_request_file_paths(preflight)
     pr = preflight["pr"]
     requested_model = MODEL_ALIASES[args.model]
     semantic_snapshot = recommendation_semantic_snapshot(
@@ -2351,7 +2453,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             raise WorkflowError(
                 "same-head pipeline reuse changed inputs other than title or body"
             )
-    state = {
+    state = resumed or {
         "version": STATE_VERSION,
         "kind": RUN_KIND,
         "created_at": utc_now(),
@@ -2377,7 +2479,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "pipeline_max_iterations": args.pipeline_max_iterations,
             }
         )
-    if previous is None:
+    if resumed is not None:
+        if state["agent_task"].get("semantic_snapshot") != semantic_snapshot:
+            raise WorkflowError("bounded pipeline task semantic snapshot changed")
+    elif previous is None:
         create_state(path, state)
     else:
         state["agent_task_history"] = [
@@ -2392,20 +2497,25 @@ def command_agent_task(args: argparse.Namespace) -> None:
             if load_run_state(path) != previous:
                 raise WorkflowError("pipeline state changed before the next sweep")
             save_state(path, state)
-    try:
-        reserve_agent_task_run(index_path, path, state)
-    except BaseException as error:
-        if previous is None:
-            path.unlink(missing_ok=True)
-        else:
-            state["agent_task"].update({"status": "failed", "error": str(error)})
-            save_state(path, state)
-        raise
+    if resumed is None:
+        try:
+            reserve_agent_task_run(index_path, path, state)
+        except BaseException as error:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                state["agent_task"].update({"status": "failed", "error": str(error)})
+                save_state(path, state)
+            raise
     artifact_stem = f"{path.stem}--{run_id}" if pipeline_mode else path.stem
     artifacts = {
         "prompt": path.with_name(f"{artifact_stem}--agent-task-prompt.txt"),
         "result": path.with_name(f"{artifact_stem}--agent-task-result.json"),
     }
+    if bounded:
+        artifacts["checkpoint"] = artifacts["result"].with_name(
+            artifacts["result"].name + ".pipeline.json"
+        )
 
     def record_failure(error: BaseException) -> None:
         current = load_run_state(path)
@@ -2436,42 +2546,119 @@ def command_agent_task(args: argparse.Namespace) -> None:
         helper = discover_cloud_task()
         prompt = build_worker_prompt(preflight)
         require_no_credentials(prompt, source="Agent Task prompt")
-        if any(artifact.exists() for artifact in artifacts.values()):
-            raise WorkflowError("refusing to overwrite existing Agent Task artifacts")
-        atomic_write_text(artifacts["prompt"], prompt)
-        state["agent_task"] = {
-            "status": "running",
-            "model": requested_model,
-            "github_mutation_policy": github_mutation_policy,
-            "policy": AGENT_TASK_POLICY,
-            "helper": str(helper),
-            "preflight": {**preflight, "identity": identity},
-            "semantic_snapshot": semantic_snapshot,
-            "prompt_file": str(artifacts["prompt"]),
-            "result_file": str(artifacts["result"]),
-            "started_at": utc_now(),
-        }
-        save_state(path, state)
-        refresh_run_index(path, state)
-        process = run(
-            [
-                sys.executable,
-                str(helper),
-                "--report",
-                "--model",
-                args.model,
-                "--pr",
-                pr["url"],
-                "--prompt-file",
-                str(artifacts["prompt"]),
-                "--result-file",
-                str(artifacts["result"]),
-                "--policy",
-                AGENT_TASK_POLICY,
-            ],
-            cwd=repo_root,
-            check=False,
-        )
+        if resumed is not None:
+            task = state["agent_task"]
+            if (
+                state["run_id"] != run_id
+                or task.get("prompt_file") != str(artifacts["prompt"])
+                or task.get("result_file") != str(artifacts["result"])
+                or task.get("helper") != str(helper)
+                or not artifacts["prompt"].is_file()
+                or artifacts["prompt"].is_symlink()
+                or artifacts["result"].is_symlink()
+                or not artifacts["checkpoint"].is_file()
+                or artifacts["checkpoint"].is_symlink()
+                or sha256_file(artifacts["prompt"]) != task.get("prompt_sha256")
+                or artifacts["prompt"].read_text(encoding="utf-8") != prompt
+                or task["preflight"].get("identity") != identity
+            ):
+                raise WorkflowError(
+                    "bounded pipeline task artifacts or pinned input changed"
+                )
+        else:
+            if any(artifact.exists() for artifact in artifacts.values()):
+                raise WorkflowError("refusing to overwrite existing Agent Task artifacts")
+            atomic_write_text(artifacts["prompt"], prompt)
+            state["agent_task"] = {
+                "status": "running",
+                "model": requested_model,
+                "github_mutation_policy": github_mutation_policy,
+                "policy": AGENT_TASK_POLICY,
+                "helper": str(helper),
+                "preflight": {**preflight, "identity": identity},
+                "semantic_snapshot": semantic_snapshot,
+                "prompt_file": str(artifacts["prompt"]),
+                "result_file": str(artifacts["result"]),
+                "started_at": utc_now(),
+                **(
+                    {
+                        "bounded_binding": binding,
+                        "prompt_sha256": sha256_file(artifacts["prompt"]),
+                    }
+                    if bounded else {}
+                ),
+            }
+            save_state(path, state)
+            refresh_run_index(path, state)
+        if resumed is not None and state["agent_task"]["status"] == "result_ready":
+            process = subprocess.CompletedProcess([], 0, "", "")
+        else:
+            process = run(
+                [
+                    sys.executable,
+                    str(helper),
+                    "--report",
+                    *(
+                        ["--pipeline-observe" if resumed is not None else "--pipeline-dispatch"]
+                        if bounded else []
+                    ),
+                    *(["--pipeline-run", args.pipeline_run] if bounded else []),
+                    "--model",
+                    args.model,
+                    "--pr",
+                    pr["url"],
+                    "--prompt-file",
+                    str(artifacts["prompt"]),
+                    "--result-file",
+                    str(artifacts["result"]),
+                    "--policy",
+                    AGENT_TASK_POLICY,
+                ],
+                cwd=repo_root,
+                check=False,
+            )
+        if bounded:
+            pending = bounded_description_pending(
+                process, artifacts["result"],
+                pipeline_run=args.pipeline_run,
+                session_id=binding["session_id"],
+            )
+            if (
+                resumed is None
+                and not pending
+                and (process.returncode == 0 or not artifacts["result"].is_file())
+            ):
+                raise WorkflowError("bounded dispatch did not return a pending checkpoint")
+            if pending:
+                if not artifacts["checkpoint"].is_file():
+                    raise WorkflowError("pending cloud task has no checkpoint")
+                emit({
+                    "result": "waiting",
+                    "state": str(path),
+                    "pr": pr["url"],
+                    "pr_number": pr["number"],
+                    "pipeline_run": args.pipeline_run,
+                    "pipeline_iteration": args.pipeline_iteration,
+                })
+                return
+            if (
+                resumed is not None
+                and state["agent_task"]["status"] == "running"
+                and process.returncode == 0
+                and artifacts["result"].is_file()
+            ):
+                state["agent_task"]["status"] = "result_ready"
+                save_state(path, state)
+                refresh_run_index(path, state)
+                emit({
+                    "result": "waiting",
+                    "state": str(path),
+                    "pr": pr["url"],
+                    "pr_number": pr["number"],
+                    "pipeline_run": args.pipeline_run,
+                    "pipeline_iteration": args.pipeline_iteration,
+                })
+                return
         if not artifacts["result"].is_file():
             raise WorkflowError(
                 f"managed cloud helper exited {process.returncode} without an atomic "
@@ -2995,6 +3182,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--github-mutation-policy", choices=("allow", "source-only")
     )
     pipeline.add_argument("--pipeline-run", required=True)
+    pipeline.add_argument("--bounded-step", action="store_true")
     pipeline.add_argument("--pipeline-iteration", type=int, required=True)
     pipeline.add_argument("--pipeline-max-iterations", type=int, required=True)
     pipeline.set_defaults(function=command_agent_task)
@@ -3041,7 +3229,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "validated",
     "source_only_no_mutation",
 })
-EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
+EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 
@@ -3100,6 +3288,7 @@ def execution_main():
         "--pipeline-iteration",
         "--pipeline-max-iterations",
         "--pipeline-run",
+        "--bounded-step",
         "--preserve-artifacts",
         "--repo-root",
         "--state",

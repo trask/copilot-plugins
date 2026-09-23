@@ -947,6 +947,419 @@ class CandidateDispatcherTest(unittest.TestCase):
         self.check_candidate("feature", managed=True)
 
 
+class PipelineStagesTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(temporary.cleanup)
+        self.files = Path(temporary.name)
+        self.prompt = self.files / "prompt.txt"
+        self.prompt.write_text("Review and prepare fixes.", encoding="utf-8")
+        self.result_path = self.files / "result.json"
+        self.run_id = "a" * 32
+        self.root = Path("C:/repo")
+        self.head = "1" * 40
+        self.pull = MODULE.PullRequestSnapshot(
+            7, "https://github.com/owner/repo/pull/7", "OPEN",
+            "owner/repo", "main", "4" * 40, "owner/repo", "feature",
+            self.head, False,
+        )
+        self.snapshot = MODULE.WorktreeSnapshot(
+            self.root, "owner/repo", "origin", "feature", self.head,
+        )
+        self.repository = mock.Mock()
+        self.repository.snapshot.return_value = self.snapshot
+        self.repository.root.return_value = self.root
+        self.repository.repository_name.return_value = "owner/repo"
+        self.repository.head.return_value = self.head
+        self.repository.fetch_pr_inputs.return_value = {}
+        self.repository.align_to_pr.return_value = self.snapshot
+        self.repository.identity.return_value = MODULE.LocalIdentity(
+            "feature", self.head, "", None,
+        )
+        self.repository.fetch_generated.return_value = "refs/cloud-agent-tasks/request-1/generated"
+        self.repository.ref_sha.return_value = self.head
+        self.repository.cloud_commits.return_value = []
+        self.repository.candidate_history.return_value = MODULE.CandidateHistory(
+            self.head, (), None,
+        )
+        self.api = mock.Mock()
+        self.api.last_response_sha256 = "e" * 64
+        self.initial = {
+            "id": "task-1", "state": "queued",
+            "created_at": "2026-09-18T12:00:00Z",
+            "repository": {"id": 11, "full_name": "owner/repo"},
+        }
+        options = MODULE.Options(
+            report=False, model="gpt-5.6-sol",
+            prompt="Review and prepare fixes.",
+            pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
+            apply_with_report=True, result_file=self.result_path,
+            policy=MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+            prompt_file=self.prompt,
+        )
+        submitted = MODULE.task_payload(options, MODULE.OUTPUT_REPORT_PATH, self.pull)["prompt"]
+        self.completed = {
+            **self.initial,
+            "state": "completed",
+            "completed_at": "2026-09-18T12:03:00Z",
+            "owner": {"id": 12, "login": "owner"},
+            "artifacts": [{
+                "type": "branch", "provider": "github",
+                "data": {"head_ref": "copilot/task-1", "base_ref": "feature"},
+            }],
+            "sessions": [{
+                "id": "session-1", "task_id": "task-1", "state": "completed",
+                "created_at": "2026-09-18T12:00:01Z",
+                "completed_at": "2026-09-18T12:03:00Z",
+                "model": "sweagent-capi:gpt-5.6-sol",
+                "base_ref": "feature", "head_ref": "copilot/task-1",
+                "repository": {"id": 11, "full_name": "owner/repo"},
+                "owner": {"id": 12, "login": "owner"},
+                "prompt": submitted,
+            }],
+        }
+        self.patchers = [
+            mock.patch.object(MODULE, "GitRepository", return_value=self.repository),
+            mock.patch.object(MODULE, "ApiClient", return_value=self.api),
+            mock.patch.object(MODULE, "repository_base", return_value=SimpleNamespace(
+                branch="main", sha="4" * 40,
+            )),
+            mock.patch.object(MODULE, "resolve_pull_request", return_value=self.pull),
+            mock.patch.object(MODULE, "validate_policy_before_post"),
+            mock.patch.object(MODULE, "_EXECUTION", None),
+            mock.patch.dict(MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "session-root"}),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def invoke(
+        self, stage="dispatch", *, run=None, prompt=None, session=None,
+        report=False,
+    ):
+        if prompt is not None:
+            self.prompt.write_text(prompt, encoding="utf-8")
+        argv = [
+            "--pipeline-" + stage, "--pipeline-run", run or self.run_id,
+            "--model", "sol", "--report" if report else "--apply-with-report",
+            "--pr", "owner/repo#7",
+            "--prompt-file", str(self.prompt), "--result-file", str(self.result_path),
+            "--policy", (
+                MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
+                if report else MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR
+            ),
+        ]
+        with mock.patch.dict(
+            MODULE.os.environ,
+            {"COPILOT_AGENT_SESSION_ID": session or "session-root"},
+        ):
+            output = io.StringIO()
+            code = MODULE.main(
+                argv, cwd=self.root, uuid_factory=lambda: "request-1",
+                stdout=output, stderr=io.StringIO(),
+                sleep=lambda seconds: self.fail(f"unexpected sleep: {seconds}"),
+            )
+            self.stdout_result = output.getvalue()
+            return code
+
+    def result(self):
+        if self.result_path.exists():
+            return json.loads(self.result_path.read_text(encoding="utf-8"))
+        return json.loads(self.stdout_result)
+
+    def test_dispatch_reserves_confirmed_task_and_rejects_duplicate_post(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        pending = self.result()
+        self.assertEqual("pending", pending["status"])
+        self.assertEqual("task-1", pending["task"]["id"])
+        self.assertIsNone(pending["completion"])
+        self.assertEqual(self.run_id, pending["pipeline"]["run_id"])
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(1, len(self.stdout_result.splitlines()))
+        checkpoint = MODULE.load_pipeline_checkpoint(
+            MODULE.pipeline_checkpoint_path(self.result_path)
+        )
+        self.assertEqual("session-root", checkpoint["identity"]["session_id"])
+        self.assertEqual(self.run_id, checkpoint["identity"]["run_id"])
+        self.assertEqual("request-1", checkpoint["request_id"])
+        self.assertEqual("task-1", checkpoint["task_id"])
+        self.assertEqual(2, self.invoke())
+        self.assertEqual(
+            "pipeline_duplicate_dispatch", self.result()["error"]["code"]
+        )
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(1, self.api._request_once.call_count)
+        self.assertEqual("POST", self.api._request_once.call_args.args[0])
+        self.assertEqual(45, self.api._request_once.call_args.kwargs["timeout"])
+
+    def test_report_policy_dispatch_and_active_observation_remain_bounded(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke(report=True))
+        self.assertEqual("not_applicable", self.result()["application"]["status"])
+        self.api._request_once.reset_mock()
+        self.api._request_once.return_value = {**self.initial, "state": "in_progress"}
+        self.assertEqual(0, self.invoke("observe", report=True))
+        self.assertEqual("pending", self.result()["status"])
+        self.assertFalse(self.result_path.exists())
+        self.api._request_once.assert_called_once()
+
+    def test_report_observation_does_not_recheck_moving_fork_before_get(self):
+        cross_repo_pull = replace(
+            self.pull, head_repository="contributor/repo", cross_repository=True,
+        )
+        with mock.patch.object(
+            MODULE, "resolve_pull_request", return_value=cross_repo_pull
+        ):
+            self.api._request_once.return_value = self.initial
+            self.assertEqual(0, self.invoke(report=True))
+        self.repository.verify_fork_head.assert_called_once()
+        self.repository.verify_fork_head.reset_mock()
+        self.api._request_once.return_value = {
+            **self.initial, "state": "in_progress",
+        }
+        self.assertEqual(0, self.invoke("observe", report=True))
+        self.assertEqual("pending", self.result()["status"])
+        self.repository.verify_fork_head.assert_not_called()
+        self.assertFalse(self.result_path.exists())
+
+    def test_managed_stages_record_remote_identity_and_observed_states(self):
+        runtime = mock.Mock()
+        self.api._request_once.return_value = self.initial
+        with mock.patch.object(MODULE, "_EXECUTION", runtime):
+            self.assertEqual(0, self.invoke())
+            self.api._request_once.return_value = {
+                **self.initial, "state": "in_progress",
+            }
+            self.assertEqual(0, self.invoke("observe"))
+            self.api._request_once.return_value = self.completed
+            self.assertEqual(0, self.invoke("observe"))
+        observations = [
+            call.args[3]
+            for call in runtime.record_dispatch.call_args_list
+            if len(call.args) == 4
+        ]
+        self.assertTrue(runtime.record_dispatch.call_args_list)
+        for call in runtime.record_dispatch.call_args_list:
+            self.assertEqual(self.result_path, call.args[0])
+            self.assertEqual("request-1", call.args[1])
+            self.assertEqual("owner/repo", call.args[2])
+        self.assertIn({"id": "task-1", "url": None, "state": "queued"}, observations)
+        self.assertIn({"id": "task-1", "state": "in_progress", "url": None}, observations)
+        self.assertIn({"id": "task-1", "state": "completed", "url": None}, observations)
+        self.assertEqual(
+            ["pending", "pending"],
+            [call.args[0]["status"] for call in runtime.emit.call_args_list],
+        )
+        self.assertEqual(
+            ["task-1", "task-1"],
+            [call.args[0]["task"]["id"] for call in runtime.emit.call_args_list],
+        )
+        self.assertEqual(
+            ["request-1", "request-1"],
+            [
+                call.args[0]["pipeline"]["request_id"]
+                for call in runtime.emit.call_args_list
+            ],
+        )
+        self.assertEqual("success", self.result()["status"])
+
+    def test_unknown_post_never_retries_or_allows_observation(self):
+        self.api._request_once.side_effect = MODULE.TransientApiError("network lost")
+        self.assertEqual(2, self.invoke())
+        self.assertEqual("pipeline_dispatch_unknown", self.result()["error"]["code"])
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(1, self.api._request_once.call_count)
+        self.assertEqual(2, self.invoke())
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(1, self.api._request_once.call_count)
+
+    def test_terminal_post_response_never_seals_as_pending(self):
+        runtime = mock.Mock()
+        self.api._request_once.return_value = {
+            **self.initial, "state": "completed",
+        }
+        with mock.patch.object(MODULE, "_EXECUTION", runtime):
+            self.assertEqual(2, self.invoke())
+        self.assertEqual(
+            "pipeline_dispatch_not_active", self.result()["error"]["code"]
+        )
+        self.assertFalse(self.result_path.exists())
+        runtime.emit.assert_called_once()
+        self.assertEqual("error", runtime.emit.call_args.args[0]["status"])
+        self.assertFalse(any(
+            len(call.args) == 4 and call.args[3].get("state") == "queued"
+            for call in runtime.record_dispatch.call_args_list
+        ))
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(1, self.api._request_once.call_count)
+
+    def test_unknown_get_fences_later_observation_without_a_final_file(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        self.api._request_once.side_effect = MODULE.TransientApiError("network lost")
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual("api_failure", self.result()["error"]["code"])
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(2, self.api._request_once.call_count)
+
+    def test_observe_rejects_changed_prompt_session_run_and_source_before_get(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        self.api._request_once.reset_mock()
+        self.assertEqual(2, self.invoke("observe", session="another-session"))
+        self.assertEqual(2, self.invoke("observe", run="b" * 32))
+        self.assertEqual(2, self.invoke("observe", prompt="A different prompt."))
+        self.prompt.write_text("Review and prepare fixes.", encoding="utf-8")
+        with mock.patch.object(
+            MODULE, "resolve_pull_request",
+            return_value=replace(self.pull, head_sha="9" * 40),
+        ):
+            self.api._request_once.return_value = {
+                **self.initial, "state": "in_progress",
+            }
+            self.assertEqual(0, self.invoke("observe"))
+            self.assertEqual("pending", self.result()["status"])
+        self.assertEqual(1, self.api._request_once.call_count)
+        self.api._request_once.reset_mock()
+        self.repository.identity.return_value = MODULE.LocalIdentity(
+            "feature", "9" * 40, "", None,
+        )
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(
+            "pipeline_identity_mismatch", self.result()["error"]["code"]
+        )
+        self.api._request_once.assert_not_called()
+
+    def test_completed_task_attests_frozen_source_for_stage_drift_handling(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        self.api._request_once.return_value = self.completed
+        with mock.patch.object(
+            MODULE, "resolve_pull_request",
+            return_value=replace(self.pull, head_sha="9" * 40),
+        ):
+            self.assertEqual(0, self.invoke("observe"))
+        outcome = self.result()
+        self.assertEqual("success", outcome["status"])
+        self.assertEqual("task-1", outcome["task"]["id"])
+        self.assertEqual("completed", outcome["task"]["state"])
+        self.assertTrue(self.result_path.exists())
+        self.assertEqual(self.head, outcome["pull_request"]["head_sha"])
+        self.assertEqual("task-1", outcome["candidate"]["task"]["id"])
+        self.assertEqual(
+            "session-1", outcome["completion"]["session"]["id"]
+        )
+        self.repository.require_identity_unchanged.assert_called()
+        self.api._request_once.assert_called()
+
+    def test_active_observation_is_one_get_per_call_and_completion_attests(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        self.api._request_once.reset_mock()
+        self.api._request_once.return_value = {**self.initial, "state": "in_progress"}
+        self.assertEqual(0, self.invoke("observe"))
+        self.assertEqual("pending", self.result()["status"])
+        self.assertEqual("in_progress", self.result()["task"]["state"])
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(1, self.api._request_once.call_count)
+        self.api._request_once.reset_mock()
+        self.assertEqual(0, self.invoke("observe"))
+        self.assertEqual("pending", self.result()["status"])
+        self.assertEqual(1, self.api._request_once.call_count)
+        self.api._request_once.reset_mock()
+        self.api._request_once.return_value = self.completed
+        self.assertEqual(0, self.invoke("observe"))
+        final = self.result()
+        self.assertEqual("success", final["status"])
+        self.assertTrue(self.result_path.exists())
+        self.assertEqual("", self.stdout_result)
+        self.assertTrue(final["attestation"]["structural_complete"])
+        self.assertEqual("session-1", final["completion"]["session"]["id"])
+        self.assertEqual("task-1", final["candidate"]["task"]["id"])
+        self.assertEqual(1, self.api._request_once.call_count)
+        self.assertEqual("GET", self.api._request_once.call_args.args[0])
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(final, self.result())
+
+    def test_observation_rejects_mismatched_remote_task_and_terminal_failure(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        self.api._request_once.return_value = {**self.initial, "id": "foreign-task"}
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual("task_identity_mismatch", self.result()["error"]["code"])
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(2, self.api._request_once.call_count)
+
+    def test_active_session_model_mismatch_cannot_be_reported_pending(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        self.api._request_once.return_value = {
+            **self.initial,
+            "state": "in_progress",
+            "sessions": [{
+                "id": "session-1", "state": "in_progress",
+                "created_at": "2026-09-18T12:00:01Z",
+                "model": "gpt-6-astra",
+            }],
+        }
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual("task_identity_mismatch", self.result()["error"]["code"])
+
+    def test_failed_task_does_not_forge_candidate_completion(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        self.api._request_once.return_value = {**self.initial, "state": "failed"}
+        self.assertEqual(2, self.invoke("observe"))
+        failed = self.result()
+        self.assertEqual("task_failed", failed["error"]["code"])
+        self.assertEqual("task-1", failed["task"]["id"])
+        self.assertIsNone(failed["candidate"])
+        self.assertIsNone(failed["completion"])
+
+    def test_interrupt_during_dispatch_leaves_non_adoptable_checkpoint(self):
+        self.api._request_once.side_effect = KeyboardInterrupt()
+        self.assertEqual(130, self.invoke())
+        self.assertEqual("interrupted", self.result()["status"])
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(2, self.invoke())
+        self.assertEqual(1, self.api._request_once.call_count)
+
+    def test_interrupt_during_observation_is_not_adopted_by_later_call(self):
+        self.api._request_once.return_value = self.initial
+        self.assertEqual(0, self.invoke())
+        self.api._request_once.side_effect = KeyboardInterrupt()
+        self.assertEqual(130, self.invoke("observe"))
+        self.assertEqual("interrupted", self.result()["status"])
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(2, self.api._request_once.call_count)
+
+    def test_bounded_requests_keep_windows_no_window_and_timeout_flags(self):
+        self.assertLessEqual(MODULE.PIPELINE_STAGE_TIMEOUT_SECONDS, 75)
+        self.assertLessEqual(MODULE.PIPELINE_REQUEST_TIMEOUT_SECONDS, 60)
+        self.assertLess(
+            MODULE.PIPELINE_REQUEST_TIMEOUT_SECONDS,
+            MODULE.PIPELINE_STAGE_TIMEOUT_SECONDS,
+        )
+        runner = mock.Mock(return_value=subprocess.CompletedProcess(["gh"], 0, "", ""))
+        with mock.patch.object(MODULE.os, "name", "nt"):
+            MODULE.run_process(runner, ["gh", "api"], timeout=45)
+        self.assertEqual(45, runner.call_args.kwargs["timeout"])
+        self.assertEqual(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            runner.call_args.kwargs["creationflags"],
+        )
+        token = MODULE._PIPELINE_DEADLINE.set(MODULE.time.monotonic() + 1)
+        try:
+            MODULE.run_process(runner, ["git", "status"])
+            self.assertLessEqual(runner.call_args.kwargs["timeout"], 1)
+        finally:
+            MODULE._PIPELINE_DEADLINE.reset(token)
+
+
 class CurrentRuntimeApiTest(unittest.TestCase):
     def options(self, root, policy=MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR):
         prompt = root / "prompt.txt"
@@ -1010,6 +1423,35 @@ class CurrentRuntimeApiTest(unittest.TestCase):
             "MARKETPLACE_APPLY_REPORT_POLICY_SELECTOR",
         ):
             self.assertFalse(hasattr(MODULE, symbol), symbol)
+
+    def test_pipeline_stage_flags_require_one_scoped_run_and_never_accept_task_id(self):
+            with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+                root = Path(directory)
+                prompt = root / "prompt.txt"
+                prompt.write_text("Review.", encoding="utf-8")
+                common = [
+                    "--apply-with-report", "--pr", "owner/repo#1",
+                    "--prompt-file", str(prompt), "--result-file", str(root / "result.json"),
+                    "--policy", MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+                ]
+                run = "a" * 32
+                self.assertEqual(
+                    MODULE.parse_args(["--pipeline-dispatch", "--pipeline-run", run, *common]).pipeline_mode,
+                    "dispatch",
+                )
+                self.assertEqual(
+                    MODULE.parse_args(["--pipeline-observe", "--pipeline-run", run, *common]).pipeline_mode,
+                    "observe",
+                )
+                for prefix in (
+                    ["--pipeline-dispatch"],
+                    ["--pipeline-run", run],
+                    ["--pipeline-dispatch", "--pipeline-observe", "--pipeline-run", run],
+                    ["--pipeline-observe", "--pipeline-run", "A" * 32],
+                    ["--pipeline-observe", "--pipeline-run", run, "--task-id", "task-1"],
+                ):
+                    with self.subTest(prefix=prefix), self.assertRaises(MODULE.CloudError):
+                        MODULE.parse_args([*prefix, *common])
 
     def test_current_verifier_api_keeps_the_existing_name(self):
         with mock.patch.object(
@@ -1086,10 +1528,17 @@ class CurrentRuntimeApiTest(unittest.TestCase):
 
 
 class ManagedResultPersistenceTest(unittest.TestCase):
+    def test_pinned_execution_runtime_digest_matches_shared_source(self):
+        source = SCRIPT.with_name("execution.py")
+        self.assertEqual(
+            hashlib.sha256(source.read_bytes()).hexdigest(),
+            MODULE.EXECUTION_SHA256,
+        )
+
     def test_unexpected_failure_writes_terminal_result(self):
         with tempfile.TemporaryDirectory() as directory:
             result_path = Path(directory) / "result.json"
-            options = SimpleNamespace(result_file=result_path)
+            options = SimpleNamespace(result_file=result_path, pipeline_mode=None)
             with (
                 mock.patch.object(MODULE, "parse_args", return_value=options),
                 mock.patch.object(
@@ -1132,6 +1581,38 @@ class ManagedResultPersistenceTest(unittest.TestCase):
             self.assertEqual(2, code)
             self.assertEqual(
                 "execution_runtime_unavailable", result["error"]["code"]
+            )
+
+    def test_pipeline_bootstrap_failure_does_not_create_final_result(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            result_path = Path(directory) / "result.json"
+            output = io.StringIO()
+            with (
+                mock.patch.dict(
+                    MODULE.os.environ,
+                    {"TRASK_EXECUTION_PARENT": str(Path(directory) / "parent.json")},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    MODULE.sys,
+                    "argv",
+                    [
+                        "cloud_task.py", "--pipeline-dispatch",
+                        "--pipeline-run", "a" * 32,
+                        "--result-file", str(result_path),
+                    ],
+                ),
+                mock.patch.object(MODULE.sys, "stdout", output),
+                mock.patch.object(
+                    MODULE, "_load_execution",
+                    side_effect=RuntimeError("runtime unavailable"),
+                ),
+            ):
+                self.assertEqual(2, MODULE.execution_main())
+            self.assertFalse(result_path.exists())
+            self.assertEqual(
+                "execution_runtime_unavailable",
+                json.loads(output.getvalue())["error"]["code"],
             )
 
 
