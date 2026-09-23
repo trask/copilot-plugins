@@ -2836,14 +2836,26 @@ def bounded_review_binding(
 
 def bounded_review_pending(
     process: subprocess.CompletedProcess[str], result_path: Path,
-    *, pipeline_run: str, session_id: str,
+    *, pipeline_run: str, session_id: str, children_before: int | None = None,
 ) -> bool:
     if process.returncode != 0:
         return False
-    try:
-        payload = parse_strict_json(process.stdout, description="cloud task checkpoint")
-    except WorkflowError:
-        return False
+    if children_before is not None:
+        children = _EXECUTION.children[children_before:]
+        terminal = children[0].terminal_result if len(children) == 1 else None
+        if (
+            not isinstance(terminal, dict)
+            or terminal.get("exit_code") != process.returncode
+            or terminal.get("local_status") != "finished"
+            or not isinstance(terminal.get("workflow_result"), dict)
+        ):
+            raise WorkflowError("bounded Agent Task has no sealed execution result")
+        payload = terminal["workflow_result"]
+    else:
+        try:
+            payload = parse_strict_json(process.stdout, description="cloud task checkpoint")
+        except WorkflowError:
+            return False
     if not isinstance(payload, dict) or payload.get("status") != "pending":
         return False
     pipeline = payload.get("pipeline")
@@ -3164,6 +3176,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             save_state(state_path, state)
         elif state["agent_task"].get("helper") != str(helper):
             raise WorkflowError("bounded pipeline task helper changed")
+        children_before = None
         if (
             resumed is not None
             and state["agent_task"]["status"] in {
@@ -3172,6 +3185,8 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         ):
             process = subprocess.CompletedProcess([], 0, "", "")
         else:
+            if bounded and _EXECUTION is not None:
+                children_before = len(_EXECUTION.children)
             process = run(
                 [
                     sys.executable,
@@ -3201,6 +3216,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 process, result_path,
                 pipeline_run=args.pipeline_run,
                 session_id=binding["session_id"],
+                children_before=children_before,
             )
             if (
                 resumed is None

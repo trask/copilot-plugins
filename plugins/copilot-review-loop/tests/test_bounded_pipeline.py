@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -277,6 +278,79 @@ class BoundedPipelineTest(unittest.TestCase):
             )["result"]["status"])
             self.assertEqual(3, worker.call_count)
             self.assertEqual(2, verify.call_count)
+
+    def test_completed_hosted_observation_imports_with_saved_prompt(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "bounded-review-state.json"
+        self.args.state = str(self.path)
+        run_id = "b" * 32
+        prompt_path = self.path.with_name(
+            f"{self.path.stem}--{run_id}--hosted-decision-prompt.txt"
+        )
+        helper = Path.cwd() / "cloud_task.py"
+        prompt = f"Copilot Review Loop hosted worker prompt version {MODULE.WORKER_PROMPT_VERSION}.\n\nsaved request"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        file_digest = MODULE.sha256_file
+        pr = {
+            "pr_url": self.target["pr_url"], "number": 7, "title": "Review",
+            "head_sha": "head", "base_sha": "base",
+        }
+        preflight = {
+            "pr": pr, "identity": {"branch": "review"},
+            "comments": [], "head_review_clean": False,
+        }
+        source = {"head": "head"}
+        github = {"head": "head"}
+        self.state = {
+            "version": MODULE.STATE_VERSION, "created_at": "now",
+            "iterations": 0, "history": [], "pr": pr,
+            "agent_task": {
+                "status": "bounded_pending", "run_id": run_id,
+                "preflight": preflight, "helper": str(helper),
+                "prompt_sha256": file_digest(prompt_path),
+                "source_before": source, "github_before": github,
+            },
+        }
+        remote = {
+            "commits": [], "final_local_head": "head", "requires_apply": False,
+            "task_id": "task", "task_url": "https://github.com/task",
+            "generated_branch": "generated", "generated_head": "head",
+            "report_path": "report.md", "report_sha256": "report-digest",
+        }
+        bundle = {
+            "result": {"completion": {}, "candidate": {}, "task": {"id": "task"}},
+            "remote": remote, "report": {"comments": []},
+            "report_content": "report", "paths_by_commit": {},
+        }
+        with (
+            mock.patch.object(MODULE, "sha256_file", side_effect=lambda path: (
+                MODULE.REQUIRED_CLOUD_TASK_SHA256 if path == helper
+                else file_digest(path) if path == prompt_path else "digest"
+            )),
+            mock.patch.object(MODULE, "run_hosted_decision_worker", return_value=bundle) as observe,
+            mock.patch.object(MODULE, "local_source_fingerprint", return_value=source),
+            mock.patch.object(MODULE, "github_decision_fingerprint", return_value=github),
+            mock.patch.object(
+                MODULE, "local_identity",
+                return_value={"branch": "review", "status": "", "head": "head"},
+            ),
+            mock.patch.object(MODULE, "metadata_for", return_value=pr),
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "source_only_policy_skip_head", return_value=None),
+            mock.patch.object(MODULE, "same_ref_forward_head_drift", return_value=False),
+            mock.patch.object(MODULE, "require_live_pr_snapshot"),
+            mock.patch.object(MODULE, "require_live_comments"),
+            mock.patch.object(MODULE, "load_agent_task_result", return_value={"task": {"id": "task"}}),
+            mock.patch.object(
+                MODULE, "apply_verified_import",
+                side_effect=RuntimeError("import reached"),
+            ) as apply,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "import reached"):
+                MODULE.command_agent_task(self.args)
+        self.assertEqual("--pipeline-observe", observe.call_args.kwargs["bounded_action"])
+        self.assertEqual(prompt, apply.call_args.kwargs["prompt"])
 
 
 if __name__ == "__main__":

@@ -175,6 +175,32 @@ class WindowsSubprocessTest(unittest.TestCase):
                 pipeline_run="a" * 32, session_id="session",
             ))
 
+    def test_pending_checkpoint_uses_sealed_child_when_stdout_is_empty(self):
+        process = MODULE.subprocess.CompletedProcess(["cloud_task"], 0, "", "")
+        observation = json.loads(pending_task_stdout("a" * 32, "session"))
+        terminal = {
+            "exit_code": 0, "local_status": "finished",
+            "workflow_result": observation,
+        }
+        execution = SimpleNamespace(children=[
+            SimpleNamespace(terminal_result={"exit_code": 0}),
+            SimpleNamespace(terminal_result=terminal),
+        ])
+        with (
+            mock.patch.object(MODULE, "_EXECUTION", execution),
+            mock.patch.object(MODULE.Path, "exists", return_value=False),
+        ):
+            self.assertTrue(MODULE.bounded_description_pending(
+                process, Path("result.json"), pipeline_run="a" * 32,
+                session_id="session", children_before=1,
+            ))
+            execution.children[1].terminal_result = {**terminal, "exit_code": 1}
+            with self.assertRaisesRegex(MODULE.WorkflowError, "no sealed execution result"):
+                MODULE.bounded_description_pending(
+                    process, Path("result.json"), pipeline_run="a" * 32,
+                    session_id="session", children_before=1,
+                )
+
 
 def pr_metadata(**overrides):
     url = "https://github.com/owner/repo/pull/7"
@@ -636,7 +662,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.83")
+        self.assertEqual(plugin["version"], "1.0.84")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1341,6 +1367,44 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("--pipeline-dispatch", commands[0])
         self.assertTrue(all("--pipeline-observe" in cmd for cmd in commands[1:]))
         self.assertTrue(all("--report" in cmd for cmd in commands))
+
+    def test_bounded_dispatch_accepts_sealed_pending_without_stdout(self):
+        report = self.proposal_report()
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+        args.pipeline_run = "a" * 32
+        args.bounded_step = True
+        execution = SimpleNamespace(children=[], record_state=lambda *_: None)
+
+        def run(command, **_kwargs):
+            result_path = Path(command[command.index("--result-file") + 1])
+            result_path.with_name(
+                result_path.name + ".pipeline.json"
+            ).write_text("{}", encoding="utf-8")
+            execution.children.append(SimpleNamespace(terminal_result={
+                "exit_code": 0, "local_status": "finished",
+                "workflow_result": json.loads(
+                    pending_task_stdout(args.pipeline_run, "session-one")
+                ),
+            }))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                if patcher.attribute != "run":
+                    stack.enter_context(patcher)
+            stack.enter_context(mock.patch.dict(
+                MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "session-one"}
+            ))
+            stack.enter_context(mock.patch.object(MODULE, "_EXECUTION", execution))
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=run))
+            MODULE.command_pipeline(args)
+        self.assertEqual("waiting", emitted[-1]["result"])
+        self.assertEqual(
+            "running", MODULE.load_run_state(Path(args.state))["agent_task"]["status"]
+        )
 
     def test_bounded_pipeline_requires_session_and_hex_run(self):
         args = self.pipeline_arguments()

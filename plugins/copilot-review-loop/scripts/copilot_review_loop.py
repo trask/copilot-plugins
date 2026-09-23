@@ -8921,6 +8921,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 raise WorkflowError("pinned Agent Tasks helper changed during review")
             if sha256_file(prompt_path) != task_state.get("prompt_sha256"):
                 raise WorkflowError("bounded review prompt changed")
+            prompt = prompt_path.read_text(encoding="utf-8")
             before_source = task_state["source_before"]
             before_github = task_state["github_before"]
         else:

@@ -192,6 +192,32 @@ class WindowsSubprocessTest(unittest.TestCase):
                 pipeline_run="a" * 32, session_id="session",
             ))
 
+    def test_pending_checkpoint_uses_sealed_child_when_stdout_is_empty(self):
+        process = MODULE.subprocess.CompletedProcess(["cloud_task"], 0, "", "")
+        observation = json.loads(pending_task_stdout("a" * 32, "session"))
+        terminal = {
+            "exit_code": 0, "local_status": "finished",
+            "workflow_result": observation,
+        }
+        execution = SimpleNamespace(children=[
+            SimpleNamespace(terminal_result={"exit_code": 0}),
+            SimpleNamespace(terminal_result=terminal),
+        ])
+        with (
+            mock.patch.object(MODULE, "_EXECUTION", execution),
+            mock.patch.object(MODULE.Path, "exists", return_value=False),
+        ):
+            self.assertTrue(MODULE.bounded_review_pending(
+                process, Path("result.json"), pipeline_run="a" * 32,
+                session_id="session", children_before=1,
+            ))
+            execution.children[1].terminal_result = {**terminal, "exit_code": 1}
+            with self.assertRaisesRegex(MODULE.WorkflowError, "no sealed execution result"):
+                MODULE.bounded_review_pending(
+                    process, Path("result.json"), pipeline_run="a" * 32,
+                    session_id="session", children_before=1,
+                )
+
 
 class AtomicWriteTest(unittest.TestCase):
     def setUp(self):
@@ -2054,7 +2080,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.61")
+        self.assertEqual(plugin["version"], "1.3.62")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2783,6 +2809,41 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertIn("--pipeline-dispatch", dispatches[0])
             self.assertTrue(all("--pipeline-observe" in cmd for cmd in dispatches[1:]))
             self.assertTrue(all("--apply-with-report" in cmd for cmd in dispatches))
+
+    def test_bounded_dispatch_accepts_sealed_pending_without_stdout(self):
+        with self.pipeline_run(fixes=0) as (args, _commands, emitted):
+            args.pipeline_run = "b" * 32
+            args.bounded_step = True
+            execution = SimpleNamespace(children=[], record_state=lambda *_: None)
+            original_run = MODULE.run.side_effect
+
+            def run(command, **kwargs):
+                if "--pipeline-dispatch" not in command:
+                    return original_run(command, **kwargs)
+                result_path = Path(command[command.index("--result-file") + 1])
+                result_path.with_name(
+                    result_path.name + ".pipeline.json"
+                ).write_text("{}", encoding="utf-8")
+                execution.children.append(SimpleNamespace(terminal_result={
+                    "exit_code": 0, "local_status": "finished",
+                    "workflow_result": json.loads(
+                        pending_task_stdout(args.pipeline_run, "review-session")
+                    ),
+                }))
+                return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.dict(
+                    MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "review-session"}
+                ),
+                mock.patch.object(MODULE, "_EXECUTION", execution),
+                mock.patch.object(MODULE, "run", side_effect=run),
+            ):
+                MODULE.command_pipeline(args)
+            self.assertEqual("waiting", emitted[-1]["result"])
+            self.assertEqual(
+                "running", MODULE.load_state(Path(args.state))["agent_task"]["status"]
+            )
 
     def test_bounded_pipeline_requires_session_and_hex_run(self):
         args = MODULE.build_parser().parse_args([
