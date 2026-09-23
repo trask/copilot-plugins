@@ -8472,6 +8472,114 @@ def require_completed_pipeline_sweep(
             raise WorkflowError("pipeline state still owns an unfinished task")
 
 
+def description_metadata_matches_pipeline_sweep(
+    previous: dict[str, Any],
+    preflight: dict[str, Any],
+    args: argparse.Namespace,
+    state_path: Path,
+) -> bool:
+    old = previous["pr"]
+    live = preflight["pr"]
+    digest = hashlib.sha256(args.pipeline_run.encode("utf-8")).hexdigest()[:16]
+    expected_name = (
+        f"{old['upstream_owner']}--{old['upstream_repo']}--{old['number']}"
+        f"--invocation-{digest}.json"
+    )
+    if state_path.parent.name != "copilot-review-loop" or state_path.name != expected_name:
+        return False
+    path = state_path.parent.parent / "pr-description" / expected_name
+    if not path.is_file():
+        return False
+    try:
+        description = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise WorkflowError(f"cannot verify pipeline description state: {path}") from error
+    if not isinstance(description, dict):
+        return False
+    pr = description.get("pr") or {}
+    proposal = description.get("proposal") or {}
+    validation = description.get("validation") or {}
+    snapshot = validation.get("clearance_snapshot") or {}
+    task = description.get("agent_task") or {}
+    base = proposal.get("base") or {}
+    head = pr.get("head") if isinstance(pr, dict) else None
+    base_ref = pr.get("base") if isinstance(pr, dict) else None
+    if any(
+        not isinstance(item, dict)
+        for item in (pr, proposal, validation, snapshot, task, base, head, base_ref)
+    ):
+        return False
+    return (
+        description.get("kind") == "run"
+        and description.get("pipeline_run") == args.pipeline_run
+        and description.get("pipeline_iteration") == args.pipeline_iteration - 1
+        and description.get("pipeline_max_iterations") == args.pipeline_max_iterations
+        and description.get("repo_root") == previous.get("repo_root")
+        and isinstance(description.get("run_id"), str)
+        and bool(description["run_id"])
+        and task.get("status") == "completed"
+        and isinstance(task.get("task"), dict)
+        and task["task"].get("state") == "completed"
+        and validation.get("mode") == "applied"
+        and validation.get("run_id") == description["run_id"] == proposal.get("run_id")
+        and isinstance(proposal.get("token"), str)
+        and bool(proposal["token"])
+        and validation.get("proposal_token") == proposal["token"]
+        and base.get("title") == old["title"]
+        and base.get("body") == old["body"]
+        and base.get("head_sha") == description.get("validated_head_sha")
+        and description["validated_head_sha"] == validation.get("head_sha") == live["head_sha"]
+        and proposal.get("title") == validation.get("title") == live["title"]
+        and proposal.get("body") == validation.get("body") == live["body"]
+        and pr.get("title") == snapshot.get("title") == live["title"]
+        and pr.get("body") == snapshot.get("body") == live["body"]
+        and pr.get("head_sha") == snapshot.get("head_sha") == live["head_sha"]
+        and head.get("sha") == live["head_sha"]
+        and base_ref.get("sha") == snapshot.get("base_sha") == live["base_sha"]
+        and snapshot.get("number") == pr.get("number") == old["number"]
+        and snapshot.get("repo_name") == pr.get("repo_name") == old["repo_name"]
+        and snapshot.get("url") == pr.get("url") == live["pr_url"]
+        and snapshot.get("head_repository") == head.get("repository") == live["head_repository"]
+        and snapshot.get("head_ref") == head.get("ref") == live["head_branch"]
+        and snapshot.get("base_repository") == base_ref.get("repository") == live["repo_name"]
+        and snapshot.get("base_ref") == base_ref.get("ref") == live["base_branch"]
+        and snapshot.get("is_draft") == pr.get("is_draft") == live["is_draft"]
+    )
+
+
+def require_pipeline_source_identity(
+    previous: dict[str, Any],
+    preflight: dict[str, Any],
+    args: argparse.Namespace,
+    state_path: Path,
+    repo_root: Path,
+) -> None:
+    old = previous["pr"]
+    live = preflight["pr"]
+    previous_skip = previous.get("policy_skip")
+    if (
+        preflight["repository_root"] != str(repo_root)
+        or (
+            isinstance(previous_skip, dict)
+            and previous_skip["viewer_login"] != preflight["viewer"]["login"]
+        )
+        or any(
+            old.get(field) != live.get(field)
+            for field in (
+                "repo_name", "number", "head_repository", "head_branch",
+                "base_branch", "is_draft",
+            )
+        )
+        or (
+            any(old.get(field) != live.get(field) for field in ("title", "body"))
+            and not description_metadata_matches_pipeline_sweep(
+                previous, preflight, args, state_path
+            )
+        )
+    ):
+        raise WorkflowError("pipeline source identity changed")
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     global ACTIVE_GITHUB_MUTATION_POLICY
 
@@ -8631,22 +8739,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
     if previous_sweep is not None:
         if existing != previous_sweep and not bounded:
             raise WorkflowError("pipeline state changed during sweep preflight")
-        previous_skip = previous_sweep.get("policy_skip")
-        if (
-            preflight["repository_root"] != str(repo_root)
-            or (
-                isinstance(previous_skip, dict)
-                and previous_skip["viewer_login"] != preflight["viewer"]["login"]
-            )
-            or any(
-                existing["pr"].get(field) != preflight["pr"].get(field)
-                for field in (
-                    "repo_name", "number", "head_repository", "head_branch",
-                    "base_branch", "title", "body", "is_draft",
-                )
-            )
-        ):
-            raise WorkflowError("pipeline source identity changed")
+        require_pipeline_source_identity(
+            previous_sweep, preflight, args, state_path, repo_root
+        )
     require_no_credentials(
         json.dumps(preflight, ensure_ascii=False, sort_keys=True),
         source="Agent Task preflight",

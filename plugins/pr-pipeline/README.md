@@ -42,6 +42,8 @@ Every stage launch and status read uses a state path derived from the Pipeline r
 
 Description status reads pass `--verify-clearance-snapshot`. Successful KEEP and replacement publication record the final validated title and body bytes, head, live base branch tip, branch identities, draft state, and authenticated viewer permissions. Status compares that recorded snapshot with fresh authenticated metadata and the authoritative branch-tip resolver. It never rewrites a receipt, starts a task, or spends an iteration. Missing historical identity is not reconstructed. Changed or unreadable inputs cannot clear the stage.
 
+On a later sweep of the same run, Copilot Review accepts a changed title or body only when the prior sweep's run-bound Description state records a completed, applied proposal from Review's saved metadata to the exact current metadata, with matching validated head, base, branch identities, and clearance snapshot. Other metadata changes still fail the source identity check.
+
 On a later native pass, an unchanged member reuses Description only when this run already collected its accepted exit-zero completion and its recorded snapshot is still current. The invocation, model, mutation policy, and earlier pass must match. Other members whose heads advanced still run Description normally. Invalid same-head clearance blocks without another semantic evaluation; Description's once-per-head guard remains in force. Phase and terminal results list reused members separately from dispatched workers and accepted completions, including when all members reuse clearance. A failed worker exit always blocks even if its state retains an older clear marker.
 
 ## Foreground ownership
