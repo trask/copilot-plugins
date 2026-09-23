@@ -36,6 +36,105 @@ PIPELINE = load("ci_warning_contract_consumer", PLUGIN / "scripts" / "pr_pipelin
 
 
 class CiWarningProducerContractTest(unittest.TestCase):
+    def test_forward_review_head_invalidates_ci_clearance_without_running_checks(self):
+        pr = {
+            "repo_name": "owner/repo", "upstream_owner": "owner", "upstream_repo": "repo",
+            "number": 7, "pr_url": "https://github.com/owner/repo/pull/7",
+            "head_owner": "owner", "head_repo": "repo", "head_branch": "topic",
+            "base_branch": "main", "state": "open",
+            "head_sha": "a" * 40, "base_sha": "b" * 40,
+            "title": "Original", "body": "Original body",
+        }
+        live = {
+            **pr, "head_sha": "c" * 40,
+            "title": "New description title", "body": "New description body",
+        }
+        for outcome in ("green", "warning"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                state = {
+                    "version": CI.STATE_VERSION, "pr": pr, "history": [],
+                    "iterations": 1, "reruns": {}, "outcome": outcome,
+                    "clean_at_head_sha": pr["head_sha"] if outcome == "green" else None,
+                    "clean_at_base_sha": pr["base_sha"] if outcome == "green" else None,
+                    "warning_at_head_sha": pr["head_sha"] if outcome == "warning" else None,
+                    "warning_at_base_sha": pr["base_sha"] if outcome == "warning" else None,
+                    "ci_warnings": [{"check_key": "check:Build", "name": "Build",
+                                    "diagnosis": "unrelated", "reason": "base fails",
+                                    "evidence": ["base run"]}] if outcome == "warning" else [],
+                    "green_snapshot_sha256": "d" * 64,
+                    "warning_snapshot_sha256": "e" * 64,
+                }
+                path = Path(directory) / "state.json"
+                path.write_text(json.dumps(state), encoding="utf-8")
+                original = path.read_bytes()
+                output = StringIO()
+                with (
+                    mock.patch.object(CI, "metadata_for", return_value=live),
+                    mock.patch.object(CI, "commit_contains", return_value=True) as ancestry,
+                    mock.patch.object(CI, "fetch_rollup", side_effect=AssertionError("stale head cannot clear")),
+                    mock.patch.object(CI, "ci_snapshot_runs", side_effect=AssertionError("stale head cannot clear")),
+                    redirect_stdout(output),
+                ):
+                    CI.command_status(CI.build_parser().parse_args([
+                        "status", "--state", str(path), "--verify-clearance-snapshot",
+                    ]))
+                ancestry.assert_called_once_with("owner/repo", pr["head_sha"], live["head_sha"])
+                self.assertEqual(original, path.read_bytes())
+                payload = json.loads(output.getvalue())
+                canonical = json.loads(CI.status_path_for(path).read_text(encoding="utf-8"))
+                verification = (
+                    "warning_verification" if outcome == "warning" else "clearance_verification"
+                )
+                for receipt in (payload, canonical):
+                    self.assertEqual("stale", receipt[verification]["result"])
+                    self.assertEqual(live["head_sha"], receipt[verification]["observed_head_sha"])
+                    self.assertEqual("pending", receipt["stage_outcome"])
+                    self.assertIsNone(receipt["outcome"])
+                    self.assertIsNone(receipt["clean_at_head_sha"])
+                    self.assertIsNone(receipt["clean_at_base_sha"])
+                    self.assertFalse(receipt["all_ci_passed"])
+                    if outcome == "warning":
+                        self.assertIsNone(receipt["warning_at_head_sha"])
+                        self.assertEqual([], receipt["ci_warnings"])
+                observed = PIPELINE.common.inspect_stage(
+                    PIPELINE.STAGE_BY_NAME[PIPELINE.STAGE_CI],
+                    PIPELINE.build_target("owner", "repo", 7),
+                    live["head_sha"], live["base_sha"],
+                    read_status=lambda *_: {
+                        "ok": True, "installed": True, "state": str(path), "payload": payload,
+                    },
+                )
+                self.assertFalse(observed["clear"])
+                self.assertNotEqual("status_failed", observed["reason"])
+
+    def test_unrelated_head_or_branch_drift_still_fails_ci_verification(self):
+        pr = {
+            "repo_name": "owner/repo", "head_owner": "owner", "head_repo": "repo",
+            "number": 7, "pr_url": "https://github.com/owner/repo/pull/7",
+            "head_branch": "topic", "base_branch": "main", "state": "open",
+            "head_sha": "a" * 40, "base_sha": "b" * 40,
+            "title": "Original", "body": "Original body",
+        }
+        state = {
+            "pr": pr, "outcome": "green", "green_snapshot_sha256": "d" * 64,
+        }
+        live = {**pr, "head_sha": "c" * 40}
+        for changed, forward in (
+            ({"head_branch": "other"}, True),
+            ({"base_sha": "d" * 40}, True),
+            ({}, False),
+        ):
+            with self.subTest(changed=changed, forward=forward), (
+                mock.patch.object(CI, "metadata_for", return_value={**live, **changed})
+            ), mock.patch.object(CI, "commit_contains", return_value=forward), (
+                mock.patch.object(
+                    CI, "fetch_rollup",
+                    side_effect=AssertionError("invalid head cannot verify checks"),
+                )
+            ):
+                with self.assertRaisesRegex(CI.WorkflowError, "pinned snapshot"):
+                    CI.verify_ci_clearance_snapshot(state)
+
     def test_green_status_revalidates_same_head_attempts_without_hosted_work(self):
         pr = {
             "repo_name": "owner/repo", "upstream_owner": "owner", "upstream_repo": "repo",

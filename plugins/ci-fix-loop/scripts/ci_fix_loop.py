@@ -8727,12 +8727,48 @@ def require_diagnosable_ci_runs(
         )
 
 
+def stale_ci_head_fields(
+    state: dict[str, Any], live: dict[str, Any]
+) -> dict[str, Any] | None:
+    pr = state["pr"]
+    if live["head_sha"].lower() == pr["head_sha"].lower():
+        return None
+    if not same_ref_forward_head_drift(
+        {**pr, "title": live.get("title"), "body": live.get("body")}, live
+    ):
+        raise WorkflowError(
+            "live pull request identity, head, base, title, or body drifted from "
+            "the pinned snapshot"
+        )
+    warning = state.get("outcome") == "warning"
+    return {
+        "stage_outcome": "pending", "outcome": None,
+        "clean_at_head_sha": None, "clean_at_base_sha": None,
+        "all_ci_passed": False,
+        **({
+            "warning_at_head_sha": None, "warning_at_base_sha": None,
+            "ci_warnings": [],
+        } if warning else {}),
+        ("warning_verification" if warning else "clearance_verification"): {
+            "result": "stale",
+            "reason": "ci_warning_snapshot_changed" if warning else "ci_snapshot_changed",
+            "expected_snapshot_sha256": (
+                state["warning_snapshot_sha256"] if warning else state["green_snapshot_sha256"]
+            ),
+            "observed_head_sha": live["head_sha"],
+        },
+    }
+
+
 def verify_ci_warning_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     expected = state.get("warning_snapshot_sha256")
     if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
         raise WorkflowError("CI warning has no frozen check snapshot identity")
     pr = state["pr"]
     live = metadata_for(parse_target(pr["pr_url"]))
+    stale = stale_ci_head_fields(state, live)
+    if stale is not None:
+        return stale
     require_live_pr_snapshot(
         {**pr, "title": live.get("title"), "body": live.get("body")},
         live, expected_head=pr["head_sha"],
@@ -8776,6 +8812,9 @@ def verify_ci_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         }
     pr = state["pr"]
     live = metadata_for(parse_target(pr["pr_url"]))
+    stale = stale_ci_head_fields(state, live)
+    if stale is not None:
+        return stale
     require_live_pr_snapshot(
         {**pr, "title": live.get("title"), "body": live.get("body")},
         live, expected_head=pr["head_sha"],

@@ -53,7 +53,7 @@
     {
       "name": "ci-fix-loop",
       "description": "Run one sealed, stateless CI repair invocation against a frozen pull request head.",
-      "version": "1.6.77",
+      "version": "1.6.78",
       "source": "./plugins/ci-fix-loop"
     },
     {
