@@ -281,7 +281,7 @@ class TestPyramidContractTest(unittest.TestCase):
             popen.call_args.args[0][1:],
         )
         self.assertEqual(
-            validate.subprocess.CREATE_NO_WINDOW,
+            0x08000000,
             popen.call_args.kwargs["creationflags"],
         )
         self.assertEqual(validate.subprocess.PIPE, popen.call_args.kwargs["stdout"])
