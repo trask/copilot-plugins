@@ -325,7 +325,9 @@ class BoundedPipelineTest(unittest.TestCase):
     def test_completed_hosted_observation_imports_with_saved_prompt(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.path = Path(temporary.name) / "bounded-review-state.json"
+        self.path = MODULE.cli_path(
+            str(Path(temporary.name) / "bounded-review-state.json")
+        )
         self.args.state = str(self.path)
         run_id = "b" * 32
         prompt_path = self.path.with_name(
