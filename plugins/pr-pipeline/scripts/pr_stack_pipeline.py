@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "6ac20fb9203fd3dc761fc24618c4e45280ea9bcb2faf2b75af6ead1f2f2310b7"
+COMMON_SHA256 = "511e54e8524958ff4f1b7cc201ee5949d369ca77b6a23464174053a2dc3ee252"
 
 
 def load_common() -> Any:
@@ -2587,7 +2587,7 @@ class StackPipeline:
                     and status["run_id"] == prior_result.get("run_id")
                     and prior_result.get("pipeline_run") == self.run_id
                     and task == prior_result.get("agent_task")
-                    and task.get("model") == self.models[phase]
+                    and task.get("model") == common.HOSTED_MODEL_FOR_COORDINATOR[self.models[phase]]
                     and task.get("github_mutation_policy") == self.github_mutation_policy
                 ):
                     reuse = {
@@ -3245,7 +3245,7 @@ class StackPipeline:
             or task.get("whole_stack") is not True
             or task.get("requested_strategy") != "auto"
             or self.conflict_strategy != "auto"
-            or task.get("model") != self.models[STAGE_CONFLICT]
+            or task.get("model") != common.HOSTED_MODEL_FOR_COORDINATOR[self.models[STAGE_CONFLICT]]
             or not isinstance(task.get("policy"), str) or not task["policy"]
             or task.get("target") != common.target_for(self.repository, clicked)["pr_url"]
             or not isinstance(iteration, dict)

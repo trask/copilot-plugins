@@ -5,7 +5,7 @@
       "installed_path": "scripts/cloud_task.py",
       "loader": "load_cloud_task_runtime",
       "module": "_trask_agent_tasks_runtime",
-      "sha256": "aee4e95aa0e228766add1fe2738a778b57ad80a2c5aa57a21ed1245099b78378",
+      "sha256": "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296",
       "source": "plugins/agent-tasks-runtime/skills/agent-tasks-runtime/scripts/cloud_task.py"
     },
     "execution": {

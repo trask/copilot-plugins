@@ -279,6 +279,49 @@ class BoundedPipelineTest(unittest.TestCase):
             self.assertEqual(3, worker.call_count)
             self.assertEqual(2, verify.call_count)
 
+    def test_hosted_dispatch_reports_sealed_helper_failure_when_streams_are_empty(self):
+        prompt_path = Path.cwd() / "prompt.txt"
+        child = SimpleNamespace(terminal_result={
+            "exit_code": 2,
+            "local_status": "failed",
+            "workflow_result": {
+                "status": "error",
+                "error": {
+                    "message": "start Agent Task failed with HTTP 400: model not enabled",
+                },
+            },
+        })
+        execution = SimpleNamespace(children=[])
+
+        def run_worker(command, **options):
+            self.assertTrue(options["require_execution"])
+            execution.children.append(child)
+            return subprocess.CompletedProcess(command, 2, "", "")
+
+        with (
+            mock.patch.object(MODULE, "_EXECUTION", execution),
+            mock.patch.object(MODULE, "load_candidate_runtime", return_value=object()),
+            mock.patch.object(MODULE.Path, "read_text", return_value=(
+                f"Copilot Review Loop hosted worker prompt version {MODULE.WORKER_PROMPT_VERSION}.\n\nbody"
+            )),
+            mock.patch.object(MODULE, "sha256_file", return_value="digest"),
+            mock.patch.object(MODULE, "run_owned_local_worker", side_effect=run_worker),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "HTTP 400: model not enabled",
+            ):
+                MODULE.run_hosted_decision_worker(
+                    repo_root=Path.cwd(), target=self.target,
+                    preflight={"pr": {"pr_url": self.target["pr_url"]}},
+                    prompt_path=prompt_path, result_path=Path.cwd() / "result.json",
+                    decision_path=Path.cwd() / "decisions.json",
+                    canonical_path=Path.cwd() / "canonical.json",
+                    run_id="b" * 32, requested_model="sol",
+                    before_source={}, before_github={},
+                    helper=Path.cwd() / "cloud_task.py", timeout=7200,
+                    bounded_action="--pipeline-dispatch",
+                )
+
     def test_completed_hosted_observation_imports_with_saved_prompt(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

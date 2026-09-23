@@ -1283,8 +1283,8 @@ class ManagedCoordinatorTest(unittest.TestCase):
 
         def verify(result, **kwargs):
             model = kwargs["options"].model
-            phase = 1 if model == "gpt-6-sol" else 2
-            self.assertEqual("gpt-6-sol" if len(commands) == 1 else "gpt-6-astra", model)
+            phase = 1 if model == "gpt-5.6-sol" else 2
+            self.assertEqual("gpt-5.6-sol" if len(commands) == 1 else "gpt-6-astra", model)
             self.assertEqual(MODULE.HOSTED_REVIEW_POLICY, kwargs["options"].policy)
             return {
                 "task": result["task"], "completion": {"session": {"id": f"session-{phase}"}},

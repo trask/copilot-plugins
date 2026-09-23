@@ -346,7 +346,7 @@ class FreshCompletionEvidenceTest(unittest.TestCase):
                     "created_at": "2026-09-18T12:00:01Z",
                     "updated_at": "2026-09-18T12:03:00Z",
                     "completed_at": "2026-09-18T12:03:00Z",
-                    "model": "sweagent-capi:gpt-6-sol",
+                    "model": "sweagent-capi:gpt-5.6-sol",
                     "base_ref": "feature",
                     "head_ref": "copilot/task-1",
                     "repository": {
@@ -366,7 +366,7 @@ class FreshCompletionEvidenceTest(unittest.TestCase):
         arguments = {
             "expected_task_id": "task-1",
             "repository": "owner/repo",
-            "requested_model": "gpt-6-sol",
+            "requested_model": "gpt-5.6-sol",
             "expected_prompt": self.prompt,
             "expected_base_ref": "feature",
             "generated_ref": "copilot/task-1",
@@ -391,7 +391,7 @@ class FreshCompletionEvidenceTest(unittest.TestCase):
         self.assertEqual(evidence["session"]["id"], "session-1")
         self.assertEqual(
             evidence["session"]["actual_model"],
-            "sweagent-capi:gpt-6-sol",
+            "sweagent-capi:gpt-5.6-sol",
         )
         self.assertEqual(
             evidence["request"]["prompt_sha256"],
@@ -645,7 +645,7 @@ class CandidateDispatcherTest(unittest.TestCase):
         )
         options = MODULE.Options(
             report=False,
-            model="gpt-6-sol",
+            model="gpt-5.6-sol",
             prompt="Review and prepare candidate fixes.",
             pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
             apply_with_report=True,
@@ -685,7 +685,7 @@ class CandidateDispatcherTest(unittest.TestCase):
                     "state": "completed",
                     "created_at": "2026-09-18T12:00:01Z",
                     "completed_at": "2026-09-18T12:03:00Z",
-                    "model": "sweagent-capi:gpt-6-sol",
+                    "model": "sweagent-capi:gpt-5.6-sol",
                     "base_ref": base_sha if historical else "feature",
                     "head_ref": "copilot/task-1",
                     "repository": {"id": 11, "full_name": "owner/repo"},
@@ -990,7 +990,7 @@ class PipelineStagesTest(unittest.TestCase):
             "repository": {"id": 11, "full_name": "owner/repo"},
         }
         options = MODULE.Options(
-            report=False, model="gpt-6-sol",
+            report=False, model="gpt-5.6-sol",
             prompt="Review and prepare fixes.",
             pull_request=MODULE.PrReference(7, "owner/repo", "owner/repo#7"),
             apply_with_report=True, result_file=self.result_path,
@@ -1011,7 +1011,7 @@ class PipelineStagesTest(unittest.TestCase):
                 "id": "session-1", "task_id": "task-1", "state": "completed",
                 "created_at": "2026-09-18T12:00:01Z",
                 "completed_at": "2026-09-18T12:03:00Z",
-                "model": "sweagent-capi:gpt-6-sol",
+                "model": "sweagent-capi:gpt-5.6-sol",
                 "base_ref": "feature", "head_ref": "copilot/task-1",
                 "repository": {"id": 11, "full_name": "owner/repo"},
                 "owner": {"id": 12, "login": "owner"},
@@ -1366,7 +1366,7 @@ class CurrentRuntimeApiTest(unittest.TestCase):
         prompt.write_text("Review.", encoding="utf-8")
         return MODULE.Options(
             report=policy == MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
-            model="gpt-6-sol",
+            model="gpt-5.6-sol",
             prompt="Review.",
             pull_request=MODULE.PrReference(1, "owner/repo", "owner/repo#1"),
             apply_with_report=policy == MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
@@ -1398,9 +1398,9 @@ class CurrentRuntimeApiTest(unittest.TestCase):
             ])
             self.assertTrue(code.apply_with_report)
             self.assertTrue(report.report)
-            self.assertEqual("gpt-6-sol", code.model)
+            self.assertEqual("gpt-5.6-sol", code.model)
             self.assertEqual(
-                "gpt-6-sol",
+                "gpt-5.6-sol",
                 MODULE.parse_args([
                     "--apply-with-report",
                     *common,
@@ -1412,7 +1412,7 @@ class CurrentRuntimeApiTest(unittest.TestCase):
                 MODULE.parse_args([
                     "--apply-with-report",
                     *common,
-                    "--model", "gpt-5.6-sol",
+                    "--model", "gpt-6-sol",
                     "--policy", MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
                 ])
             for option in (

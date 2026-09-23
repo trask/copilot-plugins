@@ -165,7 +165,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "aee4e95aa0e228766add1fe2738a778b57ad80a2c5aa57a21ed1245099b78378"
+    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -282,7 +282,7 @@ WORKER_PROMPT_VERSION = 11
 MAX_PROMPT_HISTORY_ENTRIES = 20
 MAX_PROMPT_HISTORY_BYTES = 12_000
 MODEL_ALIASES = {
-    "sol": "gpt-6-sol",
+    "sol": "gpt-5.6-sol",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -7492,9 +7492,18 @@ def run_hosted_decision_worker(
         )
     if bounded_action is not None:
         if process is not None and process.returncode != 0:
+            detail = process.stderr.strip() or process.stdout.strip()
+            if not detail and _EXECUTION is not None:
+                children = _EXECUTION.children[children_before:]
+                terminal = children[0].terminal_result if len(children) == 1 else None
+                if isinstance(terminal, dict) and terminal.get("exit_code") == process.returncode:
+                    observation = terminal.get("workflow_result")
+                    failure = observation.get("error") if isinstance(observation, dict) else None
+                    if isinstance(failure, dict) and isinstance(failure.get("message"), str):
+                        detail = failure["message"].strip()
             raise WorkflowError(
                 f"bounded hosted Agent Task helper failed ({process.returncode}): "
-                f"{process.stderr.strip() or process.stdout.strip()}"
+                f"{detail or 'no sealed helper diagnostic'}"
             )
         if _EXECUTION is not None and process is not None:
             children = _EXECUTION.children[children_before:]

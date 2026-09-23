@@ -287,7 +287,7 @@ def agent_task_result(preflight=None, **overrides):
     )
     options = RUNTIME.Options(
         report=True,
-        model="gpt-6-sol",
+        model="gpt-5.6-sol",
         prompt=prompt,
         policy=MODULE.AGENT_TASK_POLICY,
     )
@@ -300,7 +300,7 @@ def agent_task_result(preflight=None, **overrides):
         "mode": "report_recommendation",
         "repository": {"name_with_owner": pr["repo_name"]},
         "pull_request": MODULE.expected_cloud_pull_request(preflight),
-        "requested_model": "gpt-6-sol",
+        "requested_model": "gpt-5.6-sol",
         "policy": {
             "id": "marketplace-agent-report-recommendation-worker",
             "version": 1,
@@ -347,7 +347,7 @@ def agent_task_result(preflight=None, **overrides):
         },
         "completion": {
             "request": {
-                "requested_model": "gpt-6-sol",
+                "requested_model": "gpt-5.6-sol",
                 "prompt_sha256": prompt_sha256,
             },
             "task": {
@@ -361,7 +361,7 @@ def agent_task_result(preflight=None, **overrides):
             "session": {
                 "id": "session-1",
                 "state": "completed",
-                "actual_model": "sweagent-capi:gpt-6-sol",
+                "actual_model": "sweagent-capi:gpt-5.6-sol",
                 "created_at": "2026-09-18T12:00:01Z",
                 "updated_at": "2026-09-18T12:01:00Z",
                 "completed_at": "2026-09-18T12:01:00Z",
@@ -671,7 +671,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.86")
+        self.assertEqual(plugin["version"], "1.0.87")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -795,7 +795,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             remote = validate_description_result(
                 result,
                 preflight=self.preflight,
-                requested_model="gpt-6-sol",
+                requested_model="gpt-5.6-sol",
                 identity=self.identity,
             )
         verify_current_candidate.assert_called_once()
@@ -833,7 +833,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     validate_description_result(
                         value,
                         preflight=self.preflight,
-                        requested_model="gpt-6-sol",
+                        requested_model="gpt-5.6-sol",
                         identity=self.identity,
                     )
 
@@ -844,7 +844,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             validate_description_result(
                 value,
                 preflight=self.preflight,
-                requested_model="gpt-6-sol",
+                requested_model="gpt-5.6-sol",
                 identity=self.identity,
             )
 
@@ -1827,13 +1827,13 @@ class RecommendationContractTest(unittest.TestCase):
         return validate_description_result(
             self.result(report=report),
             preflight=self.preflight,
-            requested_model="gpt-6-sol",
+            requested_model="gpt-5.6-sol",
             identity=self.identity,
         )
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "aee4e95aa0e228766add1fe2738a778b57ad80a2c5aa57a21ed1245099b78378",
+            "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(
@@ -1893,7 +1893,7 @@ class RecommendationContractTest(unittest.TestCase):
         remote = validate_description_result(
             result,
             preflight=self.preflight,
-            requested_model="gpt-6-sol",
+            requested_model="gpt-5.6-sol",
             identity=self.identity,
         )
 
@@ -2164,7 +2164,7 @@ class RecommendationContractTest(unittest.TestCase):
                     validate_description_result(
                         result,
                         preflight=self.preflight,
-                        requested_model="gpt-6-sol",
+                        requested_model="gpt-5.6-sol",
                         identity=self.identity,
                     )
 
@@ -2177,7 +2177,7 @@ class RecommendationContractTest(unittest.TestCase):
             validate_description_result(
                 result,
                 preflight=self.preflight,
-                requested_model="gpt-6-sol",
+                requested_model="gpt-5.6-sol",
                 identity=self.identity,
             )
 
@@ -2216,7 +2216,7 @@ class RecommendationContractTest(unittest.TestCase):
                     validate_description_result(
                         result,
                         preflight=self.preflight,
-                        requested_model="gpt-6-sol",
+                        requested_model="gpt-5.6-sol",
                         identity=self.identity,
                     )
 

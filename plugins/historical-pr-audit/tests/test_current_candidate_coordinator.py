@@ -55,7 +55,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         )
         options = runtime.Options(
             report=False, apply_with_report=True, allow_merged_pr=True,
-            model="gpt-6-sol", policy=MODULE.AGENT_TASK_POLICY, prompt=prompt,
+            model="gpt-5.6-sol", policy=MODULE.AGENT_TASK_POLICY, prompt=prompt,
         )
         prompt_hash = MODULE.sha256_text(
             runtime.task_payload(options, runtime.OUTPUT_REPORT_PATH, pr)["prompt"]

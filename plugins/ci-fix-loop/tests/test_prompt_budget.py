@@ -40,7 +40,7 @@ class PromptBudgetTest(unittest.TestCase):
     def build(self, *, history=None):
         return MODULE.bounded_worker_prompt(
             self.preflight, helper=self.helper, iteration_allowance=1,
-            prior_history=history or [], requested_model="gpt-6-sol",
+            prior_history=history or [], requested_model="gpt-5.6-sol",
         )
 
     def submitted(self, prompt):
@@ -49,7 +49,7 @@ class PromptBudgetTest(unittest.TestCase):
             **source, state="OPEN", cross_repository=False,
         )
         options = self.runtime.Options(
-            report=False, apply_with_report=True, model="gpt-6-sol",
+            report=False, apply_with_report=True, model="gpt-5.6-sol",
             policy=MODULE.AGENT_TASK_POLICY, prompt=prompt,
         )
         return self.runtime.task_payload(
@@ -77,7 +77,7 @@ class PromptBudgetTest(unittest.TestCase):
         evidence = MODULE.controller_ci_evidence(self.preflight)
         consumer = MODULE.build_worker_prompt(
             self.preflight, iteration_allowance=1, prior_history=[],
-            requested_model="gpt-6-sol", ci_evidence=evidence,
+            requested_model="gpt-5.6-sol", ci_evidence=evidence,
         )
         self.assertLess(len(consumer.encode("utf-8")), 28000)
         self.assertGreater(len(self.submitted(consumer).encode("utf-8")), 28000)

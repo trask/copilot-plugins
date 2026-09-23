@@ -26,7 +26,7 @@ class DescriptionReuseTest(StackFixture):
             "agent_task": {
                 "status": "completed",
                 "task": {"state": "completed", "id": request["nonce"]},
-                "model": "gpt-6-sol",
+                "model": "gpt-5.6-sol",
                 "github_mutation_policy": "allow",
             },
             "clearance_verification": {
@@ -141,6 +141,7 @@ class DescriptionReuseTest(StackFixture):
             ),
             "failed task": lambda prior, receipt: receipt["agent_task"].update(status="failed"),
             "model changed": lambda prior, receipt: receipt["agent_task"].update(model="gpt-6-astra"),
+            "local model": lambda prior, receipt: receipt["agent_task"].update(model="gpt-6-sol"),
             "policy changed": lambda prior, receipt: receipt["agent_task"].update(github_mutation_policy="source-only"),
             "old base": lambda prior, receipt: receipt["pr"]["base"].update(sha="8" * 40),
             "unknown base": lambda prior, receipt: receipt["pr"]["base"].pop("sha"),

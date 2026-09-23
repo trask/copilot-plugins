@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "70565e5e924d25cfff3b8d9979fa2513afe028d6b5cf9dc7a3d25b6584ced791"
+    "f0f95255d3c454efafa3b5564f3f82f15d88cf25e0741f45824127804c891109"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@11"
@@ -97,7 +97,7 @@ CONFLICT_RECEIPT_SCHEMA = {
     "version": 3,
 }
 MODEL_ALIASES = {
-    "sol": "gpt-6-sol",
+    "sol": "gpt-5.6-sol",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")

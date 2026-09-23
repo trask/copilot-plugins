@@ -24,7 +24,7 @@ class ClearanceSnapshotTest(unittest.TestCase):
             "agent_task": {
                 "status": "completed",
                 "task": {"id": "task-1", "state": "completed"},
-                "model": "gpt-6-sol",
+                "model": "gpt-5.6-sol",
                 "github_mutation_policy": "allow",
             },
             "validation": {

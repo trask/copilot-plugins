@@ -369,7 +369,7 @@ class StackPublicationTest(unittest.TestCase):
             MODULE.conflict_preflight(
                 self.workspace, MODULE.parse_target("owner/repo#11"),
                 requested_strategy="auto", whole_stack=True, iteration_id="iteration",
-                iteration_number=1, iteration_budget=2, model="gpt-6-sol",
+                iteration_number=1, iteration_budget=2, model="gpt-5.6-sol",
                 stack_request=request,
             )
         checkout.assert_not_called()
@@ -433,12 +433,12 @@ class StackPublicationTest(unittest.TestCase):
             preflight = MODULE.conflict_preflight(
                 self.workspace, MODULE.parse_target("owner/repo#12"),
                 requested_strategy="auto", whole_stack=True, iteration_id="propagation",
-                iteration_number=1, iteration_budget=1, model="gpt-6-sol",
+                iteration_number=1, iteration_budget=1, model="gpt-5.6-sol",
                 stack_request=request,
             )
             hosted = preflight["request"]
             existing.CLOUD_MODULE.validate_request(
-                hosted, expected_strategy="native-stack", expected_model="gpt-6-sol",
+                hosted, expected_strategy="native-stack", expected_model="gpt-5.6-sol",
                 expected_pr_url=metadata["pr_url"], expected_policy=MODULE.CONFLICT_POLICY_IDENTITY,
             )
             command = MODULE.conflict_push_command(self.workspace, hosted, [

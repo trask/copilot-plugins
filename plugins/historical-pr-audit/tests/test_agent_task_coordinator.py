@@ -81,7 +81,7 @@ class CandidateOutcomeTest(unittest.TestCase):
             value = MODULE.validate_audit_candidate(
                 {"generated": {"branch": "copilot/fresh", "head_sha": "3" * 40}},
                 helper=Path("helper.py"), repo_root=Path("repo"), metadata=METADATA,
-                requested_model="gpt-6-sol", prompt="audit", max_iterations=5,
+                requested_model="gpt-5.6-sol", prompt="audit", max_iterations=5,
             )
         runtime.verify_current_candidate.assert_called_once()
         return value
@@ -166,7 +166,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "agent_task": {
                         "status": "validated",
                         "invocation_id": "original-run",
-                        "model": "gpt-6-sol",
+                        "model": "gpt-5.6-sol",
                         "pipeline": {
                             "run": None,
                             "iteration": None,
@@ -279,7 +279,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_current_policy(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "aee4e95aa0e228766add1fe2738a778b57ad80a2c5aa57a21ed1245099b78378",
+            "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY,

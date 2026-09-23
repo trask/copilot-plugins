@@ -1856,6 +1856,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
         failure = self.candidate_creation_failure()
+        failure["requested_model"] = "gpt-5.6-sol"
         failure["error"] = {
             "code": "assignment_unavailable",
             "message": (
@@ -2089,7 +2090,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.64")
+        self.assertEqual(plugin["version"], "1.3.65")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):

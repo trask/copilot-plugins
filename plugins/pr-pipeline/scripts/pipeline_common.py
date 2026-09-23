@@ -33,6 +33,12 @@ COORDINATOR_MODEL_ARGUMENTS = {
     "gpt-5.6-terra": "terra",
     "gpt-6-astra": "astra",
 }
+HOSTED_MODEL_FOR_COORDINATOR = {
+    "gpt-6-sol": "gpt-5.6-sol",
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-5.6-terra": "gpt-5.6-terra",
+    "gpt-6-astra": "gpt-6-astra",
+}
 CONFLICT_STRATEGIES = ("auto", "merge", "rebase")
 SELF_REVIEW_MODEL = "gpt-6-sol"
 SELF_REVIEW_EFFORT = "high"

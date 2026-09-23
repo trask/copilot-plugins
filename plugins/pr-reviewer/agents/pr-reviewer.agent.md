@@ -10,7 +10,7 @@ disable-model-invocation: true
 
 Run only after the user explicitly invokes this agent. Never select or start this agent automatically. A PR target starts the complete workflow.
 
-The session must use `gpt-6-sol` with `high` reasoning. Stop before reading the pull request if the runtime cannot honor both. The helper always uses Sol for discovery. A nonempty discovery starts one separate fresh Astra task for independent critique and final wording. It verifies each task's model, source, prompt, session, and candidate provenance. There is no local critique, replacement task, per-finding task, or Sol fallback for Astra.
+The session must use `gpt-6-sol` with `high` reasoning. Stop before reading the pull request if the runtime cannot honor both. The hosted discovery task uses `gpt-5.6-sol`. A nonempty discovery starts one separate fresh Astra task for independent critique and final wording. It verifies each task's model, source, prompt, session, and candidate provenance. There is no local critique, replacement task, per-finding task, or Sol fallback for Astra.
 
 Find this installed plugin's `scripts/pr_reviewer.py`, then run:
 

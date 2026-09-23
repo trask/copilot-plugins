@@ -151,7 +151,7 @@ class NativeStackClearanceTest(StackFixture):
                 pipeline_run=self.controller.run_id,
                 pipeline_iteration=request["pass"], pipeline_max_iterations=MODULE.MAX_PASSES,
                 agent_task={
-                    "status": "completed", "model": "gpt-6-sol",
+                    "status": "completed", "model": "gpt-5.6-sol",
                     "github_mutation_policy": "allow", "task": {"id": request["nonce"], "state": "completed"},
                 },
                 clearance_verification={
@@ -336,6 +336,7 @@ class NativeStackClearanceTest(StackFixture):
             "producer run": lambda prior, payload: payload["agent_task"].update(run_id="other"),
             "failed producer": lambda prior, payload: payload["agent_task"].update(status="failed"),
             "producer model": lambda prior, payload: payload["agent_task"].update(model="gpt-6-astra"),
+            "producer local model": lambda prior, payload: payload["agent_task"].update(model="gpt-6-sol"),
             "producer policy": lambda prior, payload: payload["agent_task"].update(policy="other"),
             "task identity": lambda prior, payload: payload["agent_task"].update(task_id="other"),
             "budget": lambda prior, payload: payload["agent_task"]["iteration"].update(budget=3),

@@ -183,7 +183,7 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "aee4e95aa0e228766add1fe2738a778b57ad80a2c5aa57a21ed1245099b78378"
+    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -253,7 +253,7 @@ AGENT_TASK_PROMPT_MAX_UTF8_BYTES = 28000
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
-    "sol": "gpt-6-sol",
+    "sol": "gpt-5.6-sol",
     "astra": "gpt-6-astra",
 }
 ACTIVE_GITHUB_MUTATION_POLICY = "allow"
