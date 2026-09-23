@@ -65,10 +65,10 @@ class BoundedPipelineTest(unittest.TestCase):
     def helper(self, command, **kwargs):
         phase = command[command.index("--bounded-phase") + 1]
         result_path = Path(command[command.index("--result-file") + 1])
-        receipt_path = result_path.with_name(result_path.name + ".dispatch.json")
+        receipt_path = result_path.with_name(result_path.name + ".bounded-receipt.json")
         result = CLOUD.Result(
             status="waiting", model=self.request["model"],
-            repository=self.request["repository"], strategy="merge",
+            repository=self.request["repository"], strategy=self.request["strategy"],
             request_id=self.request["request_id"],
             request_sha256=self.request["request_sha256"],
             pull_request=self.request["pull_request"],
@@ -89,10 +89,12 @@ class BoundedPipelineTest(unittest.TestCase):
             "session": "session-1", "request_id": self.request["request_id"],
             "request_sha256": self.request["request_sha256"],
             "repository": self.request["repository"], "model": self.request["model"],
-            "strategy": "merge",
+            "strategy": self.request["strategy"],
             "status": "completed" if result["task"]["state"] == "completed" else "active",
             "task": {"id": "task-1", "state": result["task"]["state"]},
         }
+        if self.request["strategy"] == "native-stack":
+            receipt["member_index"] = 0
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
         result_path.write_text(json.dumps(result), encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -112,6 +114,52 @@ class BoundedPipelineTest(unittest.TestCase):
         self.published.assert_called_once()
         self.assertEqual(0, MODULE.command_pipeline(self.args))
         self.assertEqual(1, self.dispatches)
+
+    def test_native_stack_preparation_finishes_before_dispatch(self):
+        self.request["strategy"] = "native-stack"
+        self.request["native_stack"] = {"members": [{"pr_number": 6}]}
+        self.request["request_sha256"] = MODULE.request_digest(self.request)
+        self.calls["conflict_preflight"].side_effect = lambda *a, **kw: {
+            "already_mergeable": False, "pr": copy.deepcopy(self.metadata),
+            "strategy": "native-stack", "request": copy.deepcopy(self.request),
+        }
+        self.patch(
+            "authorize_resolver_native_stack",
+            return_value={"request_id": "stack-1"},
+        )
+        guard = self.patch("require_live_conflict_guards")
+        self.assertEqual(0, MODULE.command_pipeline(self.args))
+        state = MODULE.load_state(self.path)
+        self.assertTrue(state["bounded_pipeline"]["prepared_dispatch"])
+        self.assertFalse(state["bounded_pipeline"]["inflight"])
+        self.assertEqual("dispatch", state["bounded_pipeline"]["phase"])
+        self.assertEqual(0, self.dispatches)
+        guard.assert_not_called()
+        self.assertEqual(0, MODULE.command_pipeline(self.args))
+        self.assertEqual(1, self.dispatches)
+        guard.assert_called_once()
+        self.assertEqual(1, self.calls["conflict_preflight"].call_count)
+        self.assertFalse(MODULE.load_state(self.path)["bounded_pipeline"]["prepared_dispatch"])
+
+    def test_unprepared_stack_dispatch_cannot_be_adopted(self):
+        self.request["strategy"] = "native-stack"
+        self.request["native_stack"] = {"members": [{"pr_number": 6}]}
+        self.request["request_sha256"] = MODULE.request_digest(self.request)
+        self.calls["conflict_preflight"].side_effect = lambda *a, **kw: {
+            "already_mergeable": False, "pr": copy.deepcopy(self.metadata),
+            "strategy": "native-stack", "request": copy.deepcopy(self.request),
+        }
+        self.patch(
+            "authorize_resolver_native_stack",
+            return_value={"request_id": "stack-1"},
+        )
+        self.assertEqual(0, MODULE.command_pipeline(self.args))
+        state = MODULE.load_state(self.path)
+        state["bounded_pipeline"]["prepared_dispatch"] = False
+        MODULE.save_state(self.path, state)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "cannot be adopted"):
+            MODULE.command_pipeline(self.args)
+        self.assertEqual(0, self.dispatches)
 
     def test_wrong_session_run_and_options_do_not_observe_or_dispatch(self):
         self.assertEqual(0, MODULE.command_pipeline(self.args))
@@ -135,7 +183,7 @@ class BoundedPipelineTest(unittest.TestCase):
     def test_ambiguous_dispatch_never_reposts(self):
         def ambiguous(command, **kwargs):
             result_path = Path(command[command.index("--result-file") + 1])
-            receipt_path = result_path.with_name(result_path.name + ".dispatch.json")
+            receipt_path = result_path.with_name(result_path.name + ".bounded-receipt.json")
             receipt_path.write_text(json.dumps({
                 "session": "session-1", "request_id": self.request["request_id"],
                 "request_sha256": self.request["request_sha256"],
@@ -200,6 +248,28 @@ class BoundedPipelineTest(unittest.TestCase):
 
 
 class BoundedBackendTest(unittest.TestCase):
+    def test_bounded_receipt_keeps_runtime_observation_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = existing.ManagedConflictCoordinatorTest().request()
+            options = CLOUD.Options(
+                "merge", "gpt-5.6-sol", request["pull_request"]["url"],
+                root / "request.json", root / "prompt.txt", root / "result.json",
+                request, "prompt", "dispatch", "session-1", 10**20,
+            )
+            runtime_path = root / "result.json.dispatch.json"
+            observation = {"schema": "github.copilot.dispatch-observation.v1"}
+            runtime_path.write_text(json.dumps(observation), encoding="utf-8")
+            receipt = {
+                "session": "session-1", "request_id": request["request_id"],
+                "request_sha256": request["request_sha256"],
+                "repository": request["repository"], "model": options.model,
+                "strategy": options.strategy, "status": "dispatching", "task": None,
+            }
+            CLOUD.atomic_write_json(CLOUD.bounded_receipt_path(options), receipt)
+            self.assertEqual(receipt, CLOUD.bounded_receipt(options))
+            self.assertEqual(observation, json.loads(runtime_path.read_text(encoding="utf-8")))
+
     def test_observe_and_collect_only_the_original_task(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -447,7 +517,7 @@ class BoundedNativeControllerTest(unittest.TestCase):
             if phase == "dispatch":
                 launches.append(index)
             result_path = Path(command[command.index("--result-file") + 1])
-            receipt_path = result_path.with_name(result_path.name + ".dispatch.json")
+            receipt_path = result_path.with_name(result_path.name + ".bounded-receipt.json")
             remote_state = "completed"
             task_id = f"task-{index}"
             receipt_path.write_text(json.dumps({
@@ -471,7 +541,7 @@ class BoundedNativeControllerTest(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         fixture.patch("run", side_effect=helper)
-        for expected_phase in ("collect", "dispatch", "collect", "dispatch"):
+        for expected_phase in ("dispatch", "collect", "dispatch", "collect", "dispatch"):
             code = MODULE.command_pipeline(fixture.args)
             self.assertEqual(0, code, MODULE.load_state(fixture.path)["agent_task"])
             current = MODULE.load_state(fixture.path)

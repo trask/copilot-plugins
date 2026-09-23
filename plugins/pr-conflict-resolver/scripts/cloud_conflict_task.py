@@ -3994,7 +3994,7 @@ def execute(
 
 
 def bounded_receipt_path(options: Options) -> Path:
-    return options.result_file.with_name(options.result_file.name + ".dispatch.json")
+    return options.result_file.with_name(options.result_file.name + ".bounded-receipt.json")
 
 
 def bounded_receipt(options: Options) -> dict[str, object]:

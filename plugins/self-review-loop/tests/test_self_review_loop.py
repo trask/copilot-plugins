@@ -2090,7 +2090,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.66")
+        self.assertEqual(plugin["version"], "1.3.67")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2169,7 +2169,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             max_iterations=5,
             prior_history=[],
         )
-        self.assertIn("worker prompt version 12", prompt)
+        self.assertIn("worker prompt version 13", prompt)
         self.assertIn("zero or more linear, single-parent code commits", prompt)
         self.assertIn("The dispatcher derives the exact candidate history", prompt)
         self.assertIn(MODULE.AGENT_TASK_OUTPUT_REPORT, prompt)
@@ -2179,7 +2179,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("changed_paths", pinned_data)
         self.assertNotIn("{{MARKETPLACE_SEMANTIC_PATH}}", prompt)
         self.assertNotIn('"request_id":', prompt)
-        self.assertIn("maximum_review_iterations", prompt)
+        self.assertIn("Perform one review pass only", prompt)
         self.assertIn("untrusted data", prompt)
         self.assertNotIn("`Finding: <identifier>`", prompt)
         self.assertIn("Zero code commits does not establish a clean review", prompt)
@@ -2593,11 +2593,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         def run(command, **kwargs):
             if "--result-file" in command:
                 self.assertEqual(live["head_sha"], identity["head"])
-                self.assertFalse(emitted)
+                if not commands:
+                    self.assertFalse(emitted)
                 commands.append(command)
                 state = MODULE.load_state(Path(args.state))
                 self.assertEqual(
-                    0 if len(commands) == 1 else min(fixes + 1, max_iterations),
+                    min(len(commands) - 1, max_iterations),
                     state["iterations"],
                 )
                 self.assertEqual(
@@ -2607,20 +2608,20 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.assertEqual("sol", command[command.index("--model") + 1])
                 prompt = Path(command[command.index("--prompt-file") + 1])
                 self.assertIn(
-                    f'"maximum_review_iterations": {state["agent_task"]["allowed_iterations"]}',
+                    '"maximum_review_iterations": 1',
                     prompt.read_text(encoding="utf-8"),
                 )
                 commits = (
-                    [f"{index + 6:040x}" for index in range(min(fixes, max_iterations))]
-                    if len(commands) == 1 else []
+                    [f"{len(commands) + 5:040x}"]
+                    if len(commands) <= fixes else []
                 )
                 result = self.candidate_result(commits=commits)
-                result["candidate"]["artifact_commit"] = self.candidate_metadata(
-                    self.artifact, commits[-1] if commits else self.head,
-                    [MODULE.AGENT_TASK_OUTPUT_RESULT],
-                )
-                result["candidate"]["generated"]["head_sha"] = self.artifact
-                result["generated"]["head_sha"] = self.artifact
+                if not commits:
+                    result["candidate"]["artifact_commit"] = self.candidate_metadata(
+                        self.artifact, self.head, [MODULE.AGENT_TASK_OUTPUT_RESULT],
+                    )
+                    result["candidate"]["generated"]["head_sha"] = self.artifact
+                    result["generated"]["head_sha"] = self.artifact
                 result["task"]["state"] = task_state
                 result["completion"]["task"]["state"] = task_state
                 if task_error is not None:
@@ -2642,10 +2643,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
 
         def outcome_git(_root, *arguments):
             self.assertEqual(("show", f"{self.artifact}:{MODULE.AGENT_TASK_OUTPUT_RESULT}"), arguments)
-            return json.dumps({
-                "outcome": "exhausted" if fixes >= max_iterations else "clean",
-                "iterations_used": min(fixes + 1, max_iterations) if len(commands) == 1 else 1,
-            })
+            return '{"outcome":"clean","iterations_used":1}'
 
         def verify_candidate(result, **_kwargs):
             if result["task"]["state"] != "completed":
@@ -2714,16 +2712,41 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pipeline_waits_for_fixes_then_a_terminal_clean_pass(self):
         with self.pipeline_run() as (args, commands, emitted):
             MODULE.command_pipeline(args)
-            self.assertEqual(1, len(commands))
+            self.assertEqual(2, len(commands))
             self.assertEqual(1, len(emitted))
             self.assertEqual("published", emitted[0]["result"])
             self.assertEqual("cleared", emitted[0]["stage_outcome"])
             self.assertEqual(2, emitted[0]["iterations"])
             self.assertEqual(1, len(emitted[0]["commits"]))
-            self.assertEqual(1, len(emitted[0]["tasks"]))
+            self.assertEqual(2, len(emitted[0]["tasks"]))
             state = MODULE.load_state(Path(args.state))
             self.assertEqual("", state["agent_task"]["preflight"]["identity"]["branch"])
             self.assertEqual(state["pr"]["head_sha"], MODULE.recorded_clean_at_head_sha(state))
+            self.assertEqual(1, len(state["managed_task_history"]))
+
+    def test_later_task_failure_preserves_published_pass_without_clearance(self):
+        with self.pipeline_run() as (args, commands, emitted):
+            original_run = MODULE.run.side_effect
+
+            def fail_second_pass(command, **kwargs):
+                if "--result-file" in command and commands:
+                    raise MODULE.WorkflowError("next pass unavailable")
+                return original_run(command, **kwargs)
+
+            with mock.patch.object(MODULE, "run", side_effect=fail_second_pass):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "next pass unavailable"):
+                    MODULE.command_pipeline(args)
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual(1, state["iterations"])
+            self.assertEqual(1, len(commands))
+            self.assertEqual("failed", state["agent_task"]["status"])
+            self.assertEqual(1, len(state["managed_task_history"]))
+            self.assertEqual(
+                ["0" * 39 + "6"],
+                state["managed_task_history"][0]["ordered_commits"],
+            )
+            self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
+            self.assertEqual([], emitted)
 
     def test_bounded_pipeline_observes_task_and_waits_for_remote_visibility(self):
         with self.pipeline_run(fixes=1) as (args, commands, emitted):
@@ -2810,14 +2833,20 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     self.fail("bounded publication did not finish")
                 self.assertEqual("cleared", emitted[-1]["stage_outcome"])
                 self.assertGreater(clock[0], 120)
-                self.assertEqual(1, len(commands))
+                self.assertEqual(2, len(commands))
                 self.assertEqual("completed", MODULE.load_state(Path(args.state))["agent_task"]["status"])
                 result_path = Path(dispatches[0][dispatches[0].index("--result-file") + 1])
                 self.assertFalse(
                     result_path.with_name(result_path.name + ".pipeline.json").exists()
                 )
             self.assertIn("--pipeline-dispatch", dispatches[0])
-            self.assertTrue(all("--pipeline-observe" in cmd for cmd in dispatches[1:]))
+            self.assertEqual(
+                2, sum("--pipeline-dispatch" in cmd for cmd in dispatches)
+            )
+            self.assertTrue(all(
+                "--pipeline-observe" in cmd or "--pipeline-dispatch" in cmd
+                for cmd in dispatches
+            ))
             self.assertTrue(all("--apply-with-report" in cmd for cmd in dispatches))
 
     def test_bounded_dispatch_accepts_sealed_pending_without_stdout(self):
@@ -2935,14 +2964,27 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pipeline_spends_its_budget_once_across_all_sweeps(self):
         with self.pipeline_run(fixes=5) as (args, commands, emitted):
             MODULE.command_pipeline(args)
-            self.assertEqual(1, len(commands))
+            self.assertEqual(3, len(commands))
+            self.assertEqual(3, len(emitted[-1]["commits"]))
             self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
             self.assertIsNone(MODULE.recorded_clean_at_head_sha(MODULE.load_state(Path(args.state))))
             args.pipeline_iteration = 2
             MODULE.command_pipeline(args)
-            self.assertEqual(1, len(commands))
+            self.assertEqual(3, len(commands))
             self.assertEqual(3, emitted[-1]["iterations"])
             self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
+
+    def test_one_pass_budget_publishes_code_without_claiming_clean(self):
+        with self.pipeline_run(fixes=2, max_iterations=1) as (args, commands, emitted):
+            MODULE.command_pipeline(args)
+            self.assertEqual(1, len(commands))
+            self.assertEqual("published", emitted[-1]["result"])
+            self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
+            self.assertEqual(1, emitted[-1]["iterations"])
+            self.assertEqual(1, len(emitted[-1]["commits"]))
+            self.assertIsNone(
+                MODULE.recorded_clean_at_head_sha(MODULE.load_state(Path(args.state)))
+            )
 
     def pipeline_cli(self, args):
         argv = [str(SCRIPT), "pipeline", args.target]
@@ -2965,7 +3007,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             emitted.clear()
             self.assertEqual(0, self.pipeline_cli(args))
             second = MODULE.load_state(Path(args.state))
-            self.assertEqual(2, len(commands))
+            self.assertEqual(3, len(commands))
             self.assertEqual(3, second["iterations"])
             self.assertEqual(1, second["agent_task"]["allowed_iterations"])
             self.assertEqual("9" * 40, second["agent_task"]["preflight"]["pr"]["head_sha"])
@@ -3028,7 +3070,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             emitted.clear()
             self.assertEqual(0, self.pipeline_cli(args))
             state = MODULE.load_state(Path(args.state))
-            self.assertEqual(1, len(commands))
+            self.assertEqual(2, len(commands))
             self.assertEqual(2, state["iterations"])
             self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
             self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
@@ -3100,15 +3142,38 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertIn("state changed", emitted[-1]["error"])
             self.assertEqual(3, MODULE.load_state(Path(args.state))["pipeline_budget"]["iteration"])
 
-    def test_pipeline_charges_five_hosted_passes_in_one_task(self):
+    def test_pipeline_charges_five_separate_hosted_passes(self):
         with self.pipeline_run(fixes=4, max_iterations=5) as (args, commands, emitted):
             MODULE.command_pipeline(args)
-            self.assertEqual(1, len(commands))
+            self.assertEqual(5, len(commands))
             self.assertEqual(1, len(emitted))
             self.assertEqual(5, emitted[0]["iterations"])
             self.assertEqual(4, len(emitted[0]["commits"]))
-            self.assertEqual(1, len(emitted[0]["tasks"]))
+            self.assertEqual(5, len(emitted[0]["tasks"]))
             self.assertEqual("cleared", emitted[0]["stage_outcome"])
+
+    def test_bounded_pipeline_publishes_code_without_outcome_then_reviews_again(self):
+        with self.pipeline_run(fixes=1) as (args, commands, emitted):
+            args.pipeline_run = "c" * 32
+            args.bounded_step = True
+            with mock.patch.dict(
+                MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "review-session"}
+            ):
+                MODULE.command_pipeline(args)
+                first = MODULE.load_state(Path(args.state))
+                self.assertEqual("waiting", emitted[-1]["result"])
+                self.assertNotIn("stage_outcome", emitted[-1])
+                self.assertEqual("continue", first["agent_task"]["outcome"])
+                self.assertEqual("continue", first["review"]["outcome"])
+                self.assertEqual(1, first["iterations"])
+                self.assertEqual(1, len(commands))
+                self.assertEqual(f"{6:040x}", first["pr"]["head_sha"])
+                MODULE.command_pipeline(args)
+                self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+                self.assertEqual(2, len(commands))
+                self.assertEqual(first["pr"]["head_sha"], first["agent_task"]["published_head_sha"])
+                self.assertEqual(1, len(MODULE.load_state(Path(args.state))["managed_task_history"]))
+                self.assertEqual(2, MODULE.load_state(Path(args.state))["iterations"])
 
     def test_pipeline_rejects_nonzero_exit_even_with_success_result(self):
         with self.pipeline_run(exit_code=9) as (args, commands, emitted):
@@ -3332,11 +3397,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             commits=[fix],
             changed_paths=["src/app.py"],
         )
-        result["candidate"]["artifact_commit"] = self.candidate_metadata(
-            self.artifact, fix, [MODULE.AGENT_TASK_OUTPUT_RESULT],
-        )
-        result["candidate"]["generated"]["head_sha"] = self.artifact
-        result["generated"]["head_sha"] = self.artifact
         live = {**self.preflight["pr"], "head_sha": fix}
         commands = []
 
@@ -3370,7 +3430,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
             mock.patch.object(MODULE, "run", side_effect=helper_run),
-            mock.patch.object(MODULE, "git", return_value='{"outcome":"clean","iterations_used":2}'),
+            mock.patch.object(MODULE, "git"),
             mock.patch.object(
                 MODULE,
                 "local_identity",

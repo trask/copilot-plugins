@@ -99,7 +99,7 @@ SELF_REVIEW_CANDIDATE_REPORT_SCHEMA = {
     "id": "github.copilot.self-review-loop-report",
     "version": 3,
 }
-WORKER_PROMPT_VERSION = 12
+WORKER_PROMPT_VERSION = 13
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
@@ -686,6 +686,9 @@ def default_state_path(target: dict[str, Any]) -> Path:
 
 
 def invocation_run(args: argparse.Namespace) -> str:
+    active = getattr(args, "_active_invocation_run", None)
+    if active is not None:
+        return active
     pipeline = getattr(args, "pipeline_run", None)
     continued = getattr(args, "invocation_run", None)
     fresh = bool(getattr(args, "new_invocation", False))
@@ -1432,23 +1435,22 @@ def build_worker_prompt(
         "or strong directly applicable precedent.\n\n"
         "For each verified worthwhile finding, implement the complete fix and tests. "
         "Run all focused probes, formatters, builds, and tests needed to validate it. "
-        "After a fix pass, review the complete resulting pull request again. Stop when "
-        "clean or after the supplied maximum number of review iterations. Never ask "
+        "Perform one review pass only. After fixing verified findings and validating "
+        "the fixes, stop. The local coordinator will publish verified commits and "
+        "start a new hosted task to review the resulting pull request. Never ask "
         "the local coordinator to run code, inspect files, or retry validation.\n\n"
         "Create zero or more linear, single-parent code commits. Zero code commits "
         "does not establish a clean review. Do not encode findings, mappings, changed-path "
         "claims, validation results, pull request metadata, or workflow identity for "
         "the coordinator. The dispatcher derives the exact candidate history.\n\n"
-        "Create one final single-parent output commit after all code commits. "
-        f"Write `{AGENT_TASK_OUTPUT_RESULT}` with exactly `outcome` and "
-        "`iterations_used`. Outcome is `clean` only after a complete review pass "
-        "finds nothing left to fix; `exhausted` when the entire supplied allowance "
-        "was consumed with concerns remaining; `incomplete` when analysis or "
-        "validation could not finish. Count every review pass, including a final "
-        "clean pass, not commits or pushes. Clean/exhausted counts are integers "
-        "from 1 through the allowance; exhausted consumes the full allowance. "
-        "Incomplete may use zero through the allowance and never authorizes "
-        "publication. Correct output and validation problems within this task.\n\n"
+        "If this pass finds no changes to make, create one final single-parent "
+        f"output commit with `{AGENT_TASK_OUTPUT_RESULT}` containing exactly "
+        '`{"outcome":"clean","iterations_used":1}`. Do not claim a clean pass '
+        "after creating code commits. If analysis or validation cannot finish, "
+        "do not claim clean and do not commit unvalidated fixes. Code commits "
+        "from a completed task count as one pass without any structured outcome "
+        "file. The coordinator counts passes, not commits. Correct output and "
+        "validation problems within this task.\n\n"
         f"If useful, write a free-form report to `{AGENT_TASK_OUTPUT_REPORT}` with a "
         "work summary, validation attempts, unresolved concerns, and retrospective. "
         "The report is advisory and may be absent. Keep every path in that output "
@@ -2407,8 +2409,11 @@ def candidate_review_outcome(
     repo_root: Path, remote: dict[str, Any], *, allowed_iterations: int
 ) -> dict[str, Any]:
     artifact = remote["candidate_manifest"]["artifact_commit"]
+    commits = remote["commits"]
     if artifact is None or AGENT_TASK_OUTPUT_RESULT not in artifact["changed_paths"]:
-        raise WorkflowError("Self Review candidate has no terminal outcome artifact")
+        if commits:
+            return {"outcome": "continue", "iterations_used": 1}
+        raise WorkflowError("Self Review candidate has no clean outcome or code commits")
     content = git(repo_root, "show", f"{artifact['sha']}:{AGENT_TASK_OUTPUT_RESULT}")
     if len(content.encode("utf-8")) > 4096:
         raise WorkflowError("Self Review terminal outcome exceeds 4096 bytes")
@@ -2417,16 +2422,15 @@ def candidate_review_outcome(
         raise WorkflowError("Self Review terminal outcome has invalid fields")
     outcome, used = result["outcome"], result["iterations_used"]
     if (
-        not isinstance(outcome, str) or outcome not in {"clean", "exhausted", "incomplete"}
-        or type(used) is not int
-        or not (0 if outcome == "incomplete" else 1) <= used <= allowed_iterations
-        or (outcome == "exhausted" and used != allowed_iterations)
+        not isinstance(outcome, str) or outcome not in {"clean", "incomplete"}
+        or type(used) is not int or used != 1 or allowed_iterations < 1
     ):
         raise WorkflowError("Self Review terminal outcome has invalid consumption")
+    if outcome == "clean" and commits:
+        raise WorkflowError("Self Review clean outcome includes code commits")
     return {
-        "outcome": {"clean": "cleared", "exhausted": "max_iterations_reached",
-                    "incomplete": "incomplete"}[outcome],
-        "iterations_used": used,
+        "outcome": "cleared" if outcome == "clean" else "incomplete",
+        "iterations_used": 1,
     }
 
 
@@ -2815,7 +2819,29 @@ def command_pipeline(args: argparse.Namespace) -> None:
         result = command_agent_task(args)
     finally:
         _BOUNDED_DEADLINE = previous_deadline
-    emit({**result, "tasks": [result["task"]] if result.get("task") else []})
+    emit({
+        **result,
+        "tasks": result.get("tasks") or (
+            [result["task"]] if result.get("task") else []
+        ),
+    })
+
+
+def command_agent_task(args: argparse.Namespace) -> dict[str, Any]:
+    while True:
+        result = _command_agent_task_pass(args)
+        if result.get("outcome") != "continue":
+            return result
+        state = load_state(Path(result["state"]))
+        if (state.get("review") or {}).get("outcome") != "continue":
+            return result
+        if getattr(args, "bounded_step", False) and getattr(args, "_pipeline", False):
+            return {**result, "result": "waiting"}
+        if not getattr(args, "pipeline_run", None):
+            args._active_invocation_run = (
+                getattr(args, "_new_invocation_run", None)
+                or getattr(args, "invocation_run", None)
+            )
 
 
 def bounded_review_binding(
@@ -2882,7 +2908,7 @@ def bounded_review_pending(
     return True
 
 
-def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
+def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
     global ACTIVE_GITHUB_MUTATION_POLICY
 
     ACTIVE_GITHUB_MUTATION_POLICY = github_mutation_policy(args)
@@ -2929,9 +2955,19 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             raise WorkflowError("pipeline review iteration budget changed")
         if getattr(args, "_pipeline_entry", False) and resumed is None:
             previous_iteration = recorded_budget.get("iteration")
+            continuation = (
+                previous_iteration == args.pipeline_iteration
+                and active_task.get("outcome") == "continue"
+                and active_task.get("status") == "completed"
+                and active_task.get("published_head_sha") == (existing.get("pr") or {}).get("head_sha")
+                and (existing.get("review") or {}).get("outcome") == "continue"
+            )
             if (
                 type(previous_iteration) is not int
-                or not 1 <= previous_iteration < args.pipeline_iteration
+                or not (
+                    1 <= previous_iteration < args.pipeline_iteration
+                    or continuation
+                )
             ):
                 raise WorkflowError("pipeline state requires a later sweep in the same run")
             if existing.get("repo_root") != str(repo_root):
@@ -3037,7 +3073,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         ):
             raise WorkflowError("bounded pipeline task artifacts or pinned input changed")
         prompt = build_worker_prompt(
-            preflight, max_iterations=task["allowed_iterations"],
+            preflight, max_iterations=1,
             prior_history=state.get("history") or [],
         )
         if prompt_path.read_text(encoding="utf-8") != prompt:
@@ -3050,15 +3086,30 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         state["pr"] = pr
         state["repo_root"] = str(repo_root)
         migrate_budget_counters(state)
+        if (
+            existing is not None
+            and state.get("agent_task", {}).get("outcome") == "continue"
+            and state["agent_task"].get("status") == "completed"
+        ):
+            state.setdefault("managed_task_history", []).append(
+                copy.deepcopy(state["agent_task"])
+            )
         pipeline = pipeline_scope(state, args)
         if pipeline is None:
             spent = int(state.get("iterations", 0))
-            invocation = {
-                "run": secrets.token_hex(16),
-                "iteration": None,
-                "baseline": spent,
-                "run_baseline": spent,
-            }
+            prior_invocation = state.get("invocation_budget")
+            invocation = (
+                prior_invocation
+                if isinstance(prior_invocation, dict)
+                and existing is not None
+                and state.get("agent_task", {}).get("outcome") == "continue"
+                else {
+                    "run": secrets.token_hex(16),
+                    "iteration": None,
+                    "baseline": spent,
+                    "run_baseline": spent,
+                }
+            )
             budget_scope = "invocation"
             state["invocation_budget"] = invocation
             scope = invocation
@@ -3136,6 +3187,10 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         state["agent_task"] = {
             "status": "preparing",
             "run_id": run_id,
+            "pass_scope": {
+                "run": scope["run"],
+                "iteration": scope.get("iteration"),
+            },
             "model": requested_model,
             "github_mutation_policy": ACTIVE_GITHUB_MUTATION_POLICY,
             "policy": AGENT_TASK_POLICY,
@@ -3165,7 +3220,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
     try:
         helper = discover_cloud_task()
         prompt = build_worker_prompt(
-            preflight, max_iterations=allowed_iterations,
+            preflight, max_iterations=1,
             prior_history=state.get("history") or [],
         )
         require_no_credentials(prompt, source="Agent Task prompt")
@@ -3224,7 +3279,7 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             if (
                 resumed is None
                 and not pending
-                and (process.returncode == 0 or not result_path.is_file())
+                and (process.returncode == 0 and not result_path.is_file())
             ):
                 raise WorkflowError("bounded dispatch did not return a pending checkpoint")
             if pending:
@@ -3612,6 +3667,16 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
         current["pr"] = {**pr, **final_live}
         for _ in range(report["iterations_used"]):
             charge_iteration(current)
+        if report["outcome"] == "continue":
+            budget = (
+                current.get("pipeline_budget")
+                if pipeline_mode else current.get("invocation_budget")
+            )
+            if exhausted_budget(
+                current, budget, max_iterations,
+                max_iterations if pipeline_mode else None,
+            ) is not None:
+                report = {**report, "outcome": "max_iterations_reached"}
         review = current["review"]
         review["status"] = (
             "resolved"
@@ -3642,9 +3707,12 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             review["clean_at_base_sha"] = None
         else:
             review["outcome"] = "exhausted"
+        if report["outcome"] == "continue":
+            review["outcome"] = "continue"
         review["iterations_used"] = report["iterations_used"]
         current["agent_task"]["reserved_iterations"] = 0
         current["agent_task"]["consumed_iterations"] = report["iterations_used"]
+        current["agent_task"]["outcome"] = report["outcome"]
         current["agent_task"]["status"] = "completed"
         current["agent_task"]["completed_at"] = utc_now()
         current["agent_task"]["artifacts_removed"] = False
@@ -3670,7 +3738,21 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
             report_content=report_content,
         )
         save_state(state_path, current)
-        result_name = "published" if remote["commits"] else "nothing_to_publish"
+        prior_passes = [
+            item for item in current.get("managed_task_history", [])
+            if item.get("pass_scope") == current["agent_task"]["pass_scope"]
+            and item.get("status") == "completed"
+        ]
+        all_commits = [
+            commit
+            for item in prior_passes
+            for commit in item.get("ordered_commits", [])
+        ] + remote["commits"]
+        all_tasks = [
+            {"id": item["task_id"], "url": item["task_url"]}
+            for item in prior_passes
+        ] + [{"id": remote["task_id"], "url": remote["task_url"]}]
+        result_name = "published" if all_commits else "nothing_to_publish"
         payload = {
             "result": result_name,
             "state": str(state_path),
@@ -3682,7 +3764,8 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 f"{current['pr']['title']}"
             ),
             "head_sha": published_head,
-            "commits": remote["commits"],
+            "commits": all_commits,
+            "tasks": all_tasks,
             "iterations": current["iterations"],
             "outcome": (
                 "continue"

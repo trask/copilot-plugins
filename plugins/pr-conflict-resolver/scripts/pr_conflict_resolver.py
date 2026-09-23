@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "f0f95255d3c454efafa3b5564f3f82f15d88cf25e0741f45824127804c891109"
+    "45262c0bdd7b6ec8e6ec601b1ba875d6d9a0dee7545d276144dc7e999b62c474"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@11"
@@ -10462,7 +10462,13 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     save_state(state_path, state)
     task = state["agent_task"]
     preflight = task["preflight"]
-    if preflight.get("stack_request") is not None:
+    if (
+        preflight.get("stack_request") is not None
+        and not (
+            getattr(args, "_bounded_session", None) is not None
+            and preflight["strategy"] == "native-stack"
+        )
+    ):
         require_live_conflict_guards(repo_root, preflight)
     helper = discover_conflict_task()
     command = [
@@ -10488,6 +10494,12 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     task["status"] = "running"
     save_state(state_path, state)
     if getattr(args, "_bounded_session", None) is not None:
+        if preflight["strategy"] == "native-stack":
+            state["bounded_pipeline"]["prepared_dispatch"] = True
+            state["bounded_pipeline"]["inflight"] = False
+            save_state(state_path, state)
+            output({"result": "waiting", "state": str(state_path), "wait_seconds": 1})
+            return
         advance_bounded_conflict(state_path, state, args._bounded_session)
         return
     try:
@@ -10900,6 +10912,8 @@ def advance_bounded_conflict(
         raise WorkflowError("bounded conflict helper command changed")
     for name in ("request_file", "prompt_file", "result_file"):
         require_external_path(Path(task[name]), Path(state["repo_root"]))
+    if phase == "dispatch" and preflight["strategy"] == "native-stack":
+        require_live_conflict_guards(Path(state["repo_root"]), preflight)
     bounded["inflight"] = True
     save_state(state_path, state)
     command = [
@@ -10920,7 +10934,7 @@ def advance_bounded_conflict(
     }
     if any(result.get(key) != value for key, value in identity.items()):
         raise WorkflowError("bounded conflict result identity mismatch")
-    receipt_path = result_path.with_name(result_path.name + ".dispatch.json")
+    receipt_path = result_path.with_name(result_path.name + ".bounded-receipt.json")
     receipt = (
         json.loads(receipt_path.read_text(encoding="utf-8"))
         if receipt_path.is_file() else None
@@ -11121,6 +11135,13 @@ def command_bounded_pipeline(args: argparse.Namespace) -> int:
                 save_state(state_path, state)
             elif previous["agent_task"]["status"] == "running":
                 checkpoint = previous["bounded_pipeline"]
+                prepared_dispatch = (
+                    checkpoint["phase"] == "dispatch"
+                    and checkpoint.get("prepared_dispatch") is True
+                    and previous["agent_task"]["preflight"]["strategy"] == "native-stack"
+                    and checkpoint.get("member_index", 0) == 0
+                    and not checkpoint.get("member_task_ids")
+                )
                 stack_dispatch = (
                     checkpoint["phase"] == "dispatch"
                     and previous["agent_task"]["preflight"]["strategy"] == "native-stack"
@@ -11130,12 +11151,17 @@ def command_bounded_pipeline(args: argparse.Namespace) -> int:
                     == {str(index) for index in range(checkpoint["member_index"])}
                 )
                 if (
-                    (checkpoint["phase"] == "dispatch" and not stack_dispatch)
+                    (
+                        checkpoint["phase"] == "dispatch"
+                        and not (stack_dispatch or prepared_dispatch)
+                    )
                     or checkpoint.get("inflight") is not False
                 ):
                     raise WorkflowError(
                         "prior bounded execution did not finish; remote work cannot be adopted"
                     )
+                if prepared_dispatch:
+                    checkpoint["prepared_dispatch"] = False
                 advance_bounded_conflict(state_path, previous, session)
             elif previous["agent_task"]["status"] == "completed":
                 emit({
@@ -11152,7 +11178,10 @@ def command_bounded_pipeline(args: argparse.Namespace) -> int:
                 state["bounded_pipeline"]["phase"] in {"observe", "collect"}
                 or (
                     state["bounded_pipeline"]["phase"] == "dispatch"
-                    and state["bounded_pipeline"].get("member_index", 0) > 0
+                    and (
+                        state["bounded_pipeline"].get("member_index", 0) > 0
+                        or state["bounded_pipeline"].get("prepared_dispatch") is True
+                    )
                 )
             )
         ) or (
