@@ -134,7 +134,7 @@ batch and draft the retained comments. Empty discovery needs no second task.
 The local coordinator checks provenance, anchors, permissions and freshness,
 then creates one pending review containing the exact hosted comments.
 
-Run this agent with GPT-5.6 Sol at high reasoning effort. Both hosted phases use
+Run this agent with GPT-6 Sol at high reasoning effort. Both hosted phases use
 `marketplace-agent-report-recommendation-worker@1`. There is no hosted
 max-effort guarantee, local evaluator, per-finding task or model fallback.
 

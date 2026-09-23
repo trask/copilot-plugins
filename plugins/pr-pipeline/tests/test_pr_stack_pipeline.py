@@ -332,7 +332,7 @@ class ModelTest(unittest.TestCase):
     def test_models_match_the_single_pull_request_pipeline(self):
         models = COMMON.stage_models(None)
         for stage in MODULE.PHASE_NAMES:
-            self.assertEqual("gpt-5.6-sol", models[stage])
+            self.assertEqual("gpt-6-sol", models[stage])
 
     def test_ci_workers_run_the_coordinator_directly(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CI]
@@ -345,7 +345,7 @@ class ModelTest(unittest.TestCase):
             command = COMMON.stage_command(
                 entry,
                 target,
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
                 effort="high",
                 arguments=[
                     "--pipeline-run",
@@ -392,7 +392,7 @@ class ModelTest(unittest.TestCase):
         command = COMMON.stage_command(
             entry,
             COMMON.target_for("owner/repo", 11),
-            model="gpt-5.6-sol",
+            model="gpt-6-sol",
             effort="high",
             arguments=["--pipeline-run", "a" * 32],
             prompt="frozen worker prompt",
@@ -986,7 +986,7 @@ class StackRunTest(StackFixture):
                     "agent_task": {
                         "status": "completed",
                         "task": {"id": "task-1", "state": "completed"},
-                        "model": "gpt-5.6-sol",
+                        "model": "gpt-6-sol",
                         "github_mutation_policy": "allow",
                     },
                 }
@@ -2770,7 +2770,7 @@ class CiWarningTest(StackFixture):
                 command = COMMON.stage_command(
                     MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
                     COMMON.target_for("owner/repo", 11),
-                    model="gpt-5.6-sol", effort="high", arguments=request["arguments"],
+                    model="gpt-6-sol", effort="high", arguments=request["arguments"],
                 )
                 self.assertEqual(policy, command[command.index("--github-mutation-policy") + 1])
                 self.assertEqual("run-1", command[command.index("--pipeline-run") + 1])
@@ -3626,7 +3626,7 @@ class AgentInstructionTest(unittest.TestCase):
         self.text = AGENT.read_text(encoding="utf-8")
 
     def test_requires_the_exact_primary_model_and_exposed_effort(self):
-        self.assertIn("only with model `gpt-5.6-sol`", self.text)
+        self.assertIn("only with model `gpt-6-sol`", self.text)
         self.assertIn("require `high`", self.text)
         self.assertIn("An unavailable effort value is allowed", self.text)
         self.assertIn("cannot be determined", self.text)

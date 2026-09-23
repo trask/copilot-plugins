@@ -217,7 +217,7 @@ class GithubMutationPolicyTest(unittest.TestCase):
                     command = MODULE.common.stage_command(
                         entry,
                         target,
-                        model="gpt-5.6-sol",
+                        model="gpt-6-sol",
                         effort="high",
                         arguments=[
                             "--pipeline-run",
@@ -240,7 +240,7 @@ class GithubMutationPolicyTest(unittest.TestCase):
                 command = MODULE.stage_command(
                     MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
                     target(),
-                    model="gpt-5.6-sol",
+                    model="gpt-6-sol",
                     effort="high",
                     run_id=PIPELINE_RUN,
                     sweep=2,
@@ -685,10 +685,10 @@ class StageContractTest(unittest.TestCase):
 
     def test_self_review_requires_the_exact_model_and_effort(self):
         models = MODULE.stage_models(None)
-        self.assertEqual("gpt-5.6-sol", models[MODULE.STAGE_SELF_REVIEW])
+        self.assertEqual("gpt-6-sol", models[MODULE.STAGE_SELF_REVIEW])
         with self.assertRaisesRegex(
             MODULE.WorkflowError,
-            "requires exactly model gpt-5.6-sol",
+            "requires exactly model gpt-6-sol",
         ):
             MODULE.stage_models(["self-review-loop=claude-sonnet-5"])
         with self.assertRaisesRegex(
@@ -700,8 +700,8 @@ class StageContractTest(unittest.TestCase):
     def test_self_review_launch_revalidates_the_exact_route(self):
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_SELF_REVIEW]
         for model, effort, error in (
-            ("claude-sonnet-5", "high", "requires exactly model gpt-5.6-sol"),
-            ("gpt-5.6-sol", "max", "requires exactly reasoning effort high"),
+            ("claude-sonnet-5", "high", "requires exactly model gpt-6-sol"),
+            ("gpt-6-sol", "max", "requires exactly reasoning effort high"),
         ):
             with (
                 self.subTest(model=model, effort=effort),
@@ -718,7 +718,7 @@ class StageContractTest(unittest.TestCase):
 
     def test_description_model_overrides_use_coordinator_aliases(self):
         for model, alias in (
-            ("gpt-5.6-sol", "sol"),
+            ("gpt-6-sol", "sol"),
             ("gpt-5.6-luna", "luna"),
             ("gpt-5.6-terra", "terra"),
             ("gpt-6-astra", "astra"),
@@ -736,6 +736,8 @@ class StageContractTest(unittest.TestCase):
 
     def test_unsupported_models_fail_before_stage_launch(self):
         for assignment, error in (
+            ("pr-description=gpt-5.6-sol", "does not support model"),
+            ("self-review-loop=gpt-5.6-sol", "requires exactly model"),
             ("pr-description=unknown-model", "does not support model"),
             ("pr-conflict-resolver=gpt-6-astra", "requires exactly model"),
             ("copilot-review-loop=gpt-6-astra", "requires exactly model"),
@@ -1524,7 +1526,7 @@ class MarkerTest(unittest.TestCase):
         command = MODULE.common.stage_command(
             entry,
             target(),
-            model="gpt-5.6-sol",
+            model="gpt-6-sol",
             effort="high",
             arguments=["--pipeline-run", PIPELINE_RUN],
         )
@@ -1944,7 +1946,7 @@ class RunStageStateIsolationTest(unittest.TestCase):
                         entry,
                         target(),
                         Path("C:/repo"),
-                        model="gpt-5.6-sol",
+                        model="gpt-6-sol",
                         effort="high",
                         run_id=InvocationStateIsolationTest.RUN_ID,
                         sweep=1,
@@ -2000,7 +2002,7 @@ class RunStageStateIsolationTest(unittest.TestCase):
                 entry,
                 target(),
                 Path("C:/repo"),
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
                 effort="high",
                 run_id=InvocationStateIsolationTest.RUN_ID,
                 sweep=1,
@@ -2058,7 +2060,7 @@ class RunStageStateIsolationTest(unittest.TestCase):
                 entry,
                 target(),
                 Path("C:/repo"),
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
                 effort="high",
                 run_id=InvocationStateIsolationTest.RUN_ID,
                 sweep=1,
@@ -3767,7 +3769,7 @@ class WorktreeSafetyTest(unittest.TestCase):
 class AgentInstructionTest(unittest.TestCase):
     def test_requires_the_exact_primary_model_and_exposed_effort(self):
         text = AGENT.read_text(encoding="utf-8")
-        self.assertIn("only with model `gpt-5.6-sol`", text)
+        self.assertIn("only with model `gpt-6-sol`", text)
         self.assertIn("require `high`", text)
         self.assertIn("An unavailable effort value is allowed", text)
         self.assertIn("cannot be determined", text)
@@ -4000,7 +4002,7 @@ class BoundedCommandTest(unittest.TestCase):
             }},
         ):
             stage = MODULE.run_stage(
-                MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-5.6-sol",
+                MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-6-sol",
                 effort="high", run_id="a" * 32, sweep=1, bounded=True,
             )
         self.assertTrue(stage["waiting"])
@@ -4021,7 +4023,7 @@ class BoundedCommandTest(unittest.TestCase):
             ),
         ):
             MODULE.run_stage(
-                MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-5.6-sol",
+                MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-6-sol",
                 effort="high", run_id="a" * 32, sweep=1, bounded=True,
             )
 

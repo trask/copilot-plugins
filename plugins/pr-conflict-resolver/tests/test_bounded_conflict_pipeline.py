@@ -205,7 +205,7 @@ class BoundedBackendTest(unittest.TestCase):
             root = Path(directory)
             request = existing.ManagedConflictCoordinatorTest().request()
             options = CLOUD.Options(
-                "merge", "gpt-5.6-sol", request["pull_request"]["url"],
+                "merge", "gpt-6-sol", request["pull_request"]["url"],
                 root / "request.json", root / "prompt.txt", root / "result.json",
                 request, "prompt", "dispatch", "session-1", 10**20,
             )
@@ -267,7 +267,7 @@ class BoundedBackendTest(unittest.TestCase):
             root = Path(directory)
             request = existing.ManagedConflictCoordinatorTest().request()
             options = CLOUD.Options(
-                "merge", "gpt-5.6-sol", request["pull_request"]["url"],
+                "merge", "gpt-6-sol", request["pull_request"]["url"],
                 root / "request.json", root / "prompt.txt", root / "result.json",
                 request, "prompt", "dispatch", "session-1", 10**20,
             )

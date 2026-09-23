@@ -36,7 +36,7 @@ When a stage proves that its completed hosted candidate was based on an older so
 
 Both schedulers load `pipeline_common.py` from its pinned source bytes without reading or writing installed bytecode caches or changing interpreter-wide bytecode settings. A shared-source change requires updating both scheduler digest pins.
 
-Model overrides use canonical IDs, for example `--stage-model pr-description=gpt-6-astra`. PR Description supports `gpt-5.6-sol`, `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-6-astra`; the other stages require `gpt-5.6-sol`. The scheduler rejects unsupported routes before launching a stage.
+Model overrides use canonical IDs, for example `--stage-model pr-description=gpt-6-sol`. PR Description supports `gpt-6-sol`, `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-6-astra`; the other stages require `gpt-6-sol`. The scheduler rejects unsupported routes before launching a stage.
 
 Every stage launch and status read uses a state path derived from the Pipeline run ID. The helpers never fall back to pull-request-wide state. A status envelope must name the exact state file and pull request, current head and actual base tip. Old owners, reports, results, and clearances cannot enter a fresh run.
 

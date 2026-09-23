@@ -9,7 +9,7 @@ disable-model-invocation: true
 
 Run only when the user explicitly selects PR Conflict Resolver or invokes its command. Never select or start this agent automatically.
 
-Use this agent only with model `gpt-5.6-sol`. If the runtime exposes reasoning effort, require `high`. Stop when the model is different or cannot be determined. An unavailable effort value is allowed.
+Use this agent only with model `gpt-6-sol`. If the runtime exposes reasoning effort, require `high`. Stop when the model is different or cannot be determined. An unavailable effort value is allowed.
 
 Run the bundled helper once through the official execution tool. In an attached PR worktree, omit the target even when the activation names the PR by number:
 

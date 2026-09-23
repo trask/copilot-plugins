@@ -151,7 +151,7 @@ class NativeStackClearanceTest(StackFixture):
                 pipeline_run=self.controller.run_id,
                 pipeline_iteration=request["pass"], pipeline_max_iterations=MODULE.MAX_PASSES,
                 agent_task={
-                    "status": "completed", "model": "gpt-5.6-sol",
+                    "status": "completed", "model": "gpt-6-sol",
                     "github_mutation_policy": "allow", "task": {"id": request["nonce"], "state": "completed"},
                 },
                 clearance_verification={
@@ -304,7 +304,7 @@ class NativeStackClearanceTest(StackFixture):
                 self.stack = copy.deepcopy(original_stack)
                 self.controller.state = copy.deepcopy(state)
                 self.controller.kickoff = copy.deepcopy(config)
-                self.controller.models[MODULE.STAGE_CONFLICT] = "gpt-5.6-sol"
+                self.controller.models[MODULE.STAGE_CONFLICT] = "gpt-6-sol"
                 self.controller.conflict_strategy = "auto"
                 self.controller.github_mutation_policy = "allow"
                 self.controller.effort = "high"

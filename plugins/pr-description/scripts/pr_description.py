@@ -56,7 +56,7 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
+    "aee4e95aa0e228766add1fe2738a778b57ad80a2c5aa57a21ed1245099b78378"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -81,7 +81,7 @@ WORKER_PROMPT_VERSION = 6
 MODEL_ALIASES = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
-    "sol": "gpt-5.6-sol",
+    "sol": "gpt-6-sol",
     "astra": "gpt-6-astra",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")

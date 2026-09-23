@@ -26,7 +26,7 @@ class DescriptionReuseTest(StackFixture):
             "agent_task": {
                 "status": "completed",
                 "task": {"state": "completed", "id": request["nonce"]},
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-sol",
                 "github_mutation_policy": "allow",
             },
             "clearance_verification": {

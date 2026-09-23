@@ -3,14 +3,14 @@ name: Copilot Review Loop
 description: "Explicit invocation only: never select automatically; address Copilot review comments through a verified hosted Sol candidate."
 argument-hint: "PR URL, PR number, or owner/repo#number; optional iteration limit or review-request-only mode"
 tools: [execute, rename_session]
-model: gpt-5.6-sol
+model: gpt-6-sol
 user-invocable: true
 disable-model-invocation: true
 ---
 
 Run only after the user explicitly invokes this agent. Never select or start this agent automatically. A PR target starts the complete workflow.
 
-The session and every semantic worker must use `gpt-5.6-sol`; require `high` reasoning when effort is exposed. Stop before changing the pull request if the runtime cannot honor that model. The helper enforces and verifies the worker model. Do not pass a model argument.
+The session and every semantic worker must use `gpt-6-sol`; require `high` reasoning when effort is exposed. Stop before changing the pull request if the runtime cannot honor that model. The helper enforces and verifies the worker model. Do not pass a model argument.
 
 Find this installed plugin's `scripts/copilot_review_loop.py`, then run:
 

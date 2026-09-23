@@ -54,7 +54,7 @@ class CommonSourceLoadingTest(unittest.TestCase):
             hashlib.sha256(self.source).hexdigest(), single.COMMON_SHA256,
         )
         self.assertEqual(single.COMMON_SHA256, stack.COMMON_SHA256)
-        self.assertEqual("gpt-5.6-sol", single.common.DEFAULT_STAGE_MODEL)
+        self.assertEqual("gpt-6-sol", single.common.DEFAULT_STAGE_MODEL)
         self.assertEqual(str(self.path), single.common.run.__code__.co_filename)
         self.assertFalse(sys.dont_write_bytecode)
         self.assertFalse(self.cache.parent.exists())

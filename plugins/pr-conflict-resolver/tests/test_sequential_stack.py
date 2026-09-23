@@ -676,7 +676,7 @@ class PipelineConflictEntryTest(unittest.TestCase):
                     "iteration_id": "run-1",
                     "iteration_number": 1,
                     "iteration_budget": 3,
-                    "model": "gpt-5.6-sol",
+                    "model": "gpt-6-sol",
                 }
                 result = MODULE.conflict_preflight(Path("repo"), {}, **args)
                 if mergeable == "MERGEABLE":

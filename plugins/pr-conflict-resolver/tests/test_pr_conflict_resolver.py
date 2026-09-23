@@ -919,7 +919,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             "schema": MODULE.CONFLICT_REQUEST_SCHEMA,
             "request_id": "request-1",
             "request_sha256": "1" * 64,
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-sol",
             "policy": MODULE.CONFLICT_POLICY_IDENTITY,
             "repository": "owner/repo",
             "pull_request": {
@@ -1027,7 +1027,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "f0f95255d3c454efafa3b5564f3f82f15d88cf25e0741f45824127804c891109",
+            "70565e5e924d25cfff3b8d9979fa2513afe028d6b5cf9dc7a3d25b6584ced791",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -3121,7 +3121,7 @@ class StrategyChoiceTest(unittest.TestCase):
                 iteration_id="iteration-1",
                 iteration_number=1,
                 iteration_budget=1,
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
             )
 
         self.assertEqual("merge", preflight["strategy"])
@@ -3250,7 +3250,7 @@ class StrategyChoiceTest(unittest.TestCase):
                 iteration_id="iteration-1",
                 iteration_number=1,
                 iteration_budget=1,
-                model="gpt-5.6-sol",
+                model="gpt-6-sol",
             )
 
         members = preflight["request"]["native_stack"]["members"]
@@ -4012,7 +4012,7 @@ class ManagedRequestStrategyTest(unittest.TestCase):
             "schema": CLOUD_MODULE.REQUEST_SCHEMA,
             "request_id": "request-1",
             "request_sha256": "",
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-sol",
             "policy": CLOUD_MODULE.POLICY,
             "repository": "owner/repo",
             "pull_request": {
@@ -4052,7 +4052,7 @@ class ManagedRequestStrategyTest(unittest.TestCase):
         return CLOUD_MODULE.validate_request(
             request,
             expected_strategy="merge",
-            expected_model="gpt-5.6-sol",
+            expected_model="gpt-6-sol",
             expected_pr_url="https://github.com/owner/repo/pull/7",
         )
 
@@ -4116,7 +4116,7 @@ class ManagedRequestStrategyTest(unittest.TestCase):
         validated = CLOUD_MODULE.validate_request(
             request,
             expected_strategy="native-stack",
-            expected_model="gpt-5.6-sol",
+            expected_model="gpt-6-sol",
             expected_pr_url="https://github.com/owner/repo/pull/7",
         )
 
@@ -4334,8 +4334,8 @@ class ManagedTaskPromptTest(unittest.TestCase):
             paths,
             decode_compact_path_evidence(contract["resolution_context_paths"]),
         )
-        self.assertEqual(18340, len(prompt))
-        self.assertEqual(18340, len(prompt.encode("utf-8")))
+        self.assertEqual(18338, len(prompt))
+        self.assertEqual(18338, len(prompt.encode("utf-8")))
         self.assertLessEqual(
             len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS
         )
@@ -4597,7 +4597,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 {
                     "task_id": task_id,
                     "state": "completed",
-                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "model": "sweagent-capi:gpt-6-sol",
                     "base_ref": request["pull_request"]["head_sha"],
                     "head_ref": branch,
                 }
@@ -5213,7 +5213,7 @@ class ManagedTaskWorkingDirectoryTest(unittest.TestCase):
             prompt_file=control_root / "prompt.txt",
             input_result_file=None,
             request=request,
-            model="gpt-5.6-sol",
+            model="gpt-6-sol",
             strategy="merge",
             prior_result=None,
         )

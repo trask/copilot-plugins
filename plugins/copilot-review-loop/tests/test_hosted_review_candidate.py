@@ -164,7 +164,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
             **MODULE.expected_cloud_pull_request(self.preflight),
         )
         options = self.runtime.Options(
-            report=False, model="gpt-5.6-sol", prompt=self.prompt,
+            report=False, model="gpt-6-sol", prompt=self.prompt,
             apply_with_report=True, policy=MODULE.HOSTED_DECISION_POLICY,
             pull_request=self.runtime.PrReference(7, "owner/repo", "owner/repo#7"),
             result_file=self.result_path, prompt_file=self.prompt_path,
@@ -189,7 +189,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
             "sessions": [{
                 "id": "session-fixture", "task_id": "task-fixture",
                 "state": "completed", **timestamps,
-                "model": "sweagent-capi:gpt-5.6-sol", "prompt": submitted,
+                "model": "sweagent-capi:gpt-6-sol", "prompt": submitted,
                 "base_ref": "feature", "head_ref": "generated",
                 "repository": {"id": 1, "full_name": "owner/repo"},
                 "owner": {"login": "owner", "id": 2},
@@ -256,7 +256,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
                 repo_root=self.repo, target={}, preflight=self.preflight,
                 prompt_path=self.prompt_path, result_path=self.result_path,
                 decision_path=self.decision_path, canonical_path=self.canonical_path,
-                run_id="fresh-run", requested_model="gpt-5.6-sol",
+                run_id="fresh-run", requested_model="gpt-6-sol",
                 before_source=self.before_source, before_github=self.github,
                 helper=RUNTIME_PATH, timeout=123,
             )
@@ -279,7 +279,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
             MODULE.apply_verified_import(
                 self.repo,
                 helper=RUNTIME_PATH,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
                 prompt=self.prompt,
                 result_path=self.result_path,
                 result_sha256=MODULE.sha256_file(self.result_path),
@@ -353,7 +353,7 @@ class HostedReviewCandidateTest(unittest.TestCase):
             MODULE.apply_verified_import(
                 self.repo,
                 helper=RUNTIME_PATH,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
                 prompt=self.prompt,
                 result_path=self.result_path,
                 result_sha256=MODULE.sha256_file(self.result_path),

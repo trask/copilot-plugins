@@ -31,7 +31,7 @@ RATE_LIMIT_SAFETY_MARGIN_SECONDS = 1
 MODEL_IDS = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
-    "sol": "gpt-5.6-sol",
+    "sol": "gpt-6-sol",
     "astra": "gpt-6-astra",
 }
 ACTIVE_STATES = {"queued", "in_progress"}

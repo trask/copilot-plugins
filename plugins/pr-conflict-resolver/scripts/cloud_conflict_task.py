@@ -83,7 +83,7 @@ POLICY = {"id": POLICY_ID, "version": POLICY_VERSION, "sha256": POLICY_SHA256}
 MODEL_IDS = {
     "luna": "gpt-5.6-luna",
     "terra": "gpt-5.6-terra",
-    "sol": "gpt-5.6-sol",
+    "sol": "gpt-6-sol",
     "astra": "gpt-6-astra",
 }
 STRATEGIES = {"merge", "rebase", "native-stack"}

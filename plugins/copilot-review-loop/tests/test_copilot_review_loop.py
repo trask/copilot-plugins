@@ -1416,7 +1416,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "mode": "apply_with_report",
             "repository": {"name_with_owner": "owner/repo"},
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
-            "requested_model": "gpt-5.6-sol",
+            "requested_model": "gpt-6-sol",
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
                 "version": 3,
@@ -1550,7 +1550,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         return MODULE.validate_success_result(
             self.result(commits),
             preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
+            requested_model="gpt-6-sol",
         )
 
     def receipt(self):
@@ -1608,7 +1608,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self,
         writer,
         *,
-        requested_model="gpt-5.6-sol",
+        requested_model="gpt-6-sol",
         returncode=0,
         stdout="",
         stderr="",
@@ -1867,14 +1867,14 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_thin_and_version_is_bumped(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("model: gpt-5.6-sol", instructions)
+        self.assertIn("model: gpt-6-sol", instructions)
         self.assertIn("Do not pass a model argument", instructions)
         self.assertIn("Use the verified `session_title`", instructions)
         self.assertNotIn("--execution-handle", instructions)
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.87")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.88")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -3275,7 +3275,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.validate_success_result(
                 bad,
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
             )
         incomplete = self.result()
         incomplete["attestation"]["structural_complete"] = False
@@ -3283,7 +3283,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.validate_success_result(
                 incomplete,
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
             )
         report = json.loads(self.report())
         report["comments"][0]["thread_id"] = "PRRT_stale"
@@ -3837,7 +3837,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     "type": "session.start",
                     "data": {
                         "sessionId": session_id,
-                        "selectedModel": "gpt-5.6-sol",
+                        "selectedModel": "gpt-6-sol",
                         "reasoningEffort": "high",
                     },
                 }
@@ -3955,9 +3955,9 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "session_id": session_id,
             "events_path": str(events_path),
             "events_sha256": MODULE.sha256_file(events_path),
-            "startup_model": "gpt-5.6-sol",
+            "startup_model": "gpt-6-sol",
             "startup_reasoning_effort": "high",
-            "observed_models": ["gpt-5.6-sol"],
+            "observed_models": ["gpt-6-sol"],
             "assistant_message_count": 42,
         }
         return arguments, manifest, attestation

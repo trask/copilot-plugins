@@ -342,7 +342,7 @@ class NativeStackTaskProgressDecisionTest(unittest.TestCase):
         result = CLOUD.Result(
             schema=CLOUD.RESULT_SCHEMA,
             policy=CLOUD.POLICY,
-            model="gpt-5.6-sol",
+            model="gpt-6-sol",
             repository="owner/repo",
             strategy="native-stack",
             request_id="request-1",
@@ -379,7 +379,7 @@ class ReplayAttributionDecisionTest(unittest.TestCase):
     def setUp(self):
         self.base = "a" * 40
         self.request = existing.ManagedTaskPromptTest().minimal_request()
-        self.request["model"] = "gpt-5.6-sol"
+        self.request["model"] = "gpt-6-sol"
         self.artifact = {
             "branch": "copilot/generated-task",
             "attribution": {
@@ -406,7 +406,7 @@ class ReplayAttributionDecisionTest(unittest.TestCase):
                 {
                     "task_id": "task-1",
                     "state": "completed",
-                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "model": "sweagent-capi:gpt-6-sol",
                     "base_ref": self.base,
                     "head_ref": "copilot/generated-task",
                 }

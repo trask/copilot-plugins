@@ -165,7 +165,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
+    "aee4e95aa0e228766add1fe2738a778b57ad80a2c5aa57a21ed1245099b78378"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -183,7 +183,7 @@ CANDIDATE_AGENT_TASK_RESULT_SCHEMA = {
 LOCAL_DECISION_POLICY = "marketplace-local-review-decision-worker@3"
 LEGACY_LOCAL_DECISION_POLICY_V2 = "marketplace-local-review-decision-worker@2"
 LEGACY_LOCAL_DECISION_POLICY = "marketplace-local-review-decision-worker@1"
-LOCAL_DECISION_MODEL = "gpt-5.6-sol"
+LOCAL_DECISION_MODEL = "gpt-6-sol"
 LOCAL_DECISION_REASONING_EFFORT = "high"
 LOCAL_DECISION_AGENT_ID = "copilot-cli-default"
 LOCAL_DECISION_TIMEOUT_SECONDS = 540.0
@@ -282,7 +282,7 @@ WORKER_PROMPT_VERSION = 11
 MAX_PROMPT_HISTORY_ENTRIES = 20
 MAX_PROMPT_HISTORY_BYTES = 12_000
 MODEL_ALIASES = {
-    "sol": "gpt-5.6-sol",
+    "sol": "gpt-6-sol",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")

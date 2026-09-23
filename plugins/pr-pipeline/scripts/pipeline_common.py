@@ -25,16 +25,16 @@ import time
 from typing import Any, Callable
 
 
-DEFAULT_STAGE_MODEL = "gpt-5.6-sol"
+DEFAULT_STAGE_MODEL = "gpt-6-sol"
 DEFAULT_EFFORT = "high"
 COORDINATOR_MODEL_ARGUMENTS = {
-    "gpt-5.6-sol": "sol",
+    "gpt-6-sol": "sol",
     "gpt-5.6-luna": "luna",
     "gpt-5.6-terra": "terra",
     "gpt-6-astra": "astra",
 }
 CONFLICT_STRATEGIES = ("auto", "merge", "rebase")
-SELF_REVIEW_MODEL = "gpt-5.6-sol"
+SELF_REVIEW_MODEL = "gpt-6-sol"
 SELF_REVIEW_EFFORT = "high"
 SOURCE_ONLY_POLICY_SKIP_RESULT = "source_only_review_not_applicable"
 SOURCE_ONLY_POLICY_SKIP_REASON = "review_request_forbidden"

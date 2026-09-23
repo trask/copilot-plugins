@@ -3,14 +3,14 @@ name: Self Review Loop
 description: "Explicit invocation only: never select automatically; review and fix one pull request through a managed GitHub Agent Task."
 argument-hint: "PR URL, PR number, or owner/repo#number; optional worker model and iteration limit"
 tools: [execute, rename_session]
-model: gpt-5.6-sol
+model: gpt-6-sol
 user-invocable: true
 disable-model-invocation: true
 ---
 
 Run only after the user explicitly invokes this agent. Never select or start this agent automatically. A PR target starts the complete workflow.
 
-The primary session must use `gpt-5.6-sol` with `high` reasoning when effort is exposed. Stop before resolving the pull request if the runtime cannot honor that model. The hosted worker defaults to Sol; pass `--model luna|terra|sol|astra` only when the user selected one. An iteration limit and `--github-mutation-policy source-only` are semantic choices and may also be passed.
+The primary session must use `gpt-6-sol` with `high` reasoning when effort is exposed. Stop before resolving the pull request if the runtime cannot honor that model. The hosted worker defaults to Sol; pass `--model luna|terra|sol|astra` only when the user selected one. An iteration limit and `--github-mutation-policy source-only` are semantic choices and may also be passed.
 
 Find this installed plugin's `scripts/self_review_loop.py`, then run:
 

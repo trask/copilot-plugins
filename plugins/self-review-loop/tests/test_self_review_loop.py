@@ -592,7 +592,7 @@ class LegacyAgentInstructions:
 
     def test_requires_the_exact_primary_route_and_independent_evaluator(self):
         self.assertIn("## Model Gate", self.instructions)
-        self.assertIn("model is exactly `gpt-5.6-sol`", self.instructions)
+        self.assertIn("model is exactly `gpt-6-sol`", self.instructions)
         self.assertIn(
             "When the runtime exposes the primary session's reasoning effort, "
             "require it to be exactly `high`",
@@ -1507,7 +1507,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "mode": "apply_with_report",
             "repository": {"name_with_owner": "owner/repo"},
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
-            "requested_model": "gpt-5.6-sol",
+            "requested_model": "gpt-6-sol",
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
                 "version": 3,
@@ -1598,7 +1598,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "mode": "code_candidate",
             "repository": {"name_with_owner": "owner/repo"},
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
-            "requested_model": "gpt-5.6-sol",
+            "requested_model": "gpt-6-sol",
             "policy": {
                 "id": "marketplace-agent-code-candidate-worker",
                 "version": 1,
@@ -1636,7 +1636,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             },
             "completion": {
                 "request": {
-                    "requested_model": "gpt-5.6-sol",
+                    "requested_model": "gpt-6-sol",
                     "prompt_sha256": "c" * 64,
                 },
                 "task": {
@@ -1650,7 +1650,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "session": {
                     "id": "session-1",
                     "state": "completed",
-                    "actual_model": "gpt-5.6-sol",
+                    "actual_model": "gpt-6-sol",
                     "created_at": "2026-01-01T00:00:00Z",
                     "updated_at": "2026-01-01T00:01:00Z",
                     "completed_at": "2026-01-01T00:01:00Z",
@@ -1835,7 +1835,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         candidate_error = MODULE.validate_candidate_task_creation_failure_result(
             candidate,
             preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
+            requested_model="gpt-6-sol",
         )
         self.assertEqual("api_failure", candidate_error["code"])
         malformed_candidate = copy.deepcopy(candidate)
@@ -1847,7 +1847,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.validate_candidate_task_creation_failure_result(
                 malformed_candidate,
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
             )
 
 
@@ -1959,7 +1959,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         return MODULE.validate_success_result(
             self.result(commits=commits),
             preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
+            requested_model="gpt-6-sol",
         )
 
     def receipt(self):
@@ -2081,7 +2081,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_agent_definition_is_a_thin_managed_coordinator(self):
         instructions = AGENT.read_text(encoding="utf-8")
         self.assertIn("agent-task <target>", instructions)
-        self.assertIn("model: gpt-5.6-sol", instructions)
+        self.assertIn("model: gpt-6-sol", instructions)
         self.assertIn("execution-status` takes no arguments", instructions)
         self.assertIn("Use the verified `session_title`", instructions)
         self.assertNotIn("--execution-handle", instructions)
@@ -2089,7 +2089,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.63")
+        self.assertEqual(plugin["version"], "1.3.64")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2270,7 +2270,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 "agent_task": {
                     "status": "failed",
                     "run_id": "run-1",
-                    "model": "gpt-5.6-sol",
+                    "model": "gpt-6-sol",
                     "policy": "marketplace-agent-apply-report-worker@5",
                     "allowed_iterations": 5,
                     "preflight": self.preflight,
@@ -3302,7 +3302,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 MODULE.apply_verified_candidate_import(
                     self.repo_root,
                     helper=runtime_path,
-                    requested_model="gpt-5.6-sol",
+                    requested_model="gpt-6-sol",
                     prompt="frozen prompt",
                     result_path=result_path,
                     result_sha256=MODULE.sha256_file(result_path),
@@ -5333,7 +5333,7 @@ class CandidateContractTest(unittest.TestCase):
         generated_head = self.output if artifact else code_tip
         completion = {
             "request": {
-                "requested_model": "gpt-5.6-sol",
+                "requested_model": "gpt-6-sol",
                 "prompt_sha256": "b" * 64,
             },
             "task": {
@@ -5347,7 +5347,7 @@ class CandidateContractTest(unittest.TestCase):
             "session": {
                 "id": "session-1",
                 "state": "completed",
-                "actual_model": "gpt-5.6-sol",
+                "actual_model": "gpt-6-sol",
                 "created_at": "2026-01-01T00:00:00Z",
                 "updated_at": "2026-01-01T00:01:00Z",
                 "completed_at": "2026-01-01T00:01:00Z",
@@ -5366,7 +5366,7 @@ class CandidateContractTest(unittest.TestCase):
             "mode": "code_candidate",
             "repository": {"name_with_owner": "owner/repo"},
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
-            "requested_model": "gpt-5.6-sol",
+            "requested_model": "gpt-6-sol",
             "policy": {
                 "id": "marketplace-agent-code-candidate-worker",
                 "version": 1,
@@ -5436,7 +5436,7 @@ class CandidateContractTest(unittest.TestCase):
                 helper=Path("cloud_task.py"),
                 repo_root=Path("repo"),
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
                 prompt="frozen prompt",
             )
         runtime.verify_current_candidate.assert_called_once()
@@ -5507,7 +5507,7 @@ class CandidateContractTest(unittest.TestCase):
                 helper=Path("cloud_task.py"),
                 repo_root=Path("repo"),
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
                 prompt="frozen prompt",
             )
 
@@ -5555,7 +5555,7 @@ class CandidateContractTest(unittest.TestCase):
                     MODULE.apply_verified_candidate_import(
                         Path("repo"),
                         helper=Path("cloud_task.py"),
-                        requested_model="gpt-5.6-sol",
+                        requested_model="gpt-6-sol",
                         prompt="frozen prompt",
                         result_path=result_path,
                         result_sha256=digest,

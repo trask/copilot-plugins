@@ -513,7 +513,7 @@ class AgentCommandAdmissionTest(unittest.TestCase):
                     "--plugin-dir",
                     str(probe_plugin),
                     "--model",
-                    "gpt-5.6-sol",
+                    "gpt-6-sol",
                     "--reasoning-effort",
                     "high",
                     "--no-ask-user",
@@ -747,6 +747,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertFalse(state_path.exists())
             self.assertEqual(artifact_path, created)
             _, loaded = MODULE.load_sealed_ci_fix_artifact(artifact_path)
+            self.assertEqual("gpt-6-sol", loaded["request"]["model"])
             self.assertNotIn("package_manifest", loaded)
             self.assertNotIn("run_command_argv", loaded)
             self.assertNotIn("execution_handle", loaded["request"])
@@ -850,6 +851,29 @@ class SealedCiFixCommandTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 MODULE.WorkflowError,
                 "invocation artifact is malformed",
+            ):
+                MODULE.load_sealed_ci_fix_artifact(artifact_path)
+
+    def test_sealed_invocation_rejects_the_old_sol_model(self):
+        with tempfile.TemporaryDirectory(prefix="sealed model ") as directory:
+            _, _, artifact_path, _, _, _ = self.fixture(Path(directory))
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            artifact["request"]["model"] = "gpt-5.6-sol"
+            artifact["seal"] = MODULE.sealed_ci_fix_invocation_seal(artifact)
+            artifact_path.write_text(
+                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            artifact_path.with_name(f"{artifact_path.name}.sha256").write_text(
+                f"{MODULE.sha256_file(artifact_path)}\n",
+                encoding="ascii",
+                newline="\n",
+            )
+
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError,
+                "request identity is malformed",
             ):
                 MODULE.load_sealed_ci_fix_artifact(artifact_path)
 
@@ -2155,7 +2179,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                     "state": "in_progress",
                     "created_at": "2026-01-01T00:00:01Z",
                     "updated_at": "2026-01-01T00:00:02Z",
-                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "model": "sweagent-capi:gpt-6-sol",
                     "base_ref": "feature",
                     "head_ref": "copilot/fix",
                     "prompt": self.live_prompt,
@@ -2168,7 +2192,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
             self.task if task is None else task,
             consumer_prompt=self.consumer_prompt,
             preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
+            requested_model="gpt-6-sol",
             started_at="2026-01-01T00:00:00Z",
         )
 
@@ -2238,7 +2262,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                 baseline_task_ids={"old"},
                 consumer_prompt=self.consumer_prompt,
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
                 started_at="2026-01-01T00:00:00Z",
             )
 
@@ -2297,7 +2321,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                     run_id="run-1",
                     preflight=self.preflight,
                     consumer_prompt=self.consumer_prompt,
-                    requested_model="gpt-5.6-sol",
+                    requested_model="gpt-6-sol",
                     timeout=1,
                     discovery_interval=1,
                 )
@@ -2370,7 +2394,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                     run_id="run-1",
                     preflight=self.preflight,
                     consumer_prompt=self.consumer_prompt,
-                    requested_model="gpt-5.6-sol",
+                    requested_model="gpt-6-sol",
                     timeout=7200,
                     discovery_interval=5,
                 )
@@ -2582,7 +2606,7 @@ class HostedDispatchOwnershipTest(unittest.TestCase):
                     "id": expectations["orphan_session_id"],
                     "task_id": expectations["orphan_task_id"],
                     "state": "completed",
-                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "model": "sweagent-capi:gpt-6-sol",
                     "base_ref": retained_head,
                     "head_ref": expectations["orphan_branch"],
                     "created_at": "2026-09-17T17:19:24Z",
@@ -3089,7 +3113,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "mode": "apply_with_report",
             "repository": {"name_with_owner": "owner/repo"},
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
-            "requested_model": "gpt-5.6-sol",
+            "requested_model": "gpt-6-sol",
             "policy": {
                 "id": "marketplace-agent-apply-report-worker",
                 "version": 5,
@@ -3150,7 +3174,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             parent = commit
         completion = {
             "request": {
-                "requested_model": "gpt-5.6-sol",
+                "requested_model": "gpt-6-sol",
                 "prompt_sha256": "c" * 64,
             },
             "task": {
@@ -3164,7 +3188,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "session": {
                 "id": "session-1",
                 "state": "completed",
-                "actual_model": "gpt-5.6-sol",
+                "actual_model": "gpt-6-sol",
                 "created_at": "2026-01-01T00:00:00Z",
                 "updated_at": "2026-01-01T00:01:00Z",
                 "completed_at": "2026-01-01T00:01:00Z",
@@ -3186,7 +3210,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "mode": "code_candidate",
             "repository": {"name_with_owner": "owner/repo"},
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
-            "requested_model": "gpt-5.6-sol",
+            "requested_model": "gpt-6-sol",
             "policy": {
                 "id": "marketplace-agent-code-candidate-worker",
                 "version": 1,
@@ -3322,7 +3346,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         candidate_error = MODULE.validate_candidate_task_creation_failure_result(
             failure,
             preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
+            requested_model="gpt-6-sol",
         )
         self.assertEqual("api_failure", candidate_error["code"])
         malformed = copy.deepcopy(failure)
@@ -3334,12 +3358,14 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             MODULE.validate_candidate_task_creation_failure_result(
                 malformed,
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
             )
 
     def test_legacy_taskless_failure_remains_parseable_for_audit(self):
+        failure = self.taskless_failure()
+        failure["requested_model"] = "gpt-5.6-sol"
         error = MODULE.validate_task_creation_failure_result(
-            self.taskless_failure(),
+            failure,
             preflight=self.preflight,
             requested_model="gpt-5.6-sol",
         )
@@ -3350,7 +3376,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         return MODULE.validate_success_result(
             self.result(commits, **kwargs),
             preflight=self.preflight,
-            requested_model="gpt-5.6-sol",
+            requested_model="gpt-6-sol",
         )
 
     def report(
@@ -3463,7 +3489,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.74", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.75", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -5877,7 +5903,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             MODULE.validate_success_result(
                 wrong,
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
             )
         report = json.loads(self.report())
         report["pull_request"]["check_snapshot_sha256"] = "0" * 64
@@ -6167,7 +6193,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             MODULE.validate_success_result(
                 incomplete,
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
             )
 
     def test_rejects_credentials_in_result_report_and_logs(self):
@@ -8207,7 +8233,7 @@ class HostedCiEvidencePromptTest(unittest.TestCase):
             self.preflight,
             iteration_allowance=1,
             prior_history=[],
-            requested_model="gpt-5.6-sol",
+            requested_model="gpt-6-sol",
             ci_evidence=self.summary,
         )
 
@@ -14504,7 +14530,7 @@ class CandidateContractTest(unittest.TestCase):
             "mode": "code_candidate",
             "repository": {"name_with_owner": "owner/repo"},
             "pull_request": MODULE.expected_cloud_pull_request(self.preflight),
-            "requested_model": "gpt-5.6-sol",
+            "requested_model": "gpt-6-sol",
             "policy": {
                 "id": "marketplace-agent-code-candidate-worker",
                 "version": 1,
@@ -14546,7 +14572,7 @@ class CandidateContractTest(unittest.TestCase):
             },
             "completion": {
                 "request": {
-                    "requested_model": "gpt-5.6-sol",
+                    "requested_model": "gpt-6-sol",
                     "prompt_sha256": "b" * 64,
                 },
                 "task": {
@@ -14560,7 +14586,7 @@ class CandidateContractTest(unittest.TestCase):
                 "session": {
                     "id": "session-1",
                     "state": "completed",
-                    "actual_model": "gpt-5.6-sol",
+                    "actual_model": "gpt-6-sol",
                     "created_at": "2026-01-01T00:00:00Z",
                     "updated_at": "2026-01-01T00:01:00Z",
                     "completed_at": "2026-01-01T00:01:00Z",
@@ -14602,7 +14628,7 @@ class CandidateContractTest(unittest.TestCase):
                 helper=Path("cloud_task.py"),
                 repo_root=Path("repo"),
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
                 prompt="frozen prompt",
             )
         runtime.verify_current_candidate.assert_called_once()
@@ -14660,7 +14686,7 @@ class CandidateContractTest(unittest.TestCase):
                 helper=Path("cloud_task.py"),
                 repo_root=Path("repo"),
                 preflight=self.preflight,
-                requested_model="gpt-5.6-sol",
+                requested_model="gpt-6-sol",
                 prompt="frozen prompt",
             )
 
@@ -14708,7 +14734,7 @@ class CandidateContractTest(unittest.TestCase):
                 MODULE.apply_verified_candidate_import(
                     Path("repo"),
                     helper=Path("cloud_task.py"),
-                    requested_model="gpt-5.6-sol",
+                    requested_model="gpt-6-sol",
                     prompt="frozen prompt",
                     result_path=result_path,
                     result_sha256=digest,

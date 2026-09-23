@@ -9,7 +9,7 @@ disable-model-invocation: true
 
 Run only when the user explicitly selects PR Pipeline or invokes `/pr-pipeline`. Never select or start this agent automatically.
 
-Use this agent only with model `gpt-5.6-sol`. If the runtime exposes reasoning effort, require `high`. Stop when the model is different or cannot be determined. An unavailable effort value is allowed.
+Use this agent only with model `gpt-6-sol`. If the runtime exposes reasoning effort, require `high`. Stop when the model is different or cannot be determined. An unavailable effort value is allowed.
 
 Resolve the installed helper through the supported plugin inventory before each helper call. Start one run, then advance it through bounded foreground calls until it returns a final result. Each call includes the inventory check and launch.
 
