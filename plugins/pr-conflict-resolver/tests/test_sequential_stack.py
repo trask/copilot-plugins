@@ -91,33 +91,28 @@ class SequentialStackTest(unittest.TestCase):
         return process.stdout.decode("utf-8").strip()
 
     @classmethod
-    def commit_at(cls, directory, root, parent, subject, path, content):
-        index = directory / "temporary-index"
-        index.unlink(missing_ok=True)
-        environment = dict(os.environ)
-        environment["GIT_INDEX_FILE"] = str(index)
-        cls.git_at(root, "read-tree", parent if parent else "--empty", env=environment)
-        blob = cls.git_at(root, "hash-object", "-w", "--stdin", input=content)
-        cls.git_at(
-            root,
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            f"100644,{blob},{path}",
-            env=environment,
-        )
-        tree = cls.git_at(root, "write-tree", env=environment)
-        return cls.git_at(
-            root,
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit-tree",
-            tree,
-            *(["-p", parent] if parent else []),
-            input=subject + "\n",
-        )
+    def import_commits(cls, root, commits, ref="refs/test-fixtures/history"):
+        stream = []
+        for number, (name, parent, subject, path, content) in enumerate(commits, 1):
+            message = (subject + "\n").encode("utf-8")
+            data = content.encode("utf-8")
+            stream.extend([
+                f"commit {ref}\n".encode(),
+                f"mark :{number}\n".encode(),
+                b"author Test <test@example.com> 1700000000 +0000\n",
+                b"committer Test <test@example.com> 1700000000 +0000\n",
+                f"data {len(message)}\n".encode(), message,
+            ])
+            if parent is not None:
+                source = f":{parent}" if isinstance(parent, int) else parent
+                stream.append(f"from {source}\n".encode())
+            stream.extend([
+                f"M 100644 inline {path}\n".encode(),
+                f"data {len(data)}\n".encode(), data, b"\n",
+            ])
+        stream.extend(f"get-mark :{number}\n".encode() for number in range(1, len(commits) + 1))
+        shas = cls.git_at(root, "fast-import", "--quiet", input=b"".join(stream)).splitlines()
+        return dict(zip((name for name, *_ in commits), shas, strict=True))
 
     @classmethod
     def setUpClass(cls):
@@ -129,81 +124,20 @@ class SequentialStackTest(unittest.TestCase):
         cls.git_at(cls.template_root, "init", "--quiet")
         cls.git_at(cls.template_root, "init", "--bare", "--quiet", str(cls.template_remote))
         cls.git_at(cls.template_root, "remote", "add", "origin", str(cls.template_remote))
-        cls.seed = cls.commit_at(
-            cls.template_directory, cls.template_root, None, "Seed", "app.py", "seed\n"
-        )
-        cls.lower1 = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.seed,
-            cls.lower_message,
-            "app.py",
-            "seed\none\n",
-        )
-        cls.lower = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.lower1,
-            "Lower two",
-            "app.py",
-            "seed\none\ntwo\n",
-        )
-        cls.upper = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.lower,
-            "Upper",
-            "upper.py",
-            "upper\n",
-        )
-        cls.trunk = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.seed,
-            "Trunk",
-            "app.py",
-            "seed\ntrunk\n",
-        )
-        cls.new_lower1 = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.trunk,
-            cls.lower_message,
-            "app.py",
-            "seed\ntrunk\none\n",
-        )
-        cls.new_lower2 = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.new_lower1,
-            "Lower two",
-            "app.py",
-            "seed\ntrunk\none\ntwo\n",
-        )
-        cls.new_lower = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.new_lower2,
-            "Focused fix",
-            "app.py",
-            "seed\ntrunk\none\ntwo\nfix\n",
-        )
-        cls.new_upper = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.new_lower,
-            "Upper",
-            "upper.py",
-            "upper\n",
-        )
-        cls.report = cls.commit_at(
-            cls.template_directory,
-            cls.template_root,
-            cls.new_upper,
-            "Optional notes",
-            CLOUD.OUTPUT_REPORT_PATH,
-            "anything\n",
-        )
+        commits = [
+            ("seed", None, "Seed", "app.py", "seed\n"),
+            ("lower1", 1, cls.lower_message, "app.py", "seed\none\n"),
+            ("lower", 2, "Lower two", "app.py", "seed\none\ntwo\n"),
+            ("upper", 3, "Upper", "upper.py", "upper\n"),
+            ("trunk", 1, "Trunk", "app.py", "seed\ntrunk\n"),
+            ("new_lower1", 5, cls.lower_message, "app.py", "seed\ntrunk\none\n"),
+            ("new_lower2", 6, "Lower two", "app.py", "seed\ntrunk\none\ntwo\n"),
+            ("new_lower", 7, "Focused fix", "app.py", "seed\ntrunk\none\ntwo\nfix\n"),
+            ("new_upper", 8, "Upper", "upper.py", "upper\n"),
+            ("report", 9, "Optional notes", CLOUD.OUTPUT_REPORT_PATH, "anything\n"),
+        ]
+        for name, sha in cls.import_commits(cls.template_root, commits).items():
+            setattr(cls, name, sha)
         cls.git_at(cls.template_root, "checkout", "--quiet", "--detach", cls.lower)
         cls.branches = {
             "copilot/lower-task": cls.new_lower,
@@ -331,19 +265,10 @@ class SequentialStackTest(unittest.TestCase):
         return self.git_at(self.root, *args, input=input, env=env)
 
     def commit(self, parent, subject, path, content):
-        index = self.directory / "temporary-index"
-        index.unlink(missing_ok=True)
-        environment = dict(os.environ)
-        environment["GIT_INDEX_FILE"] = str(index)
-        self.run_git("read-tree", parent if parent else "--empty", env=environment)
-        blob = self.run_git("hash-object", "-w", "--stdin", input=content)
-        self.run_git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=environment)
-        tree = self.run_git("write-tree", env=environment)
-        return self.run_git(
-            "-c", "user.name=Test", "-c", "user.email=test@example.com",
-            "commit-tree", tree, *(["-p", parent] if parent else []),
-            input=subject + "\n",
-        )
+        return self.import_commits(
+            self.root, [("raced", parent, subject, path, content)],
+            ref="refs/test-fixtures/raced",
+        )["raced"]
 
     def start(self, _runner, _snapshot, options):
         self.launched.append(options)
