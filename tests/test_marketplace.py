@@ -30,14 +30,14 @@ CI_FIX_RELEASE_BOUNDARY_HELPER_SHA256 = (
 RUNTIME_PLUGIN = "agent-tasks-runtime"
 RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
 CONFLICT_HELPER_SHA256 = (
-    "30bf224d3de4279eabc3571e8683fde65e6a705325d085a67d38bffb969394cf"
+    "f8d9ff36412879867bbd1ad0c36d437824564fd088c7ba8871af57bf100b7464"
 )
 EXPECTED_PACKAGE_VERSIONS = {
     "agent-tasks-runtime": "1.0.36",
     "ci-fix-loop": "1.6.80",
     "copilot-review-loop": "1.1.93",
     "historical-pr-audit": "1.1.40",
-    "pr-conflict-resolver": "1.1.62",
+    "pr-conflict-resolver": "1.1.63",
     "pr-description": "1.0.90",
     "pr-pipeline": "1.5.62",
     "pr-reviewer": "1.8.30",

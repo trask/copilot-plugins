@@ -1,4 +1,3 @@
-import base64
 import copy
 from contextlib import nullcontext
 import hashlib
@@ -13,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-import zlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -38,52 +36,6 @@ assert CLOUD_SPEC is not None and CLOUD_SPEC.loader is not None
 CLOUD_MODULE = importlib.util.module_from_spec(CLOUD_SPEC)
 sys.modules[CLOUD_SPEC.name] = CLOUD_MODULE
 CLOUD_SPEC.loader.exec_module(CLOUD_MODULE)
-
-
-def decode_compact_path_evidence(evidence):
-    if evidence.get("representation") == "zlib-json-base64-v1":
-        try:
-            source = zlib.decompress(
-                base64.b64decode(evidence["data"], validate=True)
-            )
-            paths = json.loads(source.decode("utf-8"))
-        except (KeyError, ValueError, zlib.error, UnicodeError) as error:
-            raise ValueError("invalid compressed path evidence") from error
-        if (
-            len(source) != evidence.get("uncompressed_utf8_bytes")
-            or not isinstance(paths, list)
-            or not all(isinstance(path, str) for path in paths)
-            or CLOUD_MODULE.canonical_json(paths) != source
-            or len(paths) != evidence.get("count")
-            or hashlib.sha256(source).hexdigest() != evidence.get("sha256")
-        ):
-            raise ValueError("compressed path evidence does not match")
-        return paths
-    if evidence.get("representation") != "ordered-prefix-delta-v1":
-        raise ValueError("unsupported path evidence representation")
-    entries = evidence.get("entries")
-    if not isinstance(entries, list):
-        raise ValueError("path evidence entries are missing")
-    paths = []
-    previous = ""
-    for entry in entries:
-        if (
-            not isinstance(entry, list)
-            or len(entry) != 2
-            or isinstance(entry[0], bool)
-            or not isinstance(entry[0], int)
-            or entry[0] < 0
-            or entry[0] > len(previous)
-            or not isinstance(entry[1], str)
-        ):
-            raise ValueError("path evidence entry is invalid")
-        previous = previous[: entry[0]] + entry[1]
-        paths.append(previous)
-    if len(paths) != evidence.get("count"):
-        raise ValueError("path evidence count does not match")
-    if CLOUD_MODULE.value_digest(paths) != evidence.get("sha256"):
-        raise ValueError("path evidence digest does not match")
-    return paths
 
 
 class BaseDriftPublicationTest(unittest.TestCase):
@@ -960,7 +912,6 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             },
             "merge_base": "a" * 40,
             "strategy": strategy,
-            "resolution_context_paths": ["app.py"],
             "iteration": {"id": "iteration-1", "number": 1, "budget": 3},
             "guards": {
                 "merge_methods": {
@@ -1053,18 +1004,18 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "30bf224d3de4279eabc3571e8683fde65e6a705325d085a67d38bffb969394cf",
+            "f8d9ff36412879867bbd1ad0c36d437824564fd088c7ba8871af57bf100b7464",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "3e7a64d521bc62610f143aefaa74ff66817e5997f0f14e974ee8b03531e29964",
+            "b5b51023e8c9ff418ec7b2920121857b268cfd944f15a96885d16b8f9694c0b9",
         )
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
             hashlib.sha256(CLOUD_SCRIPT.read_bytes()).hexdigest(),
         )
         self.assertEqual(MODULE.CONFLICT_POLICY_IDENTITY, CLOUD_MODULE.POLICY)
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@11")
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@12")
         self.assertEqual(MODULE.CONFLICT_RESULT_SCHEMA, CLOUD_MODULE.RESULT_SCHEMA)
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
@@ -2125,7 +2076,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             command,
         )
 
-    def test_merge_range_rejects_changes_outside_the_closed_request(self):
+    def test_merge_range_rejects_reserved_output(self):
         with (
             mock.patch.object(
                 MODULE,
@@ -2135,17 +2086,16 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "conflict_diff_paths",
-                return_value=["unrelated.py"],
+                return_value=[CLOUD_MODULE.OUTPUT_REPORT_PATH],
             ),
         ):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "undeclared paths"):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "reserved path"):
                 MODULE.verify_merge_range(
                     Path("repo"),
                     "b" * 40,
                     "a" * 40,
                     "c" * 40,
                     ["c" * 40],
-                    {"app.py"},
                 )
 
     def test_rebase_publication_uses_the_exact_lease(self):
@@ -3966,7 +3916,6 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
                 MODULE.commit_identity(self.repo, commit, linear=True)
                 for commit in commits
             ],
-            {"base.txt", "after.txt"},
             sync_merges=sync_merges,
             normalization_merges=normalization_merges,
         )
@@ -4053,7 +4002,6 @@ class ManagedRequestStrategyTest(unittest.TestCase):
             },
             "merge_base": "a" * 40,
             "strategy": "merge",
-            "resolution_context_paths": ["app.py"],
             "iteration": {"id": "iteration-1", "number": 1, "budget": 1},
             "guards": {
                 "merge_methods": methods,
@@ -4094,6 +4042,26 @@ class ManagedRequestStrategyTest(unittest.TestCase):
         self.assertTrue(CLOUD_MODULE.strategy_can_land("merge", methods))
         self.assertTrue(CLOUD_MODULE.strategy_can_land("rebase", methods))
         self.assertTrue(CLOUD_MODULE.strategy_can_land("native-stack", methods))
+
+    def test_previous_request_schema_and_path_field_are_rejected(self):
+        methods = {
+            "merge_commit": True,
+            "rebase_merge": True,
+            "squash_merge": True,
+        }
+        previous = self.request(methods)
+        previous["schema"] = {**previous["schema"], "version": 3}
+        previous["request_sha256"] = CLOUD_MODULE.request_digest(previous)
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError, "unsupported conflict request schema"
+        ):
+            self.validate(previous)
+
+        expanded = self.request(methods)
+        expanded["resolution_context_paths"] = ["app.py"]
+        expanded["request_sha256"] = CLOUD_MODULE.request_digest(expanded)
+        with self.assertRaises(CLOUD_MODULE.ConflictError):
+            self.validate(expanded)
 
     def test_native_stack_request_binds_current_observed_and_history_boundary(self):
         request = self.request(
@@ -4207,93 +4175,6 @@ class ManagedTaskPromptTest(unittest.TestCase):
         }
 
 
-    def test_large_path_corpus_is_submitted_without_losing_scope(self):
-        request = self.request()
-        request["resolution_context_paths"] = [
-            f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
-            for number in range(2291)
-        ]
-        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-        options = self.options(request)
-        self.assertGreater(
-            len(CLOUD_MODULE.policy_prompt(options)),
-            CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS,
-        )
-        prompt = CLOUD_MODULE.validated_task_prompt(options)
-        self.assertLessEqual(
-            len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
-        )
-        contract = json.loads(next(
-            line.split(": ", 1)[1] for line in prompt.splitlines()
-            if line.startswith("Compact immutable task contract")
-        ))
-        evidence = contract["resolution_context_paths"]
-        self.assertEqual("zlib-json-base64-v1", evidence["representation"])
-        self.assertEqual(
-            request["resolution_context_paths"], decode_compact_path_evidence(evidence)
-        )
-        self.assertEqual(2291, evidence["count"])
-        self.assertEqual(
-            CLOUD_MODULE.value_digest(request["resolution_context_paths"]),
-            evidence["sha256"],
-        )
-
-    def test_oversized_native_member_scope_fits_both_submission_limits(self):
-        request = self.request()
-        paths = [
-            f"instrumentation/library-{number:04d}/src/main/java/io/opentelemetry/"
-            f"instrumentation/example/module{number:04d}/Example{number:04d}.java"
-            for number in range(574)
-        ]
-        request.update(
-            strategy="rebase",
-            resolution_context_paths=paths,
-            head_commits=[self.commit(number, paths[number]) for number in range(12)],
-        )
-        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-        options = self.options(request)
-        self.assertGreater(
-            len(CLOUD_MODULE.policy_prompt(options).encode("utf-8")),
-            CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES,
-        )
-        snapshot = SimpleNamespace(
-            control_root=Path("control"), repository=request["repository"]
-        )
-        with mock.patch.object(
-            CLOUD_MODULE, "api_json", return_value={"id": "task-1", "state": "queued"}
-        ) as api:
-            CLOUD_MODULE.start_task(mock.sentinel.runner, snapshot, options)
-        prompt = api.call_args.args[4]["prompt"]
-        contract = json.loads(next(
-            line.split(": ", 1)[1] for line in prompt.splitlines()
-            if line.startswith("Compact immutable task contract")
-        ))
-        self.assertIn("base64.b64decode(data, validate=True)", prompt)
-        self.assertEqual(
-            paths, decode_compact_path_evidence(contract["resolution_context_paths"])
-        )
-        self.assertEqual(request["request_sha256"], contract["request_sha256"])
-        self.assertLessEqual(len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS)
-        self.assertLessEqual(
-            len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
-        )
-
-    def test_incompressible_path_scope_still_fails_before_submission(self):
-        request = self.request()
-        request["resolution_context_paths"] = [
-            f"src/{hashlib.sha256(str(number).encode()).hexdigest()}.py"
-            for number in range(1000)
-        ]
-        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-        with mock.patch.object(CLOUD_MODULE, "api_json") as api, self.assertRaises(
-            CLOUD_MODULE.ConflictError
-        ) as failure:
-            CLOUD_MODULE.start_task(
-                mock.sentinel.runner, mock.sentinel.snapshot, self.options(request)
-            )
-        self.assertEqual("prompt_too_large", failure.exception.code)
-        api.assert_not_called()
-
     @staticmethod
     def native_scope_paths():
         return json.loads(
@@ -4302,129 +4183,36 @@ class ManagedTaskPromptTest(unittest.TestCase):
             )
         )
 
-    @staticmethod
-    def real_native_scope_paths():
-        return json.loads(
-            (Path(__file__).parent / "fixtures" / "native-scope-152.json").read_text(
-                encoding="utf-8"
-            )
-        )
-
-    def test_actual_66_path_scope_is_delivered_exactly_in_hosted_payload(self):
-        self.assertIn(
-            "not filename permissions",
-            MODULE.build_conflict_prompt({"request": self.request()}),
-        )
+    def test_source_paths_stay_in_git_evidence_not_task_contract(self):
         paths = self.native_scope_paths()
         self.assertEqual(
             "6d35c77707906847ff3ab01d755889c040883c7c81ffd170ea2f394086770432",
             CLOUD_MODULE.value_digest(paths),
         )
-        for policy in (CLOUD_MODULE.POLICY,):
-            with self.subTest(policy=policy):
-                request = self.request()
-                request.update(policy=policy, strategy="rebase", resolution_context_paths=paths)
-                request["head_commits"] = [
-                    self.commit(number, paths[number]) for number in range(18)
-                ]
-                request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-                original = copy.deepcopy(request)
-                snapshot = SimpleNamespace(
-                    control_root=Path("control"), repository=request["repository"]
-                )
-                with mock.patch.object(
-                    CLOUD_MODULE, "api_json",
-                    return_value={"id": "task-1", "state": "queued"},
-                ) as api:
-                    CLOUD_MODULE.start_task(
-                        mock.sentinel.runner, snapshot, self.options(request)
-                    )
-                payload = api.call_args.args[4]
-                prompt = payload["prompt"]
-                contract_line = next(
-                    line for line in prompt.splitlines()
-                    if line.startswith("Compact immutable task contract")
-                )
-                contract = json.loads(contract_line.split(": ", 1)[1])
-                self.assertEqual(
-                    paths,
-                    decode_compact_path_evidence(
-                        contract["resolution_context_paths"]
-                    ),
-                )
-                self.assertEqual(
-                    CLOUD_MODULE.value_digest(paths),
-                    contract["resolution_context_paths"]["sha256"],
-                )
-                self.assertEqual(original, request)
-                for key in (
-                    "schema", "request_id", "request_sha256", "model", "policy",
-                    "repository", "pull_request", "merge_base", "strategy",
-                    "iteration", "guards", "native_stack",
-                ):
-                    self.assertEqual(request[key], contract[key])
-                self.assertEqual(
-                    [CLOUD_MODULE.compact_commit_evidence(c) for c in request["head_commits"]],
-                    contract["head_commits"],
-                )
-                self.assertLessEqual(len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS)
-                self.assertLessEqual(
-                    len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
-                )
-                self.assertNotIn("digest_with_boundary_samples", prompt)
-                self.assertEqual(
-                    {"prompt", "model", "create_pull_request", "base_ref"}, set(payload)
-                )
-
-    def test_actual_152_path_scope_fits_both_prompt_limits_without_losing_scope(self):
-        paths = self.real_native_scope_paths()
-        self.assertEqual(152, len(paths))
-        self.assertEqual(
-            "d2c74f81c3db76718a6e549cb10e7b44bb31a94bd8a72619ed6e491e32d9b1b8",
-            CLOUD_MODULE.value_digest(paths),
-        )
         request = self.request()
         request.update(
-            policy=CLOUD_MODULE.POLICY,
             strategy="rebase",
-            native_stack=None,
-            resolution_context_paths=paths,
-            head_commits=[
-                self.commit(number, paths[number])
-                for number in range(12)
-            ],
+            head_commits=[self.commit(number, paths[number]) for number in range(12)],
         )
+        request["head_commits"][0]["paths"] = paths
         request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-        options = self.options(request)
-        snapshot = SimpleNamespace(
-            control_root=Path("control"),
-            repository=request["repository"],
-        )
-        with mock.patch.object(
-            CLOUD_MODULE,
-            "api_json",
-            return_value={"id": "task-1", "state": "queued"},
-        ) as api_json:
-            CLOUD_MODULE.start_task(mock.sentinel.runner, snapshot, options)
-
-        prompt = api_json.call_args.args[4]["prompt"]
-        contract_line = next(
-            line for line in prompt.splitlines()
-            if line.startswith("Compact immutable task contract")
-        )
-        contract = json.loads(contract_line.split(": ", 1)[1])
+        original = copy.deepcopy(request)
+        contract = CLOUD_MODULE.compact_request_contract(request)
+        prompt = CLOUD_MODULE.validated_task_prompt(self.options(request))
+        self.assertNotIn("resolution_context_paths", request)
+        self.assertNotIn("resolution_context_paths", contract)
+        self.assertNotIn(paths[0], prompt)
+        self.assertEqual(original, request)
         self.assertEqual(
-            paths,
-            decode_compact_path_evidence(contract["resolution_context_paths"]),
+            [CLOUD_MODULE.compact_commit_evidence(c) for c in request["head_commits"]],
+            contract["head_commits"],
         )
-        self.assertEqual(18338, len(prompt))
-        self.assertEqual(18338, len(prompt.encode("utf-8")))
-        self.assertLessEqual(
-            len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS
-        )
-        self.assertLessEqual(
-            len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
-        )
+        for key in (
+            "schema", "request_id", "request_sha256", "model", "policy",
+            "repository", "pull_request", "merge_base", "strategy",
+            "iteration", "guards", "native_stack",
+        ):
+            self.assertEqual(request[key], contract[key])
         for required in (
             request["request_id"],
             request["request_sha256"],
@@ -4436,19 +4224,108 @@ class ManagedTaskPromptTest(unittest.TestCase):
             "Do not update any user branch or pull request",
         ):
             self.assertIn(required, prompt)
+        self.assertLessEqual(
+            len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
+        )
 
-    def test_exact_scope_at_prompt_limit_is_kept_and_overflow_never_posts(self):
+    def test_574_source_paths_do_not_expand_the_submitted_prompt(self):
+        paths = [
+            f"instrumentation/library-{number:04d}/src/main/java/io/opentelemetry/"
+            f"instrumentation/example/module{number:04d}/Example{number:04d}.java"
+            for number in range(574)
+        ]
         request = self.request()
-        request["resolution_context_paths"] = self.native_scope_paths()
+        request.update(
+            strategy="rebase",
+            head_commits=[self.commit(number, paths[number]) for number in range(12)],
+        )
+        request["head_commits"][0]["paths"] = paths
         request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        snapshot = SimpleNamespace(
+            control_root=Path("control"), repository=request["repository"]
+        )
+        with mock.patch.object(
+            CLOUD_MODULE, "api_json", return_value={"id": "task-1", "state": "queued"}
+        ) as api:
+            CLOUD_MODULE.start_task(
+                mock.sentinel.runner, snapshot, self.options(request)
+            )
+        prompt = api.call_args.args[4]["prompt"]
+        contract = json.loads(next(
+            line.split(": ", 1)[1] for line in prompt.splitlines()
+            if line.startswith("Compact immutable task contract")
+        ))
+        self.assertGreater(len(CLOUD_MODULE.canonical_json(request)), 27000)
+        self.assertNotIn("resolution_context_paths", contract)
+        self.assertNotIn(paths[0], prompt)
+        self.assertEqual(request["request_sha256"], contract["request_sha256"])
+        self.assertLessEqual(len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS)
+        self.assertLessEqual(
+            len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
+        )
+
+    def test_oversized_commit_corpus_still_fails_before_submission(self):
+        request = self.request()
+        request["head_commits"] = [
+            self.commit(number, f"src/{number:04d}.py")
+            for number in range(500)
+        ]
+        request["pull_request"]["head_sha"] = request["head_commits"][-1]["sha"]
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        with mock.patch.object(CLOUD_MODULE, "api_json") as api, self.assertRaises(
+            CLOUD_MODULE.ConflictError
+        ) as failure:
+            CLOUD_MODULE.start_task(
+                mock.sentinel.runner, mock.sentinel.snapshot, self.options(request)
+            )
+        self.assertEqual("prompt_too_large", failure.exception.code)
+        api.assert_not_called()
+
+    def test_normalization_requires_exact_tree_without_a_path_list(self):
+        base, tip, tree = "a" * 40, "b" * 40, "c" * 40
+        merge = {
+            "position": 0,
+            "subject": "Merge base",
+            "trailers": [],
+            "tree": tree,
+        }
+        with (
+            mock.patch.object(CLOUD_MODULE, "ordered_commits", return_value=[tip]),
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=[base]),
+            mock.patch.object(CLOUD_MODULE, "commit_subject", return_value="Merge base"),
+            mock.patch.object(CLOUD_MODULE, "commit_trailers", return_value=[]),
+            mock.patch.object(CLOUD_MODULE, "changed_paths", return_value=["other.py"]),
+            mock.patch.object(CLOUD_MODULE, "git", return_value=tree),
+        ):
+            self.assertEqual(
+                ([tip], []),
+                CLOUD_MODULE.prove_rebase_range_mechanically(
+                    mock.sentinel.runner, Path("repo"), base, tip, [],
+                    normalization_merges=[merge],
+                ),
+            )
+        with (
+            mock.patch.object(MODULE, "ordered_commits", return_value=[tip]),
+            mock.patch.object(MODULE, "commit_parents", return_value=[base]),
+            mock.patch.object(MODULE, "conflict_commit_subject", return_value="Merge base"),
+            mock.patch.object(MODULE, "conflict_commit_trailers", return_value=[]),
+            mock.patch.object(MODULE, "conflict_changed_paths", return_value=["other.py"]),
+            mock.patch.object(MODULE, "git", return_value="d" * 40),
+            self.assertRaisesRegex(MODULE.WorkflowError, "exact tree equivalence"),
+        ):
+            MODULE.verify_rebased_range_mechanically(
+                Path("repo"), base, tip, [], [],
+                normalization_merges=[merge], normalization_commits=[tip],
+            )
+
+    def test_exact_prompt_limit_is_kept_and_overflow_never_posts(self):
+        request = self.request()
         for character in ("x", "é"):
             with self.subTest(character=character):
                 options = self.options(request)
                 options.prompt = options.prompt.rstrip()
                 remaining = CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES - len(
-                    CLOUD_MODULE.policy_prompt(
-                        options, compress_paths=True
-                    ).encode("utf-8")
+                    CLOUD_MODULE.policy_prompt(options).encode("utf-8")
                 )
                 self.assertGreater(remaining, 0)
                 width = len(character.encode("utf-8"))
@@ -4462,12 +4339,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
                     if line.startswith("Compact immutable task contract")
                 )
                 contract = json.loads(contract_line.split(": ", 1)[1])
-                self.assertEqual(
-                    request["resolution_context_paths"],
-                    decode_compact_path_evidence(
-                        contract["resolution_context_paths"]
-                    ),
-                )
+                self.assertNotIn("resolution_context_paths", contract)
                 options.prompt += "x"
                 with (
                     mock.patch.object(CLOUD_MODULE, "api_json") as api,
@@ -4478,116 +4350,6 @@ class ManagedTaskPromptTest(unittest.TestCase):
                     )
                 self.assertEqual("prompt_too_large", failure.exception.code)
                 api.assert_not_called()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def test_small_path_corpus_is_retained_exactly(self):
-        paths = ["src/main.py", "src/café.py"]
-
-        evidence = CLOUD_MODULE.compact_path_evidence(paths)
-
-        self.assertEqual(
-            {
-                "representation": "ordered-prefix-delta-v1",
-                "count": 2,
-                "sha256": CLOUD_MODULE.value_digest(paths),
-                "entries": [[0, "src/main.py"], [4, "café.py"]],
-            },
-            evidence,
-        )
-        self.assertEqual(paths, decode_compact_path_evidence(evidence))
-
-    def test_path_count_and_byte_boundaries_preserve_every_value(self):
-        for count in (0, 64, 65, 66):
-            for byte_size in (4095, 4096, 4097):
-                with self.subTest(count=count, byte_size=byte_size):
-                    paths = [
-                        f"src/{number:03d}.py" for number in range(count)
-                    ]
-                    if paths:
-                        padding = byte_size - len(CLOUD_MODULE.canonical_json(paths))
-                        paths[-1] += "x" * padding
-                        self.assertEqual(byte_size, len(CLOUD_MODULE.canonical_json(paths)))
-                    evidence = CLOUD_MODULE.compact_path_evidence(paths)
-                    self.assertEqual(
-                        "ordered-prefix-delta-v1", evidence["representation"]
-                    )
-                    self.assertEqual(paths, decode_compact_path_evidence(evidence))
-                    self.assertEqual(CLOUD_MODULE.value_digest(paths), evidence["sha256"])
-
-    def test_long_and_multibyte_paths_are_delivered_without_truncation(self):
-        long_path = f"src/{'nested-' * 50}file.py"
-        paths = [
-            long_path,
-            "src/café.py",
-            *[f"src/module-{number:03d}/file.py" for number in range(65)],
-        ]
-
-        evidence = CLOUD_MODULE.compact_path_evidence(paths)
-
-        self.assertEqual("ordered-prefix-delta-v1", evidence["representation"])
-        self.assertEqual(paths, decode_compact_path_evidence(evidence))
-        self.assertEqual(
-            CLOUD_MODULE.value_digest(paths), evidence["sha256"],
-        )
-
-    def test_path_evidence_preserves_order_duplicates_and_unicode_code_points(self):
-        paths = [
-            "src/😀/café.py",
-            "src/😀/café.py",
-            "src/😀/caféteria.py",
-            "src/βeta.py",
-        ]
-
-        evidence = CLOUD_MODULE.compact_path_evidence(paths)
-
-        self.assertEqual(paths, decode_compact_path_evidence(evidence))
-        self.assertEqual([0, len(paths[0]), 10, 4], [
-            entry[0] for entry in evidence["entries"]
-        ])
-
-    def test_path_evidence_decoder_rejects_invalid_count_prefix_and_digest(self):
-        evidence = CLOUD_MODULE.compact_path_evidence(["src/a.py", "src/b.py"])
-        defects = [
-            {**evidence, "count": 3},
-            {**evidence, "sha256": "0" * 64},
-            {**evidence, "entries": [[1, "src/a.py"], *evidence["entries"][1:]]},
-            {**evidence, "entries": [[0, "src/a.py"], [100, "b.py"]]},
-        ]
-
-        for defect in defects:
-            with self.subTest(defect=defect), self.assertRaises(ValueError):
-                decode_compact_path_evidence(defect)
-
-    def test_compressed_path_evidence_preserves_unicode_and_rejects_corruption(self):
-        paths = ["src/😀/café.py", "src/😀/café.py", "src/βeta.py"]
-        evidence = CLOUD_MODULE.compact_path_evidence(paths, compress=True)
-        self.assertEqual(paths, decode_compact_path_evidence(evidence))
-        noncanonical = base64.b64encode(
-            zlib.compress(json.dumps(paths, ensure_ascii=False).encode("utf-8"))
-        ).decode("ascii")
-        defects = [
-            {**evidence, "count": 2},
-            {**evidence, "sha256": "0" * 64},
-            {**evidence, "uncompressed_utf8_bytes": 1},
-            {**evidence, "data": "not base64!"},
-            {**evidence, "data": noncanonical},
-        ]
-        for defect in defects:
-            with self.subTest(defect=defect), self.assertRaises(ValueError):
-                decode_compact_path_evidence(defect)
 
 
     def test_final_submitted_prompt_includes_envelope_with_headroom(self):
@@ -4770,7 +4532,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 task,
             )
 
-    def test_policy_11_omits_hosted_result_validation_and_annotations(self):
+    def test_policy_12_omits_hosted_result_validation_and_annotations(self):
         request = self.minimal_request()
         prompt = CLOUD_MODULE.policy_prompt(self.options(request))
         result = CLOUD_MODULE.Result(
@@ -4778,7 +4540,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
             policy=CLOUD_MODULE.POLICY,
         ).as_dict()
 
-        self.assertIn("Policy: marketplace-conflict-worker@11", prompt)
+        self.assertIn("Policy: marketplace-conflict-worker@12", prompt)
         self.assertIn(CLOUD_MODULE.OUTPUT_REPORT_PATH, prompt)
         self.assertIn("Do not run local validation through the dispatcher", prompt)
         self.assertNotIn("validation", result)
@@ -4915,7 +4677,6 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 old,
                 "4" * 40,
                 "5" * 40,
-                {"app.py"},
             )
 
         self.assertEqual(["app.py"], mapping["changed_paths"])
@@ -4964,7 +4725,6 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 old,
                 "4" * 40,
                 "5" * 40,
-                {"app.py"},
             )
 
     def test_mapping_18_accepts_companion_relocations_but_not_reserved_output(self):
@@ -4985,9 +4745,6 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 self.assertNotIn(path, allowed)
                 old = self.commit(18, "unchanged.py")
                 reserved = path == CLOUD_MODULE.OUTPUT_REPORT_PATH
-                scope = allowed | (
-                    {path} if path == CLOUD_MODULE.OUTPUT_REPORT_PATH else set()
-                )
                 with (
                     mock.patch.object(CLOUD_MODULE, "parents", return_value=["0" * 40]),
                     mock.patch.object(
@@ -5010,7 +4767,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                     ) as failure,
                 ):
                     mapping = CLOUD_MODULE.mechanical_mapping(
-                        mock.sentinel.runner, Path("repo"), old, "4" * 40, "5" * 40, scope
+                        mock.sentinel.runner, Path("repo"), old, "4" * 40, "5" * 40
                     )
                 if reserved:
                     self.assertEqual("unexpected_history", failure.exception.code)
@@ -5033,7 +4790,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                     ),
                 ):
                     consumer_mapping = MODULE.mechanical_commit_mapping(
-                        Path("repo"), old, "4" * 40, "5" * 40, scope
+                        Path("repo"), old, "4" * 40, "5" * 40
                     )
                     self.assertEqual(mapping, consumer_mapping)
 
@@ -5050,7 +4807,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 ):
                     commits, mappings = CLOUD_MODULE.prove_rebase_range_mechanically(
                         mock.sentinel.runner, Path("repo"), "0" * 40, "4" * 40,
-                        [], scope, allow_fix_suffix=True,
+                        [], allow_fix_suffix=True,
                     )
                 if reserved:
                     self.assertEqual("unexpected_history", failure.exception.code)
@@ -5085,7 +4842,6 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 "a" * 40,
                 "4" * 40,
                 [old],
-                {"app.py"},
             )
 
 

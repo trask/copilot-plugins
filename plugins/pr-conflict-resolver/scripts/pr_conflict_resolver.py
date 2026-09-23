@@ -72,21 +72,21 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "30bf224d3de4279eabc3571e8683fde65e6a705325d085a67d38bffb969394cf"
+    "f8d9ff36412879867bbd1ad0c36d437824564fd088c7ba8871af57bf100b7464"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
-CONFLICT_POLICY = "marketplace-conflict-worker@11"
+CONFLICT_POLICY = "marketplace-conflict-worker@12"
 CONFLICT_POLICY_SHA256 = (
-    "3e7a64d521bc62610f143aefaa74ff66817e5997f0f14e974ee8b03531e29964"
+    "b5b51023e8c9ff418ec7b2920121857b268cfd944f15a96885d16b8f9694c0b9"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 11,
+    "version": 12,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-request",
-    "version": 3,
+    "version": 4,
 }
 CONFLICT_RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
@@ -8631,9 +8631,11 @@ def _conflict_preflight(
     conflict_paths = merge_tree_conflicts(
         repo_root, metadata["head_sha"], metadata["base_sha"]
     )
-    allowed_paths = set(conflict_paths)
+    reserved_output_changed = AGENT_TASK_OUTPUT_REPORT in conflict_paths
     for base_commit in ordered_commits(repo_root, merge_base, metadata["base_sha"]):
-        allowed_paths.update(conflict_changed_paths(repo_root, base_commit))
+        reserved_output_changed |= (
+            AGENT_TASK_OUTPUT_REPORT in conflict_changed_paths(repo_root, base_commit)
+        )
     head_commits: list[dict[str, Any]] = []
     native_stack = None
     outside_dependents: list[dict[str, Any]] = []
@@ -8742,14 +8744,18 @@ def _conflict_preflight(
                 for sha in unique_commits
             ]
             for commit in commits:
-                allowed_paths.update(commit["paths"])
-            allowed_paths.update(
-                merge_tree_conflicts(
+                reserved_output_changed |= (
+                    AGENT_TASK_OUTPUT_REPORT in commit["paths"]
+                )
+            reserved_output_changed |= (
+                AGENT_TASK_OUTPUT_REPORT in merge_tree_conflicts(
                     repo_root, member["head_sha"], direct_base_sha
                 )
             )
             for merge in normalization_merges:
-                allowed_paths.update(merge["remerge_paths"])
+                reserved_output_changed |= (
+                    AGENT_TASK_OUTPUT_REPORT in merge["remerge_paths"]
+                )
             members.append(
                 {
                     "pr_number": member["number"],
@@ -8807,8 +8813,10 @@ def _conflict_preflight(
         if not head_commits:
             raise WorkflowError("pull request has no unique commits to integrate")
         for commit in head_commits:
-            allowed_paths.update(commit["paths"])
-    if AGENT_TASK_OUTPUT_REPORT in allowed_paths:
+            reserved_output_changed |= (
+                AGENT_TASK_OUTPUT_REPORT in commit["paths"]
+            )
+    if reserved_output_changed:
         raise WorkflowError(
             "the advisory Agent Task output path cannot be published as source"
         )
@@ -8831,7 +8839,6 @@ def _conflict_preflight(
         },
         "merge_base": merge_base,
         "strategy": strategy,
-        "resolution_context_paths": sorted(allowed_paths),
         "iteration": {
             "id": iteration_id,
             "number": iteration_number,
@@ -8943,10 +8950,10 @@ def build_conflict_prompt(preflight: dict[str, Any]) -> str:
         "The managed policy appends a compact immutable contract for request "
         f"{request['request_id']} with retained request SHA-256 "
         f"{request['request_sha256']}. The full request remains outside the "
-        "repository as dispatcher-owned evidence. The hosted contract includes "
-        "the complete resolution context paths. These are location evidence, not "
-        "filename permissions; necessary scoped companion edits and relocations are "
-        "allowed. Preserve test discovery, execution and coverage. Do not write a result schema, receipt, validation "
+        "repository as dispatcher-owned evidence. Find conflict locations from "
+        "the pinned Git history; necessary scoped companion edits and relocations "
+        "are allowed. Preserve test discovery, execution and coverage. Do not "
+        "write a result schema, receipt, validation "
         "objects, commit annotations, path classifications, or rationale. You may "
         f"add one final path-only `{AGENT_TASK_OUTPUT_REPORT}` commit with free-form "
         "notes. The helper treats those notes as advisory and derives all acceptance "
@@ -9173,7 +9180,6 @@ def mechanical_commit_mapping(
     old: dict[str, Any],
     new_sha: str,
     parent: str,
-    allowed_paths: set[str],
     attribution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     old_parents = commit_parents(repo_root, old["sha"])
@@ -9220,7 +9226,6 @@ def verify_rebased_range_mechanically(
     tip: str,
     old_commits: list[dict[str, Any]],
     mappings: list[Any],
-    allowed_paths: set[str],
     *,
     fix_commits: list[str] | None = None,
     attribution: dict[str, Any] | None = None,
@@ -9297,7 +9302,6 @@ def verify_rebased_range_mechanically(
                     new_sha,
                 )
                 != normalization["tree"]
-                or not set(paths) <= allowed_paths
             ):
                 raise WorkflowError(
                     "normalized merge failed exact tree equivalence"
@@ -9310,7 +9314,6 @@ def verify_rebased_range_mechanically(
                 old_commit,
                 new_sha,
                 parent,
-                allowed_paths,
                 attribution,
             )
             if next(mapping) != expected:
@@ -9341,7 +9344,6 @@ def verify_merge_range(
     base: str,
     tip: str,
     commits: list[str],
-    allowed_paths: set[str],
 ) -> None:
     if not commits or commits[-1] != tip:
         raise WorkflowError("merge result has an incomplete commit range")
@@ -9350,8 +9352,9 @@ def verify_merge_range(
         expected_parents = [head, base] if index == 0 else [parent]
         if commit_parents(repo_root, commit) != expected_parents:
             raise WorkflowError("merge result has reversed or unexpected parents")
-        if not set(conflict_diff_paths(repo_root, parent, commit)) <= allowed_paths:
-            raise WorkflowError("merge result changed undeclared paths")
+        require_candidate_code_paths(
+            conflict_diff_paths(repo_root, parent, commit)
+        )
         parent = commit
 
 
@@ -9546,7 +9549,6 @@ def verify_quarantined_result(
             or not all(isinstance(item, dict) for item in artifacts)
         ):
             raise WorkflowError("stack task artifacts are incomplete")
-    allowed_paths = set(request["resolution_context_paths"])
     previous_tip = (
         request["native_stack"]["trunk"]["sha"]
         if request["strategy"] == "native-stack"
@@ -9634,7 +9636,6 @@ def verify_quarantined_result(
                 code_ref["new_sha"],
                 request["head_commits"],
                 code_ref["commits"],
-                allowed_paths,
                 attribution=verify_replay_attribution(request, artifact, previous_tip),
             )
         else:
@@ -9656,7 +9657,6 @@ def verify_quarantined_result(
                 code_ref["new_sha"],
                 member["old_commits"],
                 code_ref["commits"],
-                allowed_paths,
                 fix_commits=code_ref["fix_commits"],
                 attribution=verify_replay_attribution(
                     request, artifact["members"][index], previous_tip

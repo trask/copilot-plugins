@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -13,7 +12,6 @@ import sys
 import time
 import urllib.parse
 import uuid
-import zlib
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -35,7 +33,7 @@ TASK_PROMPT_MAX_UTF8_BYTES = (
     AGENT_TASK_PROMPT_MAX_UTF8_BYTES - TASK_PROMPT_HEADROOM_UTF8_BYTES
 )
 MODE = "conflict_with_report"
-REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 3}
+REQUEST_SCHEMA = {"id": "github.copilot.agent-task-conflict-request", "version": 4}
 RESULT_SCHEMA = {
     "id": "github.copilot.agent-task-conflict-result",
     "version": 5,
@@ -45,7 +43,7 @@ RECEIPT_SCHEMA = {
     "version": 3,
 }
 POLICY_ID = "marketplace-conflict-worker"
-POLICY_VERSION = 11
+POLICY_VERSION = 12
 POLICY_SPEC = {
     "id": POLICY_ID,
     "version": POLICY_VERSION,
@@ -73,7 +71,7 @@ POLICY_SPEC = {
         "fetched-current-base-observed-base-proven-history-boundary"
     ),
     "member_fix_commits": "linear-scoped-companion-suffix-after-complete-replay",
-    "resolution_context_paths": "informational-not-a-permission-set",
+    "conflict_locations": "worker-derives-from-pinned-git-history",
     "replay_task_base": "pinned-destination-sha",
     "replay_message": "exact-source-bytes-with-one-verified-creator-appendix",
 }
@@ -785,7 +783,6 @@ def validate_request(
             "pull_request",
             "merge_base",
             "strategy",
-            "resolution_context_paths",
             "iteration",
             "guards",
             "head_commits",
@@ -820,20 +817,6 @@ def validate_request(
     require_sha(request["merge_base"], "merge_base")
     if request["strategy"] != expected_strategy:
         raise ConflictError("conflict request strategy mismatch", "unsupported_strategy")
-    allowed_paths = request["resolution_context_paths"]
-    if (
-        not isinstance(allowed_paths, list)
-        or any(not isinstance(path, str) for path in allowed_paths)
-        or allowed_paths != sorted(set(allowed_paths))
-    ):
-        raise ConflictError("resolution_context_paths is not ordered and unique", "policy_rejected")
-    for path in allowed_paths:
-        require_path(path, "allowed path")
-    if OUTPUT_REPORT_PATH in allowed_paths:
-        raise ConflictError(
-            "the advisory output path cannot be a publishable source path",
-            "policy_rejected",
-        )
     iteration = require_exact_keys(
         request["iteration"], {"id", "number", "budget"}, "iteration"
     )
@@ -1805,53 +1788,14 @@ def value_digest(value: object) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
-def compact_path_evidence(
-    paths: Sequence[str], *, compress: bool = False
-) -> Mapping[str, object]:
-    values = list(paths)
-    if compress:
-        source = canonical_json(values)
-        return {
-            "representation": "zlib-json-base64-v1",
-            "count": len(values),
-            "sha256": hashlib.sha256(source).hexdigest(),
-            "uncompressed_utf8_bytes": len(source),
-            "data": base64.b64encode(zlib.compress(source, level=9)).decode("ascii"),
-        }
-    entries: list[list[object]] = []
-    previous = ""
-    for value in values:
-        prefix_length = 0
-        for previous_character, current_character in zip(previous, value):
-            if previous_character != current_character:
-                break
-            prefix_length += 1
-        entries.append([prefix_length, value[prefix_length:]])
-        previous = value
-    return {
-        "representation": "ordered-prefix-delta-v1",
-        "count": len(values),
-        "sha256": value_digest(values),
-        "entries": entries,
-    }
-
-
 def compact_commit_evidence(
     commit: Mapping[str, object],
-    *,
-    include_paths: bool = False,
 ) -> Mapping[str, object]:
-    evidence: dict[str, object] = {
+    return {
         "sha": commit["sha"],
         "patch_sha256": commit["patch_sha256"],
         "retained_evidence_sha256": value_digest(commit),
     }
-    if include_paths:
-        evidence["paths"] = {
-            "count": len(commit["paths"]),
-            "sha256": value_digest(commit["paths"]),
-        }
-    return evidence
 
 
 
@@ -1876,9 +1820,6 @@ def assigned_code_refs(request: Mapping[str, object]) -> list[RemoteRef]:
 
 def compact_request_contract(
     request: Mapping[str, object],
-    *,
-    compress_paths: bool = False,
-    include_per_commit_paths: bool = False,
 ) -> Mapping[str, object]:
     stack = request["native_stack"]
     compact_stack = None
@@ -1904,10 +1845,7 @@ def compact_request_contract(
                         )
                     },
                     "old_commits": [
-                        compact_commit_evidence(
-                            commit,
-                            include_paths=include_per_commit_paths,
-                        )
+                        compact_commit_evidence(commit)
                         for commit in member["old_commits"]
                     ],
                     "sync_merges": member["sync_merges"],
@@ -1932,14 +1870,8 @@ def compact_request_contract(
         "strategy": request["strategy"],
         "iteration": request["iteration"],
         "guards": request["guards"],
-        "resolution_context_paths": compact_path_evidence(
-            request["resolution_context_paths"], compress=compress_paths
-        ),
         "head_commits": [
-            compact_commit_evidence(
-                commit,
-                include_paths=include_per_commit_paths,
-            )
+            compact_commit_evidence(commit)
             for commit in request["head_commits"]
         ],
         "native_stack": compact_stack,
@@ -1984,39 +1916,10 @@ def replay_task_instructions(request: Mapping[str, object]) -> str:
     )
 
 
-def policy_prompt(
-    options: Options,
-    *,
-    compress_paths: bool = False,
-    include_per_commit_paths: bool = False,
-) -> str:
-    path_encoding = (
-        "`resolution_context_paths` uses `zlib-json-base64-v1`. Decode `data` with "
-        "Python `base64.b64decode(data, validate=True)` and `zlib.decompress`, then "
-        "decode the bytes as UTF-8 and parse JSON. Require the decompressed byte "
-        "length to equal `uncompressed_utf8_bytes`, a list of strings with length "
-        "`count`, and its canonical UTF-8 JSON bytes (sorted keys, comma and colon "
-        "separators, non-ASCII preserved) to match the decompressed bytes. Require "
-        "SHA-256 of those bytes to equal `sha256`. Preserve order and duplicates. "
-        if compress_paths
-        else (
-            "`resolution_context_paths` uses `ordered-prefix-delta-v1`. Reconstruct "
-            "its ordered path list with `previous = \"\"`. For each `[prefix_length, "
-            "suffix]` entry, require a non-negative integer no greater than the "
-            "number of Unicode code points in `previous`, append "
-            "`previous[:prefix_length] + suffix`, then set `previous` to that path. "
-            "Prefix lengths are Unicode code points, never UTF-16 code units or UTF-8 "
-            "bytes. Preserve order and duplicates. Before using the list, require its "
-            "length to equal `count` and its `sha256` to equal SHA-256 over UTF-8 JSON "
-            "with sorted keys, comma and colon separators, and non-ASCII values "
-            "preserved. "
-        )
-    )
-    path_scope = (
-        path_encoding
-        + "Stop without changes if decoding, count, or digest verification fails. "
-        "Use the reconstructed paths as conflict-location context, "
-        "not a filename permission set. Resolve the assigned member while preserving "
+def policy_prompt(options: Options) -> str:
+    worker_scope = (
+        "Find conflict locations in the pinned Git history and merge or replay "
+        "results. Resolve the assigned member while preserving "
         "both sides' intent and unaffected work. Make necessary scoped companion edits "
         "and relocations, including test/support files, when the resolution requires "
         "them. Preserve test discovery, execution and coverage; a move neither proves "
@@ -2031,11 +1934,7 @@ def policy_prompt(
                 "native stack work must be dispatched one member at a time",
                 "policy_rejected",
             )
-        compact_request = compact_request_contract(
-            options.request,
-            compress_paths=compress_paths,
-            include_per_commit_paths=include_per_commit_paths,
-        )
+        compact_request = compact_request_contract(options.request)
         refs = (
             [
                 {
@@ -2076,7 +1975,7 @@ def policy_prompt(
             "request, frozen head and base, model, policy, task, session, "
             "generated ref, commit, receipt, and completion identity. Do not "
             "author or echo those fields in a hosted result file.\n"
-            f"{path_scope}"
+            f"{worker_scope}"
             "Compact immutable task contract (input evidence only): "
             f"{canonical_json(compact_request).decode('utf-8')}\n"
             f"{code_locator_policy}"
@@ -2106,13 +2005,6 @@ def policy_prompt(
 
 def validated_task_prompt(options: Options) -> str:
     prompt = policy_prompt(options)
-    if (
-        len(prompt) > TASK_PROMPT_MAX_CHARACTERS
-        or len(prompt.encode("utf-8")) > TASK_PROMPT_MAX_UTF8_BYTES
-    ):
-        compressed = policy_prompt(options, compress_paths=True)
-        if len(compressed.encode("utf-8")) < len(prompt.encode("utf-8")):
-            prompt = compressed
     characters = len(prompt)
     utf8_bytes = len(prompt.encode("utf-8"))
     if (
@@ -2874,119 +2766,12 @@ def verify_frozen_ranges(
             )
 
 
-def validate_mapping(
-    mapping: object,
-    old: Mapping[str, object],
-    new_sha: str,
-    runner: Runner,
-    root: Path,
-    parent: str,
-    allowed_paths: set[str],
-) -> Mapping[str, object]:
-    value = require_exact_keys(
-        mapping,
-        {
-            "old_sha",
-            "new_sha",
-            "subject",
-            "trailers",
-            "patch_sha256",
-            "conflict_paths",
-            "companion_paths",
-            "unaffected_path_digests",
-            "rationale",
-        },
-        "commit mapping",
-    )
-    if value["old_sha"] != old["sha"] or value["new_sha"] != new_sha:
-        raise ConflictError("commit mapping identity mismatch", "unexpected_history")
-    subject = commit_subject(runner, root, new_sha)
-    trailers = commit_trailers(runner, root, new_sha)
-    digest = patch_sha256(runner, root, parent, new_sha)
-    if (
-        value["subject"] != old["subject"]
-        or value["subject"] != subject
-        or value["trailers"] != old["trailers"]
-        or value["trailers"] != trailers
-        or value["patch_sha256"] != digest
-    ):
-        raise ConflictError(
-            "rewritten commit subject, trailers, or digest mismatch",
-            "unexpected_history",
-        )
-    conflict_paths = value["conflict_paths"]
-    companion_paths = value["companion_paths"]
-    unaffected = value["unaffected_path_digests"]
-    if (
-        not isinstance(conflict_paths, list)
-        or not isinstance(companion_paths, list)
-        or not isinstance(unaffected, dict)
-        or any(not isinstance(path, str) for path in [*conflict_paths, *companion_paths])
-        or set(conflict_paths) & set(companion_paths)
-        or not (set(conflict_paths) | set(companion_paths)) <= allowed_paths
-    ):
-        raise ConflictError("commit mapping paths are invalid", "unexpected_history")
-    old_paths = set(old["paths"])
-    new_paths = set(changed_paths(runner, root, new_sha))
-    conflict_path_set = set(conflict_paths)
-    companion_path_set = set(companion_paths)
-    if (
-        not conflict_path_set <= old_paths
-        or new_paths - old_paths != companion_path_set
-        or not old_paths - new_paths <= conflict_path_set
-    ):
-        raise ConflictError(
-            "rewritten commit changed undeclared paths",
-            "unexpected_history",
-        )
-    if digest == old["patch_sha256"]:
-        if conflict_paths or companion_paths or value["rationale"] not in {"", None}:
-            raise ConflictError(
-                "untouched commit has conflict metadata",
-                "unexpected_history",
-            )
-    else:
-        if (
-            not conflict_paths
-            or not isinstance(value["rationale"], str)
-            or not value["rationale"].strip()
-        ):
-            raise ConflictError(
-                "conflict-touched commit lacks explicit rationale",
-                "unexpected_history",
-            )
-        unaffected_paths = old_paths - conflict_path_set
-        if set(unaffected) != unaffected_paths:
-            raise ConflictError(
-                "unaffected path digest set is incomplete",
-                "unexpected_history",
-            )
-        if unaffected_paths:
-            old_parent = parents(runner, root, old["sha"])
-            if len(old_parent) != 1:
-                raise ConflictError("old commit is not linear", "unexpected_history")
-            for path in unaffected_paths:
-                old_digest = path_patch_sha256(
-                    runner, root, old_parent[0], old["sha"], path
-                )
-                new_digest = path_patch_sha256(runner, root, parent, new_sha, path)
-                if unaffected[path] != old_digest or new_digest != old_digest:
-                    raise ConflictError(
-                        "unaffected path digest changed",
-                        "unexpected_history",
-                    )
-    return value
-
-
-
-
 def mechanical_mapping(
     runner: Runner,
     root: Path,
     old: Mapping[str, object],
     new_sha: str,
     parent: str,
-    allowed_paths: set[str],
     attribution: Mapping[str, object] | None = None,
 ) -> Mapping[str, object]:
     old_parents = parents(runner, root, str(old["sha"]))
@@ -3037,7 +2822,6 @@ def prove_rebase_range_mechanically(
     base_sha: str,
     tip: str,
     old_commits: Sequence[Mapping[str, object]],
-    allowed_paths: set[str],
     *,
     allow_fix_suffix: bool = False,
     attribution: Mapping[str, object] | None = None,
@@ -3102,7 +2886,6 @@ def prove_rebase_range_mechanically(
                     new_sha,
                 ).strip()
                 != normalization["tree"]
-                or not set(paths) <= allowed_paths
             ):
                 raise ConflictError(
                     "normalized merge failed exact tree equivalence",
@@ -3117,7 +2900,6 @@ def prove_rebase_range_mechanically(
                     old_commit,
                     new_sha,
                     parent,
-                    allowed_paths,
                     attribution,
                 )
             )
@@ -3357,7 +3139,6 @@ def prove_generated_minimal(
             )
         )
     require_local_unchanged(runner, snapshot, quarantine)
-    allowed_paths = set(request["resolution_context_paths"])
     code_refs: list[Mapping[str, object]] = []
     if request["strategy"] == "merge":
         remote, _, tip = fetched_code[0]
@@ -3405,7 +3186,6 @@ def prove_generated_minimal(
             request["pull_request"]["base_sha"],
             tip,
             request["head_commits"],
-            allowed_paths,
             attribution=attribution,
         )
         code_refs.append(build_code_ref(request, remote, tip, commits, mappings))
@@ -3420,7 +3200,6 @@ def prove_generated_minimal(
                 previous_tip,
                 tip,
                 member["old_commits"],
-                allowed_paths,
             )
             code_ref = build_code_ref(
                 request,
@@ -3634,7 +3413,7 @@ def execute_native_stack(
             "Do not replay the "
             "other stack members. After the complete replay you may append "
             "necessary scoped linear companion fixes, including test relocations. "
-            "Resolution context paths are informational, not permissions. Run required "
+            "Find conflict locations in the pinned Git history. Run required "
             "formatting and focused tests on the hosted worker. Commit only on "
             "this task's authoritative generated branch. Do not create any "
             "additional remote refs or modify source branches, PR metadata, "
@@ -3785,7 +3564,6 @@ def execute_native_stack(
             base_sha,
             tip,
             member["old_commits"],
-            set(request["resolution_context_paths"]),
             allow_fix_suffix=True,
             attribution=attribution,
             sync_merges=member["sync_merges"],

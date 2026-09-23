@@ -343,7 +343,9 @@ class SequentialStackTest(unittest.TestCase):
         for options in self.launched:
             self.assertIn("scoped linear companion fixes", options.prompt)
             self.assertNotIn("within the allowed paths", options.prompt)
+            self.assertIn("Find conflict locations in the pinned Git history", options.prompt)
             prompt = CLOUD.policy_prompt(options)
+            self.assertNotIn("resolution_context_paths", prompt)
             self.assertIn("authoritative Agent Task branch", prompt)
             self.assertNotIn("copilot/conflict-", prompt)
             self.assertNotIn("generated_refs", prompt)
