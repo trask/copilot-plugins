@@ -2249,13 +2249,17 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         result = bounded["pending_rerun"]["result"]
     else:
         try:
-            preflight = agent_task_preflight(repo_root, target, state_path=state_path)
+            preflight = agent_task_preflight(
+                repo_root, target, state_path=state_path,
+                collect_failure_logs=False,
+            )
         except WorkflowError as error:
             if error.details.get("reason") == "ci_observation_changed" or is_rate_limit_error(error):
                 emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
                 return
             raise
         snapshot = preflight["check_snapshot"]
+        stability_identity = ci_stability_sha256(snapshot)
         current_logs = set(managed_task_log_paths({"preflight": preflight}))
         recorded_logs = bounded.get("active_log_paths", [])
         if not isinstance(recorded_logs, list) or any(
@@ -2267,7 +2271,7 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         }
         cleanup_superseded_preflight_logs(state_path, previous_logs - current_logs)
         coordinator = state.get("coordinator") or {}
-        stable = coordinator.get("snapshot_sha256") == snapshot["sha256"]
+        stable = coordinator.get("stability_sha256") == stability_identity
         polls = coordinator.get("stable_polls", 0) + 1 if stable else 1
         stable_since = (
             bounded.get("stable_since") if stable else utc_now()
@@ -2277,6 +2281,7 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         update_coordinator_state(
             state_path, status="stabilizing",
             head_sha=snapshot["head_sha"], snapshot_sha256=snapshot["sha256"],
+            stability_sha256=stability_identity,
             stable_polls=polls, detail=snapshot["decision"]["detail"],
             check_snapshot=snapshot,
         )
@@ -2286,16 +2291,49 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
             str(path) for path in current_logs
         )
         save_state(state_path, state)
+        processed = processed_ci_snapshot_ids(state)
         if (
             not ci_preflight_is_stable_candidate(preflight)
             or polls < max(1, args.stability_polls)
             or (
                 dt.datetime.now(dt.timezone.utc) - parse_timestamp(stable_since)
             ).total_seconds() < max(0.0, float(getattr(args, "debounce_seconds", 0.0)))
-            or snapshot["sha256"] in processed_ci_snapshot_ids(state)
+            or stability_identity in processed
+            or snapshot["sha256"] in processed
         ):
             emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
             return
+        try:
+            complete = agent_task_preflight(repo_root, target, state_path=state_path)
+            complete_logs = set(managed_task_log_paths({"preflight": complete}))
+            if ci_stability_sha256(complete["check_snapshot"]) != stability_identity:
+                cleanup_superseded_preflight_logs(state_path, complete_logs)
+                emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+                return
+            try:
+                require_live_check_snapshot(complete)
+            except WorkflowError:
+                cleanup_superseded_preflight_logs(state_path, complete_logs)
+                raise
+        except WorkflowError as error:
+            if error.details.get("reason") != "ci_observation_changed":
+                raise
+            emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+            return
+        preflight = complete
+        snapshot = complete["check_snapshot"]
+        update_coordinator_state(
+            state_path, status="ready",
+            head_sha=snapshot["head_sha"], snapshot_sha256=snapshot["sha256"],
+            stability_sha256=stability_identity,
+            stable_polls=polls, detail=snapshot["decision"]["detail"],
+            check_snapshot=snapshot,
+        )
+        state = load_state(state_path)
+        state["bounded_step"]["active_log_paths"] = sorted(
+            str(path) for path in complete_logs
+        )
+        save_state(state_path, state)
         step_args = argparse.Namespace(**vars(args))
         step_args._preflight = preflight
         result = capture_command(command_agent_task, step_args)[-1]
@@ -6799,6 +6837,7 @@ def agent_task_preflight(
     *,
     stack_state: Path | None = None,
     state_path: Path | None = None,
+    collect_failure_logs: bool = True,
 ) -> dict[str, Any]:
     dirty = git(repo_root, "status", "--porcelain=v1")
     if dirty:
@@ -6887,14 +6926,17 @@ def agent_task_preflight(
     workflow_runs = ci_snapshot_runs(pr, checks)
     if failing_keys:
         require_diagnosable_ci_runs(checks, workflow_runs, set(failing_keys))
-    baseline = baseline_conclusions(pr, pr["base_sha"]) if failing_keys else {}
+    baseline = (
+        baseline_conclusions(pr, pr["base_sha"])
+        if failing_keys and collect_failure_logs else {}
+    )
     by_key = {check["key"]: check for check in checks}
     rollup = check_rollup_identity(checks)
     rollup_sha256 = sha256_text(
         json.dumps(rollup, separators=(",", ":"), sort_keys=True)
     )
     log_directory = None
-    if failing_keys:
+    if failing_keys and collect_failure_logs:
         if state_path is None:
             raise WorkflowError(
                 "a state path is required to store failing logs outside the repository"
@@ -6913,7 +6955,9 @@ def agent_task_preflight(
     log_downloads = []
     created_logs: list[Path] = []
     try:
-        for index, key in enumerate(failing_keys, start=1):
+        for index, key in enumerate(
+            failing_keys if collect_failure_logs else [], start=1
+        ):
             check = by_key[key]
             log_download: dict[str, Any] = {}
             log_path = (
@@ -7010,6 +7054,13 @@ def check_snapshot_sha256(snapshot: dict[str, Any]) -> str:
         if isinstance(failure, dict):
             failure.pop("log_path", None)
     return sha256_text(json.dumps(identity, separators=(",", ":"), sort_keys=True))
+
+
+def ci_stability_sha256(snapshot: dict[str, Any]) -> str:
+    return canonical_json_sha256({
+        key: snapshot[key]
+        for key in ("head_sha", "base_sha", "rollup", "decision", "workflow_runs")
+    })
 
 
 def load_cloud_task_runtime(source_path: Path) -> ModuleType:
@@ -11602,6 +11653,7 @@ def update_coordinator_state(
     status: str,
     head_sha: str | None = None,
     snapshot_sha256: str | None = None,
+    stability_sha256: str | None = None,
     stable_polls: int | None = None,
     detail: str | None = None,
     check_snapshot: dict[str, Any] | None = None,
@@ -11614,6 +11666,8 @@ def update_coordinator_state(
         coordinator["head_sha"] = head_sha
     if snapshot_sha256 is not None:
         coordinator["snapshot_sha256"] = snapshot_sha256
+    if stability_sha256 is not None:
+        coordinator["stability_sha256"] = stability_sha256
     if stable_polls is not None:
         coordinator["stable_polls"] = stable_polls
     if detail is not None:
@@ -11633,10 +11687,12 @@ def processed_ci_snapshot_ids(state: dict[str, Any]) -> set[str]:
     if not isinstance(entries, list):
         return set()
     return {
-        entry["snapshot_sha256"]
+        digest
         for entry in entries
         if isinstance(entry, dict)
         and isinstance(entry.get("snapshot_sha256"), str)
+        for digest in (entry["snapshot_sha256"], entry.get("stability_sha256"))
+        if isinstance(digest, str)
     }
 
 
@@ -11703,6 +11759,7 @@ def wait_for_stable_ci_preflight(
                     cli_path(args.stack_state) if args.stack_state else None
                 ),
                 state_path=state_path,
+                collect_failure_logs=False,
             )
         except WorkflowError as error:
             if error.details.get("reason") == "ci_observation_changed":
@@ -11730,17 +11787,11 @@ def wait_for_stable_ci_preflight(
             continue
 
         snapshot = preflight["check_snapshot"]
-        current_log_paths = set(
-            managed_task_log_paths({"preflight": preflight})
-        )
-        cleanup_superseded_preflight_logs(
-            state_path, active_log_paths - current_log_paths
-        )
-        active_log_paths = current_log_paths
-        identity = snapshot["sha256"]
+        identity = ci_stability_sha256(snapshot)
         decision = snapshot["decision"]
         state = coordinator_file_state(state_path)
-        already_processed = identity in processed_ci_snapshot_ids(state)
+        processed = processed_ci_snapshot_ids(state)
+        already_processed = identity in processed or snapshot["sha256"] in processed
         candidate = ci_preflight_is_stable_candidate(preflight) and not (
             decision["decision"] == "failures" and already_processed
         )
@@ -11764,7 +11815,7 @@ def wait_for_stable_ci_preflight(
             state_path,
             status=status,
             head_sha=snapshot["head_sha"],
-            snapshot_sha256=identity,
+            snapshot_sha256=snapshot["sha256"],
             stable_polls=stable_polls,
             detail=decision["detail"],
             check_snapshot=snapshot,
@@ -11777,60 +11828,71 @@ def wait_for_stable_ci_preflight(
                 ))
                 if time.monotonic() >= deadline:
                     continue
-                try:
-                    confirmation = agent_task_preflight(
-                        repo_root,
-                        target,
-                        stack_state=(
-                            cli_path(args.stack_state) if args.stack_state else None
-                        ),
-                        state_path=state_path,
-                    )
-                except WorkflowError as error:
-                    if error.details.get("reason") != "ci_observation_changed":
-                        raise
-                    stable_identity = None
-                    stable_polls = 0
-                    attempt = 0
-                    update_coordinator_state(
-                        state_path, status="waiting_for_checks", detail=str(error),
-                    )
-                    continue
-                if confirmation["check_snapshot"]["sha256"] != identity:
-                    confirmation_log_paths = set(
-                        managed_task_log_paths({"preflight": confirmation})
-                    )
-                    cleanup_superseded_preflight_logs(
-                        state_path, active_log_paths - confirmation_log_paths
-                    )
-                    active_log_paths = confirmation_log_paths
-                    stable_identity = None
-                    stable_polls = 0
-                    attempt = 0
-                    changed_snapshot = confirmation["check_snapshot"]
-                    update_coordinator_state(
-                        state_path,
-                        status="waiting_for_checks",
-                        head_sha=changed_snapshot["head_sha"],
-                        snapshot_sha256=changed_snapshot["sha256"],
-                        stable_polls=0,
-                        detail=changed_snapshot["decision"]["detail"],
-                        check_snapshot=changed_snapshot,
-                    )
-                    continue
-                cleanup_superseded_preflight_logs(
-                    state_path,
-                    active_log_paths
-                    - set(managed_task_log_paths({"preflight": confirmation})),
+            try:
+                confirmation = agent_task_preflight(
+                    repo_root,
+                    target,
+                    stack_state=(
+                        cli_path(args.stack_state) if args.stack_state else None
+                    ),
+                    state_path=state_path,
                 )
-                preflight = confirmation
+            except WorkflowError as error:
+                if error.details.get("reason") != "ci_observation_changed":
+                    raise
+                stable_identity = None
+                stable_polls = 0
+                attempt = 0
+                update_coordinator_state(
+                    state_path, status="waiting_for_checks", detail=str(error),
+                )
+                continue
+            confirmation_log_paths = set(
+                managed_task_log_paths({"preflight": confirmation})
+            )
+            cleanup_superseded_preflight_logs(
+                state_path, active_log_paths - confirmation_log_paths
+            )
+            active_log_paths = confirmation_log_paths
+            if ci_stability_sha256(confirmation["check_snapshot"]) != identity:
+                cleanup_superseded_preflight_logs(state_path, active_log_paths)
+                active_log_paths = set()
+                stable_identity = None
+                stable_polls = 0
+                attempt = 0
+                changed_snapshot = confirmation["check_snapshot"]
+                update_coordinator_state(
+                    state_path,
+                    status="waiting_for_checks",
+                    head_sha=changed_snapshot["head_sha"],
+                    snapshot_sha256=changed_snapshot["sha256"],
+                    stable_polls=0,
+                    detail=changed_snapshot["decision"]["detail"],
+                    check_snapshot=changed_snapshot,
+                )
+                continue
+            try:
+                require_live_check_snapshot(confirmation)
+            except WorkflowError as error:
+                cleanup_superseded_preflight_logs(state_path, active_log_paths)
+                active_log_paths = set()
+                if error.details.get("reason") != "ci_observation_changed":
+                    raise
+                stable_identity = None
+                stable_polls = 0
+                attempt = 0
+                update_coordinator_state(
+                    state_path, status="waiting_for_checks", detail=str(error),
+                )
+                continue
+            preflight = confirmation
             update_coordinator_state(
                 state_path,
                 status="ready",
-                head_sha=snapshot["head_sha"],
-                snapshot_sha256=identity,
+                head_sha=preflight["check_snapshot"]["head_sha"],
+                snapshot_sha256=preflight["check_snapshot"]["sha256"],
                 stable_polls=stable_polls,
-                detail=decision["detail"],
+                detail=preflight["check_snapshot"]["decision"]["detail"],
                 check_snapshot=preflight["check_snapshot"],
             )
             return preflight
@@ -11856,6 +11918,7 @@ def record_processed_ci_snapshot(
             {
                 "head_sha": preflight["pr"]["head_sha"],
                 "snapshot_sha256": identity,
+                "stability_sha256": ci_stability_sha256(preflight["check_snapshot"]),
                 "task_id": task.get("id"),
                 "result": result["result"],
                 "recorded_at": utc_now(),

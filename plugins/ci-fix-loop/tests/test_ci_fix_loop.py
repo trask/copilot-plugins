@@ -3489,7 +3489,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.80", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.81", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -7180,6 +7180,56 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ):
             MODULE.local_identity(self.root)
 
+    def test_lightweight_preflight_skips_failure_logs_until_checks_stabilize(self):
+        pr = {
+            **self.preflight["pr"],
+            "upstream_owner": "owner",
+            "upstream_repo": "repo",
+        }
+        checks = [
+            {
+                "key": f"status:failed-{index}", "kind": "status",
+                "name": f"failed-{index}", "workflow": None,
+                "status": None, "conclusion": None, "state": "FAILURE",
+                "class": "failed", "url": None, "workflow_run_id": None,
+                "started_at": None, "completed_at": None, "description": None,
+            }
+            for index in range(44)
+        ]
+        with (
+            mock.patch.object(MODULE, "git", return_value=""),
+            mock.patch.object(MODULE, "metadata_for", return_value=pr),
+            mock.patch.object(MODULE, "checkout_pr"),
+            mock.patch.object(MODULE, "local_identity", return_value=self.preflight["identity"]),
+            mock.patch.object(MODULE, "require_fork_head"),
+            mock.patch.object(MODULE, "find_push_remote"),
+            mock.patch.object(
+                MODULE, "gh_json",
+                side_effect=[
+                    {"permissions": dict.fromkeys(
+                        ("admin", "maintain", "push", "triage", "pull"), True
+                    )},
+                    {"login": "viewer"},
+                    [{"workflow_runs": []}],
+                    [{"workflow_runs": []}],
+                ],
+            ),
+            mock.patch.object(MODULE, "fetch_rollup", return_value=(self.head, checks)),
+            mock.patch.object(MODULE, "baseline_conclusions") as baseline,
+            mock.patch.object(MODULE, "fetch_failed_check_log") as download,
+        ):
+            preflight = MODULE.agent_task_preflight(
+                self.root, {"repo_name": "owner/repo", "number": 7},
+                state_path=self.root / "lightweight.json",
+                collect_failure_logs=False,
+            )
+        self.assertEqual("failures", preflight["check_snapshot"]["decision"]["decision"])
+        self.assertEqual(44, len(preflight["check_snapshot"]["decision"]["checks"]))
+        self.assertEqual([], preflight["check_snapshot"]["failures"])
+        self.assertEqual([], preflight["log_downloads"])
+        baseline.assert_not_called()
+        download.assert_not_called()
+
     def test_snapshot_identity_ignores_observation_time(self):
         first = copy.deepcopy(self.preflight["check_snapshot"])
         second = copy.deepcopy(first)
@@ -7187,6 +7237,21 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual(
             MODULE.check_snapshot_sha256(first),
             MODULE.check_snapshot_sha256(second),
+        )
+
+    def test_stability_identity_ignores_logs_but_tracks_check_changes(self):
+        first = copy.deepcopy(self.preflight["check_snapshot"])
+        second = copy.deepcopy(first)
+        second["failures"][0]["log_sha256"] = "0" * 64
+        second["failures"][0]["log_path"] = "another.log"
+        self.assertEqual(
+            MODULE.ci_stability_sha256(first),
+            MODULE.ci_stability_sha256(second),
+        )
+        second["workflow_runs"] = {"42": {"run_attempt": 2}}
+        self.assertNotEqual(
+            MODULE.ci_stability_sha256(first),
+            MODULE.ci_stability_sha256(second),
         )
 
     def test_one_task_primitive_refuses_a_partial_check_suite(self):
@@ -7244,8 +7309,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "agent_task_preflight",
-                side_effect=[pending, stable, stable],
+                side_effect=[pending, stable, stable, stable],
             ) as preflight,
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(MODULE.time, "sleep"),
         ):
             result = MODULE.wait_for_stable_ci_preflight(
@@ -7256,10 +7322,50 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             )
 
         self.assertEqual(result["check_snapshot"]["sha256"], stable["check_snapshot"]["sha256"])
-        self.assertEqual(preflight.call_count, 3)
+        self.assertEqual(preflight.call_count, 4)
+        self.assertEqual(
+            [False, False, False, True],
+            [call.kwargs.get("collect_failure_logs", True) for call in preflight.call_args_list],
+        )
         self.assertEqual(
             MODULE.load_state(state_path)["coordinator"]["status"],
             "ready",
+        )
+
+    def test_local_coordinator_rechecks_checks_after_collecting_logs(self):
+        stable = copy.deepcopy(self.preflight)
+        stable["check_snapshot"]["failures"] = []
+        args = SimpleNamespace(
+            wait_timeout=10, poll_interval=0, poll_max_interval=0,
+            poll_jitter=0, stability_polls=2, debounce_seconds=0,
+            stack_state=None,
+        )
+        state_path = self.root / "recheck.json"
+        changed = MODULE.WorkflowError(
+            "CI attempt changed", details={"reason": "ci_observation_changed"}
+        )
+        with (
+            mock.patch.object(
+                MODULE, "agent_task_preflight",
+                side_effect=[stable] * 6,
+            ) as observe,
+            mock.patch.object(
+                MODULE, "require_live_check_snapshot",
+                side_effect=[changed, None],
+            ) as confirm,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            result = MODULE.wait_for_stable_ci_preflight(
+                args, repo_root=self.root,
+                target={"repo_name": "owner/repo", "number": 7},
+                state_path=state_path,
+            )
+        self.assertEqual(stable, result)
+        self.assertEqual(6, observe.call_count)
+        self.assertEqual(2, confirm.call_count)
+        self.assertEqual(
+            [False, False, True, False, False, True],
+            [call.kwargs.get("collect_failure_logs", True) for call in observe.call_args_list],
         )
 
     def test_local_coordinator_skips_a_consumed_snapshot_until_it_changes(self):
@@ -7297,8 +7403,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "agent_task_preflight",
-                side_effect=[consumed, consumed, fresh, fresh],
+                side_effect=[consumed, consumed, fresh, fresh, fresh],
             ) as preflight,
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(MODULE.time, "sleep"),
         ):
             result = MODULE.wait_for_stable_ci_preflight(
@@ -7309,7 +7416,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             )
 
         self.assertEqual(result["pr"]["head_sha"], "9" * 40)
-        self.assertEqual(preflight.call_count, 4)
+        self.assertEqual(preflight.call_count, 5)
 
     def test_late_terminal_snapshot_gets_prompt_stability_confirmation(self):
         pending = copy.deepcopy(self.preflight)
@@ -7345,8 +7452,9 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 with (
                     mock.patch.object(
                         MODULE, "agent_task_preflight",
-                        side_effect=[pending] * 5 + [stable, stable],
+                        side_effect=[pending] * 5 + [stable, stable, stable],
                     ) as preflight,
+                    mock.patch.object(MODULE, "require_live_check_snapshot"),
                     mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]),
                     mock.patch.object(MODULE.time, "sleep", side_effect=sleep) as slept,
                 ):
@@ -7357,7 +7465,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     )
 
                 self.assertEqual(stable, result)
-                self.assertEqual(7, preflight.call_count)
+                self.assertEqual(8, preflight.call_count)
                 self.assertEqual(
                     [mock.call(seconds) for seconds in (1, 2, 4, 8, 16, 1)],
                     slept.call_args_list,
@@ -7425,7 +7533,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         first = copy.deepcopy(self.preflight)
         first["check_snapshot"]["failures"] = []
         changed = copy.deepcopy(first)
-        changed["check_snapshot"]["sha256"] = "9" * 64
+        changed["check_snapshot"]["workflow_runs"] = {"42": {"run_attempt": 2}}
+        changed["check_snapshot"]["sha256"] = MODULE.check_snapshot_sha256(
+            changed["check_snapshot"]
+        )
         args = SimpleNamespace(
             wait_timeout=10,
             poll_interval=1,
@@ -7446,6 +7557,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 MODULE, "agent_task_preflight",
                 side_effect=[first, changed, changed, first, first, first, first],
             ) as preflight,
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]),
             mock.patch.object(MODULE.time, "sleep", side_effect=sleep) as slept,
         ):
@@ -7490,6 +7602,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
                 with (
                     mock.patch.object(MODULE, "agent_task_preflight", side_effect=sequence) as preflight,
+                    mock.patch.object(MODULE, "require_live_check_snapshot"),
                     mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]),
                     mock.patch.object(MODULE.time, "sleep", side_effect=sleep),
                 ):

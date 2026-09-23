@@ -58,11 +58,13 @@ class BoundedCiPipelineTest(unittest.TestCase):
     def test_running_checks_wait_then_final_state_is_validated(self):
         snapshot = {
             "sha256": "snapshot", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
             "decision": {"decision": "waiting", "detail": "checks running"},
         }
         preflight = {"check_snapshot": snapshot}
         with (
-            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight) as observe,
+            mock.patch.object(MODULE, "require_live_check_snapshot") as confirm,
             mock.patch.object(MODULE, "command_agent_task") as task,
         ):
             MODULE.command_bounded_pipeline(self.args)
@@ -77,12 +79,18 @@ class BoundedCiPipelineTest(unittest.TestCase):
                 MODULE.command_bounded_pipeline(self.args)
             self.assertEqual("green", self.output[-1]["result"])
             self.assertEqual("green", self.state["bounded_step"]["terminal"]["result"])
+            self.assertEqual(
+                [False, False, True],
+                [call.kwargs.get("collect_failure_logs", True) for call in observe.call_args_list],
+            )
+            confirm.assert_called_once()
 
     def test_stability_debounce_waits_across_calls_without_sleeping(self):
         self.args.debounce_seconds = 3600
         self.args.stability_polls = 2
         snapshot = {
             "sha256": "ready", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
             "decision": {"decision": "green", "detail": "green"},
         }
         with (
@@ -96,6 +104,32 @@ class BoundedCiPipelineTest(unittest.TestCase):
         self.assertEqual(["waiting", "waiting"], [item["result"] for item in self.output])
         task.assert_not_called()
         sleep.assert_not_called()
+
+    def test_changed_checks_after_log_collection_defer_dispatch(self):
+        snapshot = {
+            "sha256": "ready", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
+            "decision": {"decision": "green", "detail": "green"},
+        }
+        changed = MODULE.WorkflowError(
+            "CI attempt changed", details={"reason": "ci_observation_changed"}
+        )
+        with (
+            mock.patch.object(
+                MODULE, "agent_task_preflight",
+                return_value={"check_snapshot": snapshot},
+            ) as observe,
+            mock.patch.object(MODULE, "require_live_check_snapshot", side_effect=changed),
+            mock.patch.object(MODULE, "command_agent_task") as task,
+        ):
+            MODULE.command_bounded_pipeline(self.args)
+        self.assertEqual("waiting", self.output[-1]["result"])
+        self.assertEqual("checks_running", self.output[-1]["reason"])
+        self.assertEqual(
+            [False, True],
+            [call.kwargs.get("collect_failure_logs", True) for call in observe.call_args_list],
+        )
+        task.assert_not_called()
 
     def test_pending_hosted_task_is_observed_without_dispatching_again(self):
         self.state = {
@@ -136,6 +170,7 @@ class BoundedCiPipelineTest(unittest.TestCase):
 
     def test_owner_rejects_different_session_and_run(self):
         snapshot = {"sha256": "x", "head_sha": "head", "base_sha": "base",
+                    "rollup": [], "workflow_runs": {},
                     "decision": {"decision": "waiting", "detail": "pending"}}
         with mock.patch.object(MODULE, "agent_task_preflight", return_value={"check_snapshot": snapshot}):
             MODULE.command_bounded_pipeline(self.args)
