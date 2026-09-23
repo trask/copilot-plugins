@@ -1027,7 +1027,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "152679ce8d1ed127ff6b66e75d60fea350362e98eaaeb01f870e914941fd9ed7",
+            "d1305cc844fe5955a8dc7b408d7d06003d1668721df4df571d17610ec7b9df43",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -3226,6 +3226,7 @@ class StrategyChoiceTest(unittest.TestCase):
                     "f" * 40,
                     [head],
                     [],
+                    [],
                 ),
             ),
             mock.patch.object(
@@ -3327,7 +3328,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         head = "c" * 40
         common = "d" * 40
 
-        merge_base, commits, sync_merges = self.validate(
+        merge_base, commits, sync_merges, normalization_merges = self.validate(
             current_base=current,
             history_boundary=retained,
             head=head,
@@ -3337,6 +3338,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         self.assertEqual(common, merge_base)
         self.assertEqual([head], commits)
         self.assertEqual([], sync_merges)
+        self.assertEqual([], normalization_merges)
 
     def test_dependent_base_may_have_advanced_beyond_the_child(self):
         current_parent = "e" * 40
@@ -3344,7 +3346,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         child = "1" * 40
         common = "2" * 40
 
-        merge_base, commits, sync_merges = self.validate(
+        merge_base, commits, sync_merges, normalization_merges = self.validate(
             current_base=current_parent,
             history_boundary=retained_parent,
             head=child,
@@ -3354,6 +3356,7 @@ class NativeStackMemberHistoryTest(unittest.TestCase):
         self.assertEqual(common, merge_base)
         self.assertEqual([child], commits)
         self.assertEqual([], sync_merges)
+        self.assertEqual([], normalization_merges)
 
     def test_member_requires_common_history_with_current_base(self):
         with self.assertRaisesRegex(
@@ -3797,7 +3800,12 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
         ):
             MODULE.commit_identity(self.repo, merge, linear=True)
 
-        merge_base, commits, sync_merges = MODULE.native_stack_member_history(
+        (
+            merge_base,
+            commits,
+            sync_merges,
+            normalization_merges,
+        ) = MODULE.native_stack_member_history(
             self.repo,
             current_base=current_base,
             history_boundary=self.retained_base,
@@ -3807,6 +3815,7 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
         self.assertEqual(current_base, merge_base)
         self.assertEqual([upper, head], commits)
         self.assertEqual([merge], [item["sha"] for item in sync_merges])
+        self.assertEqual([], normalization_merges)
         self.assertEqual(1, sync_merges[0]["position"])
         self.assertEqual([upper, current_base], sync_merges[0]["parents"])
         self.assertEqual(
@@ -3824,6 +3833,7 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
                 for commit in commits
             ],
             "sync_merges": sync_merges,
+            "normalization_merges": [],
         }
         CLOUD_MODULE.verify_frozen_ranges(
             subprocess.run,
@@ -3850,42 +3860,150 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
                 member,
             )
 
-    def test_sync_merge_with_resolution_changes_fails_closed(self):
-        current_base, _upper, merge, head = self.build_sync_merge(
+    def test_resolution_merge_with_exact_direct_base_is_normalized(self):
+        current_base, upper, merge, head = self.build_sync_merge(
             conflicted=True
         )
 
-        with self.assertRaises(MODULE.NativeStackNormalizationRequired) as raised:
+        (
+            merge_base,
+            commits,
+            sync_merges,
+            normalization_merges,
+        ) = MODULE.native_stack_member_history(
+            self.repo,
+            current_base=current_base,
+            history_boundary=self.retained_base,
+            head=head,
+        )
+        self.assertEqual(current_base, merge_base)
+        self.assertEqual([upper, head], commits)
+        self.assertEqual([], sync_merges)
+        self.assertEqual([merge], [
+            item["sha"] for item in normalization_merges
+        ])
+        self.assertEqual(
+            "merge commit "
+            f"{merge} carries conflict-resolution changes and requires "
+            "explicit owner normalization",
+            normalization_merges[0]["reason"],
+        )
+        self.assertNotEqual(
+            hashlib.sha256(b"").hexdigest(),
+            normalization_merges[0]["remerge_diff_sha256"],
+        )
+        self.assertEqual(
+            ["base.txt"],
+            normalization_merges[0]["remerge_paths"],
+        )
+        self.assertEqual(
+            "exact-direct-base-tree-replay",
+            normalization_merges[0]["proof"],
+        )
+
+    def test_exact_tree_normalization_candidate_is_verified(self):
+        current_base, upper, merge, head = self.build_sync_merge(
+            conflicted=True
+        )
+        _, commits, sync_merges, normalization_merges = (
             MODULE.native_stack_member_history(
                 self.repo,
                 current_base=current_base,
                 history_boundary=self.retained_base,
                 head=head,
             )
-        manifest = raised.exception.manifest
-        self.assertEqual(
-            "github.copilot.native-stack-normalization",
-            manifest["schema"]["id"],
         )
-        self.assertEqual([merge], [
-            item["sha"] for item in manifest["normalization_merges"]
+        self.git("checkout", "-q", "-b", "normalized", current_base)
+        self.git("cherry-pick", upper, check=False)
+        self.write("base.txt", "upper and lower\n")
+        self.git("add", "base.txt")
+        self.git("cherry-pick", "--continue", check=True)
+        replayed_upper = self.git("rev-parse", "HEAD")
+        normalized = self.git(
+            "commit-tree",
+            f"{merge}^{{tree}}",
+            "-p",
+            replayed_upper,
+            "-m",
+            "Merge latest base",
+        )
+        self.git("reset", "-q", "--hard", normalized)
+        self.git("cherry-pick", head)
+        candidate = self.git("rev-parse", "HEAD")
+
+        rewritten, mappings = CLOUD_MODULE.prove_rebase_range_mechanically(
+            subprocess.run,
+            self.repo,
+            current_base,
+            candidate,
+            [
+                MODULE.commit_identity(self.repo, commit, linear=True)
+                for commit in commits
+            ],
+            {"base.txt", "after.txt"},
+            sync_merges=sync_merges,
+            normalization_merges=normalization_merges,
+        )
+
+        self.assertEqual(
+            [replayed_upper, normalized, candidate],
+            rewritten,
+        )
+        self.assertEqual([upper, head], [
+            mapping["old_sha"] for mapping in mappings
         ])
         self.assertEqual(
-            "merge commit "
-            f"{merge} carries conflict-resolution changes and requires "
-            "explicit owner normalization",
-            manifest["normalization_merges"][0]["reason"],
+            self.git("show", "-s", "--format=%T", merge),
+            self.git("show", "-s", "--format=%T", normalized),
         )
-        self.assertNotEqual(
-            hashlib.sha256(b"").hexdigest(),
-            manifest["normalization_merges"][0]["remerge_diff_sha256"],
+
+    def test_resolution_merge_with_nonexact_direct_base_still_escalates(self):
+        current_base, _upper, merge, head = self.build_sync_merge(
+            conflicted=True
         )
+        self.git("checkout", "-q", "main")
+        self.write("later.txt", "later\n")
+        self.git("add", "later.txt")
+        self.git("commit", "-q", "-m", "Later base")
+        advanced_base = self.git("rev-parse", "HEAD")
+
+        with self.assertRaises(MODULE.NativeStackNormalizationRequired) as raised:
+            MODULE.native_stack_member_history(
+                self.repo,
+                current_base=advanced_base,
+                history_boundary=self.retained_base,
+                head=head,
+            )
+
+        manifest = raised.exception.manifest
         self.assertEqual(
-            ["base.txt"],
-            manifest["normalization_merges"][0]["remerge_paths"],
+            [merge],
+            [item["sha"] for item in manifest["normalization_merges"]],
         )
-        self.assertEqual(False, manifest["required_outcome"]["push"])
-        self.assertEqual(2, len(MODULE.commit_parents(self.repo, merge)))
+        self.assertEqual([], manifest["safe_normalization_merges"])
+
+    def test_tip_sync_merge_with_nonexact_direct_base_still_escalates(self):
+        _current_base, _upper, merge, _head = self.build_sync_merge()
+        self.git("checkout", "-q", "main")
+        self.write("later.txt", "later\n")
+        self.git("add", "later.txt")
+        self.git("commit", "-q", "-m", "Later base")
+        advanced_base = self.git("rev-parse", "HEAD")
+
+        with self.assertRaises(MODULE.NativeStackNormalizationRequired) as raised:
+            MODULE.native_stack_member_history(
+                self.repo,
+                current_base=advanced_base,
+                history_boundary=self.retained_base,
+                head=merge,
+            )
+
+        manifest = raised.exception.manifest
+        self.assertEqual(
+            [merge],
+            [item["sha"] for item in manifest["normalization_merges"]],
+        )
+        self.assertEqual([], manifest["safe_normalization_merges"])
 
 
 class ManagedRequestStrategyTest(unittest.TestCase):
@@ -4216,8 +4334,8 @@ class ManagedTaskPromptTest(unittest.TestCase):
             paths,
             decode_compact_path_evidence(contract["resolution_context_paths"]),
         )
-        self.assertEqual(18134, len(prompt))
-        self.assertEqual(18134, len(prompt.encode("utf-8")))
+        self.assertEqual(18340, len(prompt))
+        self.assertEqual(18340, len(prompt.encode("utf-8")))
         self.assertLessEqual(
             len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS
         )

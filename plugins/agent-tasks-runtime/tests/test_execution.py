@@ -494,6 +494,42 @@ class ExecutionTest(unittest.TestCase):
             [event["remote_status"] for event in observation["history"]],
         )
 
+    def test_dispatch_progress_persists_only_sanitized_state_transitions(self):
+        context = self.context()
+        result_path = self.root / "remote-result.json"
+        context.record_dispatch(result_path, "request-one", "owner/repo")
+        task = {
+            "id": "task-one",
+            "state": "queued",
+            "url": "https://example/task-one",
+            "prompt": "must not be retained",
+        }
+        context.record_dispatch(result_path, "request-one", "owner/repo", task)
+        context.record_dispatch(result_path, "request-one", "owner/repo", task)
+        context.record_dispatch(
+            result_path,
+            "request-one",
+            "owner/repo",
+            {**task, "state": "in_progress", "stdout": "sealed"},
+        )
+
+        observation = EXECUTION.read(
+            result_path.with_name(result_path.name + ".dispatch.json")
+        )
+        self.assertEqual(
+            ["creating", "queued", "in_progress"],
+            [
+                (event["task"] or {}).get("state", event["remote_status"])
+                for event in observation["history"]
+            ],
+        )
+        serialized = json.dumps(observation)
+        self.assertNotIn("must not be retained", serialized)
+        self.assertNotIn("sealed", serialized)
+        latest = context.latest_dispatch_progress(observed_after=0)
+        self.assertEqual("in_progress", latest["task"]["state"])
+        self.assertEqual("active", latest["remote_status"])
+
     def test_nonzero_preserves_original_result_and_error(self):
         context = self.context()
         context.emit({"result": "complete", "retained_commits": ["abc"]})

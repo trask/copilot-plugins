@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "152679ce8d1ed127ff6b66e75d60fea350362e98eaaeb01f870e914941fd9ed7"
+    "d1305cc844fe5955a8dc7b408d7d06003d1668721df4df571d17610ec7b9df43"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@11"
@@ -7919,7 +7919,12 @@ def native_stack_member_history(
     current_base: str,
     history_boundary: str,
     head: str,
-) -> tuple[str, list[str], list[dict[str, Any]]]:
+) -> tuple[
+    str,
+    list[str],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     if not is_ancestor(repo_root, history_boundary, head):
         raise WorkflowError(
             f"proven history boundary {history_boundary} is not an ancestor "
@@ -7946,6 +7951,7 @@ def native_stack_member_history(
     linear_commits = []
     sync_merges = []
     normalization_merges = []
+    unsafe_normalization_merges = []
     previous = None
     for position, commit in enumerate(commits):
         parents = commit_parents(repo_root, commit)
@@ -7966,16 +7972,22 @@ def native_stack_member_history(
                     )
                 )
             except WorkflowError as error:
-                normalization_merges.append(
-                    normalization_merge_identity(
-                        repo_root,
-                        commit,
-                        position=position,
-                        reason=str(error),
-                    )
+                normalization = normalization_merge_identity(
+                    repo_root,
+                    commit,
+                    position=position,
+                    reason=str(error),
                 )
+                if (
+                    len(normalization["parents"]) == 2
+                    and normalization["parents"][1] == current_base
+                ):
+                    normalization["proof"] = "exact-direct-base-tree-replay"
+                    normalization_merges.append(normalization)
+                else:
+                    unsafe_normalization_merges.append(normalization)
         else:
-            normalization_merges.append(
+            unsafe_normalization_merges.append(
                 normalization_merge_identity(
                     repo_root,
                     commit,
@@ -7994,18 +8006,21 @@ def native_stack_member_history(
         )
         if tip_sync_merge is not None:
             sync_merges.remove(tip_sync_merge)
-            normalization_merges.append(
-                normalization_merge_identity(
-                    repo_root,
-                    head,
-                    position=tip_sync_merge["position"],
-                    reason=(
-                        "native stack member ends in a merge commit and requires "
-                        "explicit owner normalization"
-                    ),
-                )
+            normalization = normalization_merge_identity(
+                repo_root,
+                head,
+                position=tip_sync_merge["position"],
+                reason=(
+                    "native stack member ends in a merge commit and requires "
+                    "tree-preserving linear normalization"
+                ),
             )
-    if normalization_merges:
+            if normalization["parents"][1] == current_base:
+                normalization["proof"] = "exact-direct-base-tree-replay"
+                normalization_merges.append(normalization)
+            else:
+                unsafe_normalization_merges.append(normalization)
+    if unsafe_normalization_merges:
         raise NativeStackNormalizationRequired(
             {
                 "schema": {
@@ -8019,7 +8034,8 @@ def native_stack_member_history(
                 "first_parent_commits": commits,
                 "linear_commits": linear_commits,
                 "safe_sync_merges": sync_merges,
-                "normalization_merges": normalization_merges,
+                "safe_normalization_merges": normalization_merges,
+                "normalization_merges": unsafe_normalization_merges,
                 "required_outcome": {
                     "history": "linear",
                     "new_parent": current_base,
@@ -8035,7 +8051,7 @@ def native_stack_member_history(
                 },
             }
         )
-    return merge_bases[0], linear_commits, sync_merges
+    return merge_bases[0], linear_commits, sync_merges, normalization_merges
 
 
 def conflict_commit_subject(repo_root: Path, commit: str) -> str:
@@ -8618,16 +8634,26 @@ def _conflict_preflight(
                 preflight_refs=preflight_refs,
             )
             try:
-                (
-                    direct_merge_base,
-                    unique_commits,
-                    sync_merges,
-                ) = native_stack_member_history(
+                member_history = native_stack_member_history(
                     repo_root,
                     current_base=direct_base_sha,
                     history_boundary=history_boundary_sha,
                     head=member["head_sha"],
                 )
+                if len(member_history) == 3:
+                    (
+                        direct_merge_base,
+                        unique_commits,
+                        sync_merges,
+                    ) = member_history
+                    normalization_merges = []
+                else:
+                    (
+                        direct_merge_base,
+                        unique_commits,
+                        sync_merges,
+                        normalization_merges,
+                    ) = member_history
             except NativeStackNormalizationRequired as error:
                 error.manifest["member"] = {
                     "pr_number": member["number"],
@@ -8681,6 +8707,8 @@ def _conflict_preflight(
                     repo_root, member["head_sha"], direct_base_sha
                 )
             )
+            for merge in normalization_merges:
+                allowed_paths.update(merge["remerge_paths"])
             members.append(
                 {
                     "pr_number": member["number"],
@@ -8702,6 +8730,7 @@ def _conflict_preflight(
                     },
                     "old_commits": commits,
                     "sync_merges": sync_merges,
+                    "normalization_merges": normalization_merges,
                     "lease_sha": member["head_sha"],
                 }
             )
@@ -8856,7 +8885,10 @@ def build_conflict_prompt(preflight: dict[str, Any]) -> str:
         "and lease. A recorded direct-base synchronization merge has exactly two "
         "parents, a second parent in the current direct-base ancestry, and an empty "
         "remerge diff. Omit only those topology-only merge commits while mapping "
-        "every listed linear commit one-to-one. Preserve unaffected patches exactly. "
+        "every listed linear commit one-to-one. A recorded normalization merge has "
+        "the exact direct base as its second parent; replace it with one linear "
+        "commit at the recorded position whose tree, subject, and trailers exactly "
+        "match the recorded merge. Preserve unaffected patches exactly. "
         "The coordinator derives commit mappings, changed paths, and patch "
         "differences from Git.\n\n"
         "Run the repository's required formatting and focused validation remotely. "
@@ -9151,33 +9183,104 @@ def verify_rebased_range_mechanically(
     *,
     fix_commits: list[str] | None = None,
     attribution: dict[str, Any] | None = None,
+    sync_merges: list[dict[str, Any]] | None = None,
+    normalization_merges: list[dict[str, Any]] | None = None,
+    normalization_commits: list[str] | None = None,
 ) -> None:
     commits = ordered_commits(repo_root, base, tip)
     fixes = [] if fix_commits is None else fix_commits
+    synchronizations = [] if sync_merges is None else sync_merges
+    normalizations = (
+        [] if normalization_merges is None else normalization_merges
+    )
+    normalized = (
+        [] if normalization_commits is None else normalization_commits
+    )
+    replay_count = len(old_commits) + len(normalizations)
     if (
         not isinstance(fixes, list)
-        or len(commits) != len(old_commits) + len(fixes)
-        or commits[len(old_commits):] != fixes
+        or not isinstance(normalized, list)
+        or len(commits) != replay_count + len(fixes)
+        or commits[replay_count:] != fixes
         or len(mappings) != len(old_commits)
     ):
         raise WorkflowError("rewritten range dropped, added, squashed, or reordered commits")
+    merge_by_position = {
+        merge["position"]: ("sync", merge)
+        for merge in synchronizations
+    }
+    merge_by_position.update({
+        merge["position"]: ("normalization", merge)
+        for merge in normalizations
+    })
+    source_length = len(old_commits) + len(merge_by_position)
     parent = base
-    for old, new_sha, mapping in zip(old_commits, commits, mappings):
+    old = iter(old_commits)
+    mapping = iter(mappings)
+    replay_index = 0
+    observed_normalizations = []
+    for position in range(source_length):
+        merge = merge_by_position.get(position)
+        if merge is not None and merge[0] == "sync":
+            continue
+        new_sha = commits[replay_index]
+        replay_index += 1
         if commit_parents(repo_root, new_sha) != [parent]:
             raise WorkflowError("rewritten range is not linear")
-        expected = mechanical_commit_mapping(
-            repo_root,
-            old,
-            new_sha,
-            parent,
-            allowed_paths,
-            attribution,
-        )
-        if mapping != expected:
-            raise WorkflowError(
-                "generated commit mapping does not match mechanical history"
+        if merge is not None:
+            normalization = merge[1]
+            if attribution is not None:
+                verify_replay_message_bytes(
+                    repo_root,
+                    normalization,
+                    new_sha,
+                    attribution,
+                )
+            elif (
+                conflict_commit_subject(repo_root, new_sha)
+                != normalization["subject"]
+                or conflict_commit_trailers(repo_root, new_sha)
+                != normalization["trailers"]
+            ):
+                raise WorkflowError(
+                    "normalized merge subject or trailers changed"
+                )
+            paths = conflict_changed_paths(repo_root, new_sha)
+            require_candidate_code_paths(paths)
+            if (
+                git(
+                    repo_root,
+                    "show",
+                    "-s",
+                    "--format=%T",
+                    new_sha,
+                )
+                != normalization["tree"]
+                or not set(paths) <= allowed_paths
+            ):
+                raise WorkflowError(
+                    "normalized merge failed exact tree equivalence"
+                )
+            observed_normalizations.append(new_sha)
+        else:
+            old_commit = next(old)
+            expected = mechanical_commit_mapping(
+                repo_root,
+                old_commit,
+                new_sha,
+                parent,
+                allowed_paths,
+                attribution,
             )
+            if next(mapping) != expected:
+                raise WorkflowError(
+                    "generated commit mapping does not match mechanical history"
+                )
         parent = new_sha
+    if observed_normalizations != normalized:
+        raise WorkflowError(
+            "normalized merge commit sequence does not match its proof"
+        )
     for new_sha in fixes:
         if commit_parents(repo_root, new_sha) != [parent]:
             raise WorkflowError("member fix suffix is not linear")
@@ -9226,16 +9329,19 @@ def verify_native_stack_member_input(
         raise WorkflowError(
             "native stack observed ancestry disagrees with its history boundary"
         )
-    merge_base, commits, sync_merges = native_stack_member_history(
+    merge_base, commits, sync_merges, normalization_merges = (
+        native_stack_member_history(
         repo_root,
         current_base=member["direct_base_sha"],
         history_boundary=member["history_boundary_sha"],
         head=member["head_sha"],
+        )
     )
     if (
         merge_base != member["direct_merge_base"]
         or commits != [commit["sha"] for commit in member["old_commits"]]
         or sync_merges != member["sync_merges"]
+        or normalization_merges != member.get("normalization_merges", [])
     ):
         raise WorkflowError("native stack member retained history identity drifted")
 
@@ -9419,7 +9525,9 @@ def verify_quarantined_result(
             "commits",
         }
         if request["strategy"] == "native-stack":
-            expected_keys.add("fix_commits")
+            expected_keys.update(
+                {"fix_commits", "normalization_commits"}
+            )
         if not isinstance(code_ref, dict) or set(code_ref) != expected_keys:
             raise WorkflowError("generated code ref is malformed")
         role = code_ref["role"]
@@ -9497,6 +9605,7 @@ def verify_quarantined_result(
                 or code_ref["base_sha"] != previous_tip
                 or code_ref["base_ref"] != member["direct_base_ref"]
                 or not isinstance(code_ref["fix_commits"], list)
+                or not isinstance(code_ref.get("normalization_commits"), list)
             ):
                 raise WorkflowError("native stack result violates member order or lease")
             verify_native_stack_member_input(repo_root, member)
@@ -9511,6 +9620,9 @@ def verify_quarantined_result(
                 attribution=verify_replay_attribution(
                     request, artifact["members"][index], previous_tip
                 ),
+                sync_merges=member["sync_merges"],
+                normalization_merges=member.get("normalization_merges", []),
+                normalization_commits=code_ref["normalization_commits"],
             )
             previous_tip = code_ref["new_sha"]
     artifact_keys = {"branch", "head_sha", "source_tip_sha", "report", "receipt"}
@@ -10920,7 +11032,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
+EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

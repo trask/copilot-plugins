@@ -164,7 +164,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "7304791a4fb91fa820340d1fa3b1e48698ee7036cd5408b85554aa7cb0290c91"
+    "fa74322811f6f4546bc271450ab5a30e4c25f96724b6e6a7666e5ee07e7c220a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -2216,7 +2216,8 @@ class _ReviewBodyDetails(HTMLParser):
 
 def _legacy_suppressed_entries(content: str) -> list[dict[str, Any]]:
     headers = list(re.finditer(
-        r"^\s*\*\*(?P<path>.+):(?P<line>\d+)\*\*\s*$",
+        r"^\s*\*\*(?:\[(?P<link_path>[^]\r\n]+):(?P<link_line>\d+)\]"
+        r"\([^)\r\n]+\)|(?P<path>.+):(?P<line>\d+))\*\*\s*$",
         content, flags=re.MULTILINE,
     ))
     parsed: list[dict[str, Any]] = []
@@ -2227,8 +2228,10 @@ def _legacy_suppressed_entries(content: str) -> list[dict[str, Any]]:
         )
         comment_body = content[header.end():end].strip()
         comment_body = re.sub(r"^\*(?:\s+|$)", "", comment_body)
+        comment_body = re.sub(r"\*\s*$", "", comment_body).strip()
         parsed.append({
-            "path": header["path"], "line": int(header["line"]),
+            "path": header["link_path"] or header["path"],
+            "line": int(header["link_line"] or header["line"]),
             "body": comment_body,
         })
     return parsed
@@ -2308,7 +2311,12 @@ def _legacy_review_details(content: str) -> list[dict[str, Any]]:
         if not re.match(
             r"(?:Suppressed comments|Previously missed)\b", title, re.IGNORECASE
         ):
-            entries.extend(parse_suppressed_comments(content[heading.end():end]))
+            unknown_block = content[heading.end():end]
+            if _legacy_suppressed_entries(unknown_block):
+                raise WorkflowError(
+                    "Copilot review body contains an unparsed actionable section"
+                )
+            entries.extend(parse_suppressed_comments(unknown_block))
             continue
         label = re.fullmatch(
             r"(?:Suppressed comments|Previously missed)\s*\((\d+)\)",
@@ -2330,7 +2338,10 @@ def _legacy_review_details(content: str) -> list[dict[str, Any]]:
             if int(group[1]) != int(label[1]):
                 raise WorkflowError("Copilot review body feedback count is inconsistent")
             block = block[group.end():]
-        if block.strip() and not re.match(r"\s*\*\*[^*\r\n]+:\d+\*\*", block):
+        if block.strip() and not re.match(
+            r"\s*\*\*(?:\[[^]\r\n]+:\d+\]\([^)]+\)|[^*\r\n]+:\d+)\*\*",
+            block,
+        ):
             raise WorkflowError("Copilot review body contains unparsed legacy feedback")
         parsed = _legacy_suppressed_entries(block)
         _validate_body_entries(parsed, int(label[1]))
@@ -9262,7 +9273,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "source_changed",
     "review_comments_pending_preparation",
 })
-EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
+EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

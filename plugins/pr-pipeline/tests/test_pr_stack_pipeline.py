@@ -3632,9 +3632,13 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertIn("cannot be determined", self.text)
 
     def test_the_agent_only_runs_and_reports_the_foreground_helper(self):
-        self.assertIn('pr_stack_pipeline.py" run <target>', self.text)
+        self.assertIn("copilot plugin list --json", self.text)
+        self.assertIn(
+            "installed-plugins\\trask-plugins\\pr-pipeline\\scripts\\pr_stack_pipeline.py",
+            self.text,
+        )
         self.assertNotIn('pr_stack_pipeline.py" watch', self.text)
-        self.assertIn("Run the installed helper once", self.text)
+        self.assertIn("run it once through the official execution tool", self.text)
         self.assertIn("Invoke the helper synchronously", self.text)
         self.assertIn(
             "Do not send a user-visible response while the command is running",
@@ -3644,6 +3648,9 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertNotIn("execution tool's asynchronous mode", self.text)
         self.assertIn("shared Runtime owns execution identity", self.text)
         self.assertIn("verified terminal `workflow_result`", self.text)
+        self.assertIn("Never use recursive filesystem discovery", self.text)
+        self.assertIn("source checkout", self.text)
+        self.assertNotIn("<installed-pr-pipeline>", self.text)
 
     def test_the_agent_hides_runtime_plumbing(self):
         for text in (

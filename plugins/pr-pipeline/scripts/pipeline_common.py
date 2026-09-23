@@ -1180,6 +1180,29 @@ def stage_live_progress(
     }
 
 
+def hosted_task_progress(*, observed_after: float) -> dict[str, Any] | None:
+    if _EXECUTION is None or not hasattr(_EXECUTION, "latest_dispatch_progress"):
+        return None
+    event = _EXECUTION.latest_dispatch_progress(observed_after=observed_after)
+    if not isinstance(event, dict):
+        return None
+    task = event.get("task")
+    state = task.get("state") if isinstance(task, dict) else None
+    if not isinstance(state, str) or not state:
+        state = event.get("remote_status")
+    if not isinstance(state, str) or not state:
+        return None
+    progress = {
+        "phase": "hosted_task",
+        "hosted_task_state": state,
+        "observed_at": event.get("observed_at"),
+        "elapsed_seconds": event.get("elapsed_seconds"),
+    }
+    if isinstance(task, dict) and isinstance(task.get("id"), str):
+        progress["hosted_task_id"] = task["id"]
+    return progress
+
+
 def read_stage_status(
     entry: dict[str, Any],
     target: dict[str, Any],
@@ -1459,6 +1482,24 @@ def stage_failure_summary(stage_result: Any, *, text_limit: int = 512) -> dict[s
     """Preview a retained task error without changing the controller's stop reason."""
     if not isinstance(stage_result, dict):
         return {}
+    sealed = stage_result.get("sealed_terminal")
+    if isinstance(sealed, dict):
+        workflow = sealed.get("workflow_result")
+        error = workflow.get("error") if isinstance(workflow, dict) else None
+        if error is None:
+            error = sealed.get("error")
+        if isinstance(error, dict):
+            error = ": ".join(
+                value for key in ("code", "message")
+                if isinstance(value := error.get(key), str) and value.strip()
+            )
+        if isinstance(error, str) and error.strip():
+            return {
+                "stage": stage_result.get("stage"),
+                "error": error,
+                "child_run_id": sealed.get("run_id"),
+                "child_result_sha256": sealed.get("result_sha256"),
+            }
     status = stage_result.get("status")
     sources = [stage_result, status] if isinstance(status, dict) else [stage_result]
     for source in sources:
@@ -2143,13 +2184,30 @@ def run_monitored(
         if process.poll() is None:
             terminate_process_tree(process)
         raise
-    return {
+    result = {
         "returncode": process.wait(),
         "log_path": str(log_path),
         "started_at": started_at,
         "ended_at": utc_now(),
         "launch_receipt": process.launch_receipt if isinstance(process, OwnedProcess) else None,
     }
+    terminal = getattr(process, "terminal_result", None)
+    if isinstance(terminal, dict):
+        result["child_terminal_result"] = {
+            key: terminal[key]
+            for key in (
+                "run_id",
+                "result_file",
+                "result_sha256",
+                "exit_code",
+                "local_status",
+                "error",
+                "workflow_result",
+                "finalization_errors",
+            )
+            if key in terminal
+        }
+    return result
 
 
 def windows_process_identity(pid: int) -> dict[str, Any] | None:

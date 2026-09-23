@@ -31,6 +31,9 @@ CCR_V2_RESOLVED_REVIEW = (
 LEGACY_REVIEW_DETAILS = (
     Path(__file__).parent / "fixtures" / "legacy-review-details-review.json"
 )
+CURRENT_REVIEW_DETAILS = (
+    Path(__file__).parent / "fixtures" / "current-review-details-review.json"
+)
 CCA_DISABLED_RESULT = (
     Path(__file__).parent / "fixtures" / "cca-disabled-agent-task-result.json"
 )
@@ -1762,7 +1765,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.82")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.83")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -5836,6 +5839,45 @@ class CarryOverProgressTest(unittest.TestCase):
 
 
 class SuppressedCommentTest(unittest.TestCase):
+    def test_parses_current_overview_and_review_details_body(self):
+        review = json.loads(CURRENT_REVIEW_DETAILS.read_text(encoding="utf-8"))
+        self.assertEqual(
+            MODULE.parse_suppressed_comments(review["body"]),
+            [
+                {
+                    "path": "scripts/report.py",
+                    "line": 74,
+                    "body": "[Correctness] Preserve the last complete hourly bucket "
+                    "when the next bucket is partial.",
+                },
+                {
+                    "path": "scripts/collect.py",
+                    "line": 118,
+                    "body": "[Validation] Reject records whose normalized timestamp "
+                    "falls outside the requested window.",
+                },
+            ],
+        )
+
+    def test_current_review_details_reject_malformed_actionable_near_misses(self):
+        body = json.loads(
+            CURRENT_REVIEW_DETAILS.read_text(encoding="utf-8")
+        )["body"]
+        cases = [
+            body.replace("Suppressed comments (2)", "Suppressed comments (3)"),
+            body.replace("scripts/report.py:74", "scripts/report.py"),
+            body.replace(
+                "### Suppressed comments (2)",
+                "### Unknown actionable findings (2)",
+            ),
+            body.replace("</summary>\n\n### Suppressed", "\n\n### Suppressed"),
+        ]
+        for malformed in cases:
+            with self.subTest(body=malformed), self.assertRaisesRegex(
+                MODULE.WorkflowError, "review body"
+            ):
+                MODULE.parse_suppressed_comments(malformed)
+
     def test_parses_exact_legacy_review_details_body(self):
         review = json.loads(LEGACY_REVIEW_DETAILS.read_text(encoding="utf-8"))
         self.assertEqual(

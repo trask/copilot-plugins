@@ -465,6 +465,36 @@ class FreshCompletionEvidenceTest(unittest.TestCase):
             hashlib.sha256(body.encode("utf-8")).hexdigest(),
         )
 
+    def test_assignment_unavailable_is_not_retried_without_admission_proof(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "HTTP/2 404 Not Found\r\nContent-Type: application/json\r\n\r\n"
+                '{"message":"assignment not found",'
+                '"documentation_url":"https://docs.github.com/rest"}',
+                "gh: assignment not found (HTTP 404)",
+            )
+
+        api = MODULE.ApiClient(runner, max_transient_failures=3)
+        with self.assertRaisesRegex(
+            MODULE.CloudError,
+            "task admission is unknown and the request was not retried",
+        ) as raised:
+            api.request_json(
+                "POST",
+                "agents/repos/owner/repo/tasks",
+                payload={"prompt": "redacted"},
+                expected_status=201,
+                operation="start Agent Task",
+            )
+
+        self.assertEqual("assignment_unavailable", raised.exception.code)
+        self.assertEqual(1, len(calls))
+
 
 class DetachedCandidateCheckoutTest(unittest.TestCase):
     def setUp(self):

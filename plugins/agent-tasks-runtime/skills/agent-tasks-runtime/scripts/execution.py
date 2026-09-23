@@ -780,6 +780,7 @@ class OwnedProcess:
         self.observation_complete = False
         self.owner_terminated = False
         self.observed_descendants: list[dict[str, Any]] = []
+        self.terminal_result: dict[str, Any] | None = None
 
     @property
     def returncode(self):
@@ -839,6 +840,7 @@ class OwnedProcess:
                 or not same_process(result.get("owner", {}), self.launch_receipt["process_identity"])
             ):
                 raise ExecutionError("child exit lacks a matching sealed execution result")
+            self.terminal_result = result
 
     def close_process_handle(self) -> None:
         if not self.process_handle_closed:
@@ -1110,6 +1112,7 @@ class Execution:
             "stdout": str(self.directory / "stdout.log"),
             "stderr": str(self.directory / "stderr.log"),
             "progress": str(self.directory / "progress.jsonl"),
+            "remote_progress": str(self.directory / "remote-progress.jsonl"),
             "cancel": str(self.directory / "cancel.json"),
         }
         if route is not None:
@@ -1181,10 +1184,21 @@ class Execution:
                         task: dict[str, Any] | None = None) -> None:
         path = result_path.with_name(result_path.name + ".dispatch.json")
         self.record_state(path, {})
-        state = task.get("state") if isinstance(task, dict) else None
+        sanitized_task = None
+        if isinstance(task, dict):
+            sanitized_task = {
+                key: task[key]
+                for key in ("id", "state", "url")
+                if isinstance(task.get(key), str) and task[key]
+            }
+        state = (
+            sanitized_task.get("state")
+            if isinstance(sanitized_task, dict)
+            else None
+        )
         remote_status = (
             "creating"
-            if task is None else
+            if sanitized_task is None else
             "terminal"
             if state in REMOTE_TERMINAL_STATES else
             "active"
@@ -1194,7 +1208,7 @@ class Execution:
         event = {
             "observed_at": time.time(),
             "remote_status": remote_status,
-            "task": task,
+            "task": sanitized_task,
         }
         history = []
         if path.is_file():
@@ -1207,14 +1221,73 @@ class Execution:
             ):
                 raise ExecutionError("dispatch observation identity changed")
             history = prior["history"]
+            prior_event = history[-1] if history else None
+            if (
+                isinstance(prior_event, dict)
+                and prior_event.get("remote_status") == remote_status
+                and prior_event.get("task") == sanitized_task
+            ):
+                return
         history.append(event)
         write(path, {
             "schema": "github.copilot.dispatch-observation.v1",
             "request_id": request_id, "repository": repository,
             "status": "terminal" if remote_status == "terminal" else "observing",
-            "task": task, "remote_status": remote_status,
+            "task": sanitized_task, "remote_status": remote_status,
             "history": history,
         })
+        root = load_handle(self.root)
+        progress_event = {
+            "event": "hosted_task_progress",
+            "schema": "github.copilot.hosted-task-progress.v1",
+            "observed_at": event["observed_at"],
+            "elapsed_seconds": int(
+                max(0, event["observed_at"] - history[0]["observed_at"])
+            ),
+            "request_id": request_id,
+            "repository": repository,
+            "remote_status": remote_status,
+            "task": sanitized_task,
+        }
+        remote_progress = Path(root["remote_progress"])
+        with guard(remote_progress.with_suffix(".guard")):
+            with remote_progress.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(progress_event, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            with Path(root["progress"]).open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(progress_event, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+    def latest_dispatch_progress(
+        self, *, observed_after: float
+    ) -> dict[str, Any] | None:
+        root = load_handle(self.root)
+        path = Path(root["remote_progress"])
+        if not path.is_file():
+            return None
+        latest = None
+        with guard(path.with_suffix(".guard")):
+            lines = path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ExecutionError(
+                    "hosted task progress journal is malformed"
+                ) from error
+            if (
+                not isinstance(event, dict)
+                or event.get("event") != "hosted_task_progress"
+                or event.get("schema")
+                != "github.copilot.hosted-task-progress.v1"
+                or not isinstance(event.get("observed_at"), (int, float))
+            ):
+                raise ExecutionError("hosted task progress journal is invalid")
+            if event["observed_at"] >= observed_after:
+                latest = event
+        return latest
 
     def start(self, command: list[str], *, require_execution: bool = False, **options: Any) -> OwnedProcess:
         self.check_cancel()

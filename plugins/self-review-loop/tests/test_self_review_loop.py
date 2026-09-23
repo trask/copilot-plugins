@@ -1726,11 +1726,18 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             )
 
 
-    def test_current_creation_failure_retains_ownership_without_retry(self):
+    def test_assignment_failure_retains_unknown_creation_without_retry(self):
         state_path = self.directory / "cca-disabled-state.json"
         helper = self.directory / "cloud_task.py"
         helper.write_text("# helper\n", encoding="utf-8")
         failure = self.candidate_creation_failure()
+        failure["error"] = {
+            "code": "assignment_unavailable",
+            "message": (
+                "start Agent Task failed with HTTP 404: assignment not found; "
+                "task admission is unknown and the request was not retried"
+            ),
+        }
         commands = []
 
         def helper_run(command, **_kwargs):
@@ -1774,7 +1781,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.WorkflowError,
-                r"Agent Task failed \[api_failure\]: start Agent Task failed",
+                r"Agent Task failed \[assignment_unavailable\]: start Agent Task failed",
             ):
                 MODULE.command_agent_task(args)
             with self.assertRaisesRegex(
@@ -1805,7 +1812,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIsNone(task["semantic_output"])
         self.assertIsNone(task["candidate"])
         self.assertIsNone(task["completion"])
-        self.assertEqual("not_created", task["task_id_status"])
+        self.assertEqual("unknown_creation", task["task_id_status"])
         self.assertNotIn("recovery_command", task)
         self.assertNotIn("retry_command", task)
         self.assertNotIn("managed_task_history", state)
@@ -1957,7 +1964,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.59")
+        self.assertEqual(plugin["version"], "1.3.60")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):

@@ -78,7 +78,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "7304791a4fb91fa820340d1fa3b1e48698ee7036cd5408b85554aa7cb0290c91"
+    "fa74322811f6f4546bc271450ab5a30e4c25f96724b6e6a7666e5ee07e7c220a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -3072,7 +3072,11 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                     {
                         "status": "failed",
                         "task_id": None,
-                        "task_id_status": "not_created",
+                        "task_id_status": (
+                            "unknown_creation"
+                            if failure["code"] == "assignment_unavailable"
+                            else "not_created"
+                        ),
                         "error": failure,
                     }
                 )
@@ -3453,7 +3457,10 @@ def command_agent_task(args: argparse.Namespace) -> dict[str, Any] | None:
                 if imported
                 else "failed"
             )
-            if task_state.get("task_id_status") != "not_created":
+            if task_state.get("task_id_status") not in {
+                "not_created",
+                "unknown_creation",
+            }:
                 task_state["error"] = str(error)
             task_state["failed_at"] = utc_now()
             save_state(state_path, current)
@@ -3741,7 +3748,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "published",
     "nothing_to_publish",
 })
-EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
+EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

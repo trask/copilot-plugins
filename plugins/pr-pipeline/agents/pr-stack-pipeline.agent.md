@@ -11,13 +11,31 @@ Run only when the user explicitly selects PR Stack Pipeline or invokes `/pr-stac
 
 Use this agent only with model `gpt-5.6-sol`. If the runtime exposes reasoning effort, require `high`. Stop when the model is different or cannot be determined. An unavailable effort value is allowed.
 
-Run the installed helper once through the official execution tool:
+Resolve the installed helper through the supported plugin inventory, then run it once through the official execution tool. Use one foreground execution request containing the inventory check and launch.
 
-```text
-python "<installed-pr-pipeline>/scripts/pr_stack_pipeline.py" run <target>
+PowerShell:
+
+```powershell
+$plugins = @(copilot plugin list --json | ConvertFrom-Json | Where-Object {
+  $_.name -eq "pr-pipeline" -and $_.marketplace -eq "trask-plugins" -and
+  $_.source -eq "installed" -and $_.enabled -eq $true
+})
+if ($plugins.Count -ne 1) { throw "pr-pipeline@trask-plugins is not installed and enabled exactly once" }
+$copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { "$env:USERPROFILE\.copilot" }
+$entrypoint = Join-Path $copilotHome "installed-plugins\trask-plugins\pr-pipeline\scripts\pr_stack_pipeline.py"
+python $entrypoint run "<target>"
 ```
 
-Use `python3` on POSIX when needed. Accept the starting pull request as a GitHub PR URL, `owner/repo#number`, or bare PR number. A bare number resolves from the current workspace.
+POSIX:
+
+```sh
+plugins="$(copilot plugin list --json)" || exit $?
+printf '%s' "$plugins" | python3 -c 'import json,sys; p=[x for x in json.load(sys.stdin) if x.get("name")=="pr-pipeline" and x.get("marketplace")=="trask-plugins" and x.get("source")=="installed" and x.get("enabled") is True]; raise SystemExit(0 if len(p)==1 else "pr-pipeline@trask-plugins is not installed and enabled exactly once")' || exit $?
+copilot_home="${COPILOT_HOME:-$HOME/.copilot}"
+python3 "$copilot_home/installed-plugins/trask-plugins/pr-pipeline/scripts/pr_stack_pipeline.py" run "<target>"
+```
+
+Replace `<target>` with the starting pull request. Accept a GitHub PR URL, `owner/repo#number`, or bare PR number. A bare number resolves from the current workspace. Never use recursive filesystem discovery (`Get-ChildItem -Recurse`, `find`, `rg`, or equivalents), and never run a helper from the current repository, a source checkout, or any path not bound to the verified installed plugin inventory.
 
 The helper selects the open starting pull request plus every open descendant in current native-stack order. Predecessors are not selected. Draft and non-draft open members are included. Inactive descendants are not dispatched, but the helper freezes the complete topology, including inactive members, as source evidence.
 

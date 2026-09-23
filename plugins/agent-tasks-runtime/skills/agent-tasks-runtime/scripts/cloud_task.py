@@ -372,6 +372,9 @@ class ResultEnvelope:
 class Progress:
     task_id: str | None = None
     last_state: str | None = None
+    result_path: Path | None = None
+    request_id: str | None = None
+    repository: str | None = None
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -1853,6 +1856,19 @@ class ApiClient:
                 + (f": {message}" if message else ""),
                 response.headers.get("retry-after"),
             )
+        message = _api_message(response.body)
+        if (
+            method == "POST"
+            and endpoint.endswith("/tasks")
+            and response.status == 404
+            and isinstance(message, str)
+            and message.casefold() == "assignment not found"
+        ):
+            raise CloudError(
+                f"{operation} failed with HTTP 404: assignment not found; "
+                "task admission is unknown and the request was not retried",
+                "assignment_unavailable",
+            )
         raise CloudError(_permanent_api_error(operation, response), "api_failure")
 
 def parse_http_response(output: str) -> HttpResponse:
@@ -2232,7 +2248,25 @@ def monitor_task(
     progress.task_id = str(current["id"])
     while True:
         state = str(current["state"])
+        changed = progress.last_state != state
         progress.last_state = state
+        if (
+            changed
+            and _EXECUTION is not None
+            and progress.result_path is not None
+            and progress.request_id is not None
+            and progress.repository is not None
+        ):
+            _EXECUTION.record_dispatch(
+                progress.result_path,
+                progress.request_id,
+                progress.repository,
+                {
+                    "id": progress.task_id,
+                    "state": state,
+                    "url": current.get("html_url") or current.get("url"),
+                },
+            )
         if state in SUCCESS_STATES:
             return current
         if state in ERROR_STATES:
@@ -2619,6 +2653,9 @@ def execute(
     request_id = str(uuid_factory())
     if result is not None:
         result.request_id = request_id
+    progress.result_path = options.result_file
+    progress.request_id = request_id
+    progress.repository = repository
     pull_request = resolve_pull_request(
         runner,
         root,
@@ -2915,7 +2952,7 @@ def main(
 
 
 _EXECUTION = None
-EXECUTION_SHA256 = "28ae906479db527349f658287780bb3e8f1127b82b5a9dbebc5a07b695aaf8c1"
+EXECUTION_SHA256 = "9f3a13b1316e2e256d1383040ce75d52af874a2794973737fcdddce009fc7c2e"
 
 def _load_execution():
     """Load only the pinned shared foreground execution source."""

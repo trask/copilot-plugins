@@ -1967,6 +1967,61 @@ class RunStageStateIsolationTest(unittest.TestCase):
         self.assertIn("Copilot review addressing comments", transition["message"])
         self.assertIn("1m 1s elapsed", transition["message"])
 
+    def test_nested_hosted_task_transition_replaces_generic_stage_progress(self):
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
+        events = []
+
+        def monitored(_command, *, cwd, log_path, progress):
+            del cwd, log_path
+            progress()
+            return {
+                "returncode": 0,
+                "log_path": "stage.log",
+                "started_at": "start",
+                "ended_at": "end",
+            }
+
+        with (
+            mock.patch.object(MODULE, "stage_command", return_value=["copilot"]),
+            mock.patch.object(
+                MODULE, "stage_log_path", return_value=Path("stage.log")
+            ),
+            mock.patch.object(
+                MODULE.common,
+                "stage_live_progress",
+                return_value={"phase": "running"},
+            ),
+            mock.patch.object(
+                MODULE.common,
+                "hosted_task_progress",
+                return_value={
+                    "phase": "hosted_task",
+                    "hosted_task_state": "in_progress",
+                    "hosted_task_id": "task-one",
+                },
+            ),
+            mock.patch.object(
+                MODULE.common, "run_monitored", side_effect=monitored
+            ),
+        ):
+            MODULE.run_stage(
+                entry,
+                target(),
+                Path("C:/repo"),
+                model="gpt-5.6-sol",
+                effort="high",
+                run_id=InvocationStateIsolationTest.RUN_ID,
+                sweep=1,
+                report=events.append,
+            )
+
+        self.assertEqual("in_progress", events[0]["hosted_task_state"])
+        transition = MODULE.progress_transition(events[0])
+        self.assertIn(
+            "conflict resolution hosted task in progress",
+            transition["message"],
+        )
+
 
 class SweepTest(unittest.TestCase):
     def setUp(self):
@@ -3352,6 +3407,58 @@ class SweepTest(unittest.TestCase):
         self.assertEqual(task_error, result["detail"])
         self.assertNotIn(".log", result["detail"])
 
+    def test_nonzero_stage_exit_preserves_sealed_error_when_state_is_missing(self):
+        original = self.run_stage
+        sealed_error = "Copilot review body contains unparsed review details"
+
+        def fail_conflict(entry, *args, **kwargs):
+            result = original(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CONFLICT:
+                result.update(
+                    returncode=1,
+                    child_terminal_result={
+                        "run_id": "child-run",
+                        "result_sha256": "a" * 64,
+                        "exit_code": 1,
+                        "local_status": "failed",
+                        "workflow_result": {
+                            "result": "error",
+                            "error": sealed_error,
+                        },
+                        "finalization_errors": [
+                            "stage state was not recorded"
+                        ],
+                    },
+                )
+                self.clear_at[entry["stage"]] = None
+            return result
+
+        MODULE.run_stage.side_effect = fail_conflict
+        original_inspect = self.inspect
+
+        def missing_state(entry, *args, **kwargs):
+            result = original_inspect(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CONFLICT and self.launched:
+                result.update(
+                    reason="no_state",
+                    status={},
+                    status_state="C:/run/missing-state.json",
+                )
+            return result
+
+        MODULE.inspect_stage.side_effect = missing_state
+
+        result = self.execute()
+
+        self.assertEqual("stage_execution_failed", result["reason"])
+        self.assertEqual(sealed_error, result["detail"])
+        stage = result["stage_result"]
+        self.assertEqual("no_state", stage["reason"])
+        self.assertEqual("child-run", stage["sealed_terminal"]["run_id"])
+        self.assertEqual(
+            "no_state", stage["missing_state_diagnostic"]["reason"]
+        )
+
     def test_failed_coordinator_cannot_clear_a_stage_even_with_a_current_marker(self):
         def fail_after_marker(entry, *args, **kwargs):
             result = self.run_stage(entry, *args, **kwargs)
@@ -3539,7 +3646,11 @@ class AgentInstructionTest(unittest.TestCase):
 
     def test_agent_uses_one_synchronous_terminal_controller(self):
         text = AGENT.read_text(encoding="utf-8")
-        self.assertIn("pr_pipeline.py\" run <target>", text)
+        self.assertIn("copilot plugin list --json", text)
+        self.assertIn(
+            "installed-plugins\\trask-plugins\\pr-pipeline\\scripts\\pr_pipeline.py",
+            text,
+        )
         self.assertIn("at most two sweeps", text)
         self.assertIn("Sweeps never reset a stage budget", text)
         self.assertIn("Invoke the helper synchronously", text)
@@ -3553,6 +3664,13 @@ class AgentInstructionTest(unittest.TestCase):
         self.assertNotIn("execution tool's asynchronous mode", text)
         self.assertIn("verified terminal `workflow_result`", text)
         self.assertIn("verified Markdown presentation exactly", text)
+
+    def test_agent_forbids_recursive_or_checkout_entrypoint_discovery(self):
+        text = AGENT.read_text(encoding="utf-8")
+        self.assertIn("Never use recursive filesystem discovery", text)
+        self.assertIn("never run a helper from the current repository", text)
+        self.assertIn("source checkout", text)
+        self.assertNotIn("<installed-pr-pipeline>", text)
         self.assertIn("Do not reconstruct a summary from workflow state", text)
         self.assertNotIn("--execution-handle", text)
         self.assertNotIn("--pipeline-run", text)
