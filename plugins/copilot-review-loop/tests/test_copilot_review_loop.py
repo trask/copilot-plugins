@@ -1088,6 +1088,115 @@ class LegacyAgentInstructions:
         self.assertNotIn("omit to use the current branch's PR", self.instructions)
 
 
+class AtomicWriteTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name).resolve()
+
+    def write(self, kind, path, value):
+        if kind == "state":
+            MODULE.save_state(
+                path, {"version": MODULE.STATE_VERSION, "value": value}
+            )
+        else:
+            MODULE.atomic_write_text(path, value)
+
+    def test_windows_sharing_denial_retries_the_same_atomic_replacement(self):
+        original_replace = MODULE.os.replace
+        for kind in ("state", "text"):
+            for code in (5, 32):
+                with self.subTest(kind=kind, code=code):
+                    path = self.directory / f"{kind}-{code}"
+                    self.write(kind, path, "old")
+                    original = path.read_bytes()
+                    attempts = []
+
+                    def temporarily_locked(source, destination):
+                        self.assertEqual(original, path.read_bytes())
+                        attempts.append((source, Path(source).read_bytes()))
+                        if len(attempts) < 3:
+                            error = PermissionError(13, "sharing denied")
+                            error.winerror = code
+                            raise error
+                        original_replace(source, destination)
+
+                    with (
+                        mock.patch.object(MODULE, "IS_WINDOWS", True),
+                        mock.patch.object(
+                            MODULE.os, "replace", side_effect=temporarily_locked
+                        ),
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                    ):
+                        self.write(kind, path, "new")
+                    self.assertEqual([attempts[0]] * 3, attempts)
+                    self.assertEqual(
+                        [mock.call(0.01), mock.call(0.02)],
+                        sleep.call_args_list,
+                    )
+                    self.assertNotEqual(original, path.read_bytes())
+                    self.assertEqual([], list(self.directory.glob("*.tmp")))
+
+    def test_replacement_exhaustion_preserves_state_and_original_error(self):
+        for kind in ("state", "text"):
+            with self.subTest(kind=kind):
+                path = self.directory / kind
+                self.write(kind, path, "old")
+                original = path.read_bytes()
+                error = PermissionError(13, "sharing denied")
+                error.winerror = 5
+                with (
+                    mock.patch.object(MODULE, "IS_WINDOWS", True),
+                    mock.patch.object(MODULE.os, "replace", side_effect=error) as replace,
+                    mock.patch.object(MODULE.time, "sleep") as sleep,
+                    self.assertRaises(PermissionError) as raised,
+                ):
+                    self.write(kind, path, "new")
+                self.assertIs(error, raised.exception)
+                self.assertEqual(6, replace.call_count)
+                self.assertEqual(
+                    [mock.call(delay) for delay in MODULE.WINDOWS_REPLACE_RETRY_DELAYS],
+                    sleep.call_args_list,
+                )
+                self.assertEqual(original, path.read_bytes())
+                self.assertEqual([], list(self.directory.glob("*.tmp")))
+
+    def test_other_replacement_errors_are_not_retried(self):
+        for windows, error in (
+            (False, PermissionError(13, "access denied")),
+            (True, FileNotFoundError(2, "missing")),
+            (True, OSError(28, "disk full")),
+        ):
+            with self.subTest(windows=windows, error=repr(error)):
+                path = self.directory / "state"
+                MODULE.save_state(path, {"version": MODULE.STATE_VERSION})
+                original = path.read_bytes()
+                with (
+                    mock.patch.object(MODULE, "IS_WINDOWS", windows),
+                    mock.patch.object(MODULE.os, "replace", side_effect=error) as replace,
+                    mock.patch.object(MODULE.time, "sleep") as sleep,
+                    self.assertRaises(OSError) as raised,
+                ):
+                    MODULE.save_state(path, {"version": MODULE.STATE_VERSION, "new": True})
+                self.assertIs(error, raised.exception)
+                replace.assert_called_once()
+                sleep.assert_not_called()
+                self.assertEqual(original, path.read_bytes())
+                self.assertEqual([], list(self.directory.glob("*.tmp")))
+
+    @unittest.skipUnless(MODULE.IS_WINDOWS, "requires Windows file sharing")
+    def test_open_status_reader_releases_before_retry(self):
+        path = self.directory / "state"
+        self.write("state", path, "old")
+        with path.open("r", encoding="utf-8") as reader:
+            with mock.patch.object(
+                MODULE.time, "sleep", side_effect=lambda _delay: reader.close()
+            ) as sleep:
+                self.write("state", path, "new")
+        sleep.assert_called_once_with(0.01)
+        self.assertEqual("new", MODULE.load_state(path)["value"])
+
+
 class AgentTaskCoordinatorTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -1765,7 +1874,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.86")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.87")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(

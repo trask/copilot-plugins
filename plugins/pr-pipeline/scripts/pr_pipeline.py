@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "2be44498221b42fafd30d6603caaa7cf6862b7cf188d55da62e492f0b5d3bd4c"
+COMMON_SHA256 = "388e93800ccf4dd8b15c7096637e0e015949998f5bf0f4d5d6168abdbf8b83d1"
 
 
 def load_common() -> Any:

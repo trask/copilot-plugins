@@ -341,9 +341,35 @@ class WindowsSubprocessTest(unittest.TestCase):
                 sleep=sleep,
             )
         self.assertEqual(0, result["returncode"])
-        self.assertEqual(2, progress.call_count)
+        self.assertEqual(1, progress.call_count)
         sleep.assert_called_once_with(0)
         process.wait.assert_called_once()
+
+    def test_stage_exit_at_deadline_preserves_the_child_failure(self):
+        process = mock.Mock()
+        process.poll.side_effect = [None, 1]
+        process.wait.return_value = 1
+        process.terminal_result = {
+            "exit_code": 1,
+            "workflow_result": {
+                "result": "error", "error": "state replacement denied",
+            },
+        }
+        progress = mock.Mock(side_effect=[None, AssertionError("deadline masked child")])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = MODULE.common.run_monitored(
+                ["copilot"], cwd=root, log_path=root / "stage.log",
+                progress=progress, interval=0,
+                start=mock.Mock(return_value=process),
+                sleep=mock.Mock(),
+            )
+        self.assertEqual(1, result["returncode"])
+        self.assertEqual(
+            "state replacement denied",
+            result["child_terminal_result"]["workflow_result"]["error"],
+        )
+        progress.assert_called_once()
 
     def test_owned_stage_monitor_terminates_and_reaps_on_interruption(self):
         process = mock.Mock()

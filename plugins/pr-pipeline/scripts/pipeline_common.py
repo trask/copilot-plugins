@@ -2179,6 +2179,8 @@ def run_monitored(
             if _EXECUTION is not None:
                 _EXECUTION.check_cancel()
             sleep(interval)
+            if process.poll() is not None:
+                break
             progress()
     except BaseException as failure:
         if process.poll() is None:
