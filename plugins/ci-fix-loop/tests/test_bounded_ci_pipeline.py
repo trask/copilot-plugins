@@ -256,11 +256,12 @@ class BoundedCiPipelineTest(unittest.TestCase):
 
     def test_managed_final_observation_requires_matching_sealed_result(self):
         execution = SimpleNamespace(children=[])
+        current = {"result": None}
 
         def run(command, **kwargs):
             execution.children.append(SimpleNamespace(terminal_result={
                 "exit_code": 0, "local_status": "finished",
-                "workflow_result": None,
+                "workflow_result": current["result"],
             }))
             return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -276,13 +277,7 @@ class BoundedCiPipelineTest(unittest.TestCase):
                     Path.cwd(), self.path,
                 )
             execution.children.clear()
-            def mismatched_run(command, **kwargs):
-                execution.children.append(SimpleNamespace(terminal_result={
-                    "exit_code": 0, "local_status": "finished",
-                    "workflow_result": {"status": "error"},
-                }))
-                return subprocess.CompletedProcess(command, 0, "", "")
-            execution.run = mismatched_run
+            current["result"] = {"status": "error"}
             with self.assertRaisesRegex(MODULE.WorkflowError, "differs from sealed child"):
                 MODULE.run_bounded_cloud_helper(
                     ["python", "helper", "--pipeline-run", "a" * 32],
