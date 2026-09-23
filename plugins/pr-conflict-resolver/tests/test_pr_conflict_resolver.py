@@ -1,3 +1,4 @@
+import base64
 import copy
 from contextlib import nullcontext
 import hashlib
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -39,6 +41,24 @@ CLOUD_SPEC.loader.exec_module(CLOUD_MODULE)
 
 
 def decode_compact_path_evidence(evidence):
+    if evidence.get("representation") == "zlib-json-base64-v1":
+        try:
+            source = zlib.decompress(
+                base64.b64decode(evidence["data"], validate=True)
+            )
+            paths = json.loads(source.decode("utf-8"))
+        except (KeyError, ValueError, zlib.error, UnicodeError) as error:
+            raise ValueError("invalid compressed path evidence") from error
+        if (
+            len(source) != evidence.get("uncompressed_utf8_bytes")
+            or not isinstance(paths, list)
+            or not all(isinstance(path, str) for path in paths)
+            or CLOUD_MODULE.canonical_json(paths) != source
+            or len(paths) != evidence.get("count")
+            or hashlib.sha256(source).hexdigest() != evidence.get("sha256")
+        ):
+            raise ValueError("compressed path evidence does not match")
+        return paths
     if evidence.get("representation") != "ordered-prefix-delta-v1":
         raise ValueError("unsupported path evidence representation")
     entries = evidence.get("entries")
@@ -1033,7 +1053,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "b5c73adfb6c06bcc1c7021e5fcc4ddd86f8dcc23499145d719b10e9e3b8323bb",
+            "30bf224d3de4279eabc3571e8683fde65e6a705325d085a67d38bffb969394cf",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -4187,27 +4207,84 @@ class ManagedTaskPromptTest(unittest.TestCase):
         }
 
 
-    def test_large_path_corpus_fails_before_submission_without_losing_scope(self):
+    def test_large_path_corpus_is_submitted_without_losing_scope(self):
         request = self.request()
         request["resolution_context_paths"] = [
             f"instrumentation/library-{number:04d}/src/main/java/Type{number}.java"
             for number in range(2291)
         ]
         request["request_sha256"] = CLOUD_MODULE.request_digest(request)
-
-        compact = CLOUD_MODULE.compact_request_contract(request)
-        evidence = compact["resolution_context_paths"]
-
-        self.assertEqual("ordered-prefix-delta-v1", evidence["representation"])
+        options = self.options(request)
+        self.assertGreater(
+            len(CLOUD_MODULE.policy_prompt(options)),
+            CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS,
+        )
+        prompt = CLOUD_MODULE.validated_task_prompt(options)
+        self.assertLessEqual(
+            len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
+        )
+        contract = json.loads(next(
+            line.split(": ", 1)[1] for line in prompt.splitlines()
+            if line.startswith("Compact immutable task contract")
+        ))
+        evidence = contract["resolution_context_paths"]
+        self.assertEqual("zlib-json-base64-v1", evidence["representation"])
         self.assertEqual(
-            request["resolution_context_paths"],
-            decode_compact_path_evidence(evidence),
+            request["resolution_context_paths"], decode_compact_path_evidence(evidence)
         )
         self.assertEqual(2291, evidence["count"])
         self.assertEqual(
             CLOUD_MODULE.value_digest(request["resolution_context_paths"]),
             evidence["sha256"],
         )
+
+    def test_oversized_native_member_scope_fits_both_submission_limits(self):
+        request = self.request()
+        paths = [
+            f"instrumentation/library-{number:04d}/src/main/java/io/opentelemetry/"
+            f"instrumentation/example/module{number:04d}/Example{number:04d}.java"
+            for number in range(574)
+        ]
+        request.update(
+            strategy="rebase",
+            resolution_context_paths=paths,
+            head_commits=[self.commit(number, paths[number]) for number in range(12)],
+        )
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
+        options = self.options(request)
+        self.assertGreater(
+            len(CLOUD_MODULE.policy_prompt(options).encode("utf-8")),
+            CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES,
+        )
+        snapshot = SimpleNamespace(
+            control_root=Path("control"), repository=request["repository"]
+        )
+        with mock.patch.object(
+            CLOUD_MODULE, "api_json", return_value={"id": "task-1", "state": "queued"}
+        ) as api:
+            CLOUD_MODULE.start_task(mock.sentinel.runner, snapshot, options)
+        prompt = api.call_args.args[4]["prompt"]
+        contract = json.loads(next(
+            line.split(": ", 1)[1] for line in prompt.splitlines()
+            if line.startswith("Compact immutable task contract")
+        ))
+        self.assertIn("base64.b64decode(data, validate=True)", prompt)
+        self.assertEqual(
+            paths, decode_compact_path_evidence(contract["resolution_context_paths"])
+        )
+        self.assertEqual(request["request_sha256"], contract["request_sha256"])
+        self.assertLessEqual(len(prompt), CLOUD_MODULE.TASK_PROMPT_MAX_CHARACTERS)
+        self.assertLessEqual(
+            len(prompt.encode("utf-8")), CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES
+        )
+
+    def test_incompressible_path_scope_still_fails_before_submission(self):
+        request = self.request()
+        request["resolution_context_paths"] = [
+            f"src/{hashlib.sha256(str(number).encode()).hexdigest()}.py"
+            for number in range(1000)
+        ]
+        request["request_sha256"] = CLOUD_MODULE.request_digest(request)
         with mock.patch.object(CLOUD_MODULE, "api_json") as api, self.assertRaises(
             CLOUD_MODULE.ConflictError
         ) as failure:
@@ -4369,7 +4446,9 @@ class ManagedTaskPromptTest(unittest.TestCase):
                 options = self.options(request)
                 options.prompt = options.prompt.rstrip()
                 remaining = CLOUD_MODULE.TASK_PROMPT_MAX_UTF8_BYTES - len(
-                    CLOUD_MODULE.policy_prompt(options).encode("utf-8")
+                    CLOUD_MODULE.policy_prompt(
+                        options, compress_paths=True
+                    ).encode("utf-8")
                 )
                 self.assertGreater(remaining, 0)
                 width = len(character.encode("utf-8"))
@@ -4488,6 +4567,24 @@ class ManagedTaskPromptTest(unittest.TestCase):
             {**evidence, "entries": [[0, "src/a.py"], [100, "b.py"]]},
         ]
 
+        for defect in defects:
+            with self.subTest(defect=defect), self.assertRaises(ValueError):
+                decode_compact_path_evidence(defect)
+
+    def test_compressed_path_evidence_preserves_unicode_and_rejects_corruption(self):
+        paths = ["src/😀/café.py", "src/😀/café.py", "src/βeta.py"]
+        evidence = CLOUD_MODULE.compact_path_evidence(paths, compress=True)
+        self.assertEqual(paths, decode_compact_path_evidence(evidence))
+        noncanonical = base64.b64encode(
+            zlib.compress(json.dumps(paths, ensure_ascii=False).encode("utf-8"))
+        ).decode("ascii")
+        defects = [
+            {**evidence, "count": 2},
+            {**evidence, "sha256": "0" * 64},
+            {**evidence, "uncompressed_utf8_bytes": 1},
+            {**evidence, "data": "not base64!"},
+            {**evidence, "data": noncanonical},
+        ]
         for defect in defects:
             with self.subTest(defect=defect), self.assertRaises(ValueError):
                 decode_compact_path_evidence(defect)

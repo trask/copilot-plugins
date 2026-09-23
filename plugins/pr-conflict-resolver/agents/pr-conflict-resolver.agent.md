@@ -27,6 +27,8 @@ The helper first proves a clean checkout at the exact PR head. An exact attached
 
 For an ordinary PR, the helper freezes the head, live base, merge base, repository merge settings, strategy, source commits, conflict context, allowed companion paths, iteration, and publication lease. It sends semantic conflict work to the pinned hosted worker, verifies the returned task and Git history, and publishes only the accepted code commits.
 
+The helper includes every resolution context path in the hosted prompt. When the readable encoding exceeds the submission limit, it compresses the path list losslessly and requires the worker to verify its count and digest before use. If the complete request still exceeds the limit, it stops before dispatch.
+
 When the selected PR needs native-stack conflict resolution, the helper discovers every current open stack member, including predecessors and descendants. It creates its own one-use authorization bound to the active Resolver run, process, repository, complete source snapshot, topology, member order, selected PR, Pipeline position when present, and exact branch leases. It prepares members in order and publishes every verified member in one atomic push. Callers never supply stack membership, `--whole-stack`, or a request file.
 
 The helper rechecks task provenance, model, prompt and request digests, source identity, topology, outside dependents, candidate history, process ownership, cancellation, and exact remote heads before publication and final clearance. Stale work remains retained evidence and consumes its attempt. It is never adopted into a new run.

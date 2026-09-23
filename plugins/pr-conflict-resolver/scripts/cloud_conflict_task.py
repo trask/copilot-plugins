@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+import zlib
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
@@ -1803,8 +1805,19 @@ def value_digest(value: object) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
-def compact_path_evidence(paths: Sequence[str]) -> Mapping[str, object]:
+def compact_path_evidence(
+    paths: Sequence[str], *, compress: bool = False
+) -> Mapping[str, object]:
     values = list(paths)
+    if compress:
+        source = canonical_json(values)
+        return {
+            "representation": "zlib-json-base64-v1",
+            "count": len(values),
+            "sha256": hashlib.sha256(source).hexdigest(),
+            "uncompressed_utf8_bytes": len(source),
+            "data": base64.b64encode(zlib.compress(source, level=9)).decode("ascii"),
+        }
     entries: list[list[object]] = []
     previous = ""
     for value in values:
@@ -1864,6 +1877,7 @@ def assigned_code_refs(request: Mapping[str, object]) -> list[RemoteRef]:
 def compact_request_contract(
     request: Mapping[str, object],
     *,
+    compress_paths: bool = False,
     include_per_commit_paths: bool = False,
 ) -> Mapping[str, object]:
     stack = request["native_stack"]
@@ -1918,7 +1932,9 @@ def compact_request_contract(
         "strategy": request["strategy"],
         "iteration": request["iteration"],
         "guards": request["guards"],
-        "resolution_context_paths": compact_path_evidence(request["resolution_context_paths"]),
+        "resolution_context_paths": compact_path_evidence(
+            request["resolution_context_paths"], compress=compress_paths
+        ),
         "head_commits": [
             compact_commit_evidence(
                 commit,
@@ -1971,19 +1987,35 @@ def replay_task_instructions(request: Mapping[str, object]) -> str:
 def policy_prompt(
     options: Options,
     *,
+    compress_paths: bool = False,
     include_per_commit_paths: bool = False,
 ) -> str:
+    path_encoding = (
+        "`resolution_context_paths` uses `zlib-json-base64-v1`. Decode `data` with "
+        "Python `base64.b64decode(data, validate=True)` and `zlib.decompress`, then "
+        "decode the bytes as UTF-8 and parse JSON. Require the decompressed byte "
+        "length to equal `uncompressed_utf8_bytes`, a list of strings with length "
+        "`count`, and its canonical UTF-8 JSON bytes (sorted keys, comma and colon "
+        "separators, non-ASCII preserved) to match the decompressed bytes. Require "
+        "SHA-256 of those bytes to equal `sha256`. Preserve order and duplicates. "
+        if compress_paths
+        else (
+            "`resolution_context_paths` uses `ordered-prefix-delta-v1`. Reconstruct "
+            "its ordered path list with `previous = \"\"`. For each `[prefix_length, "
+            "suffix]` entry, require a non-negative integer no greater than the "
+            "number of Unicode code points in `previous`, append "
+            "`previous[:prefix_length] + suffix`, then set `previous` to that path. "
+            "Prefix lengths are Unicode code points, never UTF-16 code units or UTF-8 "
+            "bytes. Preserve order and duplicates. Before using the list, require its "
+            "length to equal `count` and its `sha256` to equal SHA-256 over UTF-8 JSON "
+            "with sorted keys, comma and colon separators, and non-ASCII values "
+            "preserved. "
+        )
+    )
     path_scope = (
-        "`resolution_context_paths` uses `ordered-prefix-delta-v1`. Reconstruct its "
-        "ordered path list with `previous = \"\"`. For each `[prefix_length, suffix]` "
-        "entry, require a non-negative integer no greater than the number of Unicode "
-        "code points in `previous`, append `previous[:prefix_length] + suffix`, then "
-        "set `previous` to that path. Prefix lengths are Unicode code points, never "
-        "UTF-16 code units or UTF-8 bytes. Preserve order and duplicates. Before using "
-        "the list, require its length to equal `count` and its `sha256` to equal "
-        "SHA-256 over UTF-8 JSON with sorted keys, comma and colon separators, and "
-        "non-ASCII values preserved. Stop without changes if decoding, count, or digest "
-        "verification fails. Use the reconstructed paths as conflict-location context, "
+        path_encoding
+        + "Stop without changes if decoding, count, or digest verification fails. "
+        "Use the reconstructed paths as conflict-location context, "
         "not a filename permission set. Resolve the assigned member while preserving "
         "both sides' intent and unaffected work. Make necessary scoped companion edits "
         "and relocations, including test/support files, when the resolution requires "
@@ -2001,6 +2033,7 @@ def policy_prompt(
             )
         compact_request = compact_request_contract(
             options.request,
+            compress_paths=compress_paths,
             include_per_commit_paths=include_per_commit_paths,
         )
         refs = (
@@ -2073,6 +2106,13 @@ def policy_prompt(
 
 def validated_task_prompt(options: Options) -> str:
     prompt = policy_prompt(options)
+    if (
+        len(prompt) > TASK_PROMPT_MAX_CHARACTERS
+        or len(prompt.encode("utf-8")) > TASK_PROMPT_MAX_UTF8_BYTES
+    ):
+        compressed = policy_prompt(options, compress_paths=True)
+        if len(compressed.encode("utf-8")) < len(prompt.encode("utf-8")):
+            prompt = compressed
     characters = len(prompt)
     utf8_bytes = len(prompt.encode("utf-8"))
     if (
