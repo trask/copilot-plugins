@@ -38,7 +38,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "c84474ac0c7745f9331479cc8d76c719e2c3785e838bac78a21061c708a28296"
+    "d86fa0d04d0d080d5aa9b059c7d5ee258092e0d20abb606c59bbd6ec0ac3aba1"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -2312,7 +2312,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "existing_pending_review",
     "created_pending_review",
 })
-EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
+EXECUTION_SHA256 = "d149f16fa6c89e57155aa815e98261c01985a85742b5bb2c15bc85527fad4acb"
 EXECUTION_RELATIVE_PATH = Path("scripts", "execution.py")
 
 

@@ -1004,7 +1004,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "f8d9ff36412879867bbd1ad0c36d437824564fd088c7ba8871af57bf100b7464",
+            "47332bf93f41589703eee61263b855682bc9563be3b7185231b9dd67df1ad1b4",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -1565,6 +1565,43 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         status = emitted(status_emit)
         self.assertEqual("ready", status["result"])
         self.assertEqual("failed", status["agent_task"]["status"])
+
+    def test_unsafe_native_stack_normalization_retains_owner_evidence(self):
+        directory = temporary_directory(self)
+        state_path = directory / "state.json"
+        args = MODULE.build_parser().parse_args(
+            [
+                "agent-task", "owner/repo#7", "--repo-root", str(directory),
+                "--state", str(state_path),
+            ]
+        )
+        manifest = {
+            "schema": {"id": "github.copilot.native-stack-normalization", "version": 1},
+            "normalization_merges": [{"sha": "a" * 40}],
+        }
+        error = MODULE.NativeStackNormalizationRequired(manifest)
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=directory),
+            mock.patch.object(
+                MODULE, "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#7"),
+            ),
+            mock.patch.object(MODULE, "require_external_path"),
+            mock.patch.object(MODULE, "conflict_preflight", side_effect=error),
+            mock.patch.object(MODULE, "discover_conflict_task") as discover,
+            mock.patch.object(MODULE, "emit") as emit,
+        ):
+            MODULE.command_agent_task(args)
+
+        discover.assert_not_called()
+        task = MODULE.load_state(state_path)["agent_task"]
+        self.assertEqual("failed", task["status"])
+        self.assertEqual("not_created", task["task_id_status"])
+        self.assertEqual("native_stack_normalization_required", task["error"]["code"])
+        self.assertEqual(manifest, task["normalization"])
+        self.assertEqual(error.manifest_sha256, task["normalization_sha256"])
+        self.assertEqual("task_creation_failed", emitted(emit)["result"])
 
     @unittest.skip("legacy normalization recovery is intentionally unavailable")
     def test_native_stack_normalization_is_retained_without_task_creation(self):
@@ -2722,6 +2759,22 @@ class MergeabilityTest(unittest.TestCase):
         self.assertEqual(3, metadata_for.call_count)
         self.assertEqual([mock.call(0.1), mock.call(0.2)], clock.sleep.call_args_list)
 
+    def test_default_wait_covers_mergeability_computed_after_thirty_seconds(self):
+        target = MODULE.parse_target("owner/repo#7")
+        answers = [pr_metadata(mergeable="UNKNOWN")] * 5 + [
+            pr_metadata(mergeable="CONFLICTING")
+        ]
+        with mock.patch.object(
+            MODULE, "metadata_for", side_effect=answers
+        ) as metadata_for, mock.patch.object(MODULE, "time") as clock:
+            result = MODULE.live_mergeability(target)
+        self.assertEqual("CONFLICTING", result["mergeable"])
+        self.assertEqual(6, metadata_for.call_count)
+        self.assertEqual(
+            list(map(mock.call, MODULE.MERGEABILITY_RETRY_DELAYS[:5])),
+            clock.sleep.call_args_list,
+        )
+
     def test_an_answer_that_never_settles_is_returned_as_unknown(self):
         target = MODULE.parse_target("owner/repo#7")
         with mock.patch.object(
@@ -2768,7 +2821,7 @@ class MergeabilityTest(unittest.TestCase):
         )
 
     def test_the_default_delays_back_off(self):
-        self.assertEqual((2, 4, 8, 16), MODULE.MERGEABILITY_RETRY_DELAYS)
+        self.assertEqual((2, 4, 8, 16, 30, 30, 30), MODULE.MERGEABILITY_RETRY_DELAYS)
 
 
 class RepositorySettingsTest(unittest.TestCase):

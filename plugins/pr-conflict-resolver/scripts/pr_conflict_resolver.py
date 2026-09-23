@@ -25,7 +25,7 @@ from typing import Any, Iterable
 
 STATE_VERSION = 1
 AUTOMATION_BLOCKER_KIND = "automation_blocker"
-MERGEABILITY_RETRY_DELAYS = (2, 4, 8, 16)
+MERGEABILITY_RETRY_DELAYS = (2, 4, 8, 16, 30, 30, 30)
 PR_HEAD_LAG_RETRY_DELAY = 1
 REMOTE_REF_LAG_RETRY_DELAYS = (1, 2, 4)
 IS_WINDOWS = os.name == "nt"
@@ -72,10 +72,11 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "f8d9ff36412879867bbd1ad0c36d437824564fd088c7ba8871af57bf100b7464"
+    "47332bf93f41589703eee61263b855682bc9563be3b7185231b9dd67df1ad1b4"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@12"
+LEGACY_NO_TASK_POLICY = "marketplace-conflict-worker@11"
 CONFLICT_POLICY_SHA256 = (
     "b5b51023e8c9ff418ec7b2920121857b268cfd944f15a96885d16b8f9694c0b9"
 )
@@ -10339,8 +10340,10 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     except NativeStackNormalizationRequired as error:
         task = state["agent_task"]
         task["status"] = "failed"
+        task["normalization"] = error.manifest
+        task["normalization_sha256"] = error.manifest_sha256
         task["error"] = {
-            "code": "conflict_preflight_failed",
+            "code": "native_stack_normalization_required",
             "message": str(error),
         }
         save_state(state_path, state)
@@ -10711,7 +10714,16 @@ def require_later_conflict_sweep(
         or any(previous[key] != value for key, value in binding.items() if key != "iteration")
         or not isinstance(task, dict)
         or task.get("status") != "completed"
-        or task.get("policy") != CONFLICT_POLICY
+        or (
+            task.get("policy") != CONFLICT_POLICY
+            and not (
+                task.get("policy") == LEGACY_NO_TASK_POLICY
+                and state.get("last_result") == "mergeable"
+                and task.get("task_id") is None
+                and task.get("task_id_status") == "not_needed"
+                and result is None
+            )
+        )
         or task.get("model") != binding["model"]
         or task.get("invocation_id") != binding["run"]
         or task.get("error")
@@ -11432,7 +11444,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "head_changed",
     "no_descendants",
 })
-EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
+EXECUTION_SHA256 = "d149f16fa6c89e57155aa815e98261c01985a85742b5bb2c15bc85527fad4acb"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

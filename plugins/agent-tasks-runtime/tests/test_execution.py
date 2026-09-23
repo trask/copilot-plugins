@@ -114,7 +114,8 @@ class ExecutionTest(unittest.TestCase):
         })
         return handle, result_path, state, record
 
-    def pending_child_evidence(self, context, *, directory=None, name="stage", waiting=False):
+    def pending_child_evidence(self, context, *, directory=None, name="stage",
+                               waiting=False, waiting_status=False):
         handle, result_path, state, record = self.child_evidence(
             context, directory=directory, name=name
         )
@@ -126,11 +127,16 @@ class ExecutionTest(unittest.TestCase):
         observation["history"][-1]["task"]["state"] = "queued"
         EXECUTION.write(dispatch, observation)
         child = EXECUTION.read(result_path)
+        child["remote_status"] = "unconfirmed"
         child["remote_work_may_continue"] = True
-        child["workflow_result"] = (
-            {"result": "waiting"} if waiting
-            else {"status": "pending", "task": {"id": f"task-{name}"}}
-        )
+        if waiting_status:
+            child["workflow_result"] = {"status": "waiting"}
+        elif waiting:
+            child["workflow_result"] = {"result": "waiting"}
+        else:
+            child["workflow_result"] = {
+                "status": "pending", "task": {"id": f"task-{name}"}
+            }
         child["remote_tasks"] = [{**observation, "evidence": str(dispatch)}]
         EXECUTION.write(result_path, child)
         EXECUTION.write(handle, {
@@ -2242,6 +2248,92 @@ class ExecutionTest(unittest.TestCase):
             {"task-stage", "task-hosted"},
             {item["task"]["id"] for item in result["remote_tasks"]},
         )
+
+    def test_waiting_status_child_can_finish_a_bounded_step(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                context = EXECUTION.Execution(
+                    self.root / str(nested) / "root.json", command=["python"],
+                    terminal_results=frozenset({"waiting"}),
+                )
+                _, stage_result, _, _ = self.pending_child_evidence(
+                    context, waiting_status=True
+                )
+                if nested:
+                    self.pending_child_evidence(
+                        context, directory=stage_result.parent, name="hosted",
+                        waiting_status=True,
+                    )
+                context.emit({
+                    "result": "waiting", "task_id": "task-hosted" if nested else "task-stage",
+                    "task_state": "queued",
+                })
+
+                result = context.finish(0)
+
+                self.assertEqual(0, result["exit_code"])
+                self.assertEqual("finished", result["local_status"])
+                self.assertEqual([], result["finalization_errors"])
+                self.assertEqual("unconfirmed", result["remote_status"])
+                self.assertTrue(result["remote_work_may_continue"])
+                self.assertEqual(
+                    {"task-stage", "task-hosted"} if nested else {"task-stage"},
+                    {item["task"]["id"] for item in result["remote_tasks"]},
+                )
+
+    def test_waiting_status_child_rejects_unverified_or_unfinished_evidence(self):
+        for defect in ("unknown_dispatch", "missing_request", "missing_task",
+                       "terminal_dispatch", "failed_child", "undrained_child",
+                       "unknown_grandchild", "wrong_task", "nonwaiting_root"):
+            with self.subTest(defect=defect):
+                context = EXECUTION.Execution(
+                    self.root / defect / "root.json", command=["python"],
+                    terminal_results=frozenset({"waiting", "complete"}),
+                )
+                handle, result_path, _, _ = self.pending_child_evidence(
+                    context, waiting_status=True
+                )
+                if defect == "unknown_grandchild":
+                    handle, result_path, _, _ = self.pending_child_evidence(
+                        context, directory=result_path.parent, name="hosted",
+                        waiting_status=True,
+                    )
+                child = EXECUTION.read(result_path)
+                if defect in {"unknown_dispatch", "unknown_grandchild",
+                              "missing_request", "missing_task", "terminal_dispatch"}:
+                    observation = child["remote_tasks"][0]
+                    if defect in {"unknown_dispatch", "unknown_grandchild"}:
+                        observation["remote_status"] = "unknown"
+                    elif defect == "missing_request":
+                        observation["request_id"] = None
+                    elif defect == "missing_task":
+                        observation["task"] = None
+                    else:
+                        observation["remote_status"] = "terminal"
+                    EXECUTION.write(Path(observation["evidence"]), {
+                        key: value for key, value in observation.items() if key != "evidence"
+                    })
+                elif defect == "failed_child":
+                    child["exit_code"] = 1
+                    child["local_status"] = "failed"
+                elif defect == "undrained_child":
+                    child["local_children_drained"] = False
+                elif defect == "wrong_task":
+                    child["workflow_result"]["task"] = {"id": "different"}
+                EXECUTION.write(result_path, child)
+                EXECUTION.write(handle, {
+                    **EXECUTION.read(handle),
+                    "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                })
+                context.emit({
+                    "result": "complete" if defect == "nonwaiting_root" else "waiting"
+                })
+
+                result = context.finish(0)
+
+                self.assertEqual(1, result["exit_code"])
+                self.assertEqual("failed", result["local_status"])
+                self.assertTrue(result["finalization_errors"])
 
     def test_unknown_or_mismatched_pending_task_cannot_finish_a_step(self):
         for defect in (

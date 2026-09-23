@@ -3604,6 +3604,36 @@ class SweepTest(unittest.TestCase):
             "no_state", stage["missing_state_diagnostic"]["reason"]
         )
 
+    def test_nonzero_stage_exit_reports_sealed_error_when_prior_state_is_stale(self):
+        original = self.run_stage
+        sealed_error = (
+            "pipeline state requires a completed earlier sweep with unchanged identity"
+        )
+
+        def fail_conflict(entry, *args, **kwargs):
+            result = original(entry, *args, **kwargs)
+            if entry["stage"] == MODULE.STAGE_CONFLICT:
+                result.update(
+                    returncode=1,
+                    child_terminal_result={
+                        "run_id": "child-run",
+                        "result_sha256": "a" * 64,
+                        "exit_code": 1,
+                        "local_status": "failed",
+                        "workflow_result": {
+                            "result": "error",
+                            "error": sealed_error,
+                        },
+                    },
+                )
+            return result
+
+        MODULE.run_stage.side_effect = fail_conflict
+        result = self.execute()
+        self.assertEqual("stage_execution_failed", result["reason"])
+        self.assertEqual(sealed_error, result["detail"])
+        self.assertEqual("child-run", result["stage_result"]["sealed_terminal"]["run_id"])
+
     def test_failed_coordinator_cannot_clear_a_stage_even_with_a_current_marker(self):
         def fail_after_marker(entry, *args, **kwargs):
             result = self.run_stage(entry, *args, **kwargs)

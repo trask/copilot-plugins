@@ -101,6 +101,32 @@ class ConflictPipelineSweepTest(unittest.TestCase):
         self.assertEqual(1, self.calls["conflict_preflight"].call_count)
         self.calls["discover_conflict_task"].assert_not_called()
 
+    def test_prior_policy_no_task_clearance_can_be_revalidated(self):
+        state = self.first_sweep()
+        state["agent_task"]["policy"] = MODULE.LEGACY_NO_TASK_POLICY
+        MODULE.save_state(self.path, state)
+        self.metadata["head_sha"] = "c" * 40
+
+        self.assertEqual(0, MODULE.command_pipeline(self.args))
+        current = MODULE.load_state(self.path)
+        self.assertEqual("c" * 40, MODULE.cleared_head_sha(current))
+        self.assertEqual(
+            MODULE.LEGACY_NO_TASK_POLICY,
+            current["pipeline_sweep_history"][0]["agent_task"]["policy"],
+        )
+        self.calls["discover_conflict_task"].assert_not_called()
+
+    def test_prior_policy_with_hosted_result_cannot_be_revalidated(self):
+        state = self.first_sweep()
+        state["agent_task"]["policy"] = MODULE.LEGACY_NO_TASK_POLICY
+        state["agent_task"]["result"] = {"status": "success"}
+        MODULE.save_state(self.path, state)
+        before = self.path.read_bytes()
+
+        with self.assertRaisesRegex(MODULE.WorkflowError, "completed earlier sweep"):
+            MODULE.command_pipeline(self.args)
+        self.assertEqual(before, self.path.read_bytes())
+
     def test_completed_unknown_publication_can_be_reobserved_without_new_task(self):
         state = self.first_sweep()
         fixture = existing.ManagedConflictCoordinatorTest()

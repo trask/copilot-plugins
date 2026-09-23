@@ -451,6 +451,22 @@ class BoundedBackendTest(unittest.TestCase):
 
 
 class BoundedSweepTest(unittest.TestCase):
+    def test_prior_policy_no_task_clearance_can_be_revalidated(self):
+        fixture = sweeps.ConflictPipelineSweepTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.args.bounded_step = True
+        with mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": "session-1"}):
+            self.assertEqual(0, MODULE.command_pipeline(fixture.args))
+            state = MODULE.load_state(fixture.path)
+            state["agent_task"]["policy"] = MODULE.LEGACY_NO_TASK_POLICY
+            MODULE.save_state(fixture.path, state)
+            fixture.args.pipeline_iteration = 2
+            fixture.metadata["head_sha"] = "c" * 40
+            self.assertEqual(0, MODULE.command_pipeline(fixture.args))
+        self.assertEqual("c" * 40, MODULE.cleared_head_sha(MODULE.load_state(fixture.path)))
+        fixture.calls["discover_conflict_task"].assert_not_called()
+
     def test_completed_sweep_rechecks_live_base_without_another_dispatch(self):
         fixture = sweeps.ConflictPipelineSweepTest()
         fixture.setUp()

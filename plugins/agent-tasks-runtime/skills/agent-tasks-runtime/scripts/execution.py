@@ -419,7 +419,7 @@ def verified_pending_child(terminal: dict[str, Any]) -> bool:
     if (
         not isinstance(workflow, dict)
         or workflow.get("result") not in {None, "waiting"}
-        or workflow.get("status") not in {None, "pending"}
+        or workflow.get("status") not in {None, "pending", "waiting"}
         or (
             workflow.get("result") is None
             and workflow.get("status") is None

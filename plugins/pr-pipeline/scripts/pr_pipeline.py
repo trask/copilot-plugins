@@ -1413,11 +1413,9 @@ def run_pipeline(
                 run_id,
             )
             child_terminal = launched.get("child_terminal_result")
-            if (
-                after.get("reason") == "no_state"
-                and isinstance(child_terminal, dict)
-            ):
+            if launched.get("returncode") != 0 and isinstance(child_terminal, dict):
                 after["sealed_terminal"] = child_terminal
+            if after.get("reason") == "no_state" and isinstance(child_terminal, dict):
                 after["missing_state_diagnostic"] = {
                     "reason": "no_state",
                     "expected_path": after.get("status_state"),
@@ -1801,7 +1799,7 @@ EXECUTION_TERMINAL_RESULTS = frozenset({
     "continue",
     "waiting",
 })
-EXECUTION_SHA256 = "737375138585724c2ff1eb5a3e3dc84f432839e6b494a165f12ecb478617b458"
+EXECUTION_SHA256 = "d149f16fa6c89e57155aa815e98261c01985a85742b5bb2c15bc85527fad4acb"
 EXECUTION_RELATIVE_PATH = Path('scripts', 'execution.py')
 
 

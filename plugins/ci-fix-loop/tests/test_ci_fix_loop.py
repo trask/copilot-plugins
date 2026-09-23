@@ -3489,7 +3489,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.81", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.82", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
