@@ -2167,6 +2167,70 @@ def review_has_inline_findings(
     )
 
 
+def _mask_markdown_code(content: str) -> str:
+    masked = list(content)
+    hidden = [False] * len(content)
+
+    def hide(start: int, end: int) -> None:
+        for index in range(start, end):
+            hidden[index] = True
+            if content[index] not in "\r\n":
+                masked[index] = " "
+
+    fence: tuple[str, int] | None = None
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        text = line.rstrip("\r\n")
+        if fence is not None:
+            hide(offset, offset + len(line))
+            marker, minimum = fence
+            if re.fullmatch(
+                rf" {{0,3}}{re.escape(marker)}{{{minimum},}}[ \t]*", text
+            ):
+                fence = None
+        else:
+            opening = re.match(r" {0,3}(`{3,}|~{3,})", text)
+            if opening is not None:
+                marker = opening[1]
+                if marker[0] == "~" or "`" not in text[opening.end():]:
+                    fence = (marker[0], len(marker))
+                    hide(offset, offset + len(line))
+        offset += len(line)
+
+    index = 0
+    while index < len(content):
+        if hidden[index] or content[index] != "`":
+            index += 1
+            continue
+        end = index
+        while end < len(content) and content[end] == "`" and not hidden[end]:
+            end += 1
+        width = end - index
+        candidate = end
+        while candidate < len(content):
+            candidate = content.find("`", candidate)
+            if candidate < 0:
+                break
+            if hidden[candidate]:
+                candidate += 1
+                continue
+            candidate_end = candidate
+            while (
+                candidate_end < len(content)
+                and content[candidate_end] == "`"
+                and not hidden[candidate_end]
+            ):
+                candidate_end += 1
+            if candidate_end - candidate == width:
+                hide(index, candidate_end)
+                end = candidate_end
+                break
+            candidate = candidate_end
+        index = end
+
+    return "".join(masked)
+
+
 class _ReviewBodyDetails(HTMLParser):
     def __init__(self, body: str) -> None:
         super().__init__(convert_charrefs=False)
@@ -2174,7 +2238,7 @@ class _ReviewBodyDetails(HTMLParser):
         self.offsets = [0, *(match.end() for match in re.finditer("\n", body))]
         self.sections: list[dict[str, Any]] = []
         self.stack: list[dict[str, Any]] = []
-        self.feed(body)
+        self.feed(_mask_markdown_code(body))
         self.close()
 
     def source_offset(self) -> int:

@@ -1765,7 +1765,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.83")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.84")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -5858,6 +5858,27 @@ class SuppressedCommentTest(unittest.TestCase):
                 },
             ],
         )
+
+    def test_review_details_treat_markdown_html_examples_as_text(self):
+        body = """
+<details><summary>Review details</summary>
+### Suppressed comments (1)
+**src/dashboard.js:154**
+* Replace the `<title>` tooltip and document this example:
+```html
+</details>
+```
+- **Files reviewed:** 1/1 changed files
+- **Comments generated:** 0 new
+- **Review effort level:** Balanced
+</details>
+"""
+        self.assertEqual(MODULE.parse_suppressed_comments(body), [{
+            "path": "src/dashboard.js",
+            "line": 154,
+            "body": "Replace the `<title>` tooltip and document this example:\n"
+            "```html\n</details>\n```",
+        }])
 
     def test_current_review_details_reject_malformed_actionable_near_misses(self):
         body = json.loads(
