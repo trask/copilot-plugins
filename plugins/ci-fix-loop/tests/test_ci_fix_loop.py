@@ -3489,7 +3489,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.82", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.83", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -3678,9 +3678,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual(["verify-pre", "download", "verify-post"], events)
 
-    def test_failed_log_retries_exact_http2_cancel_then_succeeds(self):
+    def test_failed_log_falls_back_after_http2_cancel(self):
         check = self.preflight["check_snapshot"]["failures"][0]
-        error_text = "stream ID 1; CANCEL; received from peer"
+        error_text = (
+            "failed to get run log: stream error: stream ID 1; CANCEL; "
+            "received from peer"
+        )
         cancelled = MODULE.subprocess.CompletedProcess(
             ["gh"], 1, b"", error_text.encode("utf-8")
         )
@@ -3688,9 +3691,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             ["gh"], 0, b"focused failure log\n", b""
         )
         evidence = {}
+        phases = []
         with (
             mock.patch.object(MODULE, "resolve_run_id", return_value=1),
-            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+            mock.patch.object(
+                MODULE, "verify_failed_log_download_identity",
+                side_effect=lambda *_args, **kwargs: phases.append(kwargs["phase"]),
+            ),
             mock.patch.object(
                 MODULE, "run_bytes", side_effect=[cancelled, succeeded]
             ) as run,
@@ -3702,12 +3709,19 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
 
         self.assertEqual("focused failure log\n", content)
         self.assertEqual(2, run.call_count)
-        self.assertEqual(run.call_args_list[0].args[0], run.call_args_list[1].args[0])
+        self.assertEqual("run", run.call_args_list[0].args[0][1])
+        self.assertEqual(
+            ["gh", "api", "--method", "GET", "-H",
+             "Accept: application/vnd.github+json", "-H",
+             f"X-GitHub-Api-Version: {MODULE.AGENT_TASK_API_VERSION}",
+             "repos/owner/repo/actions/jobs/2/logs", "--allow-escape-sequences"],
+            run.call_args_list[1].args[0],
+        )
         self.assertEqual(
             MODULE.FAILED_LOG_DOWNLOAD_TIMEOUT_SECONDS,
             run.call_args_list[0].kwargs["timeout"],
         )
-        sleep.assert_called_once_with(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS[0])
+        sleep.assert_not_called()
         self.assertEqual(
             ["transient_failure", "success"],
             [attempt["result"] for attempt in evidence["attempts"]],
@@ -3715,6 +3729,30 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual(2, evidence["attempt_count"])
         self.assertIsNone(evidence["terminal_error"])
         self.assertEqual(MODULE.sha256_text(content), evidence["content_sha256"])
+        self.assertEqual(["pre", "fallback", "post"], phases)
+
+    def test_run_only_log_retries_http2_cancel_without_job_fallback(self):
+        check = copy.deepcopy(self.preflight["check_snapshot"]["failures"][0])
+        check.update(
+            name=check["workflow"], url="https://github.com/owner/repo/actions/runs/1"
+        )
+        cancelled = MODULE.subprocess.CompletedProcess(
+            ["gh"], 1, b"", b"stream ID 1; CANCEL; received from peer"
+        )
+        succeeded = MODULE.subprocess.CompletedProcess(["gh"], 0, b"failure\n", b"")
+        with (
+            mock.patch.object(MODULE, "verify_failed_log_download_identity"),
+            mock.patch.object(
+                MODULE, "run_bytes", side_effect=[cancelled, succeeded]
+            ) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                "failure\n", MODULE.fetch_failed_check_log(self.preflight["pr"], check)
+            )
+
+        self.assertEqual(run.call_args_list[0].args[0], run.call_args_list[1].args[0])
+        sleep.assert_called_once_with(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS[0])
 
     def test_failed_log_retries_multiple_transient_failures_then_succeeds(self):
         check = self.preflight["check_snapshot"]["failures"][0]
@@ -3765,16 +3803,13 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 self.preflight["pr"], check, evidence=evidence
             )
 
-        self.assertEqual(2 * attempts_per_method, run.call_count)
         self.assertEqual(
-            2 * len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS),
-            sleep.call_count,
-        )
-        self.assertEqual(
-            ["gh-run-view"] * attempts_per_method
+            ["gh-run-view"]
             + ["rest-job-log"] * attempts_per_method,
             [attempt["method"] for attempt in evidence["attempts"]],
         )
+        self.assertEqual(attempts_per_method + 1, run.call_count)
+        self.assertEqual(len(MODULE.FAILED_LOG_DOWNLOAD_RETRY_DELAYS), sleep.call_count)
         self.assertEqual(
             "transient_retry_exhausted",
             evidence["terminal_error"]["classification"],

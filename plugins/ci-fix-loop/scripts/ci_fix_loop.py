@@ -6200,6 +6200,18 @@ def failed_log_download_error_is_transient(
     )
 
 
+def failed_log_download_stream_cancelled(
+    process: subprocess.CompletedProcess[bytes],
+) -> bool:
+    stderr = (process.stderr or b"").decode("utf-8", errors="replace").casefold()
+    return bool(
+        re.search(r"\bstream id \d+;\s*cancel(?:;|\b)", stderr)
+        or re.search(
+            r"http/2 stream \d+ was not closed cleanly:\s*cancel\b", stderr
+        )
+    )
+
+
 def record_failed_log_download_attempt(
     evidence: dict[str, Any],
     *,
@@ -6771,6 +6783,11 @@ def fetch_failed_check_log(
                 )
                 failure.details["log_download"] = copy.deepcopy(download_evidence)
                 raise failure
+            if (
+                method_index + 1 < len(methods)
+                and failed_log_download_stream_cancelled(process)
+            ):
+                break
             if method_attempt < len(FAILED_LOG_DOWNLOAD_RETRY_DELAYS):
                 delay = FAILED_LOG_DOWNLOAD_RETRY_DELAYS[method_attempt]
                 if time.monotonic() + delay >= deadline:
