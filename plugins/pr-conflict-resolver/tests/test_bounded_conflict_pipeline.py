@@ -64,6 +64,8 @@ class BoundedPipelineTest(unittest.TestCase):
 
     def helper(self, command, **kwargs):
         phase = command[command.index("--bounded-phase") + 1]
+        deadline = float(command[command.index("--bounded-deadline") + 1])
+        self.assertLessEqual(deadline, MODULE.time.monotonic() + 100)
         result_path = Path(command[command.index("--result-file") + 1])
         receipt_path = result_path.with_name(result_path.name + ".bounded-receipt.json")
         result = CLOUD.Result(
@@ -140,6 +142,32 @@ class BoundedPipelineTest(unittest.TestCase):
         guard.assert_called_once()
         self.assertEqual(1, self.calls["conflict_preflight"].call_count)
         self.assertFalse(MODULE.load_state(self.path)["bounded_pipeline"]["prepared_dispatch"])
+
+    def test_native_stack_preparation_can_finish_after_100_seconds(self):
+        self.request["strategy"] = "native-stack"
+        self.request["native_stack"] = {"members": [{"pr_number": 6}]}
+        self.request["request_sha256"] = MODULE.request_digest(self.request)
+        clock = [10.0]
+
+        def preflight(*_args, **_kwargs):
+            clock[0] += 100
+            return {
+                "already_mergeable": False,
+                "pr": copy.deepcopy(self.metadata),
+                "strategy": "native-stack",
+                "request": copy.deepcopy(self.request),
+            }
+
+        self.calls["conflict_preflight"].side_effect = preflight
+        self.patch(
+            "authorize_resolver_native_stack", return_value={"request_id": "stack-1"},
+        )
+        with mock.patch.object(MODULE.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual(0, MODULE.command_pipeline(self.args))
+        state = MODULE.load_state(self.path)
+        self.assertTrue(state["bounded_pipeline"]["prepared_dispatch"])
+        self.assertEqual("running", state["agent_task"]["status"])
+        self.assertEqual(0, self.dispatches)
 
     def test_unprepared_stack_dispatch_cannot_be_adopted(self):
         self.request["strategy"] = "native-stack"
@@ -248,6 +276,59 @@ class BoundedPipelineTest(unittest.TestCase):
 
 
 class BoundedBackendTest(unittest.TestCase):
+    def test_parse_unbounded_and_bounded_conflict_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = existing.ManagedConflictCoordinatorTest().request()
+            request["head_commits"] = [{
+                "sha": request["pull_request"]["head_sha"],
+                "subject": "Resolve conflict",
+                "trailers": [],
+                "patch_sha256": "c" * 64,
+                "paths": ["app.py"],
+            }]
+            request["request_sha256"] = CLOUD.request_digest(request)
+            request_path = root / "request.json"
+            prompt_path = root / "prompt.txt"
+            result_path = root / "result.json"
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+            prompt_path.write_text("Resolve the conflict", encoding="utf-8")
+            command = [
+                "--conflict-with-report",
+                "--strategy", "merge",
+                "--model", "sol",
+                "--pr", request["pull_request"]["url"],
+                "--request-file", str(request_path),
+                "--prompt-file", str(prompt_path),
+                "--result-file", str(result_path),
+                "--policy", CLOUD.POLICY_SELECTOR,
+            ]
+            ordinary = CLOUD.parse_args(command)
+            self.assertIsNone(ordinary.bounded_phase)
+            self.assertIsNone(ordinary.bounded_session)
+            self.assertIsNone(ordinary.bounded_deadline)
+            with mock.patch.object(CLOUD.time, "monotonic", return_value=100):
+                bounded = CLOUD.parse_args([
+                    *command, "--bounded-phase", "dispatch",
+                    "--bounded-session", "session-1",
+                    "--bounded-deadline", "140",
+                ])
+            self.assertEqual("dispatch", bounded.bounded_phase)
+            self.assertEqual("session-1", bounded.bounded_session)
+            self.assertEqual(140, bounded.bounded_deadline)
+            for flags, message in (
+                (["--bounded-phase", "dispatch"], "requires session and deadline"),
+                (["--bounded-phase", ""], "requires session and deadline"),
+                ([
+                    "--bounded-phase", "unknown", "--bounded-session", "session-1",
+                    "--bounded-deadline", "140",
+                ], "invalid bounded phase"),
+            ):
+                with self.subTest(flags=flags), self.assertRaisesRegex(
+                    CLOUD.ConflictError, message,
+                ):
+                    CLOUD.parse_args([*command, *flags])
+
     def test_bounded_receipt_keeps_runtime_observation_separate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

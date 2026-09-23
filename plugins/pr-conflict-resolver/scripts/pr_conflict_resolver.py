@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "45262c0bdd7b6ec8e6ec601b1ba875d6d9a0dee7545d276144dc7e999b62c474"
+    "fb687e5b5db948bba4b56ca32cb1505c9ca19bc2b5a568b18f866113e3edab4e"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@11"
@@ -106,6 +106,7 @@ CONFLICT_RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
 AGENT_TASK_OUTPUT_REPORT = ".github/agent-task-output/report.md"
 _BOUNDED_DEADLINE: float | None = None
 _BOUNDED_STACK_AUTH: tuple[Path, str] | None = None
+BOUNDED_STEP_SECONDS = 180.0
 
 
 class WorkflowError(RuntimeError):
@@ -10890,6 +10891,8 @@ def revalidate_pipeline_conflict(
 def advance_bounded_conflict(
     state_path: Path, state: dict[str, Any], session: str,
 ) -> None:
+    if _BOUNDED_DEADLINE is None:
+        raise WorkflowError("bounded conflict deadline is missing")
     task = state["agent_task"]
     bounded = state["bounded_pipeline"]
     phase = bounded["phase"]
@@ -10919,7 +10922,8 @@ def advance_bounded_conflict(
     save_state(state_path, state)
     command = [
         *task["helper_command"], "--bounded-phase", phase,
-        "--bounded-session", session, "--bounded-deadline", str(_BOUNDED_DEADLINE),
+        "--bounded-session", session,
+        "--bounded-deadline", str(min(_BOUNDED_DEADLINE, time.monotonic() + 90)),
     ]
     process = run(command, cwd=Path(state["repo_root"]), check=False)
     result_path = Path(task["result_file"])
@@ -11087,7 +11091,7 @@ def command_bounded_pipeline(args: argparse.Namespace) -> int:
         _BOUNDED_STACK_AUTH = None
         raise WorkflowError("another invocation owns the pipeline state") from None
     started = False
-    _BOUNDED_DEADLINE = time.monotonic() + 90
+    _BOUNDED_DEADLINE = time.monotonic() + BOUNDED_STEP_SECONDS
     try:
         with lock:
             previous = load_state(state_path) if state_path.exists() else None

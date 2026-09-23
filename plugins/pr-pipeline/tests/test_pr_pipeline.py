@@ -4006,7 +4006,9 @@ class BoundedCommandTest(unittest.TestCase):
         self.assertTrue(stage["waiting"])
         self.assertEqual(60, stage["wait_seconds"])
 
-    def test_step_deadline_is_shorter_than_the_outer_execution_limit(self):
+    def test_bounded_stage_expires_at_step_deadline(self):
+        self.assertEqual(180, MODULE.STEP_DEADLINE_SECONDS)
+
         def monitor(_command, *, progress, **_options):
             progress()
 
@@ -4024,6 +4026,29 @@ class BoundedCommandTest(unittest.TestCase):
                 MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-6-sol",
                 effort="high", run_id="a" * 32, sweep=1, bounded=True,
             )
+
+    def test_bounded_conflict_preparation_can_finish_after_100_seconds(self):
+        def monitor(_command, *, progress, **_options):
+            progress()
+            return {
+                "returncode": 0,
+                "child_terminal_result": {
+                    "workflow_result": {"result": "waiting", "wait_seconds": 1},
+                },
+            }
+
+        with (
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0.0, 100.0]),
+            mock.patch.object(MODULE.common, "run_monitored", side_effect=monitor),
+            mock.patch.object(MODULE.common, "stage_live_progress", return_value=None),
+            mock.patch.object(MODULE.common, "hosted_task_progress", return_value=None),
+        ):
+            stage = MODULE.run_stage(
+                MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-6-sol",
+                effort="high", run_id="a" * 32, sweep=1, bounded=True,
+            )
+        self.assertTrue(stage["waiting"])
+
 
 class ParserTest(unittest.TestCase):
     def test_pipeline_exposes_bounded_session_commands(self):

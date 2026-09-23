@@ -1016,12 +1016,14 @@ def parse_args(args: Sequence[str]) -> Options:
         expected_policy=POLICY,
     )
     prompt = read_external_text(paths["--prompt-file"], "prompt file")
-    bounded = [values.get(key) for key in (
+    bounded_keys = (
         "--bounded-phase", "--bounded-session", "--bounded-deadline",
-    )]
-    if any(bounded) and not all(bounded):
+    )
+    bounded = [values.get(key) for key in bounded_keys]
+    bounded_present = [key in values for key in bounded_keys]
+    if any(bounded_present) and not all(bounded_present):
         raise ConflictError("bounded phase requires session and deadline", "policy_rejected")
-    if bounded:
+    if all(bounded_present):
         if bounded[0] not in {"dispatch", "observe", "collect"}:
             raise ConflictError("invalid bounded phase", "policy_rejected")
         if not isinstance(bounded[1], str) or not ID_RE.fullmatch(bounded[1]):

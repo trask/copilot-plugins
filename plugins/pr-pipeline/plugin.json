@@ -1,7 +1,7 @@
 {
   "name": "pr-pipeline",
   "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
-  "version": "1.5.59",
+  "version": "1.5.60",
   "author": {
     "name": "Trask Stalnaker"
   },

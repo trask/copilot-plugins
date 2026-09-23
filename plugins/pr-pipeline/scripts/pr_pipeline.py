@@ -56,7 +56,7 @@ WorkflowError = common.WorkflowError
 
 MAX_SWEEPS = 2
 STAGE_HEARTBEAT_SECONDS = 60.0
-STEP_DEADLINE_SECONDS = 90.0
+STEP_DEADLINE_SECONDS = 180.0
 CI_SNAPSHOT_CHANGED_REASONS = {
     "clearance_verification": "ci_snapshot_changed",
     "warning_verification": "ci_warning_snapshot_changed",
