@@ -165,6 +165,29 @@ class NativeStackClearanceTest(StackFixture):
         self.controller.state["pass"] = 1
         return self.controller.run_conflict_phase(1, self.stack["members"])
 
+    def test_conflict_status_reads_clearance_without_execution_runtime(self):
+        self.phase()
+        path = self.receipt_path(MODULE.STAGE_CONFLICT)
+        with (
+            mock.patch.object(
+                CONFLICT.sys,
+                "argv",
+                ["pr_conflict_resolver.py", "status", "--state", str(path)],
+            ),
+            mock.patch.dict(
+                CONFLICT.os.environ, {"TRASK_EXECUTION_PARENT": "request.json"}
+            ),
+            mock.patch.object(
+                CONFLICT, "_load_execution", side_effect=FileNotFoundError("copilot")
+            ) as load_execution,
+        ):
+            self.assertEqual(0, CONFLICT.execution_main())
+        load_execution.assert_not_called()
+        status = self.calls[(CONFLICT, "emit")].call_args.args[0]
+        self.assertEqual("ready", status["result"])
+        self.assertEqual("cleared", status["stage_outcome"])
+        self.assertEqual(self.stack["members"][0]["head_sha"], status["mergeable_at_head_sha"])
+
     def fill_other_stages(self):
         for member in self.stack["members"]:
             for stage in MODULE.STAGE_NAMES[1:]:

@@ -9751,6 +9751,8 @@ def _load_execution():
 def execution_main():
     commands = ('agent-task', 'pipeline')
     arguments = sys.argv[1:]
+    if arguments and arguments[0] == "status":
+        return main()
     standalone_internal = {
         "--cancellation-grace",
         "--debounce-seconds",

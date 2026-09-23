@@ -38,7 +38,7 @@ Both schedulers load `pipeline_common.py` from its pinned source bytes without r
 
 Model overrides use canonical IDs, for example `--stage-model pr-description=gpt-6-sol`. PR Description supports `gpt-6-sol`, `gpt-5.6-luna`, `gpt-5.6-terra`, and `gpt-6-astra`; the other stages require `gpt-6-sol`. These select the local coordinator model; hosted Sol Agent Tasks use `gpt-5.6-sol`. The scheduler rejects unsupported routes before launching a stage.
 
-Every stage launch and status read uses a state path derived from the Pipeline run ID. The helpers never fall back to pull-request-wide state. A status envelope must name the exact state file and pull request, current head and actual base tip. Old owners, reports, results, and clearances cannot enter a fresh run.
+Every stage launch and status read uses a state path derived from the Pipeline run ID. The helpers never fall back to pull-request-wide state. Read-only stage status commands do not load the execution Runtime when they inherit an owned subprocess environment. A status envelope must name the exact state file and pull request, current head and actual base tip. Old owners, reports, results, and clearances cannot enter a fresh run.
 
 Description status reads pass `--verify-clearance-snapshot`. Successful KEEP and replacement publication record the final validated title and body bytes, head, live base branch tip, branch identities, draft state, and authenticated viewer permissions. Status compares that recorded snapshot with fresh authenticated metadata and the authoritative branch-tip resolver. It never rewrites a receipt, starts a task, or spends an iteration. Missing historical identity is not reconstructed. Changed or unreadable inputs cannot clear the stage.
 

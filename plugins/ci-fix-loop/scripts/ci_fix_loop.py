@@ -14614,6 +14614,8 @@ def _load_execution():
 def execution_main():
     commands = ("pipeline", "run")
     arguments = sys.argv[1:]
+    if arguments and arguments[0] == "status":
+        return main()
     selected = (
         os.environ.get("TRASK_EXECUTION_PARENT")
         or arguments
