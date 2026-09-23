@@ -127,6 +127,15 @@ class WindowsSubprocessTest(unittest.TestCase):
         self.assertGreater(subprocess_run.call_args.kwargs["timeout"], 0)
         self.assertLess(subprocess_run.call_args.kwargs["timeout"], 90)
 
+    def test_bounded_dispatch_requires_sealed_execution_result(self):
+        completed = MODULE.subprocess.CompletedProcess(["cloud_task"], 0, "", "")
+        execution = SimpleNamespace(run=mock.Mock(return_value=completed))
+        with mock.patch.object(MODULE, "_EXECUTION", execution):
+            self.assertIs(
+                MODULE.run(["cloud_task"], require_execution=True), completed
+            )
+        self.assertIs(execution.run.call_args.kwargs["require_execution"], True)
+
     def test_bounded_pipeline_deadline_precedes_parent_limit(self):
         args = MODULE.build_parser().parse_args([
             "pipeline", "owner/repo#7", "--state", "state.json",
@@ -2080,7 +2089,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.62")
+        self.assertEqual(plugin["version"], "1.3.63")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2820,6 +2829,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             def run(command, **kwargs):
                 if "--pipeline-dispatch" not in command:
                     return original_run(command, **kwargs)
+                self.assertIs(kwargs["require_execution"], True)
                 result_path = Path(command[command.index("--result-file") + 1])
                 result_path.with_name(
                     result_path.name + ".pipeline.json"

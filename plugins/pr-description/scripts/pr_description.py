@@ -130,6 +130,7 @@ def run(
     cwd: Path | None = None,
     input_text: str | None = None,
     check: bool = True,
+    require_execution: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     try:
         process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
@@ -144,6 +145,7 @@ def run(
             env=subprocess_environment(),
             **bounded_subprocess_timeout(),
             **windows_no_window_options(),
+            **({"require_execution": require_execution} if _EXECUTION else {}),
         )
     except subprocess.TimeoutExpired as error:
         raise WorkflowError("bounded pipeline subprocess exceeded its time limit") from error
@@ -2631,6 +2633,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 ],
                 cwd=repo_root,
                 check=False,
+                require_execution=bounded,
             )
         if bounded:
             pending = bounded_description_pending(

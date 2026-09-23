@@ -112,6 +112,15 @@ class WindowsSubprocessTest(unittest.TestCase):
         self.assertGreater(subprocess_run.call_args.kwargs["timeout"], 0)
         self.assertLess(subprocess_run.call_args.kwargs["timeout"], 90)
 
+    def test_bounded_dispatch_requires_sealed_execution_result(self):
+        completed = MODULE.subprocess.CompletedProcess(["cloud_task"], 0, "", "")
+        execution = SimpleNamespace(run=mock.Mock(return_value=completed))
+        with mock.patch.object(MODULE, "_EXECUTION", execution):
+            self.assertIs(
+                MODULE.run(["cloud_task"], require_execution=True), completed
+            )
+        self.assertIs(execution.run.call_args.kwargs["require_execution"], True)
+
     def test_bounded_pipeline_deadline_precedes_parent_limit(self):
         args = MODULE.build_parser().parse_args([
             "pipeline", "owner/repo#7", "--state", "state.json",
@@ -662,7 +671,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.84")
+        self.assertEqual(plugin["version"], "1.0.85")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1378,7 +1387,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         args.bounded_step = True
         execution = SimpleNamespace(children=[], record_state=lambda *_: None)
 
-        def run(command, **_kwargs):
+        def run(command, **kwargs):
+            self.assertIs(kwargs["require_execution"], True)
             result_path = Path(command[command.index("--result-file") + 1])
             result_path.with_name(
                 result_path.name + ".pipeline.json"
