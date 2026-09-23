@@ -27,7 +27,7 @@ The helper first proves a clean checkout at the exact PR head. An exact attached
 
 For an ordinary PR, the helper freezes the head, live base, merge base, repository merge settings, strategy, source commits, iteration, and publication lease. It sends semantic conflict work to the pinned hosted worker, verifies the returned task and Git history, and publishes only the accepted code commits.
 
-The worker discovers conflict locations from the pinned Git history. The controller verifies rewritten commits and any normalization merge against frozen source history without sending a precomputed path list. A prompt that exceeds the Agent Task limit stops before dispatch.
+The worker discovers conflict locations from the pinned Git history. For a native-stack merge against an older base, it resolves the merge on a candidate branch against the current direct base; it does not have to reproduce the old tree. The controller verifies the source history, linear replay and candidate provenance without sending a precomputed path list. An exact-direct-base normalization still requires the recorded tree. A prompt that exceeds the Agent Task limit stops before dispatch.
 
 When the selected PR needs native-stack conflict resolution, the helper discovers every current open stack member, including predecessors and descendants. It creates its own one-use authorization bound to the active Resolver run, process, repository, complete source snapshot, topology, member order, selected PR, Pipeline position when present, and exact branch leases. It prepares members in order and publishes every verified member in one atomic push. Callers never supply stack membership, `--whole-stack`, or a request file.
 

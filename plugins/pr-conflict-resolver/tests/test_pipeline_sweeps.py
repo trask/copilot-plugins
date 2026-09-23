@@ -103,7 +103,7 @@ class ConflictPipelineSweepTest(unittest.TestCase):
 
     def test_prior_policy_no_task_clearance_can_be_revalidated(self):
         state = self.first_sweep()
-        state["agent_task"]["policy"] = MODULE.LEGACY_NO_TASK_POLICY
+        state["agent_task"]["policy"] = MODULE.PREVIOUS_NO_TASK_POLICY
         MODULE.save_state(self.path, state)
         self.metadata["head_sha"] = "c" * 40
 
@@ -111,7 +111,7 @@ class ConflictPipelineSweepTest(unittest.TestCase):
         current = MODULE.load_state(self.path)
         self.assertEqual("c" * 40, MODULE.cleared_head_sha(current))
         self.assertEqual(
-            MODULE.LEGACY_NO_TASK_POLICY,
+            MODULE.PREVIOUS_NO_TASK_POLICY,
             current["pipeline_sweep_history"][0]["agent_task"]["policy"],
         )
         self.calls["discover_conflict_task"].assert_not_called()

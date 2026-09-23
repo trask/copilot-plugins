@@ -10,7 +10,7 @@ flowchart LR
 
     subgraph pipeline["Five-stage pipeline"]
         direction TB
-        conflict["1. Conflict Resolver<br/>request v4, result v5, receipt v3<br/>marketplace-conflict-worker@12"]
+        conflict["1. Conflict Resolver<br/>request v4, result v5, receipt v3<br/>marketplace-conflict-worker@13"]
         copilotReview["2. Copilot Review<br/>hosted Runtime result v5<br/>code-candidate@1"]
         selfReview["3. Self Review<br/>coordinator report v3<br/>code candidate policy @1"]
         ci["4. CI Fix<br/>coordinator report v7, receipt v3<br/>code candidate policy @1"]
@@ -103,7 +103,7 @@ Both CI push propagation and predecessor alignment pass a versioned `--stack-req
 
 Descendant propagation uses the hosted conflict worker and its verified receipts, not local rebase/format/repair commands. Only authorized descendants enter its atomic push, each with an exact source-head lease. One hosted attempt belongs to each frozen propagation request. A controlled publication failure can retry those verified candidates within the same active run, without another hosted task or a fresh budget. Interrupted, foreign, and legacy state cannot publish, finalize receipts, or remove retained workspaces.
 
-Conflict request v4 pins source identities and replay order without a precomputed path list. Hosted workers find conflict locations in Git and may make necessary scoped companion changes and relocate tests while preserving both sides' intent and behavior. Both local verifiers retain unsafe-path and reserved-output checks, exact-tree normalization, member order, source identity, attribution and history checks. Structural acceptance does not prove a candidate correct.
+Conflict request v4 pins source identities and replay order without a precomputed path list. Hosted workers find conflict locations in Git and may make necessary scoped companion changes and relocate tests while preserving both sides' intent and behavior. A stale-base native-stack merge is resolved on a hosted candidate branch without requiring the old tree; exact-direct-base normalization still requires its recorded tree. Both local verifiers retain unsafe-path and reserved-output checks, member order, source identity, attribution and history checks. Structural acceptance does not prove a candidate correct.
 
 ## Hosted outputs
 

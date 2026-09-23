@@ -1004,18 +1004,18 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "47332bf93f41589703eee61263b855682bc9563be3b7185231b9dd67df1ad1b4",
+            "3bf07781cef792c00667e12c1df8b9ad6256b9ae2225ba6923aa4a3234e09319",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "b5b51023e8c9ff418ec7b2920121857b268cfd944f15a96885d16b8f9694c0b9",
+            "7356c63041ed86a8ba01901ca2e85e49140296086314e190c5047383b49b626a",
         )
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
             hashlib.sha256(CLOUD_SCRIPT.read_bytes()).hexdigest(),
         )
         self.assertEqual(MODULE.CONFLICT_POLICY_IDENTITY, CLOUD_MODULE.POLICY)
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@12")
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@13")
         self.assertEqual(MODULE.CONFLICT_RESULT_SCHEMA, CLOUD_MODULE.RESULT_SCHEMA)
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
@@ -3985,8 +3985,8 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
             self.git("show", "-s", "--format=%T", normalized),
         )
 
-    def test_resolution_merge_with_nonexact_direct_base_still_escalates(self):
-        current_base, _upper, merge, head = self.build_sync_merge(
+    def test_resolution_merge_with_stale_base_is_rebased_by_worker(self):
+        _current_base, upper, merge, head = self.build_sync_merge(
             conflicted=True
         )
         self.git("checkout", "-q", "main")
@@ -3995,43 +3995,144 @@ class NativeStackSynchronizationMergeIntegrationTest(unittest.TestCase):
         self.git("commit", "-q", "-m", "Later base")
         advanced_base = self.git("rev-parse", "HEAD")
 
-        with self.assertRaises(MODULE.NativeStackNormalizationRequired) as raised:
+        merge_base, commits, sync_merges, normalization_merges = (
             MODULE.native_stack_member_history(
                 self.repo,
                 current_base=advanced_base,
                 history_boundary=self.retained_base,
                 head=head,
             )
-
-        manifest = raised.exception.manifest
-        self.assertEqual(
-            [merge],
-            [item["sha"] for item in manifest["normalization_merges"]],
         )
-        self.assertEqual([], manifest["safe_normalization_merges"])
+        self.assertEqual([upper, head], commits)
+        self.assertEqual([], sync_merges)
+        self.assertEqual([merge], [item["sha"] for item in normalization_merges])
+        self.assertEqual("worker-rebase", normalization_merges[0]["proof"])
+        member = {
+            "pr_number": 7,
+            "repository": "owner/repo",
+            "head_ref": "upper",
+            "direct_base_sha": advanced_base,
+            "direct_base_ref": "main",
+            "observed_base_sha": self.retained_base,
+            "history_boundary_sha": self.retained_base,
+            "direct_merge_base": merge_base,
+            "head_sha": head,
+            "expected_new_parent": {"role": "trunk", "old_sha": advanced_base},
+            "lease_sha": head,
+            "old_commits": [
+                MODULE.commit_identity(self.repo, sha, linear=True) for sha in commits
+            ],
+            "sync_merges": sync_merges,
+            "normalization_merges": normalization_merges,
+        }
+        stack = {
+            "trunk": {"ref": "main", "sha": advanced_base},
+            "members": [member],
+            "outside_dependents": [],
+        }
+        CLOUD_MODULE.validate_native_stack(stack)
+        CLOUD_MODULE.prove_native_stack_member_input(
+            subprocess.run, self.repo, member,
+        )
+        changed_source = copy.deepcopy(member)
+        changed_source["normalization_merges"][0]["tree"] = "f" * 40
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError, "normalization merge proof changed",
+        ):
+            CLOUD_MODULE.prove_native_stack_member_input(
+                subprocess.run, self.repo, changed_source,
+            )
+        wrong_proof = copy.deepcopy(stack)
+        wrong_proof["members"][0]["normalization_merges"][0]["proof"] = (
+            "exact-direct-base-tree-replay"
+        )
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError, "exact direct base",
+        ):
+            CLOUD_MODULE.validate_native_stack(wrong_proof)
+        wrong_parent = copy.deepcopy(stack)
+        wrong_parent["members"][0]["normalization_merges"][0]["parents"][1] = (
+            advanced_base
+        )
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError, "stale-base merge",
+        ):
+            CLOUD_MODULE.validate_native_stack(wrong_parent)
+        self.git("checkout", "-q", "-b", "normalized", advanced_base)
+        self.git("cherry-pick", upper, check=False)
+        self.write("base.txt", "upper and lower\n")
+        self.git("add", "base.txt")
+        self.git("cherry-pick", "--continue")
+        replayed_upper = self.git("rev-parse", "HEAD")
+        normalized = self.git(
+            "commit-tree", "HEAD^{tree}", "-p", replayed_upper,
+            "-m", "Merge latest base",
+        )
+        self.git("reset", "-q", "--hard", normalized)
+        self.git("cherry-pick", head)
+        candidate = self.git("rev-parse", "HEAD")
 
-    def test_tip_sync_merge_with_nonexact_direct_base_still_escalates(self):
-        _current_base, _upper, merge, _head = self.build_sync_merge()
+        rewritten, mappings = CLOUD_MODULE.prove_rebase_range_mechanically(
+            subprocess.run,
+            self.repo,
+            advanced_base,
+            candidate,
+            member["old_commits"],
+            sync_merges=sync_merges,
+            normalization_merges=normalization_merges,
+        )
+        self.assertEqual([replayed_upper, normalized, candidate], rewritten)
+        self.assertNotEqual(
+            self.git("show", "-s", "--format=%T", merge),
+            self.git("show", "-s", "--format=%T", normalized),
+        )
+        MODULE.verify_rebased_range_mechanically(
+            self.repo, advanced_base, candidate, member["old_commits"], mappings,
+            normalization_merges=normalization_merges,
+            normalization_commits=[normalized],
+        )
+        non_linear = self.git(
+            "commit-tree", f"{normalized}^{{tree}}", "-p", replayed_upper,
+            "-p", advanced_base, "-m", "Merge latest base",
+        )
+        non_linear_tip = self.git(
+            "commit-tree", f"{candidate}^{{tree}}", "-p", non_linear,
+            "-m", "Upper follow-up",
+        )
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError, "not linear",
+        ):
+            CLOUD_MODULE.prove_rebase_range_mechanically(
+                subprocess.run, self.repo, advanced_base, non_linear_tip,
+                member["old_commits"], normalization_merges=normalization_merges,
+            )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "dropped|not linear"):
+            MODULE.verify_rebased_range_mechanically(
+                self.repo, advanced_base, non_linear_tip, member["old_commits"], [],
+                normalization_merges=normalization_merges,
+                normalization_commits=[non_linear],
+            )
+
+    def test_tip_sync_merge_with_stale_base_is_delegated(self):
+        _current_base, upper, merge, _head = self.build_sync_merge()
         self.git("checkout", "-q", "main")
         self.write("later.txt", "later\n")
         self.git("add", "later.txt")
         self.git("commit", "-q", "-m", "Later base")
         advanced_base = self.git("rev-parse", "HEAD")
 
-        with self.assertRaises(MODULE.NativeStackNormalizationRequired) as raised:
+        _, commits, sync_merges, normalization_merges = (
             MODULE.native_stack_member_history(
                 self.repo,
                 current_base=advanced_base,
                 history_boundary=self.retained_base,
                 head=merge,
             )
-
-        manifest = raised.exception.manifest
-        self.assertEqual(
-            [merge],
-            [item["sha"] for item in manifest["normalization_merges"]],
         )
-        self.assertEqual([], manifest["safe_normalization_merges"])
+        self.assertEqual([upper], commits)
+        self.assertEqual([], sync_merges)
+        self.assertEqual([merge], [item["sha"] for item in normalization_merges])
+        self.assertEqual("worker-rebase", normalization_merges[0]["proof"])
 
 
 class ManagedRequestStrategyTest(unittest.TestCase):
@@ -4341,6 +4442,7 @@ class ManagedTaskPromptTest(unittest.TestCase):
             "subject": "Merge base",
             "trailers": [],
             "tree": tree,
+            "proof": "exact-direct-base-tree-replay",
         }
         with (
             mock.patch.object(CLOUD_MODULE, "ordered_commits", return_value=[tip]),
@@ -4356,6 +4458,19 @@ class ManagedTaskPromptTest(unittest.TestCase):
                     mock.sentinel.runner, Path("repo"), base, tip, [],
                     normalization_merges=[merge],
                 ),
+            )
+        with (
+            mock.patch.object(CLOUD_MODULE, "ordered_commits", return_value=[tip]),
+            mock.patch.object(CLOUD_MODULE, "parents", return_value=[base]),
+            mock.patch.object(CLOUD_MODULE, "commit_subject", return_value="Merge base"),
+            mock.patch.object(CLOUD_MODULE, "commit_trailers", return_value=[]),
+            mock.patch.object(CLOUD_MODULE, "changed_paths", return_value=["other.py"]),
+            mock.patch.object(CLOUD_MODULE, "git", return_value="d" * 40),
+            self.assertRaisesRegex(CLOUD_MODULE.ConflictError, "exact tree equivalence"),
+        ):
+            CLOUD_MODULE.prove_rebase_range_mechanically(
+                mock.sentinel.runner, Path("repo"), base, tip, [],
+                normalization_merges=[merge],
             )
         with (
             mock.patch.object(MODULE, "ordered_commits", return_value=[tip]),
@@ -4585,7 +4700,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
                 task,
             )
 
-    def test_policy_12_omits_hosted_result_validation_and_annotations(self):
+    def test_policy_13_omits_hosted_result_validation_and_annotations(self):
         request = self.minimal_request()
         prompt = CLOUD_MODULE.policy_prompt(self.options(request))
         result = CLOUD_MODULE.Result(
@@ -4593,7 +4708,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
             policy=CLOUD_MODULE.POLICY,
         ).as_dict()
 
-        self.assertIn("Policy: marketplace-conflict-worker@12", prompt)
+        self.assertIn("Policy: marketplace-conflict-worker@13", prompt)
         self.assertIn(CLOUD_MODULE.OUTPUT_REPORT_PATH, prompt)
         self.assertIn("Do not run local validation through the dispatcher", prompt)
         self.assertNotIn("validation", result)

@@ -72,17 +72,18 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "47332bf93f41589703eee61263b855682bc9563be3b7185231b9dd67df1ad1b4"
+    "3bf07781cef792c00667e12c1df8b9ad6256b9ae2225ba6923aa4a3234e09319"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
-CONFLICT_POLICY = "marketplace-conflict-worker@12"
+CONFLICT_POLICY = "marketplace-conflict-worker@13"
 LEGACY_NO_TASK_POLICY = "marketplace-conflict-worker@11"
+PREVIOUS_NO_TASK_POLICY = "marketplace-conflict-worker@12"
 CONFLICT_POLICY_SHA256 = (
-    "b5b51023e8c9ff418ec7b2920121857b268cfd944f15a96885d16b8f9694c0b9"
+    "7356c63041ed86a8ba01901ca2e85e49140296086314e190c5047383b49b626a"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 12,
+    "version": 13,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
@@ -8020,14 +8021,12 @@ def native_stack_member_history(
                     position=position,
                     reason=str(error),
                 )
-                if (
-                    len(normalization["parents"]) == 2
-                    and normalization["parents"][1] == current_base
-                ):
-                    normalization["proof"] = "exact-direct-base-tree-replay"
-                    normalization_merges.append(normalization)
-                else:
-                    unsafe_normalization_merges.append(normalization)
+                normalization["proof"] = (
+                    "exact-direct-base-tree-replay"
+                    if normalization["parents"][1] == current_base
+                    else "worker-rebase"
+                )
+                normalization_merges.append(normalization)
         else:
             unsafe_normalization_merges.append(
                 normalization_merge_identity(
@@ -8054,14 +8053,15 @@ def native_stack_member_history(
                 position=tip_sync_merge["position"],
                 reason=(
                     "native stack member ends in a merge commit and requires "
-                    "tree-preserving linear normalization"
+                    "linear normalization"
                 ),
             )
-            if normalization["parents"][1] == current_base:
-                normalization["proof"] = "exact-direct-base-tree-replay"
-                normalization_merges.append(normalization)
-            else:
-                unsafe_normalization_merges.append(normalization)
+            normalization["proof"] = (
+                "exact-direct-base-tree-replay"
+                if normalization["parents"][1] == current_base
+                else "worker-rebase"
+            )
+            normalization_merges.append(normalization)
     if unsafe_normalization_merges:
         raise NativeStackNormalizationRequired(
             {
@@ -8934,10 +8934,11 @@ def build_conflict_prompt(preflight: dict[str, Any]) -> str:
         "and lease. A recorded direct-base synchronization merge has exactly two "
         "parents, a second parent in the current direct-base ancestry, and an empty "
         "remerge diff. Omit only those topology-only merge commits while mapping "
-        "every listed linear commit one-to-one. A recorded normalization merge has "
-        "the exact direct base as its second parent; replace it with one linear "
-        "commit at the recorded position whose tree, subject, and trailers exactly "
-        "match the recorded merge. Preserve unaffected patches exactly. "
+        "every listed linear commit one-to-one. Replace each recorded normalization "
+        "merge with one linear commit at its position, preserving its subject and "
+        "trailers. For an exact-direct-base-tree-replay, also preserve the old tree. "
+        "For a worker-rebase, resolve the merge against the supplied current base "
+        "without copying its old tree. Preserve unaffected patches exactly. "
         "The coordinator derives commit mappings, changed paths, and patch "
         "differences from Git.\n\n"
         "Run the repository's required formatting and focused validation remotely. "
@@ -9295,13 +9296,8 @@ def verify_rebased_range_mechanically(
             paths = conflict_changed_paths(repo_root, new_sha)
             require_candidate_code_paths(paths)
             if (
-                git(
-                    repo_root,
-                    "show",
-                    "-s",
-                    "--format=%T",
-                    new_sha,
-                )
+                normalization["proof"] == "exact-direct-base-tree-replay"
+                and git(repo_root, "show", "-s", "--format=%T", new_sha)
                 != normalization["tree"]
             ):
                 raise WorkflowError(
@@ -10717,7 +10713,9 @@ def require_later_conflict_sweep(
         or (
             task.get("policy") != CONFLICT_POLICY
             and not (
-                task.get("policy") == LEGACY_NO_TASK_POLICY
+                task.get("policy") in {
+                    LEGACY_NO_TASK_POLICY, PREVIOUS_NO_TASK_POLICY,
+                }
                 and state.get("last_result") == "mergeable"
                 and task.get("task_id") is None
                 and task.get("task_id_status") == "not_needed"
