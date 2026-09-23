@@ -254,3 +254,57 @@ class TestPyramidContractTest(unittest.TestCase):
                 mock.patch.object(validate.os, "cpu_count", return_value=16),
             ):
                 self.assertEqual((4, "load"), validate.pytest_parallelism())
+
+    def test_runner_streams_pytest_output_and_preserves_windows_creation_flags(self):
+        process = mock.MagicMock()
+        process.__enter__.return_value = process
+        process.stdout.read.side_effect = [b"pytest progress\n", b"failure details\n", b""]
+        process.wait.return_value = 1
+        output = mock.Mock(buffer=mock.Mock())
+        with (
+            mock.patch.object(validate.os, "name", "nt"),
+            mock.patch.object(
+                validate.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True,
+            ),
+            mock.patch.object(validate.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(validate.sys, "stdout", output),
+        ):
+            self.assertEqual(1, validate.run_pytest("tests/test_test_pyramid.py"))
+        self.assertEqual(
+            [mock.call(b"pytest progress\n"), mock.call(b"failure details\n")],
+            output.buffer.write.call_args_list,
+        )
+        self.assertEqual(2, output.buffer.flush.call_count)
+        popen.assert_called_once()
+        self.assertEqual(
+            ["-m", "pytest", "tests/test_test_pyramid.py"],
+            popen.call_args.args[0][1:],
+        )
+        self.assertEqual(
+            validate.subprocess.CREATE_NO_WINDOW,
+            popen.call_args.kwargs["creationflags"],
+        )
+        self.assertEqual(validate.subprocess.PIPE, popen.call_args.kwargs["stdout"])
+        self.assertEqual(validate.subprocess.STDOUT, popen.call_args.kwargs["stderr"])
+        self.assertEqual(0, popen.call_args.kwargs["bufsize"])
+
+    def test_runner_kills_pytest_on_interrupt(self):
+        process = mock.MagicMock()
+        process.__enter__.return_value = process
+        process.stdout.read.side_effect = KeyboardInterrupt
+        with mock.patch.object(validate.subprocess, "Popen", return_value=process):
+            with self.assertRaises(KeyboardInterrupt):
+                validate.run_pytest()
+        process.kill.assert_called_once_with()
+
+    def test_targeted_runner_forwards_selectors_without_changing_suite_modes(self):
+        with (
+            mock.patch.object(validate.sys, "argv", [
+                "tools/validate.py", "test", "tests/test_test_pyramid.py", "-k", "runner",
+            ]),
+            mock.patch.object(validate, "run_pytest", return_value=5) as run_pytest,
+        ):
+            self.assertEqual(5, validate.main())
+        run_pytest.assert_called_once_with(
+            "-n", "0", "--tb=short", "tests/test_test_pyramid.py", "-k", "runner",
+        )

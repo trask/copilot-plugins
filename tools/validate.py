@@ -35,14 +35,25 @@ def run_pytest(*arguments: str) -> int:
     options: dict[str, object] = {
         "cwd": ROOT,
         "env": pytest_environment(),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "bufsize": 0,
     }
     if os.name == "nt":
         options["creationflags"] = subprocess.CREATE_NO_WINDOW
-    return subprocess.run(
+    with subprocess.Popen(
         [sys.executable, "-m", "pytest", *arguments],
-        check=False,
         **options,
-    ).returncode
+    ) as process:
+        try:
+            assert process.stdout is not None
+            while chunk := process.stdout.read(4096):
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+            return process.wait()
+        except (KeyboardInterrupt, BrokenPipeError):
+            process.kill()
+            raise
 
 
 def main() -> int:
@@ -66,7 +77,12 @@ def main() -> int:
             "-m",
             "windows_e2e",
         )
-    print("usage: python tools/validate.py [fast|full]", file=sys.stderr)
+    if mode == "test" and len(sys.argv) > 2:
+        return run_pytest("-n", "0", "--tb=short", *sys.argv[2:])
+    print(
+        "usage: python tools/validate.py [fast|full|test <pytest selector> ...]",
+        file=sys.stderr,
+    )
     return 2
 
 
