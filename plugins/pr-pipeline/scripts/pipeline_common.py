@@ -946,23 +946,6 @@ def worktree_dirt(repo_root: Path) -> str:
     return git(repo_root, "status", "--porcelain=v1")
 
 
-def unreachable_commit_count(repo_root: Path) -> int:
-    value = git_or_none(
-        repo_root,
-        "rev-list",
-        "--count",
-        "HEAD",
-        "--not",
-        "--branches",
-        "--remotes",
-        "--tags",
-    )
-    try:
-        return int(value or "0")
-    except ValueError:
-        return 0
-
-
 def fetch_pr_head(
     repo_root: Path,
     target: dict[str, Any],
@@ -1020,12 +1003,44 @@ def checkout_fetched_head(repo_root: Path, head_sha: str) -> dict[str, Any]:
     }
 
 
+def retain_checkout_head(
+    repo_root: Path, target: dict[str, Any], run_id: str, head_sha: str,
+) -> dict[str, Any]:
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise WorkflowError("invalid pipeline run ID for checkout recovery")
+    reference = (
+        f"refs/copilot/pr-pipeline/{run_id}/{target['number']}/{head_sha}"
+    )
+    existing = git_or_none(repo_root, "show-ref", "--verify", "--hash", reference)
+    if existing == head_sha:
+        return {"result": "ready", "recovery_ref": reference}
+    if existing is not None:
+        return {
+            "result": "blocked",
+            "reason": "recovery_ref_failed",
+            "detail": f"checkout recovery ref {reference} points to {existing}",
+        }
+    result = run(
+        ["git", "-C", str(repo_root), "update-ref", reference, head_sha, "0" * 40],
+        check=False,
+    )
+    if result.returncode != 0:
+        return {
+            "result": "blocked",
+            "reason": "recovery_ref_failed",
+            "detail": (
+                f"could not retain checkout head {head_sha} under {reference}: "
+                f"{result.stderr.strip() or result.stdout.strip() or 'no output'}"
+            ),
+        }
+    return {"result": "ready", "recovery_ref": reference}
+
+
 def sync_worktree(
     repo_root: Path,
     target: dict[str, Any],
-    pr: dict[str, Any],
     *,
-    known_safe_head: str | None,
+    run_id: str,
     fetch: Callable[..., dict[str, Any]] = fetch_pr_head,
     checkout: Callable[..., dict[str, Any]] = checkout_fetched_head,
 ) -> dict[str, Any]:
@@ -1043,30 +1058,18 @@ def sync_worktree(
     local = git(repo_root, "rev-parse", "HEAD")
     if local == desired:
         return {"result": "ready", "head_sha": local, "changed": False}
-
-    branch = git_or_none(repo_root, "branch", "--show-current") or ""
-    safe_to_move = local == known_safe_head
-    safe_to_move = safe_to_move or git_succeeds(
-        repo_root, "merge-base", "--is-ancestor", local, desired
+    retained = (
+        {"result": "ready"}
+        if git_succeeds(repo_root, "merge-base", "--is-ancestor", local, desired)
+        else retain_checkout_head(repo_root, target, run_id, local)
     )
-    if branch and branch != pr.get("head_branch"):
-        safe_to_move = True
-    if not safe_to_move and unreachable_commit_count(repo_root) == 0:
-        safe_to_move = branch != pr.get("head_branch")
-    if not safe_to_move:
-        return {
-            "result": "blocked",
-            "reason": "local_head_not_published",
-            "detail": (
-                f"the worktree head {local} is not the pull request head {desired}; "
-                "moving it could hide local commits"
-            ),
-        }
+    if retained["result"] != "ready":
+        return retained
     checked_out = checkout(repo_root, desired)
     if checked_out["result"] != "ready":
-        return checked_out
+        return {**retained, **checked_out, "previous_head_sha": local}
     return {
-        **checked_out,
+        **retained, **checked_out,
         "changed": True,
         "previous_head_sha": local,
     }
@@ -1076,6 +1079,7 @@ def settle_after_stage(
     repo_root: Path,
     target: dict[str, Any],
     *,
+    run_id: str,
     started_head_sha: str,
     fetch: Callable[..., dict[str, Any]] = fetch_pr_head,
     checkout: Callable[..., dict[str, Any]] = checkout_fetched_head,
@@ -1115,11 +1119,18 @@ def settle_after_stage(
                 f"but the pull request head is {remote}"
             ),
         }
+    retained = (
+        {"result": "ready"}
+        if published
+        else retain_checkout_head(repo_root, target, run_id, local)
+    )
+    if retained["result"] != "ready":
+        return retained
     checked_out = checkout(repo_root, remote)
     if checked_out["result"] != "ready":
-        return checked_out
+        return {**retained, **checked_out, "previous_head_sha": local}
     return {
-        **checked_out,
+        **retained, **checked_out,
         "local_head_sha": local,
         "pr_head_sha": remote,
         "changed": checked_out["head_sha"] != started_head_sha,

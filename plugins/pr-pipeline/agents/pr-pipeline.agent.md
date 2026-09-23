@@ -55,6 +55,8 @@ The helper runs at most two sweeps in this order:
 
 Each deterministic stage coordinator owns its hosted tasks and fixed allowance. A second sweep is allowed only after head or base movement, or when CI alone needs fresh same-revision snapshot verification. Sweeps never reset a stage budget.
 
+The published PR head, not the local branch, is the Pipeline's source of truth. The controller requires a clean checkout, retains a divergent local tip under a run-specific recovery ref, and checks out the fetched PR head before each stage. Retained local commits do not become part of the PR; unpublished commits left by a stage still block.
+
 Conflict Resolver decides whether the selected PR needs complete native-stack work. It discovers the stack and creates its own run-bound authorization. PR Pipeline does not pass stack membership, `--whole-stack`, or a stack request.
 
 The helper rejects stale heads, unsafe stack topology, unreadable state, active children after a coordinator exits, unverified source publication, and missing terminal evidence. Target-branch tip movement alone does not reject verified work or force another hosted pass. Stale hosted work remains retained evidence and consumes its attempt. Review exhaustion stays uncleared. CI warnings clear only when the CI coordinator verifies the check snapshot at the current head. Unknown failures never clear.

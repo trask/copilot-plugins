@@ -86,10 +86,15 @@ FAIL_CLOSED_COVERAGE = {
         "SequentialStackTest",
         "test_publication_rejects_concurrent_writer_without_partial_push",
     ),
-    "pipeline unpublished commit retention": (
+    "pipeline stage unpublished commit retention": (
         "plugins/pr-pipeline/tests/test_pr_pipeline.py",
         "WorktreeSafetyTest",
-        "test_unreachable_local_commit_is_not_discarded",
+        "test_stage_does_not_discard_unpublished_commits",
+    ),
+    "pipeline divergent checkout recovery": (
+        "plugins/pr-pipeline/tests/test_pr_pipeline.py",
+        "WorktreeSafetyTest",
+        "test_recovery_ref_failure_does_not_move_checkout",
     ),
     "runtime detached checkout drift": (
         "plugins/agent-tasks-runtime/tests/test_cloud_task.py",

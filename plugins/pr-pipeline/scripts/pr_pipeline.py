@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "bc9a607fae2b75d642b5fa0016032b2383b106f87de89957bd88c88ba5268091"
+COMMON_SHA256 = "393696e4887db57b2f542d8f214ab0f9652aab523deca9a58ee077fbd16ab624"
 
 
 def load_common() -> Any:
@@ -104,7 +104,6 @@ commits_added = common.commits_added
 local_commits_between = common.local_commits_between
 target_remote = common.target_remote
 worktree_dirt = common.worktree_dirt
-unreachable_commit_count = common.unreachable_commit_count
 stage_script_path = common.stage_script_path
 stage_state_path = common.stage_state_path
 string_at = common.string_at
@@ -645,15 +644,11 @@ def checkout_fetched_head(repo_root: Path, head_sha: str) -> dict[str, Any]:
 def sync_worktree(
     repo_root: Path,
     target: dict[str, Any],
-    pr: dict[str, Any],
     *,
-    known_safe_head: str | None,
+    run_id: str,
 ) -> dict[str, Any]:
     return common.sync_worktree(
-        repo_root,
-        target,
-        pr,
-        known_safe_head=known_safe_head,
+        repo_root, target, run_id=run_id,
         fetch=fetch_pr_head,
         checkout=checkout_fetched_head,
     )
@@ -663,12 +658,12 @@ def settle_after_stage(
     repo_root: Path,
     target: dict[str, Any],
     *,
-    started_head_sha: str,
+    run_id: str, started_head_sha: str,
 ) -> dict[str, Any]:
     return common.settle_after_stage(
         repo_root,
         target,
-        started_head_sha=started_head_sha,
+        run_id=run_id, started_head_sha=started_head_sha,
         fetch=fetch_pr_head,
         checkout=checkout_fetched_head,
     )
@@ -1065,6 +1060,15 @@ def run_pipeline(
             )
         return outcome
 
+    def report_checkout_recovery(value: dict[str, Any]) -> None:
+        if value.get("recovery_ref"):
+            report_event(
+                report, "checkout_head_retained", run_id=run_id,
+                previous_head_sha=value["previous_head_sha"],
+                head_sha=value["head_sha"],
+                recovery_ref=value["recovery_ref"],
+            )
+
     if cursor is None:
         report_event(report, "pipeline_started", run_id=run_id, target=target["pr_url"])
 
@@ -1081,10 +1085,7 @@ def run_pipeline(
             )
         previous_safe_head = known_safe_head
         synced = sync_worktree(
-            repo_root,
-            target,
-            pr,
-            known_safe_head=known_safe_head,
+            repo_root, target, run_id=run_id,
         )
         if synced["result"] != "ready":
             return blocked_result(
@@ -1095,6 +1096,7 @@ def run_pipeline(
                 reason=synced["reason"],
                 detail=synced["detail"],
             )
+        report_checkout_recovery(synced)
         known_safe_head = synced["head_sha"]
         continuing_sweep = bool(
             bounded and cursor is not None and sweep == start_sweep
@@ -1134,10 +1136,7 @@ def run_pipeline(
                     detail=f"the pull request is {pr['state']}",
                 )
             synced = sync_worktree(
-                repo_root,
-                target,
-                pr,
-                known_safe_head=known_safe_head,
+                repo_root, target, run_id=run_id,
             )
             if synced["result"] != "ready":
                 return blocked_result(
@@ -1149,6 +1148,7 @@ def run_pipeline(
                     reason=synced["reason"],
                     detail=synced["detail"],
                 )
+            report_checkout_recovery(synced)
             current_head = synced["head_sha"]
             head_changed = head_changed or current_head != known_safe_head
             base_changed = base_changed or pr["base_sha"] != sweep_started_base
@@ -1325,8 +1325,10 @@ def run_pipeline(
             settled = settle_after_stage(
                 repo_root,
                 target,
-                started_head_sha=started_head,
+                run_id=run_id, started_head_sha=started_head,
             )
+            if settled["result"] == "ready":
+                report_checkout_recovery(settled)
             commits_after = snapshot_pr_commits(target)
             published_commits, commit_tracking_errors, history_rewritten = commits_added(
                 commits_before, commits_after
@@ -1505,10 +1507,7 @@ def run_pipeline(
         completed_sweeps = sweep
         pr = read_pull_request(target)
         synced = sync_worktree(
-            repo_root,
-            target,
-            pr,
-            known_safe_head=known_safe_head,
+            repo_root, target, run_id=run_id,
         )
         if synced["result"] != "ready":
             return blocked_result(
@@ -1519,6 +1518,7 @@ def run_pipeline(
                 reason=synced["reason"],
                 detail=synced["detail"],
             )
+        report_checkout_recovery(synced)
         final_head = synced["head_sha"]
         known_safe_head = final_head
         head_changed = head_changed or final_head != sweep_started_head

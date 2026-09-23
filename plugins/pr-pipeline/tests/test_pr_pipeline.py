@@ -2105,11 +2105,11 @@ class SweepTest(unittest.TestCase):
     def read_pr(self, _target):
         return {**pull_request(self.sync_heads[-1]), "base_sha": self.base_sha}
 
-    def sync(self, _repo, _target, _pr, *, known_safe_head):
+    def sync(self, _repo, _target, *, run_id):
         return {
             "result": "ready",
             "head_sha": self.sync_heads[-1],
-            "changed": known_safe_head not in (None, self.sync_heads[-1]),
+            "changed": False,
         }
 
     def run_stage(
@@ -2156,7 +2156,7 @@ class SweepTest(unittest.TestCase):
             ]
         }
 
-    def settle(self, _repo, _target, *, started_head_sha):
+    def settle(self, _repo, _target, *, run_id, started_head_sha):
         return {
             "result": "ready",
             "head_sha": self.sync_heads[-1],
@@ -2205,6 +2205,23 @@ class SweepTest(unittest.TestCase):
             [(stage, 1) for stage in MODULE.STAGE_NAMES],
             self.launched,
         )
+
+    def test_rewritten_checkout_reports_retained_head(self):
+        def rewritten_checkout(_repo, _target, *, run_id):
+            result = self.sync(_repo, _target, run_id=run_id)
+            if not any(event["event"] == "checkout_head_retained" for event in self.events):
+                result.update({
+                    "previous_head_sha": "a" * 40,
+                    "recovery_ref": f"refs/copilot/pr-pipeline/{run_id}/7/{'a' * 40}",
+                })
+            return result
+
+        with mock.patch.object(MODULE, "sync_worktree", side_effect=rewritten_checkout):
+            self.assertEqual("complete", self.execute()["result"])
+        event = next(event for event in self.events if event["event"] == "checkout_head_retained")
+        self.assertEqual("a" * 40, event["previous_head_sha"])
+        self.assertEqual(self.sync_heads[-1], event["head_sha"])
+        self.assertIn(event["run_id"], event["recovery_ref"])
 
     def test_bounded_calls_wait_without_restarting_the_stage(self):
         original_stage = self.run_stage
@@ -3712,16 +3729,13 @@ class WorktreeSafetyTest(unittest.TestCase):
         self.git(local, "config", "user.email", "t@example.com")
         return local
 
-    def sync(self, local: Path, remote: Path, known_safe_head=None):
+    def sync(self, local: Path, remote: Path):
         with mock.patch.object(MODULE, "target_remote", return_value=str(remote)):
             return MODULE.sync_worktree(
-                local,
-                target(),
-                pull_request(),
-                known_safe_head=known_safe_head,
+                local, target(), run_id="a" * 32,
             )
 
-    def test_unreachable_local_commit_is_not_discarded(self):
+    def test_divergent_detached_commit_is_retained_before_switching(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
             self.git(repo, "init", "-q", "-b", "main")
@@ -3729,20 +3743,129 @@ class WorktreeSafetyTest(unittest.TestCase):
             published = self.git(repo, "rev-parse", "HEAD")
             self.git(repo, "checkout", "-q", "--detach")
             self.git(repo, "commit", "-q", "--allow-empty", "-m", "local")
+            previous = self.git(repo, "rev-parse", "HEAD")
             with mock.patch.object(
                 MODULE,
                 "fetch_pr_head",
                 return_value={"result": "ready", "head_sha": published},
             ):
                 result = MODULE.sync_worktree(
-                    repo,
-                    target(),
-                    pull_request(published),
-                    known_safe_head=None,
+                    repo, target(), run_id="a" * 32,
                 )
-            self.assertEqual("blocked", result["result"])
-            self.assertEqual("local_head_not_published", result["reason"])
-            self.assertNotEqual(published, self.git(repo, "rev-parse", "HEAD"))
+            self.assertEqual("ready", result["result"])
+            self.assertEqual(published, self.git(repo, "rev-parse", "HEAD"))
+            self.assertEqual(previous, self.git(repo, "rev-parse", result["recovery_ref"]))
+            self.assertEqual(previous, result["previous_head_sha"])
+
+    def test_rewritten_pr_head_preserves_local_branch_and_recovery_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, base, old_head = self.make_remote(root)
+            local = self.clone(root, remote)
+            self.git(local, "fetch", "-q", str(remote), "refs/pull/7/head")
+            self.git(local, "checkout", "-q", "-b", "feature", "FETCH_HEAD")
+            self.git(local, "commit", "-q", "--allow-empty", "-m", "local only")
+            local_tip = self.git(local, "rev-parse", "HEAD")
+            self.git(remote, "checkout", "-q", "-b", "rewritten", base)
+            self.git(remote, "commit", "-q", "--allow-empty", "-m", "rebased")
+            new_head = self.git(remote, "rev-parse", "HEAD")
+            self.git(remote, "update-ref", "refs/pull/7/head", new_head)
+
+            result = self.sync(local, remote)
+
+            self.assertEqual("ready", result["result"])
+            self.assertEqual(new_head, self.git(local, "rev-parse", "HEAD"))
+            self.assertEqual(local_tip, self.git(local, "rev-parse", "feature"))
+            self.assertEqual(local_tip, self.git(local, "rev-parse", result["recovery_ref"]))
+            self.assertEqual("", self.git(local, "branch", "--show-current"))
+            self.git(local, "checkout", "-q", "--detach", local_tip)
+            self.assertEqual(result["recovery_ref"], self.sync(local, remote)["recovery_ref"])
+
+    def test_recovery_ref_failure_does_not_move_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            self.git(repo, "init", "-q", "-b", "main")
+            self.git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+            published = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "commit", "-q", "--allow-empty", "-m", "local")
+            local_tip = self.git(repo, "rev-parse", "HEAD")
+            with (
+                mock.patch.object(MODULE, "fetch_pr_head", return_value={
+                    "result": "ready", "head_sha": published,
+                }),
+                mock.patch.object(MODULE.common, "retain_checkout_head", return_value={
+                    "result": "blocked", "reason": "recovery_ref_failed", "detail": "denied",
+                }),
+                mock.patch.object(MODULE, "checkout_fetched_head") as checkout,
+            ):
+                result = MODULE.sync_worktree(repo, target(), run_id="a" * 32)
+            self.assertEqual("recovery_ref_failed", result["reason"])
+            self.assertEqual(local_tip, self.git(repo, "rev-parse", "HEAD"))
+            checkout.assert_not_called()
+
+    def test_recovery_ref_collision_keeps_local_head(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            self.git(repo, "init", "-q", "-b", "main")
+            self.git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+            published = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "commit", "-q", "--allow-empty", "-m", "local")
+            local_tip = self.git(repo, "rev-parse", "HEAD")
+            reference = f"refs/copilot/pr-pipeline/{'a' * 32}/7/{local_tip}"
+            self.git(repo, "update-ref", reference, published)
+            with mock.patch.object(MODULE, "fetch_pr_head", return_value={
+                "result": "ready", "head_sha": published,
+            }):
+                result = MODULE.sync_worktree(repo, target(), run_id="a" * 32)
+            self.assertEqual("recovery_ref_failed", result["reason"])
+            self.assertEqual(local_tip, self.git(repo, "rev-parse", "HEAD"))
+            self.assertEqual(published, self.git(repo, "rev-parse", reference))
+
+    def test_dirty_checkout_remains_blocked_before_rewrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, _base, _head = self.make_remote(root)
+            local = self.clone(root, remote)
+            (local / "unfinished.txt").write_text("local work", encoding="utf-8")
+            before = self.git(local, "rev-parse", "HEAD")
+            result = self.sync(local, remote)
+            self.assertEqual("dirty_worktree", result["reason"])
+            self.assertEqual(before, self.git(local, "rev-parse", "HEAD"))
+
+    def test_stage_does_not_discard_unpublished_commits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, _base, old_head = self.make_remote(root)
+            local = self.clone(root, remote)
+            self.git(local, "fetch", "-q", str(remote), "refs/pull/7/head")
+            self.git(local, "checkout", "-q", "--detach", "FETCH_HEAD")
+            self.git(local, "commit", "-q", "--allow-empty", "-m", "unpublished stage")
+            local_tip = self.git(local, "rev-parse", "HEAD")
+            with mock.patch.object(MODULE, "target_remote", return_value=str(remote)):
+                result = MODULE.settle_after_stage(
+                    local, target(), run_id="a" * 32, started_head_sha=old_head,
+                )
+            self.assertEqual("stage_left_unpublished_commits", result["reason"])
+            self.assertEqual(local_tip, self.git(local, "rev-parse", "HEAD"))
+
+    def test_stage_settlement_retains_head_rewritten_during_stage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, base, old_head = self.make_remote(root)
+            local = self.clone(root, remote)
+            self.git(local, "fetch", "-q", str(remote), "refs/pull/7/head")
+            self.git(local, "checkout", "-q", "--detach", "FETCH_HEAD")
+            self.git(remote, "checkout", "-q", "-b", "rewritten", base)
+            self.git(remote, "commit", "-q", "--allow-empty", "-m", "rebased")
+            new_head = self.git(remote, "rev-parse", "HEAD")
+            self.git(remote, "update-ref", "refs/pull/7/head", new_head)
+            with mock.patch.object(MODULE, "target_remote", return_value=str(remote)):
+                result = MODULE.settle_after_stage(
+                    local, target(), run_id="a" * 32, started_head_sha=old_head,
+                )
+            self.assertEqual("ready", result["result"])
+            self.assertEqual(new_head, self.git(local, "rev-parse", "HEAD"))
+            self.assertEqual(old_head, self.git(local, "rev-parse", result["recovery_ref"]))
 
     def test_detached_old_pr_head_moves_to_new_pr_head(self):
         with tempfile.TemporaryDirectory() as temporary:
