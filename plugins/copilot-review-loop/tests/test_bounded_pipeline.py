@@ -210,7 +210,7 @@ class BoundedPipelineTest(unittest.TestCase):
             current["status"] = next(statuses)
             self.assertIn("--pipeline-run", command)
             self.assertIn("--apply-with-report", command)
-            self.assertLess(options["timeout"], 120)
+            self.assertIsNone(options["timeout"])
             output = (
                 json.dumps(pending())
                 if current["status"] == "pending" else ""

@@ -100,7 +100,6 @@ REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
 OUTPUT_REPORT_PATH = ".github/agent-task-output/report.md"
 Runner = Callable[..., subprocess.CompletedProcess[str]]
-_BOUNDED_DEADLINE: float | None = None
 
 
 class ConflictError(RuntimeError):
@@ -137,7 +136,6 @@ class Options:
     prompt: str
     bounded_phase: str | None = None
     bounded_session: str | None = None
-    bounded_deadline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -951,7 +949,6 @@ def parse_args(args: Sequence[str]) -> Options:
         "--policy",
         "--bounded-phase",
         "--bounded-session",
-        "--bounded-deadline",
     }
     while index < len(args):
         token = args[index]
@@ -968,7 +965,7 @@ def parse_args(args: Sequence[str]) -> Options:
         values[token] = args[index + 1]
         index += 2
     required = flags | (options - {
-        "--bounded-phase", "--bounded-session", "--bounded-deadline",
+        "--bounded-phase", "--bounded-session",
     })
     missing = sorted(required - values.keys())
     if missing:
@@ -1016,26 +1013,16 @@ def parse_args(args: Sequence[str]) -> Options:
         expected_policy=POLICY,
     )
     prompt = read_external_text(paths["--prompt-file"], "prompt file")
-    bounded_keys = (
-        "--bounded-phase", "--bounded-session", "--bounded-deadline",
-    )
+    bounded_keys = ("--bounded-phase", "--bounded-session")
     bounded = [values.get(key) for key in bounded_keys]
     bounded_present = [key in values for key in bounded_keys]
     if any(bounded_present) and not all(bounded_present):
-        raise ConflictError("bounded phase requires session and deadline", "policy_rejected")
+        raise ConflictError("bounded phase requires session", "policy_rejected")
     if all(bounded_present):
         if bounded[0] not in {"dispatch", "observe", "collect"}:
             raise ConflictError("invalid bounded phase", "policy_rejected")
         if not isinstance(bounded[1], str) or not ID_RE.fullmatch(bounded[1]):
             raise ConflictError("invalid bounded session", "policy_rejected")
-        try:
-            deadline = float(bounded[2])
-        except (TypeError, ValueError):
-            raise ConflictError("invalid bounded deadline", "policy_rejected") from None
-        if not time.monotonic() < deadline <= time.monotonic() + 100:
-            raise ConflictError("bounded deadline is outside this call", "policy_rejected")
-    else:
-        deadline = None
     return Options(
         strategy,
         MODEL_IDS[alias],
@@ -1047,7 +1034,6 @@ def parse_args(args: Sequence[str]) -> Options:
         prompt,
         bounded[0],
         bounded[1],
-        deadline,
     )
 
 
@@ -1100,17 +1086,10 @@ def run_process(
         kwargs["input"] = input_text
     if os.name == "nt":
         kwargs["creationflags"] = _creation_flags()
-    if _BOUNDED_DEADLINE is not None:
-        remaining = _BOUNDED_DEADLINE - time.monotonic()
-        if remaining <= 1:
-            raise ConflictError("bounded call deadline reached", "bounded_deadline")
-        kwargs["timeout"] = min(remaining - 1, 20)
     try:
         return runner(process_command, **kwargs)
     except subprocess.TimeoutExpired:
-        raise ConflictError(
-            f"{command[0]} exceeded the bounded call deadline", "bounded_deadline"
-        ) from None
+        raise ConflictError(f"{command[0]} timed out", "stale_target") from None
     except UnicodeError as error:
         raise ConflictError(
             f"{command[0]} returned invalid UTF-8: {error}",
@@ -4200,7 +4179,6 @@ def main(
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
 ) -> int:
-    global _BOUNDED_DEADLINE
     args = list(sys.argv[1:] if argv is None else argv)
     result_path = result_path_from_args(args)
     result = Result()
@@ -4209,14 +4187,10 @@ def main(
         options = parse_args(args)
         result_path = options.result_file
         if getattr(options, "bounded_phase", None) is not None:
-            _BOUNDED_DEADLINE = options.bounded_deadline
-            try:
-                exit_code = execute_bounded(
-                    options, cwd=Path.cwd() if cwd is None else cwd,
-                    runner=runner, progress=progress, result=result,
-                )
-            finally:
-                _BOUNDED_DEADLINE = None
+            exit_code = execute_bounded(
+                options, cwd=Path.cwd() if cwd is None else cwd,
+                runner=runner, progress=progress, result=result,
+            )
         else:
             exit_code = execute(
                 options, cwd=Path.cwd() if cwd is None else cwd,

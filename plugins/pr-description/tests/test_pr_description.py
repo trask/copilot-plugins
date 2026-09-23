@@ -102,15 +102,11 @@ class WindowsSubprocessTest(unittest.TestCase):
 
         self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
 
-    def test_bounded_run_limits_subprocess_time(self):
+    def test_bounded_run_does_not_set_a_wall_clock_limit(self):
         completed = MODULE.subprocess.CompletedProcess(["git"], 0, "", "")
-        with (
-            mock.patch.object(MODULE, "_BOUNDED_DEADLINE", MODULE.time.monotonic() + 110),
-            mock.patch.object(MODULE.subprocess, "run", return_value=completed) as subprocess_run,
-        ):
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed) as subprocess_run:
             MODULE.run(["git"])
-        self.assertGreater(subprocess_run.call_args.kwargs["timeout"], 0)
-        self.assertLess(subprocess_run.call_args.kwargs["timeout"], 90)
+        self.assertNotIn("timeout", subprocess_run.call_args.kwargs)
 
     def test_bounded_dispatch_requires_sealed_execution_result(self):
         completed = MODULE.subprocess.CompletedProcess(["cloud_task"], 0, "", "")
@@ -121,27 +117,18 @@ class WindowsSubprocessTest(unittest.TestCase):
             )
         self.assertIs(execution.run.call_args.kwargs["require_execution"], True)
 
-    def test_bounded_pipeline_deadline_precedes_parent_limit(self):
+    def test_bounded_pipeline_runs_without_a_call_deadline(self):
         args = MODULE.build_parser().parse_args([
             "pipeline", "owner/repo#7", "--state", "state.json",
             "--pipeline-run", "a" * 32, "--pipeline-iteration", "1",
             "--pipeline-max-iterations", "2", "--bounded-step",
         ])
-        deadlines = []
-        original = MODULE._BOUNDED_DEADLINE
-
-        def check_deadline(_args):
-            deadlines.append(MODULE._BOUNDED_DEADLINE - MODULE.time.monotonic())
-
         with (
             mock.patch.dict(MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "session"}),
-            mock.patch.object(MODULE, "command_agent_task", side_effect=check_deadline),
+            mock.patch.object(MODULE, "command_agent_task") as task,
         ):
             MODULE.command_pipeline(args)
-        self.assertEqual(len(deadlines), 1)
-        self.assertGreater(deadlines[0], 80)
-        self.assertLess(deadlines[0], 90)
-        self.assertEqual(MODULE._BOUNDED_DEADLINE, original)
+        task.assert_called_once_with(args)
 
     def test_pending_checkpoint_cannot_claim_a_final_result(self):
         process = MODULE.subprocess.CompletedProcess(
@@ -671,7 +658,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.89")
+        self.assertEqual(plugin["version"], "1.0.90")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):

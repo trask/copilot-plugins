@@ -147,7 +147,7 @@ class BoundedCiPipelineTest(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.WorkflowError, "another session or run"):
                     MODULE.command_bounded_pipeline(self.args)
 
-    def test_helper_caps_external_wait_and_observes_repeated_pending(self):
+    def test_helper_observes_repeated_pending_without_a_deadline(self):
         calls = []
         responses = iter(["pending", "pending", "completed"])
 
@@ -178,7 +178,7 @@ class BoundedCiPipelineTest(unittest.TestCase):
                         Path.cwd(), self.path
                     )["status"],
                 )
-        self.assertEqual([85, 85, 85], [call["timeout"] for call in calls])
+        self.assertTrue(all("timeout" not in call for call in calls))
         self.assertTrue(all(call["creationflags"] == 0x08000000 for call in calls))
 
     def test_helper_rejects_pending_result_for_another_run(self):
@@ -231,7 +231,7 @@ class BoundedCiPipelineTest(unittest.TestCase):
                 Path.cwd(), self.path,
             )["status"])
         self.assertIs(options[0]["require_execution"], True)
-        self.assertEqual(85, options[0]["timeout"])
+        self.assertNotIn("timeout", options[0])
 
     def test_managed_final_observation_reads_result_after_sealed_child(self):
         execution = SimpleNamespace(children=[])

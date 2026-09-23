@@ -64,8 +64,7 @@ class BoundedPipelineTest(unittest.TestCase):
 
     def helper(self, command, **kwargs):
         phase = command[command.index("--bounded-phase") + 1]
-        deadline = float(command[command.index("--bounded-deadline") + 1])
-        self.assertLessEqual(deadline, MODULE.time.monotonic() + 100)
+        self.assertNotIn("--bounded-deadline", command)
         result_path = Path(command[command.index("--result-file") + 1])
         receipt_path = result_path.with_name(result_path.name + ".bounded-receipt.json")
         result = CLOUD.Result(
@@ -101,13 +100,13 @@ class BoundedPipelineTest(unittest.TestCase):
         result_path.write_text(json.dumps(result), encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    def test_remote_work_longer_than_outer_deadline_uses_one_dispatch(self):
-        for elapsed in (0, 65, 130, 180):
+    def test_remote_work_across_long_intervals_uses_one_dispatch(self):
+        for elapsed in (0, 65, 130, 3600):
             with self.subTest(elapsed=elapsed):
                 with mock.patch.object(MODULE.time, "monotonic", return_value=elapsed):
                     self.assertEqual(0, MODULE.command_pipeline(self.args))
                 state = MODULE.load_state(self.path)
-                if elapsed < 180:
+                if elapsed < 3600:
                     self.assertEqual("running", state["agent_task"]["status"])
                     self.assertEqual(1, state["managed_attempts"])
         self.assertEqual("completed", MODULE.load_state(self.path)["agent_task"]["status"])
@@ -143,14 +142,14 @@ class BoundedPipelineTest(unittest.TestCase):
         self.assertEqual(1, self.calls["conflict_preflight"].call_count)
         self.assertFalse(MODULE.load_state(self.path)["bounded_pipeline"]["prepared_dispatch"])
 
-    def test_native_stack_preparation_can_finish_after_100_seconds(self):
+    def test_native_stack_preparation_can_finish_after_an_hour(self):
         self.request["strategy"] = "native-stack"
         self.request["native_stack"] = {"members": [{"pr_number": 6}]}
         self.request["request_sha256"] = MODULE.request_digest(self.request)
         clock = [10.0]
 
         def preflight(*_args, **_kwargs):
-            clock[0] += 100
+            clock[0] += 3600
             return {
                 "already_mergeable": False,
                 "pr": copy.deepcopy(self.metadata),
@@ -306,23 +305,19 @@ class BoundedBackendTest(unittest.TestCase):
             ordinary = CLOUD.parse_args(command)
             self.assertIsNone(ordinary.bounded_phase)
             self.assertIsNone(ordinary.bounded_session)
-            self.assertIsNone(ordinary.bounded_deadline)
-            with mock.patch.object(CLOUD.time, "monotonic", return_value=100):
-                bounded = CLOUD.parse_args([
-                    *command, "--bounded-phase", "dispatch",
-                    "--bounded-session", "session-1",
-                    "--bounded-deadline", "140",
-                ])
+            bounded = CLOUD.parse_args([
+                *command, "--bounded-phase", "dispatch",
+                "--bounded-session", "session-1",
+            ])
             self.assertEqual("dispatch", bounded.bounded_phase)
             self.assertEqual("session-1", bounded.bounded_session)
-            self.assertEqual(140, bounded.bounded_deadline)
             for flags, message in (
-                (["--bounded-phase", "dispatch"], "requires session and deadline"),
-                (["--bounded-phase", ""], "requires session and deadline"),
+                (["--bounded-phase", "dispatch"], "requires session"),
+                (["--bounded-phase", ""], "requires session"),
                 ([
                     "--bounded-phase", "unknown", "--bounded-session", "session-1",
-                    "--bounded-deadline", "140",
                 ], "invalid bounded phase"),
+                (["--bounded-deadline", "140"], "unknown option"),
             ):
                 with self.subTest(flags=flags), self.assertRaisesRegex(
                     CLOUD.ConflictError, message,
@@ -336,7 +331,7 @@ class BoundedBackendTest(unittest.TestCase):
             options = CLOUD.Options(
                 "merge", "gpt-5.6-sol", request["pull_request"]["url"],
                 root / "request.json", root / "prompt.txt", root / "result.json",
-                request, "prompt", "dispatch", "session-1", 10**20,
+                request, "prompt", "dispatch", "session-1",
             )
             runtime_path = root / "result.json.dispatch.json"
             observation = {"schema": "github.copilot.dispatch-observation.v1"}
@@ -358,7 +353,7 @@ class BoundedBackendTest(unittest.TestCase):
             options = CLOUD.Options(
                 "merge", "gpt-5.6-sol", request["pull_request"]["url"],
                 root / "request.json", root / "prompt.txt", root / "result.json",
-                request, "prompt", "dispatch", "session-1", 10**20,
+                request, "prompt", "dispatch", "session-1",
             )
             snapshot = CLOUD.LocalSnapshot(
                 root / "repo", root, "owner/repo", "origin",
@@ -420,7 +415,7 @@ class BoundedBackendTest(unittest.TestCase):
             options = CLOUD.Options(
                 "merge", "gpt-5.6-sol", request["pull_request"]["url"],
                 root / "request.json", root / "prompt.txt", root / "result.json",
-                request, "prompt", "dispatch", "session-1", 10**20,
+                request, "prompt", "dispatch", "session-1",
             )
             snapshot = CLOUD.LocalSnapshot(
                 root / "repo", root, "owner/repo", "origin",
@@ -518,7 +513,7 @@ class BoundedNativeStackTest(unittest.TestCase):
                 self.assertEqual(0, CLOUD.execute_bounded(
                     replace(
                         fixture.options, bounded_phase=phase,
-                        bounded_session="session-1", bounded_deadline=10**20,
+                        bounded_session="session-1",
                     ),
                     cwd=fixture.root, runner=subprocess.run,
                     progress=CLOUD.Progress(), result=result,
@@ -540,8 +535,7 @@ class BoundedNativeStackTest(unittest.TestCase):
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         options = replace(
-            fixture.options, bounded_phase="dispatch",
-            bounded_session="session-1", bounded_deadline=10**20,
+            fixture.options, bounded_phase="dispatch", bounded_session="session-1",
         )
         with (
             mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": "session-1"}),

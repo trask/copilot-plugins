@@ -1243,13 +1243,12 @@ def read_stage_status(
         process = run(
             command,
             check=False,
-            timeout=30,
         )
     except WorkflowError as error:
         return {
             **common,
             "ok": False,
-            "reason": "status_timeout",
+            "reason": "status_failed",
             "detail": str(error),
         }
     if process.returncode != 0:

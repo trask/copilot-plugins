@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "0b0ad38c9264aae92bc8c4932ad0dfb940e7efe386e1c3361fa32013bf30c3ad"
+COMMON_SHA256 = "bc9a607fae2b75d642b5fa0016032b2383b106f87de89957bd88c88ba5268091"
 
 
 def load_common() -> Any:
@@ -56,7 +56,6 @@ WorkflowError = common.WorkflowError
 
 MAX_SWEEPS = 2
 STAGE_HEARTBEAT_SECONDS = 60.0
-STEP_DEADLINE_SECONDS = 180.0
 CI_SNAPSHOT_CHANGED_REASONS = {
     "clearance_verification": "ci_snapshot_changed",
     "warning_verification": "ci_warning_snapshot_changed",
@@ -833,10 +832,6 @@ def run_stage(
     def progress() -> None:
         nonlocal last_reported_at, last_signature
         now = time.monotonic()
-        if bounded and now - started_at >= STEP_DEADLINE_SECONDS:
-            raise WorkflowError(
-                f"{entry['stage']} exceeded the bounded step deadline"
-            )
         current = common.stage_live_progress(
             entry,
             target,

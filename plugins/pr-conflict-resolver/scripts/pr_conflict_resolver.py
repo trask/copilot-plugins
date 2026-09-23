@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "fb687e5b5db948bba4b56ca32cb1505c9ca19bc2b5a568b18f866113e3edab4e"
+    "b5c73adfb6c06bcc1c7021e5fcc4ddd86f8dcc23499145d719b10e9e3b8323bb"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@11"
@@ -104,9 +104,7 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CONFLICT_REPORT_DIRECTORY = ".github/agent-task-conflict-reports"
 CONFLICT_RECEIPT_DIRECTORY = ".github/agent-task-conflict-receipts"
 AGENT_TASK_OUTPUT_REPORT = ".github/agent-task-output/report.md"
-_BOUNDED_DEADLINE: float | None = None
 _BOUNDED_STACK_AUTH: tuple[Path, str] | None = None
-BOUNDED_STEP_SECONDS = 180.0
 
 
 class WorkflowError(RuntimeError):
@@ -150,14 +148,6 @@ def run(
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    options: dict[str, Any] = {}
-    if _BOUNDED_DEADLINE is not None:
-        remaining = _BOUNDED_DEADLINE - time.monotonic()
-        if remaining <= 1:
-            raise WorkflowError("bounded pipeline call deadline reached")
-        options["timeout"] = (
-            remaining - 1 if command[0] == sys.executable else min(remaining - 1, 20)
-        )
     try:
         process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
             command,
@@ -170,7 +160,6 @@ def run(
             stderr=subprocess.PIPE,
             check=False,
             env=env,
-            **options,
             **windows_no_window_options(),
         )
     except subprocess.TimeoutExpired as error:
@@ -190,18 +179,11 @@ def git_try(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[str
 
 
 def git_bytes(repo_root: Path, *arguments: str) -> bytes | None:
-    options: dict[str, Any] = {}
-    if _BOUNDED_DEADLINE is not None:
-        remaining = _BOUNDED_DEADLINE - time.monotonic()
-        if remaining <= 1:
-            raise WorkflowError("bounded pipeline call deadline reached")
-        options["timeout"] = min(remaining - 1, 20)
     process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         ["git", "-C", str(repo_root), *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
-        **options,
         **windows_no_window_options(),
     )
     return process.stdout if process.returncode == 0 else None
@@ -10891,8 +10873,6 @@ def revalidate_pipeline_conflict(
 def advance_bounded_conflict(
     state_path: Path, state: dict[str, Any], session: str,
 ) -> None:
-    if _BOUNDED_DEADLINE is None:
-        raise WorkflowError("bounded conflict deadline is missing")
     task = state["agent_task"]
     bounded = state["bounded_pipeline"]
     phase = bounded["phase"]
@@ -10923,7 +10903,6 @@ def advance_bounded_conflict(
     command = [
         *task["helper_command"], "--bounded-phase", phase,
         "--bounded-session", session,
-        "--bounded-deadline", str(min(_BOUNDED_DEADLINE, time.monotonic() + 90)),
     ]
     process = run(command, cwd=Path(state["repo_root"]), check=False)
     result_path = Path(task["result_file"])
@@ -11052,7 +11031,7 @@ def advance_bounded_conflict(
 
 
 def command_bounded_pipeline(args: argparse.Namespace) -> int:
-    global _BOUNDED_DEADLINE, _BOUNDED_STACK_AUTH
+    global _BOUNDED_STACK_AUTH
     session = os.environ.get("COPILOT_AGENT_SESSION_ID")
     if not session or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", session):
         raise WorkflowError("bounded pipeline requires COPILOT_AGENT_SESSION_ID")
@@ -11091,7 +11070,6 @@ def command_bounded_pipeline(args: argparse.Namespace) -> int:
         _BOUNDED_STACK_AUTH = None
         raise WorkflowError("another invocation owns the pipeline state") from None
     started = False
-    _BOUNDED_DEADLINE = time.monotonic() + BOUNDED_STEP_SECONDS
     try:
         with lock:
             previous = load_state(state_path) if state_path.exists() else None
@@ -11211,7 +11189,6 @@ def command_bounded_pipeline(args: argparse.Namespace) -> int:
             return 1
         raise
     finally:
-        _BOUNDED_DEADLINE = None
         _BOUNDED_STACK_AUTH = None
         lock_path.unlink(missing_ok=True)
 

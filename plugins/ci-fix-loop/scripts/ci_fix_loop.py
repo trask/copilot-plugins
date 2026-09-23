@@ -2133,7 +2133,7 @@ def run_bounded_cloud_helper(
     process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
         command, cwd=str(repo_root), text=True, encoding="utf-8",
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        env=subprocess_environment(), timeout=85,
+        env=subprocess_environment(),
         **({"require_execution": True} if _EXECUTION is not None else {}),
         **windows_no_window_options(),
     )

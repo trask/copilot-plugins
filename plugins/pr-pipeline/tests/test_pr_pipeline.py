@@ -1586,7 +1586,7 @@ class InvocationStateIsolationTest(unittest.TestCase):
                         "--verify-clearance-snapshot" in command,
                     )
                     self.assertEqual(str(state), command[command.index("--state") + 1])
-                    self.assertEqual(30, run.call_args.kwargs["timeout"])
+                    self.assertNotIn("timeout", run.call_args.kwargs)
 
     def test_20075_reads_only_fresh_stage_state(self):
         stale_owner = "e9a8f3877a7e86e16973f9ebe01caaa2"
@@ -4006,28 +4006,7 @@ class BoundedCommandTest(unittest.TestCase):
         self.assertTrue(stage["waiting"])
         self.assertEqual(60, stage["wait_seconds"])
 
-    def test_bounded_stage_expires_at_step_deadline(self):
-        self.assertEqual(180, MODULE.STEP_DEADLINE_SECONDS)
-
-        def monitor(_command, *, progress, **_options):
-            progress()
-
-        with (
-            mock.patch.object(
-                MODULE.time, "monotonic",
-                side_effect=[0.0, MODULE.STEP_DEADLINE_SECONDS],
-            ),
-            mock.patch.object(MODULE.common, "run_monitored", side_effect=monitor),
-            self.assertRaisesRegex(
-                MODULE.WorkflowError, "exceeded the bounded step deadline"
-            ),
-        ):
-            MODULE.run_stage(
-                MODULE.STAGES[0], target(), Path("C:/repo"), model="gpt-6-sol",
-                effort="high", run_id="a" * 32, sweep=1, bounded=True,
-            )
-
-    def test_bounded_conflict_preparation_can_finish_after_100_seconds(self):
+    def test_bounded_stage_can_finish_after_old_step_deadline(self):
         def monitor(_command, *, progress, **_options):
             progress()
             return {
@@ -4038,7 +4017,7 @@ class BoundedCommandTest(unittest.TestCase):
             }
 
         with (
-            mock.patch.object(MODULE.time, "monotonic", side_effect=[0.0, 100.0]),
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0.0, 3600.0]),
             mock.patch.object(MODULE.common, "run_monitored", side_effect=monitor),
             mock.patch.object(MODULE.common, "stage_live_progress", return_value=None),
             mock.patch.object(MODULE.common, "hosted_task_progress", return_value=None),

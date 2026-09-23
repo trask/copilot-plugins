@@ -138,18 +138,6 @@ def subprocess_environment() -> dict[str, str]:
     return environment
 
 
-_BOUNDED_DEADLINE: float | None = None
-
-
-def bounded_subprocess_timeout() -> dict[str, float]:
-    if _BOUNDED_DEADLINE is None:
-        return {}
-    remaining = _BOUNDED_DEADLINE - time.monotonic() - 5
-    if remaining <= 0:
-        raise WorkflowError("bounded pipeline call exceeded its subprocess allowance")
-    return {"timeout": min(remaining, 85)}
-
-
 def run(
     command: list[str],
     *,
@@ -169,7 +157,6 @@ def run(
             stderr=subprocess.PIPE,
             check=False,
             env=subprocess_environment(),
-            **bounded_subprocess_timeout(),
             **windows_no_window_options(),
             **({"require_execution": require_execution} if _EXECUTION else {}),
         )
@@ -197,7 +184,6 @@ def run_bytes(
             stderr=subprocess.PIPE,
             check=False,
             env=subprocess_environment(),
-            **bounded_subprocess_timeout(),
             **windows_no_window_options(),
         )
     except subprocess.TimeoutExpired as error:
@@ -2811,14 +2797,7 @@ def command_pipeline(args: argparse.Namespace) -> None:
             raise WorkflowError("bounded pipeline requires COPILOT_AGENT_SESSION_ID")
     args._pipeline = True
     args._pipeline_entry = True
-    global _BOUNDED_DEADLINE
-    previous_deadline = _BOUNDED_DEADLINE
-    if getattr(args, "bounded_step", False):
-        _BOUNDED_DEADLINE = time.monotonic() + 85
-    try:
-        result = command_agent_task(args)
-    finally:
-        _BOUNDED_DEADLINE = previous_deadline
+    result = command_agent_task(args)
     emit({
         **result,
         "tasks": result.get("tasks") or (

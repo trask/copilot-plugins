@@ -660,7 +660,7 @@ def run_owned_local_worker(
     *,
     cwd: Path,
     input_text: str,
-    timeout: float = LOCAL_DECISION_TIMEOUT_SECONDS,
+    timeout: float | None = LOCAL_DECISION_TIMEOUT_SECONDS,
     environment: dict[str, str] | None = None,
     description: str = "local Copilot decision process",
     require_execution: bool = False,
@@ -692,7 +692,8 @@ def run_owned_local_worker(
                     f"{description} timed out; owned process-tree shutdown did not drain output"
                 ) from shutdown_error
             raise WorkflowError(
-                f"{description} timed out after {timeout:g} seconds",
+                f"{description} timed out"
+                + (f" after {timeout:g} seconds" if timeout is not None else ""),
                 details={
                     "dispatcher_stdout_sha256": sha256_text(stdout),
                     "dispatcher_stderr_sha256": sha256_text(stderr),
@@ -7494,7 +7495,7 @@ def run_hosted_decision_worker(
     if not already_final:
         process = run_owned_local_worker(
             command, cwd=repo_root, input_text="",
-            timeout=min(timeout, 85) if bounded_action is not None else timeout,
+            timeout=None if bounded_action is not None else timeout,
             environment=subprocess_environment(), description="hosted Agent Task dispatcher",
             require_execution=bounded_action is not None,
         )
