@@ -2885,7 +2885,11 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
                 )
             resumed = existing
     if pipeline_mode and existing is not None:
-        if (existing.get("pr") or {}).get("pr_url") != target["pr_url"]:
+        stored_pr = existing.get("pr") or {}
+        if any(
+            stored_pr.get(field) != target[field]
+            for field in ("pr_url", "repo_name", "number")
+        ):
             raise WorkflowError("pipeline state belongs to a different pull request")
         active_task = existing.get("agent_task") or {}
         if resumed is None and (
@@ -2939,14 +2943,12 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
     ):
         if load_state(state_path) != existing:
             raise WorkflowError("pipeline state changed during sweep preflight")
-        if any(
-            existing["pr"].get(field) != pr.get(field)
-            for field in (
-                "repo_name", "number", "head_repository", "head_branch", "base_branch",
-                "title", "body", "is_draft",
-            )
+        if (
+            pr.get("pr_url") != target["pr_url"]
+            or pr.get("repo_name") != target["repo_name"]
+            or pr.get("number") != target["number"]
         ):
-            raise WorkflowError("pipeline source identity changed")
+            raise WorkflowError("pipeline target identity changed")
     previous_clean_at_head_sha = None
     if existing is None:
         state = {

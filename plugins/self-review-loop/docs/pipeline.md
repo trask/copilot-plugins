@@ -6,6 +6,8 @@ PR Pipeline may call `scripts/self_review_loop.py pipeline` with `--bounded-step
 
 The completed observation also returns waiting. The next call verifies the result and begins publication with a fresh execution deadline. Completed code passes return waiting until a later clean pass or the iteration budget is exhausted.
 
+A later sweep in the same run starts from a fresh PR preflight. The target PR and completed task history remain bound, but the current branch, head, base, draft state, title, and body need not match the prior sweep. The stage keeps its spent iteration count; it only accepts a new hosted result against that task's pinned inputs.
+
 The cloud helper reports pending status as JSON on stdout and stores its checkpoint at `<result-file>.pipeline.json`. The final v5 result file does not exist until task completion. After successful publication, the stage removes the checkpoint with the other task artifacts unless `--preserve-artifacts` is set.
 
 Without `--bounded-step`, pipeline and standalone commands retain their existing synchronous behavior.

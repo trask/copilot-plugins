@@ -1874,7 +1874,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.97")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.98")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -9673,6 +9673,57 @@ class PipelineBudgetTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "preflight reached"):
                 MODULE.command_agent_task(args)
         preflight.assert_called_once()
+
+    def test_later_sweep_uses_changed_metadata_without_description_receipt(self):
+        target = {
+            "owner": "owner", "repo": "repo", "number": 7,
+            "pr_url": "https://github.com/owner/repo/pull/7",
+        }
+        previous_pr = {
+            "repo_name": "owner/repo", "number": 7, "pr_url": target["pr_url"],
+            "head_sha": "a" * 40, "head_branch": "feature",
+            "head_repository": "owner/repo", "base_branch": "main",
+            "title": "Old title", "body": "Old body", "is_draft": True,
+        }
+        prior = {
+            "budget_scope": "pipeline",
+            "pipeline_budget": {
+                "run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0,
+            },
+            "repo_root": "repo", "github_mutation_policy": "allow",
+            "last_result": "max_iterations_reached", "max_iterations": 5,
+            "iterations": 5, "pr": previous_pr,
+            "queue": {"id": "pr-7", "status": "active", "comments": [], "batches": []},
+        }
+        live_pr = {
+            **previous_pr, "head_sha": "b" * 40, "head_branch": "new-feature",
+            "head_repository": "fork/repo", "base_branch": "release",
+            "title": "New title", "body": "Human body edit", "is_draft": False,
+        }
+        preflight = {
+            "pr": live_pr, "repository_root": "repo", "viewer": {"login": "viewer"},
+            "comments": [{"id": 1}], "head_review_clean": False,
+        }
+        args = SimpleNamespace(
+            target="owner/repo#7", repo_root=None, model="sol",
+            pipeline_run="run-a", pipeline_iteration=2, max_iterations=5,
+            github_mutation_policy="allow", _pipeline_entry=True,
+        )
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=Path("repo")),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "invocation_state_path", return_value=(Path("state.json"), "id")),
+            mock.patch.object(MODULE, "require_outside_repository"),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(MODULE, "load_state", return_value=prior),
+            mock.patch.object(MODULE, "wait_for_stable_review_preflight", return_value=preflight),
+            mock.patch.object(MODULE, "historical_source_fixes",
+                              side_effect=MODULE.WorkflowError("fresh preflight accepted")) as history,
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "fresh preflight accepted"):
+                MODULE.command_agent_task(args)
+        history.assert_called_once()
 
     def test_each_sweep_gets_five_iterations_without_refreshing_on_relaunch(self):
         state = {"iterations": 0, "budget_scope": "pipeline"}

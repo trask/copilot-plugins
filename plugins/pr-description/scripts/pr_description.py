@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-import copy
 from contextlib import contextmanager
 import datetime as dt
 import errno
@@ -2243,19 +2242,6 @@ def recommendation_semantic_snapshot(
     }
 
 
-def same_snapshot_except_description(
-    left: dict[str, Any], right: dict[str, Any]
-) -> bool:
-    left = copy.deepcopy(left)
-    right = copy.deepcopy(right)
-    for snapshot in (left, right):
-        source = snapshot.get("source")
-        if isinstance(source, dict):
-            source.pop("title", None)
-            source.pop("body", None)
-    return left == right
-
-
 def reserve_agent_task_run(
     index_path: Path,
     run_path: Path,
@@ -2443,40 +2429,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         pipeline_run=getattr(args, "pipeline_run", None),
         pipeline_max_iterations=getattr(args, "pipeline_max_iterations", None),
     )
-    if previous is not None:
-        prior_snapshot = (previous.get("agent_task") or {}).get("semantic_snapshot")
-        if not isinstance(prior_snapshot, dict):
-            raise WorkflowError(
-                "pipeline state predates semantic snapshot binding; start a fresh run"
-            )
-        if prior_snapshot == semantic_snapshot:
-            if stage_outcome(previous) == "excluded":
-                emit(
-                    {
-                        "result": "source_only_no_mutation",
-                        "state": str(path),
-                        "pr": target["pr_url"],
-                        "pr_number": pr["number"],
-                        "pr_title": pr["title"],
-                        "session_title": (
-                            f"PR Description: {pr['number']} - {pr['title']}"
-                        ),
-                        "head_sha": pr["head_sha"],
-                        "validated_head_sha": None,
-                        "stage_outcome": "excluded",
-                    }
-                )
-                return
-            raise WorkflowError(
-                "pipeline description was already evaluated for this semantic snapshot"
-            )
-        if (
-            previous["pr"]["head_sha"] == pr["head_sha"]
-            and not same_snapshot_except_description(prior_snapshot, semantic_snapshot)
-        ):
-            raise WorkflowError(
-                "same-head pipeline reuse changed inputs other than title or body"
-            )
     state = resumed or {
         "version": STATE_VERSION,
         "kind": RUN_KIND,

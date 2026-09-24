@@ -182,6 +182,113 @@ class BoundedCiPipelineTest(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.WorkflowError, "another session or run"):
                     MODULE.command_bounded_pipeline(self.args)
 
+    def test_later_sweep_reobserves_a_processed_snapshot_and_keeps_receipts(self):
+        snapshot = {
+            "sha256": "ready", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
+            "decision": {"decision": "waiting", "detail": "checks running"},
+        }
+        preflight = {"pr": {"head_sha": "head"}, "check_snapshot": snapshot}
+        with (
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight) as observe,
+            mock.patch.object(MODULE, "require_live_check_snapshot") as confirm,
+            mock.patch.object(MODULE, "command_agent_task",
+                              side_effect=lambda _: MODULE.emit({
+                                  "result": "green", "state": str(self.path),
+                              })) as task,
+        ):
+            MODULE.command_bounded_pipeline(self.args)
+            snapshot["decision"] = {"decision": "green", "detail": "green"}
+            self.state["bounded_step"]["terminal"] = {
+                "result": "green", "state": str(self.path),
+            }
+            self.state["agent_task"] = {"status": "completed"}
+            self.state["budget_scope"] = "pipeline"
+            self.state["coordinator"] = {
+                "processed_snapshots": [{
+                    "snapshot_sha256": "ready",
+                    "stability_sha256": MODULE.ci_stability_sha256(snapshot),
+                    "task_id": "first-task",
+                }],
+                "status": "waiting_for_checks",
+                "stability_sha256": MODULE.ci_stability_sha256(snapshot),
+                "stable_polls": 9,
+            }
+            self.args.pipeline_iteration = 2
+            MODULE.command_bounded_pipeline(self.args)
+
+        self.assertEqual("green", self.output[-1]["result"])
+        self.assertEqual(3, observe.call_count)
+        confirm.assert_called_once()
+        task.assert_called_once()
+        self.assertEqual(1, self.state["bounded_processed_snapshot_baseline"])
+        self.assertEqual(1, self.state["coordinator"]["stable_polls"])
+        self.assertEqual(set(), MODULE.processed_ci_snapshot_ids(self.state))
+        MODULE.record_processed_ci_snapshot(
+            self.path, preflight, {"result": "published", "task": {"id": "second-task"}},
+        )
+        self.assertEqual(
+            ["first-task", "second-task"],
+            [entry["task_id"] for entry in self.state["coordinator"]["processed_snapshots"]],
+        )
+        self.assertIn("ready", MODULE.processed_ci_snapshot_ids(self.state))
+
+    def test_later_sweep_keeps_owner_fields_and_requires_completed_work(self):
+        snapshot = {
+            "sha256": "ready", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
+            "decision": {"decision": "waiting", "detail": "checks running"},
+        }
+        with mock.patch.object(MODULE, "agent_task_preflight",
+                               return_value={"check_snapshot": snapshot}) as observe:
+            MODULE.command_bounded_pipeline(self.args)
+            self.state["bounded_step"]["terminal"] = {"result": "green"}
+            self.args.pipeline_iteration = 2
+            for field, value in (
+                ("model", "terra"),
+                ("github_mutation_policy", "source-only"),
+                ("max_iterations", 6),
+                ("pipeline_max_iterations", 3),
+            ):
+                with self.subTest(field=field):
+                    original = getattr(self.args, field)
+                    setattr(self.args, field, value)
+                    with self.assertRaisesRegex(MODULE.WorkflowError, "another session or run"):
+                        MODULE.command_bounded_pipeline(self.args)
+                    setattr(self.args, field, original)
+            with mock.patch.object(
+                MODULE, "resolve_target",
+                return_value=MODULE.parse_target("owner/repo#8"),
+            ):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "another session or run"):
+                    MODULE.command_bounded_pipeline(self.args)
+            self.state["agent_task"] = {"status": "bounded_pending"}
+            with self.assertRaisesRegex(MODULE.WorkflowError, "another session or run"):
+                MODULE.command_bounded_pipeline(self.args)
+            self.state["agent_task"] = {"status": "completed"}
+            self.state["coordinator"] = {"pending_rerun": {"check": "build"}}
+            with self.assertRaisesRegex(MODULE.WorkflowError, "active workflow ownership"):
+                MODULE.command_bounded_pipeline(self.args)
+            self.state["coordinator"] = {"status": "waiting_for_checks"}
+            for task_field, value in (
+                ("retry_command", "retry hosted task"),
+                ("dispatch_monitor", {"status": "starting"}),
+                ("dispatch_monitor", {"status": "running"}),
+            ):
+                with self.subTest(task_field=task_field, value=value):
+                    self.state["agent_task"][task_field] = value
+                    with self.assertRaisesRegex(MODULE.WorkflowError, "active workflow ownership"):
+                        MODULE.command_bounded_pipeline(self.args)
+                    self.state["agent_task"].pop(task_field)
+            self.state["pending_stack_push"] = {"head": "head"}
+            with self.assertRaisesRegex(MODULE.WorkflowError, "another session or run"):
+                MODULE.command_bounded_pipeline(self.args)
+            self.state.pop("pending_stack_push")
+            self.args.pipeline_iteration = 3
+            with self.assertRaisesRegex(MODULE.WorkflowError, "valid sweep position"):
+                MODULE.command_bounded_pipeline(self.args)
+        observe.assert_called_once()
+
     def test_helper_observes_repeated_pending_without_a_deadline(self):
         calls = []
         responses = iter(["pending", "pending", "completed"])

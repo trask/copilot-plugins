@@ -608,10 +608,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "fetch_committed_bytes",
-                side_effect=[
-                    (json.loads(report_content)["proposal"]["title"] + "\n").encode(),
-                    (json.loads(report_content)["proposal"]["body"] + "\n").encode(),
-                ],
+                side_effect=lambda _repo, path, _sha, **_kwargs: (
+                    (
+                        json.loads(report_content)["proposal"][
+                            "title" if path == MODULE.AGENT_TASK_OUTPUT_TITLE else "body"
+                        ]
+                    ) + "\n"
+                ).encode(),
             ),
             mock.patch.object(
                 MODULE,
@@ -658,7 +661,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.93")
+        self.assertEqual(plugin["version"], "1.0.94")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -1578,11 +1581,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             }
             self.assertEqual("cleared", emitted[-1]["stage_outcome"])
             args.pipeline_iteration = 2
-            before = Path(args.state).read_bytes()
-            with self.assertRaisesRegex(MODULE.WorkflowError, "already evaluated"):
-                MODULE.command_pipeline(args)
-            self.assertEqual(before, Path(args.state).read_bytes())
-            self.assertEqual(1, len(self.helper_commands))
             self.preflight["pr"]["head_sha"] = "9" * 40
             self.preflight["pr"]["head"]["sha"] = "9" * 40
             self.identity["head"] = "9" * 40
@@ -1607,7 +1605,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         for path, content in first_artifacts.items():
             self.assertEqual(content, Path(path).read_bytes())
 
-    def test_later_sweep_keeps_same_head_source_only_proposal_excluded(self):
+    def test_later_sweep_rechecks_same_head_source_only_proposal(self):
         report = self.proposal_report(
             decision="replace", title="Better title", body="Better body"
         )
@@ -1620,18 +1618,23 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 stack.enter_context(patcher)
             update = stack.enter_context(mock.patch.object(MODULE, "update_pr"))
             MODULE.command_pipeline(args)
-            before = Path(args.state).read_bytes()
+            first = MODULE.load_run_state(Path(args.state))
             args.pipeline_iteration = 2
-            MODULE.command_pipeline(args)
-        self.assertEqual(before, Path(args.state).read_bytes())
-        self.assertEqual(1, len(self.helper_commands))
+            with mock.patch.object(MODULE.secrets, "token_hex", return_value="run-2"):
+                MODULE.command_pipeline(args)
+        second = MODULE.load_run_state(Path(args.state))
+        self.assertEqual(2, len(self.helper_commands))
+        self.assertEqual(
+            first["agent_task"]["semantic_snapshot"],
+            second["agent_task_history"][0]["semantic_snapshot"],
+        )
         self.assertEqual(["excluded", "excluded"], [
             item["stage_outcome"] for item in emitted
         ])
         self.assertIsNone(emitted[-1]["validated_head_sha"])
         update.assert_not_called()
 
-    def test_same_head_keep_still_rejects_before_state_write_or_second_dispatch(self):
+    def test_same_head_keep_starts_fresh_later_sweep(self):
         report = self.proposal_report()
         patches, _, _ = self.command_patches(
             self.result(report), report, self.receipt()
@@ -1641,12 +1644,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             for patcher in patches:
                 stack.enter_context(patcher)
             MODULE.command_pipeline(args)
-            before = Path(args.state).read_bytes()
             args.pipeline_iteration = 2
-            with self.assertRaisesRegex(MODULE.WorkflowError, "semantic snapshot"):
+            with mock.patch.object(MODULE.secrets, "token_hex", return_value="run-2"):
                 MODULE.command_pipeline(args)
-        self.assertEqual(before, Path(args.state).read_bytes())
-        self.assertEqual(1, len(self.helper_commands))
+        self.assertEqual(2, MODULE.load_run_state(Path(args.state))["pipeline_iteration"])
+        self.assertEqual(2, len(self.helper_commands))
 
     def test_later_sweep_rechecks_same_head_after_title_and_body_change(self):
         report = self.proposal_report()
@@ -1708,6 +1710,50 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(
             first["agent_task"]["semantic_snapshot"],
             second["agent_task_history"][0]["semantic_snapshot"],
+        )
+
+    def test_later_sweep_rechecks_same_head_after_draft_and_viewer_change(self):
+        report = self.proposal_report()
+        patches, emitted, _ = self.command_patches(
+            self.result(report), report, self.receipt()
+        )
+        args = self.pipeline_arguments()
+
+        def run(command, **_kwargs):
+            self.helper_commands.append(command)
+            prompt = Path(command[command.index("--prompt-file") + 1])
+            result = result_with_prompt_identity(
+                self.result(report), self.preflight, prompt.read_text(encoding="utf-8")
+            )
+            self.last_runtime_result = result
+            Path(command[command.index("--result-file") + 1]).write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                if patcher.attribute != "run":
+                    stack.enter_context(patcher)
+            stack.enter_context(mock.patch.object(MODULE, "run", side_effect=run))
+            MODULE.command_pipeline(args)
+            first = MODULE.load_run_state(Path(args.state))
+            self.preflight["pr"]["is_draft"] = True
+            self.preflight["viewer"]["permissions"]["push"] = False
+            args.pipeline_iteration = 2
+            with mock.patch.object(MODULE.secrets, "token_hex", return_value="run-2"):
+                MODULE.command_pipeline(args)
+
+        second = MODULE.load_run_state(Path(args.state))
+        self.assertEqual(["cleared", "cleared"], [item["stage_outcome"] for item in emitted])
+        self.assertEqual(2, len(self.helper_commands))
+        self.assertEqual(
+            first["agent_task"]["semantic_snapshot"],
+            second["agent_task_history"][0]["semantic_snapshot"],
+        )
+        self.assertTrue(second["agent_task"]["semantic_snapshot"]["source"]["is_draft"])
+        self.assertFalse(
+            second["agent_task"]["semantic_snapshot"]["source"]["viewer"]["permissions"]["push"]
         )
 
     def test_applied_pipeline_captures_final_literal_metadata_not_original_inputs(self):
@@ -1786,10 +1832,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual("current", MODULE.verify_clearance_snapshot(state)["result"])
             live["pr"]["base"]["sha"] = "8" * 40
             args.pipeline_iteration = 2
-            with self.assertRaisesRegex(MODULE.WorkflowError, "already evaluated"):
+            self.preflight["pr"]["base"]["sha"] = live["pr"]["base"]["sha"]
+            with mock.patch.object(MODULE.secrets, "token_hex", return_value="run-2"):
                 MODULE.command_pipeline(args)
             self.assertEqual("current", MODULE.verify_clearance_snapshot(state)["result"])
-        self.assertEqual(1, len(self.helper_commands))
+        self.assertEqual(2, len(self.helper_commands))
 
     def test_applied_metadata_survives_base_advance_before_clearance_capture(self):
         report = self.proposal_report(

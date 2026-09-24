@@ -2079,7 +2079,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.73")
+        self.assertEqual(plugin["version"], "1.3.74")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -3091,6 +3091,48 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual("cleared", emitted[-1]["stage_outcome"])
             self.assertIsNotNone(MODULE.recorded_clean_at_head_sha(state))
 
+    def test_later_sweep_rechecks_changed_pr_metadata(self):
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            self.assertEqual(0, self.pipeline_cli(args))
+            self.pipeline_live.update(
+                head_sha="9" * 40,
+                base_sha="8" * 40,
+                head_owner="fork",
+                head_repository="fork/repo",
+                head_branch="new-feature",
+                base_branch="release",
+                title="Updated title",
+                body="Updated body",
+                is_draft=False,
+            )
+            self.pipeline_identity["head"] = self.pipeline_live["head_sha"]
+            args.pipeline_iteration = 2
+            emitted.clear()
+            self.assertEqual(0, self.pipeline_cli(args))
+            self.assertEqual(2, len(commands))
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual(self.pipeline_live, state["pr"])
+            self.assertEqual(self.pipeline_live, state["agent_task"]["preflight"]["pr"])
+            self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+
+    def test_later_sweep_rechecks_description_at_the_same_head(self):
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            self.assertEqual(0, self.pipeline_cli(args))
+            first_task = MODULE.load_state(Path(args.state))["agent_task"]["run_id"]
+            self.pipeline_live.update(
+                base_sha="8" * 40,
+                title="Description stage title",
+                body="Description stage body",
+            )
+            args.pipeline_iteration = 2
+            emitted.clear()
+            self.assertEqual(0, self.pipeline_cli(args))
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual(2, len(commands))
+            self.assertNotEqual(first_task, state["agent_task"]["run_id"])
+            self.assertEqual(self.pipeline_live["body"], state["pr"]["body"])
+            self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+
     def test_later_sweep_rejects_same_or_older_completed_sweep(self):
         with self.pipeline_run(fixes=0) as (args, commands, emitted):
             self.assertEqual(0, self.pipeline_cli(args))
@@ -3111,9 +3153,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "changed cap": lambda state: state["pipeline_budget"].update(max_iterations=9),
             "wrong checkout": lambda state: state.update(repo_root="other"),
             "wrong PR": lambda state: state["pr"].update(pr_url="https://github.com/owner/repo/pull/8"),
-            "changed head ref": lambda state: state["pr"].update(head_branch="other"),
-            "changed head repo": lambda state: state["pr"].update(head_repository="fork/repo"),
-            "changed base ref": lambda state: state["pr"].update(base_branch="other"),
+            "wrong PR number": lambda state: state["pr"].update(number=8),
+            "wrong PR repository": lambda state: state["pr"].update(repo_name="other/repo"),
             "policy changed": lambda state: state["agent_task"].update(github_mutation_policy="allow"),
             "model changed": lambda state: state["agent_task"].update(model="gpt-6-astra"),
             "active": lambda state: state["agent_task"].update(status="running"),
@@ -3137,6 +3178,22 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     self.assertEqual(1, self.pipeline_cli(args))
                     self.assertEqual(before, Path(args.state).read_bytes())
                     self.assertEqual(1, len(commands))
+
+    def test_later_sweep_rejects_live_pr_target_drift(self):
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            self.assertEqual(0, self.pipeline_cli(args))
+            args.pipeline_iteration = 2
+            original_preflight = MODULE.agent_task_preflight.side_effect
+
+            def wrong_target(*values, **kwargs):
+                preflight = original_preflight(*values, **kwargs)
+                preflight["pr"]["number"] = 8
+                return preflight
+
+            with mock.patch.object(MODULE, "agent_task_preflight", side_effect=wrong_target):
+                self.assertEqual(1, self.pipeline_cli(args))
+            self.assertIn("target identity changed", emitted[-1]["error"])
+            self.assertEqual(1, len(commands))
 
     def test_later_sweep_rejects_state_changed_during_preflight(self):
         with self.pipeline_run(fixes=0) as (args, commands, emitted):

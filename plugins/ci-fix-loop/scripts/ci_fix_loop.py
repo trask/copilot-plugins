@@ -2204,6 +2204,12 @@ def run_bounded_cloud_helper(
 
 def command_bounded_pipeline(args: argparse.Namespace) -> None:
     require_tools()
+    if (
+        type(args.pipeline_iteration) is not int
+        or type(args.pipeline_max_iterations) is not int
+        or not 1 <= args.pipeline_iteration <= args.pipeline_max_iterations
+    ):
+        raise WorkflowError("bounded CI pipeline requires a valid sweep position")
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
     state_path = cli_path(args.state)
@@ -2227,12 +2233,47 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         previous = bounded.get("owner")
         if (
             not isinstance(previous, dict)
-            or previous.get("session_id") != session_id
-            or previous.get("pipeline_run") != args.pipeline_run
-            or previous.get("pipeline_iteration", 0) >= args.pipeline_iteration
+            or any(
+                previous.get(key) != value
+                for key, value in owner.items()
+                if key != "pipeline_iteration"
+            )
+            or type(previous.get("pipeline_iteration")) is not int
+            or previous["pipeline_iteration"] >= args.pipeline_iteration
             or bounded.get("terminal") is None
+            or isinstance(bounded.get("pending_rerun"), dict)
+            or not fresh_invocation_may_supersede_task(state.get("agent_task"))
+            or isinstance(state.get("pending_stack_push"), dict)
         ):
             raise WorkflowError("bounded CI pipeline belongs to another session or run")
+        coordinator = state.get("coordinator")
+        if coordinator is not None and not isinstance(coordinator, dict):
+            raise WorkflowError("bounded CI coordinator state is malformed")
+        task = state.get("agent_task")
+        monitor = task.get("dispatch_monitor") if isinstance(task, dict) else None
+        if (
+            (isinstance(task, dict) and task.get("retry_command") is not None)
+            or (
+                isinstance(monitor, dict)
+                and monitor.get("status") in {"starting", "running"}
+            )
+            or (
+                isinstance(coordinator, dict)
+                and (
+                    isinstance(coordinator.get("pending_rerun"), dict)
+                    or coordinator.get("status") in {"starting", "running", "waiting"}
+                )
+            )
+        ):
+            raise WorkflowError("bounded CI pipeline still has active workflow ownership")
+        receipts = (coordinator or {}).get("processed_snapshots", [])
+        if not isinstance(receipts, list):
+            raise WorkflowError("bounded CI processed snapshot receipts are malformed")
+        if isinstance(coordinator, dict):
+            coordinator.pop("stability_sha256", None)
+            coordinator.pop("stable_polls", None)
+            coordinator.pop("check_snapshot", None)
+        state["bounded_processed_snapshot_baseline"] = len(receipts)
         bounded = None
     elif bounded is not None and not isinstance(bounded, dict):
         raise WorkflowError("bounded CI pipeline owner is malformed")
@@ -12153,6 +12194,14 @@ def processed_ci_snapshot_ids(state: dict[str, Any]) -> set[str]:
     entries = coordinator.get("processed_snapshots")
     if not isinstance(entries, list):
         return set()
+    baseline = state.get("bounded_processed_snapshot_baseline", 0)
+    if (
+        state.get("budget_scope") == "pipeline"
+        and isinstance(state.get("bounded_step"), dict)
+        and type(baseline) is int
+        and 0 <= baseline <= len(entries)
+    ):
+        entries = entries[baseline:]
     return {
         digest
         for entry in entries
@@ -12376,9 +12425,17 @@ def record_processed_ci_snapshot(
     coordinator = state.setdefault("coordinator", {})
     entries = coordinator.setdefault("processed_snapshots", [])
     identity = preflight["check_snapshot"]["sha256"]
+    baseline = state.get("bounded_processed_snapshot_baseline", 0)
+    if not (
+        state.get("budget_scope") == "pipeline"
+        and isinstance(state.get("bounded_step"), dict)
+        and type(baseline) is int
+        and 0 <= baseline <= len(entries)
+    ):
+        baseline = 0
     if not any(
         isinstance(entry, dict) and entry.get("snapshot_sha256") == identity
-        for entry in entries
+        for entry in entries[baseline:]
     ):
         task = result.get("task") if isinstance(result.get("task"), dict) else {}
         entries.append(
