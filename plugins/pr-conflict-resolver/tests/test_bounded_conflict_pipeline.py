@@ -787,6 +787,7 @@ class BoundedNativeStackTest(unittest.TestCase):
             mock.patch.object(CLOUD, "fetch_pinned_inputs"),
             mock.patch.object(CLOUD, "start_task", side_effect=start_pending) as post,
             mock.patch.object(CLOUD, "get_task", side_effect=get_task),
+            mock.patch.object(CLOUD, "_EXECUTION", mock.Mock(run=subprocess.run)) as execution,
         ):
             for phase in phases:
                 result = CLOUD.Result()
@@ -800,6 +801,18 @@ class BoundedNativeStackTest(unittest.TestCase):
                 ))
                 outcomes.append(result.status)
             self.assertEqual(2, post.call_count)
+            for options in fixture.launched:
+                self.assertTrue(
+                    any(
+                        call.args[:3] == (
+                            options.result_file,
+                            options.request["request_id"],
+                            fixture.snapshot.repository,
+                        )
+                        and call.args[3]["state"] == "completed"
+                        for call in execution.record_dispatch.call_args_list
+                    )
+                )
         self.assertEqual(["waiting"] * 6 + ["success"], outcomes)
         self.assertEqual(
             [fixture.trunk, fixture.new_lower],

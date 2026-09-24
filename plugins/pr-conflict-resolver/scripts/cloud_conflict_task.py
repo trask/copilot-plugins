@@ -3562,13 +3562,30 @@ def execute_native_stack(
         result.task_base_ref = result.task_base_sha = base_sha
         if options.bounded_phase is None:
             atomic_write_json(options.result_file, result.as_dict())
-            final = monitor_task(runner, snapshot, initial, progress, sleep)
+            progress.result_path = member_options.result_file
+            progress.request_id = str(member_request["request_id"])
+            try:
+                final = monitor_task(runner, snapshot, initial, progress, sleep)
+            finally:
+                progress.result_path = options.result_file
+                progress.request_id = request_id
         elif options.bounded_phase == "dispatch":
             result.status = "waiting"
             result.code_refs = []
             result.artifact = None
             return
-        elif options.bounded_phase == "observe":
+        if _EXECUTION is not None:
+            _EXECUTION.record_dispatch(
+                member_options.result_file,
+                str(member_request["request_id"]),
+                snapshot.repository,
+                {
+                    "id": task_id,
+                    "state": str(final["state"]),
+                    "url": task_link(final),
+                },
+            )
+        if options.bounded_phase == "observe":
             result.task_state = progress.task_state = str(final["state"])
             result.task_url = task_link(final) or result.task_url
             if final["state"] in TERMINAL_STATES:

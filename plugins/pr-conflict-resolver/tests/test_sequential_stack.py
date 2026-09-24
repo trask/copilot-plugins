@@ -360,6 +360,26 @@ class SequentialStackTest(unittest.TestCase):
             self.assertIn("Do not switch branches", prompt)
             self.assertIn("Cherry-pick each `head_commits` SHA", prompt)
 
+    def test_each_completed_member_records_its_own_terminal_observation(self):
+        execution = mock.Mock(run=subprocess.run)
+        with mock.patch.object(CLOUD, "_EXECUTION", execution):
+            result = self.execute()
+
+        self.assertEqual("success", result.status)
+        for options, number in zip(self.launched, (6, 7), strict=True):
+            self.assertTrue(
+                any(
+                    call.args[:3] == (
+                        options.result_file,
+                        options.request["request_id"],
+                        self.snapshot.repository,
+                    )
+                    and call.args[3]["state"] == "completed"
+                    for call in execution.record_dispatch.call_args_list
+                ),
+                f"member {number} has no terminal dispatch observation",
+            )
+
     def publication_state(self):
         self.execute()
         MODULE.verify_quarantined_result(
