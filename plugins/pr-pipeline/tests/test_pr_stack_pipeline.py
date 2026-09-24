@@ -1,3 +1,4 @@
+import copy
 from contextlib import redirect_stdout
 import hashlib
 import importlib.util
@@ -58,6 +59,7 @@ def stack(members=(11, 12, 13), number=77, heads=None) -> dict:
                 "head_branch": f"branch-{member}",
                 "base_branch": "main" if index == 0 else f"branch-{members[index - 1]}",
                 "head_sha": heads.get(member, head_of(member)),
+                "conflict_status": "PASSED",
                 "is_draft": member % 2 == 1,
                 "state": "OPEN",
             }
@@ -529,6 +531,17 @@ class TopologyTest(unittest.TestCase):
                                             "baseRefOid": "a" * 40,
                                             "baseRef": {"target": {"oid": BASE}},
                                             "mergeable": "MERGEABLE",
+                                            "mergeRequirements": {"conditions": [
+                                                {
+                                                    "__typename": "PullRequestMergeConflictStateCondition",
+                                                    "result": "FAILED",
+                                                    "conflicts": ["file.txt"],
+                                                },
+                                                {
+                                                    "__typename": "PullRequestReviewCondition",
+                                                    "result": "PASSED",
+                                                },
+                                            ]},
                                             "isDraft": True,
                                             "state": "OPEN",
                                         },
@@ -546,16 +559,83 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(77, live["number"])
         self.assertEqual([11], [member["number"] for member in live["members"]])
         self.assertEqual(BASE, live["members"][0]["base_sha"])
-        self.assertEqual("MERGEABLE", live["members"][0]["mergeable"])
+        self.assertEqual("FAILED", live["members"][0]["conflict_status"])
         self.assertIn("baseRef { target { oid } }", MODULE.STACK_QUERY)
+        self.assertIn("PullRequestMergeConflictStateCondition { conflicts }", MODULE.STACK_QUERY)
+        self.assertNotIn("headRefOid mergeable", MODULE.STACK_QUERY)
 
-        payload["data"]["repository"]["pullRequest"]["stack"]["entries"]["nodes"][
-            0
-        ]["position"] = 1
+        pull = payload["data"]["repository"]["pullRequest"]["stack"]["entries"]["nodes"][0]["pullRequest"]
+        pull["mergeable"] = "CONFLICTING"
+        pull["mergeRequirements"]["conditions"][0].update(result="PASSED", conflicts=[])
+        pull["mergeRequirements"]["conditions"][1]["result"] = "FAILED"
+        self.assertEqual("PASSED", MODULE.read_native_stack(
+            "owner/repo", 11, api=lambda arguments: payload,
+        )["members"][0]["conflict_status"])
+        for conditions in (
+            [], [{"__typename": "PullRequestMergeConflictStateCondition", "result": "UNKNOWN"}],
+            [{"__typename": "PullRequestMergeConflictStateCondition", "result": {}}],
+            [{"__typename": "PullRequestReviewCondition", "result": "PASSED"}],
+            [{"__typename": "PullRequestMergeConflictStateCondition", "result": "PASSED"}] * 2,
+        ):
+            with self.subTest(conditions=conditions):
+                pull["mergeRequirements"]["conditions"] = conditions
+                self.assertEqual("UNKNOWN", MODULE.read_native_stack(
+                    "owner/repo", 11, api=lambda arguments: payload,
+                )["members"][0]["conflict_status"])
+        pull.pop("mergeRequirements")
+        self.assertEqual("UNKNOWN", MODULE.read_native_stack(
+            "owner/repo", 11, api=lambda arguments: payload,
+        )["members"][0]["conflict_status"])
+
+        native = payload["data"]["repository"]["pullRequest"]["stack"]
+        nodes = native["entries"]["nodes"]
+        nodes[0]["position"] = 1
+        self.assertEqual([11], [member["number"] for member in MODULE.read_native_stack(
+            "owner/repo", 11, api=lambda arguments: payload,
+        )["members"]])
+        next_node = copy.deepcopy(nodes[0])
+        next_node["position"] = 2
+        next_node["pullRequest"].update(
+            number=12, headRefName="branch-12",
+            baseRefName="branch-11", headRefOid=head_of(12),
+        )
+        native["size"] = 2
+        nodes.append(next_node)
+        self.assertEqual([11, 12], [member["number"] for member in MODULE.read_native_stack(
+            "owner/repo", 11, api=lambda arguments: payload,
+        )["members"]])
+        nodes[1]["position"] = 3
         with self.assertRaisesRegex(MODULE.WorkflowError, "positions are malformed"):
             MODULE.read_native_stack(
                 "owner/repo", 11, api=lambda arguments: payload
             )
+
+    def test_conflict_condition_requires_complete_consistent_paths(self):
+        for result, conflicts, expected in (
+            ("PASSED", [], "PASSED"),
+            ("FAILED", ["file.txt"], "FAILED"),
+            ("PASSED", ["file.txt"], "UNKNOWN"),
+            ("PASSED", None, "UNKNOWN"),
+            ("PASSED", "file.txt", "UNKNOWN"),
+            ("PASSED", [""], "UNKNOWN"),
+            ("PASSED", ["  "], "UNKNOWN"),
+            ("PASSED", [42], "UNKNOWN"),
+            ("FAILED", [None], "UNKNOWN"),
+        ):
+            with self.subTest(result=result, conflicts=conflicts):
+                self.assertEqual(expected, MODULE.merge_conflict_result({
+                    "mergeRequirements": {"conditions": [{
+                        "__typename": "PullRequestMergeConflictStateCondition",
+                        "result": result,
+                        "conflicts": conflicts,
+                    }]},
+                }))
+        self.assertEqual("UNKNOWN", MODULE.merge_conflict_result({
+            "mergeRequirements": {"conditions": [{
+                "__typename": "PullRequestMergeConflictStateCondition",
+                "result": "PASSED",
+            }]},
+        }))
 
 
 class StackFixture(unittest.TestCase):
@@ -698,12 +778,13 @@ class StackRunTest(StackFixture):
         pipeline = self.pipeline(kickoff([11, 12]))
         selected = MODULE.validate_selection(pipeline.kickoff, self.stack)["selected"]
         for member in selected:
-            member.update(mergeable="MERGEABLE", base_sha=BASE)
+            member.update(mergeable="UNKNOWN", conflict_status="PASSED", base_sha=BASE)
 
         result = pipeline.run_conflict_phase(1, selected)
 
         self.assertEqual(0, result["dispatches"])
         self.assertTrue(result["clear"])
+        self.assertEqual("conflict_status_checked", result["action"])
         self.assertEqual([], self.launcher.started)
 
     def test_unselected_predecessors_are_never_dispatched(self):
@@ -725,13 +806,13 @@ class StackRunTest(StackFixture):
         )
 
     def test_partial_selection_blocks_conflicting_unknown_and_stale_metadata(self):
-        for mergeable, base_sha in (
-            ("CONFLICTING", BASE), ("UNKNOWN", BASE), ("MERGEABLE", "a" * 40),
+        for conflict_status, base_sha in (
+            ("FAILED", BASE), ("UNKNOWN", BASE), ("PASSED", "a" * 40),
         ):
-            with self.subTest(mergeable=mergeable, base_sha=base_sha):
+            with self.subTest(conflict_status=conflict_status, base_sha=base_sha):
                 self.stack = stack(members=(10, 11))
                 member = self.stack["members"][-1]
-                member.update(mergeable=mergeable, base_sha=base_sha)
+                member.update(mergeable="MERGEABLE", conflict_status=conflict_status, base_sha=base_sha)
                 pipeline = self.pipeline(kickoff([11]))
 
                 result = pipeline.run_conflict_phase(1, [member])
@@ -743,15 +824,23 @@ class StackRunTest(StackFixture):
                 self.assertEqual(0, result["dispatches"])
                 self.assertEqual([], self.launcher.started)
 
-    def test_partial_selection_final_snapshot_rechecks_mergeability(self):
+    def test_partial_selection_final_snapshot_rechecks_conflict_status(self):
         self.stack = stack(members=(10, 11))
         member = self.stack["members"][-1]
-        member.update(mergeable="MERGEABLE", base_sha=BASE)
+        member.update(mergeable="UNKNOWN", conflict_status="PASSED", base_sha=BASE)
         self.clear_everything()
         pipeline = self.pipeline(kickoff([11]))
-        self.assertEqual("complete", pipeline.final_snapshot()["result"])
+        snapshot = pipeline.final_snapshot()
+        self.assertEqual("complete", snapshot["result"])
+        conflict = snapshot["pull_requests"][0]["stages"][0]
+        self.assertEqual(
+            "github_conflict_status", conflict["clearance_kind"],
+        )
+        self.assertEqual("PASSED", conflict["status"]["conflict_status"])
+        self.assertEqual(member["head_sha"], conflict["clear_at_head_sha"])
+        self.assertEqual(BASE, conflict["clear_at_base_sha"])
 
-        member["mergeable"] = "CONFLICTING"
+        member["conflict_status"] = "FAILED"
 
         result = pipeline.final_snapshot()
         self.assertEqual("incomplete", result["result"])

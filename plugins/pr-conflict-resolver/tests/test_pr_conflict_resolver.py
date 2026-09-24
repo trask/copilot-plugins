@@ -1913,7 +1913,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertNotIn("attempt", state)
         payload = emitted(emit)
         self.assertEqual("task_creation_failed", payload["result"])
-        self.assertIn("stable pull request mergeability", payload["error"]["message"])
+        self.assertIn("stable pull request conflict status", payload["error"]["message"])
 
     def test_conflicting_agent_task_still_requires_a_supported_strategy(self):
         directory = temporary_directory(self)
@@ -2629,12 +2629,44 @@ def gh_metadata(**overrides):
     return payload
 
 
+def gh_conflict(result="FAILED", *, head="head1", base="main", paths=None):
+    return {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "number": 7,
+                    "headRefOid": head,
+                    "baseRefName": base,
+                    "mergeRequirements": {
+                        "state": "UNKNOWN",
+                        "conditions": [
+                            {
+                                "__typename": "PullRequestMergeConflictStateCondition",
+                                "result": result,
+                                "conflicts": (
+                                    ["LettuceBatchRequest.java"]
+                                    if paths is None and result == "FAILED"
+                                    else ([] if paths is None else paths)
+                                ),
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+    }
+
+
 class PullRequestMetadataTest(unittest.TestCase):
-    def metadata(self, *, base_tip="live-tip", **overrides):
+    def metadata(self, *, base_tip="live-tip", conflict=None, **overrides):
         target = MODULE.parse_target("owner/repo#7")
         with mock.patch.object(
             MODULE, "gh_json", return_value=gh_metadata(**overrides)
-        ), mock.patch.object(MODULE, "base_ref_tip", return_value=base_tip):
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value=base_tip
+        ), mock.patch.object(
+            MODULE, "graphql", return_value=conflict or gh_conflict()
+        ):
             return MODULE.metadata_for(target)
 
     def test_normalizes_the_fields_the_resolver_uses(self):
@@ -2648,6 +2680,7 @@ class PullRequestMetadataTest(unittest.TestCase):
         self.assertEqual("main", metadata["base_branch"])
         self.assertEqual("live-tip", metadata["base_sha"])
         self.assertEqual("CONFLICTING", metadata["mergeable"])
+        self.assertEqual(["LettuceBatchRequest.java"], metadata["conflict_paths"])
         self.assertEqual("DIRTY", metadata["merge_state_status"])
         self.assertEqual([{"sha": "head1", "message": "Add a thing"}], metadata["commits"])
 
@@ -2657,7 +2690,9 @@ class PullRequestMetadataTest(unittest.TestCase):
             MODULE, "gh_json", return_value=gh_metadata(baseRefOid="frozen")
         ), mock.patch.object(
             MODULE, "base_ref_tip", return_value="live-tip"
-        ) as tip:
+        ) as tip, mock.patch.object(
+            MODULE, "graphql", return_value=gh_conflict()
+        ):
             metadata = MODULE.metadata_for(target)
         self.assertEqual("live-tip", metadata["base_sha"])
         tip.assert_called_once_with("owner/repo", "main")
@@ -2671,6 +2706,61 @@ class PullRequestMetadataTest(unittest.TestCase):
     def test_rejects_metadata_for_another_pull_request(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "does not match the requested"):
             self.metadata(number=8)
+
+    def test_conflict_condition_overrides_unknown_aggregate_mergeability(self):
+        metadata = self.metadata(mergeable="UNKNOWN", mergeStateStatus="UNKNOWN")
+        self.assertEqual("CONFLICTING", metadata["mergeable"])
+        self.assertEqual(["LettuceBatchRequest.java"], metadata["conflict_paths"])
+
+    def test_passed_conflict_condition_overrides_conflicting_aggregate(self):
+        metadata = self.metadata(
+            conflict=gh_conflict("PASSED"), mergeable="CONFLICTING"
+        )
+        self.assertEqual("MERGEABLE", metadata["mergeable"])
+        self.assertEqual([], metadata["conflict_paths"])
+
+    def test_unknown_or_stale_conflict_condition_does_not_clear(self):
+        self.assertEqual(
+            "UNKNOWN", self.metadata(conflict=gh_conflict("UNKNOWN"))["mergeable"]
+        )
+        self.assertEqual(
+            "UNKNOWN",
+            self.metadata(conflict=gh_conflict("PASSED", head="old-head"))["mergeable"],
+        )
+        self.assertEqual(
+            "UNKNOWN",
+            self.metadata(conflict=gh_conflict("FAILED", base="old-base"))["mergeable"],
+        )
+
+    def test_stale_conflict_head_is_read_again(self):
+        target = MODULE.parse_target("owner/repo#7")
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=gh_metadata(mergeable="UNKNOWN")
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value="live-tip"
+        ), mock.patch.object(
+            MODULE, "graphql",
+            side_effect=[gh_conflict("FAILED", head="old-head"), gh_conflict("FAILED")],
+        ) as query, mock.patch.object(MODULE, "time"):
+            metadata = MODULE.live_mergeability(target, delays=(0, 0))
+        self.assertEqual("CONFLICTING", metadata["mergeable"])
+        self.assertEqual(2, query.call_count)
+        self.assertIn(
+            "PullRequestMergeConflictStateCondition { conflicts }",
+            query.call_args.args[0],
+        )
+
+    def test_missing_or_malformed_conflict_condition_fails(self):
+        for conflict in (
+            {"data": {"repository": {"pullRequest": {"number": 7}}}},
+            gh_conflict("INVALID"),
+            gh_conflict({"not": "a result"}),
+            gh_conflict("FAILED", paths=[""]),
+            gh_conflict("PASSED", paths=["file.java"]),
+        ):
+            with self.subTest(conflict=conflict):
+                with self.assertRaises(MODULE.WorkflowError):
+                    self.metadata(conflict=conflict)
 
     def test_rejects_a_deleted_head_repository(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "head repository is unavailable"):
@@ -9348,6 +9438,7 @@ def stack_entry(
     head,
     base,
     mergeable="MERGEABLE",
+    condition_result=None,
     oid=None,
     base_oid=None,
     retargeted_from=None,
@@ -9364,6 +9455,18 @@ def stack_entry(
             "headRefName": head,
             "baseRefName": base,
             "mergeable": mergeable,
+            "mergeRequirements": {
+                "conditions": [
+                    {
+                        "__typename": "PullRequestMergeConflictStateCondition",
+                        "result": condition_result or {
+                            "MERGEABLE": "PASSED", "CONFLICTING": "FAILED",
+                            "UNKNOWN": "UNKNOWN",
+                        }[mergeable],
+                        "conflicts": [],
+                    }
+                ]
+            },
             "headRefOid": head_oid,
             "baseRefOid": base_oid or f"baseoid{number}",
             "state": state,
@@ -9425,6 +9528,13 @@ class ParseStackTest(unittest.TestCase):
         self.assertEqual([5, 7], [member["number"] for member in stack["members"]])
         self.assertEqual("main", stack["trunk"])
         self.assertEqual("oid7", stack["members"][1]["head_sha"])
+
+    def test_stack_member_conflicts_use_condition_not_aggregate_mergeability(self):
+        raw = self.raw(
+            [stack_entry(1, 7, "feature", "main", "UNKNOWN", condition_result="FAILED")]
+        )
+        stack = MODULE.parse_stack(raw)
+        self.assertEqual("CONFLICTING", stack["members"][0]["mergeable"])
 
     def test_an_automatic_base_retarget_records_the_previous_branch(self):
         stack = MODULE.parse_stack(

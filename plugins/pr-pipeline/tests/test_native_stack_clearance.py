@@ -23,7 +23,7 @@ class NativeStackClearanceTest(StackFixture):
         self.metadata = {}
         parent = BASE
         for member in self.stack["members"]:
-            member.update(base_sha=parent, mergeable="MERGEABLE", is_draft=False)
+            member.update(base_sha=parent, mergeable="MERGEABLE", conflict_status="PASSED", is_draft=False)
             self.metadata[member["number"]] = {
                 **member, **COMMON.target_for("owner/repo", member["number"]),
                 "upstream_owner": "owner", "upstream_repo": "repo",
@@ -240,6 +240,13 @@ class NativeStackClearanceTest(StackFixture):
             self.calls[(CONFLICT, name)].assert_not_called()
         self.assertEqual([], list(self.controller.repo_root.rglob("*")))
 
+    def test_live_conflict_condition_clears_even_when_legacy_mergeability_is_unknown(self):
+        self.phase()
+        self.fill_other_stages()
+        for member in self.stack["members"]:
+            member["mergeable"] = "UNKNOWN"
+        self.assertEqual("complete", self.controller.final_snapshot()["result"])
+
     def test_snapshot_is_read_only_and_retains_no_state_without_accepted_evidence(self):
         self.phase()
         self.fill_other_stages()
@@ -305,8 +312,8 @@ class NativeStackClearanceTest(StackFixture):
             "child base": lambda: self.tips.update({"branch-11": "c" * 40}),
             "base unknown": lambda: self.tips.update(main=None),
             "base metadata": lambda: self.stack["members"][1].update(base_sha="c" * 40),
-            "unknown mergeability": lambda: self.stack["members"][1].update(mergeable="UNKNOWN"),
-            "conflicting": lambda: self.stack["members"][1].update(mergeable="CONFLICTING"),
+            "unknown conflict status": lambda: self.stack["members"][1].update(conflict_status="UNKNOWN"),
+            "conflicting": lambda: self.stack["members"][1].update(conflict_status="FAILED"),
             "closed": lambda: self.stack["members"][1].update(state="CLOSED"),
             "head ref": lambda: self.stack["members"][1].update(head_branch="other"),
             "base ref": lambda: self.stack["members"][1].update(base_branch="main"),
@@ -392,7 +399,7 @@ class NativeStackClearanceTest(StackFixture):
             "member base": lambda c: c["members"][1].update(direct_base_sha="c" * 40),
             "member ref": lambda c: c["members"][1].update(head_ref="other"),
             "merge base": lambda c: c["members"][1].update(merge_base="c" * 40),
-            "unknown member": lambda c: c["members"][1].update(mergeable="UNKNOWN"),
+            "unexpected member evidence": lambda c: c["members"][1].update(unexpected=True),
             "repository": lambda c: c["members"][1].update(repository="other/repo"),
             "authorization digest": lambda c: c["authorization"].update(request_sha256="c" * 64),
             "authorization run": lambda c: c["authorization"]["owner"].update(run_id="other"),
@@ -515,11 +522,11 @@ class NativeStackClearanceTest(StackFixture):
             with self.subTest(change=change), mock.patch.object(self.controller, "inspect", side_effect=changed):
                 self.assert_incomplete()
 
-    def test_closing_snapshot_must_still_be_mergeable_and_open(self):
+    def test_closing_snapshot_must_still_be_conflict_free_and_open(self):
         self.phase()
         self.fill_other_stages()
         original = copy.deepcopy(self.stack)
-        for mutation in ({"mergeable": "UNKNOWN"}, {"state": "CLOSED"}, {"base_sha": "c" * 40}):
+        for mutation in ({"conflict_status": "UNKNOWN"}, {"conflict_status": "FAILED"}, {"state": "CLOSED"}, {"base_sha": "c" * 40}):
             closing = copy.deepcopy(original)
             closing["members"][1].update(mutation)
             with self.subTest(mutation=mutation), mock.patch.object(

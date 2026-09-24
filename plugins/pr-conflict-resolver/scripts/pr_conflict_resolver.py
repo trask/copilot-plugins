@@ -286,6 +286,39 @@ def commit_contains(repository: str, ancestor: str, descendant: str) -> bool:
     }
 
 
+def conflict_condition(pull: dict[str, Any]) -> tuple[str, list[str]]:
+    """Map GitHub's file-conflict check to the resolver's conflict-only states."""
+    requirements = pull.get("mergeRequirements")
+    conditions = requirements.get("conditions") if isinstance(requirements, dict) else None
+    if not isinstance(conditions, list):
+        raise WorkflowError("GitHub did not return pull request conflict conditions")
+    matches = [
+        condition for condition in conditions
+        if isinstance(condition, dict)
+        and condition.get("__typename") == "PullRequestMergeConflictStateCondition"
+    ]
+    if len(matches) != 1:
+        raise WorkflowError(
+            "GitHub did not return exactly one pull request conflict condition"
+        )
+    condition = matches[0]
+    result = condition.get("result")
+    paths = condition.get("conflicts")
+    if not isinstance(result, str) or result not in {
+        "PASSED", "FAILED", "UNKNOWN"
+    } or not isinstance(paths, list) or any(
+        not isinstance(path, str) or not path for path in paths
+    ):
+        raise WorkflowError("GitHub returned an invalid pull request conflict condition")
+    if result == "PASSED" and paths:
+        raise WorkflowError(
+            "GitHub returned conflict paths for a passed conflict condition"
+        )
+    return {"PASSED": "MERGEABLE", "FAILED": "CONFLICTING", "UNKNOWN": "UNKNOWN"}[
+        result
+    ], paths
+
+
 def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
     """Turn a GraphQL ``PullRequestStack`` into an ordered member snapshot.
 
@@ -391,13 +424,14 @@ def parse_stack(raw: dict[str, Any]) -> dict[str, Any]:
             raise WorkflowError(
                 f"native stack member {number!r} is missing a required field"
             )
+        mergeable, _ = conflict_condition(member)
         members.append(
             {
                 "position": node.get("position"),
                 "number": number,
                 "head_branch": head_branch,
                 "base_branch": base_branch,
-                "mergeable": member.get("mergeable"),
+                "mergeable": mergeable,
                 "head_sha": head_sha,
                 "base_sha": base_sha,
                 "commits": commit_shas,
@@ -522,7 +556,11 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
         "          nodes {"
         "            position"
         "            pullRequest {"
-        "              number headRefName baseRefName mergeable headRefOid baseRefOid state"
+        "              number headRefName baseRefName headRefOid baseRefOid state"
+        "              mergeRequirements { conditions {"
+        "                __typename result"
+        "                ... on PullRequestMergeConflictStateCondition { conflicts }"
+        "              } }"
         "              commits(first: $first) {"
         "                totalCount"
         "                pageInfo { hasNextPage }"
@@ -1073,7 +1111,7 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
 
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
-        "number,title,url,state,isDraft,mergeable,mergeStateStatus,headRefName,"
+        "number,title,url,state,isDraft,mergeStateStatus,headRefName,"
         "headRefOid,headRepositoryOwner,headRepository,baseRefName,commits"
     )
     metadata = gh_json(
@@ -1125,6 +1163,39 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(headline, str):
             raise WorkflowError(f"resolved PR commit {index} has no message headline")
         commits.append({"sha": sha, "message": headline.strip()})
+    conflict_payload = graphql(
+        "query($owner: String!, $name: String!, $number: Int!) {"
+        "  repository(owner: $owner, name: $name) {"
+        "    pullRequest(number: $number) {"
+        "      number headRefOid baseRefName"
+        "      mergeRequirements { conditions {"
+        "        __typename result"
+        "        ... on PullRequestMergeConflictStateCondition { conflicts }"
+        "      } }"
+        "    }"
+        "  }"
+        "}",
+        {
+            "owner": resolved["owner"],
+            "name": resolved["repo"],
+            "number": target["number"],
+        },
+    )
+    data = conflict_payload.get("data") if isinstance(conflict_payload, dict) else None
+    repository = data.get("repository") if isinstance(data, dict) else None
+    pull = repository.get("pullRequest") if isinstance(repository, dict) else None
+    if not isinstance(pull, dict) or pull.get("number") != target["number"]:
+        raise WorkflowError(
+            "GitHub did not return matching pull request conflict conditions"
+        )
+    mergeable, conflict_paths = conflict_condition(pull)
+    conflict_head = pull.get("headRefOid")
+    conflict_base = pull.get("baseRefName")
+    if not isinstance(conflict_head, str) or not isinstance(conflict_base, str):
+        raise WorkflowError("GitHub returned conflict conditions without a head or base")
+    if conflict_head != head_sha or conflict_base != base_branch:
+        mergeable = "UNKNOWN"
+        conflict_paths = []
     return {
         "number": target["number"],
         "title": title.strip(),
@@ -1134,7 +1205,8 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "upstream_repo": resolved["repo"],
         "state": metadata.get("state"),
         "is_draft": bool(metadata.get("isDraft")),
-        "mergeable": metadata.get("mergeable"),
+        "mergeable": mergeable,
+        "conflict_paths": conflict_paths,
         "merge_state_status": metadata.get("mergeStateStatus"),
         "head_owner": head_owner["login"],
         "head_repo": head_repository["name"],
@@ -1158,18 +1230,18 @@ def require_open_pull_request(metadata: dict[str, Any]) -> None:
 def mergeability_settled(
     metadata: dict[str, Any], expected_head: str | None = None
 ) -> bool:
-    """Report whether a mergeability read is worth acting on.
+    """Report whether a file-conflict result is worth acting on.
 
-    A read is worth acting on once GitHub has finished computing the value and, when
+    A read is worth acting on once GitHub has evaluated the condition and, when
     an expected head SHA is given, once the answer describes that commit.
 
     This narrows the stale window rather than closing it. No GitHub field states the
-    commit a mergeable value was computed against, so an answer that describes the
+    commit a conflict result was computed against, so an answer that describes the
     expected head can still carry a value computed just before the push landed. What
     it does rule out is the larger case, where the pull request has not registered the
     push at all and the answer is plainly about the previous head.
     """
-    if metadata.get("mergeable") == "UNKNOWN":
+    if metadata.get("mergeable") not in {"MERGEABLE", "CONFLICTING"}:
         return False
     if expected_head is None:
         return True
@@ -1182,11 +1254,10 @@ def live_mergeability(
     delays: Iterable[float] = MERGEABILITY_RETRY_DELAYS,
     expected_head: str | None = None,
 ) -> dict[str, Any]:
-    """Read mergeability live, waiting while GitHub is still computing it.
+    """Read the file-conflict condition until GitHub evaluates the current head.
 
-    GitHub computes the value lazily, so the first read of a freshly pushed head is
-    routinely UNKNOWN. Reading it again is what triggers and then observes the
-    computation.
+    GitHub can return UNKNOWN after a push. Reading again gives its conflict
+    condition time to settle without relying on aggregate mergeability.
 
     A read taken right after a push can also still describe the previous head, and
     that stale answer carries a settled mergeable value rather than UNKNOWN. Pass the
@@ -1204,7 +1275,7 @@ def live_mergeability(
 def classify_mergeability(
     metadata: dict[str, Any], *, expected_head: str | None = None
 ) -> str:
-    """Name the mergeability an answer reports, for the head it describes.
+    """Name the file-conflict result for the head the answer describes.
 
     An answer about any other head is reported as unknown rather than believed, which
     fails safe: the caller escalates instead of trusting a value it cannot place.
@@ -8348,7 +8419,7 @@ def validate_native_stack_member_observation(
     ):
         raise WorkflowError("native stack identity, head, or direct base changed")
     if current.get("mergeable") not in {"MERGEABLE", "CONFLICTING"}:
-        raise WorkflowError("GitHub did not return stable native stack mergeability")
+        raise WorkflowError("GitHub did not return stable native stack conflict status")
 
 
 def native_stack_members_aligned(members: list[dict[str, Any]]) -> bool:
@@ -8573,7 +8644,7 @@ def _conflict_preflight(
             "a non-default pull request base is supported only through a native stack"
         )
     if metadata["mergeable"] not in {"MERGEABLE", "CONFLICTING"}:
-        raise WorkflowError("GitHub did not return stable pull request mergeability")
+        raise WorkflowError("GitHub did not return stable pull request conflict status")
     if metadata["mergeable"] == "MERGEABLE" and not (
         stack is not None and whole_stack
     ):
@@ -8627,7 +8698,7 @@ def _conflict_preflight(
         else strategy_choice["strategy"]
     )
     if metadata["mergeable"] != "CONFLICTING" and strategy != "native-stack":
-        raise WorkflowError("GitHub did not return a stable conflicting pull request")
+        raise WorkflowError("GitHub did not return a confirmed pull request conflict")
     merge_base = git(repo_root, "merge-base", metadata["head_sha"], metadata["base_sha"])
     conflict_paths = merge_tree_conflicts(
         repo_root, metadata["head_sha"], metadata["base_sha"]

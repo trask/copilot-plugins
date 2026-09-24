@@ -661,8 +661,12 @@ STACK_QUERY = (
     "          nodes {"
     "            position"
     "            pullRequest {"
-    "              number title headRefName baseRefName headRefOid mergeable isDraft state"
+    "              number title headRefName baseRefName headRefOid isDraft state"
     "              baseRef { target { oid } }"
+    "              mergeRequirements { conditions {"
+    "                __typename result"
+    "                ... on PullRequestMergeConflictStateCondition { conflicts }"
+    "              } }"
     "            }"
     "          }"
     "        }"
@@ -671,6 +675,32 @@ STACK_QUERY = (
     "  }"
     "}"
 )
+
+
+def merge_conflict_result(member: dict[str, Any]) -> str:
+    requirements = member.get("mergeRequirements")
+    conditions = (
+        requirements.get("conditions") if isinstance(requirements, dict) else None
+    )
+    if not isinstance(conditions, list):
+        return "UNKNOWN"
+    conflict_conditions = [
+        condition for condition in conditions
+        if isinstance(condition, dict)
+        and condition.get("__typename") == "PullRequestMergeConflictStateCondition"
+    ]
+    if len(conflict_conditions) != 1:
+        return "UNKNOWN"
+    condition = conflict_conditions[0]
+    conflicts = condition.get("conflicts")
+    if not isinstance(conflicts, list) or any(
+        not isinstance(path, str) or not path.strip() for path in conflicts
+    ):
+        return "UNKNOWN"
+    result = condition.get("result")
+    if result == "PASSED":
+        return "UNKNOWN" if conflicts else "PASSED"
+    return "FAILED" if result == "FAILED" else "UNKNOWN"
 
 
 def parse_stack(raw: Any) -> dict[str, Any] | None:
@@ -739,7 +769,7 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
                 "base_branch": base_branch,
                 "head_sha": head_sha,
                 "base_sha": base_target.get("oid") if isinstance(base_target, dict) else None,
-                "mergeable": member.get("mergeable"),
+                "conflict_status": merge_conflict_result(member),
                 "is_draft": bool(member.get("isDraft")),
                 "state": member.get("state"),
             }
@@ -757,7 +787,8 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
         raise WorkflowError(
             f"the native stack reports {size!r} members but exposes {len(members)}"
         )
-    if [member["position"] for member in members] != list(range(size)):
+    positions = [member["position"] for member in members]
+    if positions not in (list(range(size)), list(range(1, size + 1))):
         raise WorkflowError("the native stack member positions are malformed")
     if len({member["number"] for member in members}) != size:
         raise WorkflowError("the native stack repeats a pull request")
@@ -2367,12 +2398,12 @@ class StackPipeline:
         target = common.target_for(self.repository, number)
         return self.inspect(STAGE_BY_NAME[stage], target, head_sha, base_sha)
 
-    def mergeability_clearance(
+    def conflict_clearance(
         self, member: dict[str, Any], base_sha: str | None
     ) -> dict[str, Any]:
         clear = (
             member.get("state") == "OPEN"
-            and member.get("mergeable") == "MERGEABLE"
+            and member.get("conflict_status") == "PASSED"
             and base_sha is not None
             and member.get("base_sha") == base_sha
         )
@@ -2381,13 +2412,13 @@ class StackPipeline:
             "clear": clear,
             "clear_at_head_sha": member["head_sha"] if clear else None,
             "clear_at_base_sha": base_sha if clear else None,
-            "clearance_kind": "github_mergeability" if clear else None,
+            "clearance_kind": "github_conflict_status" if clear else None,
             "outcome": "cleared" if clear else None,
             "reason": None if clear else "unsupported_partial_selection_conflict",
             "installed": stage_script_path(STAGE_BY_NAME[STAGE_CONFLICT]).is_file(),
             "status_state": None,
             "status": {
-                "mergeable": member.get("mergeable"),
+                "conflict_status": member.get("conflict_status", "UNKNOWN"),
                 "head_sha": member["head_sha"],
                 "base_sha": member.get("base_sha"),
             },
@@ -2412,7 +2443,7 @@ class StackPipeline:
             results = [
                 (
                     member,
-                    self.mergeability_clearance(member, self.base_sha_for(member)),
+                    self.conflict_clearance(member, self.base_sha_for(member)),
                 )
                 for member in current["selected"]
             ]
@@ -2426,14 +2457,14 @@ class StackPipeline:
                 "completions": [],
                 "clear": blocked is None,
                 "completed": blocked is None,
-                "action": "mergeability_checked",
+                "action": "conflict_status_checked",
                 "stopped": None if blocked is None else {
                     "step": "conflict_scope",
                     "number": blocked["number"],
                     "stage": STAGE_CONFLICT,
                     "reason": "unsupported_partial_selection_conflict",
                     "detail": (
-                        "the selected suffix is not freshly mergeable at its exact "
+                        "the selected suffix has no passing conflict check at its exact "
                         "head and base; conflict publication would require "
                         "authorization for the full native stack"
                     ),
@@ -3293,11 +3324,16 @@ class StackPipeline:
             or clearance.get("trunk") != {"ref": stack["trunk"], "sha": pull_requests[0]["base_sha"]}
             or any(
                 member.get("state") != "OPEN"
-                or member.get("mergeable") != "MERGEABLE"
+                or member.get("conflict_status") != "PASSED"
                 or member.get("base_sha") != item["base_sha"]
                 for member, item in zip(validation["selected"], pull_requests)
             )
-            or clearance.get("members") != [
+            or not isinstance(clearance.get("members"), list)
+            or [
+                {key: value for key, value in evidence.items() if key != "mergeable"}
+                if isinstance(evidence, dict) else evidence
+                for evidence in clearance["members"]
+            ] != [
                 {
                     "pr_number": member["number"],
                     "repository": self.repository,
@@ -3306,7 +3342,6 @@ class StackPipeline:
                     "direct_base_ref": member["base_branch"],
                     "direct_base_sha": item["base_sha"],
                     "merge_base": item["base_sha"],
-                    "mergeable": "MERGEABLE",
                 }
                 for member, item in zip(validation["selected"], pull_requests)
             ]
@@ -3395,7 +3430,7 @@ class StackPipeline:
                     "pull_requests": pull_requests,
                 }
             stages = [
-                self.mergeability_clearance(member, base_sha)
+                self.conflict_clearance(member, base_sha)
                 if entry["stage"] == STAGE_CONFLICT and not whole_stack
                 else self.inspect(entry, target, member["head_sha"], base_sha)
                 for entry in STAGES
