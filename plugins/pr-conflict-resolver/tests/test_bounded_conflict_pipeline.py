@@ -41,7 +41,6 @@ class BoundedPipelineTest(unittest.TestCase):
             "strategy": "merge", "request": copy.deepcopy(self.request),
         }
         self.patch("build_conflict_prompt", return_value="Resolve the conflict")
-        self.patch("require_no_credentials")
         self.patch("discover_conflict_task", return_value=self.root / "cloud_conflict_task.py")
         self.patch("verify_quarantined_result")
         self.patch("require_live_conflict_guards")

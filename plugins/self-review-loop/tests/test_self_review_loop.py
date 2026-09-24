@@ -2079,7 +2079,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.74")
+        self.assertEqual(plugin["version"], "1.3.75")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2174,7 +2174,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIn("Zero code commits does not establish a clean review", prompt)
         self.assertIn(MODULE.AGENT_TASK_OUTPUT_RESULT, prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
-        MODULE.require_no_credentials(prompt, source="prompt")
 
 
 

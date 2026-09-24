@@ -35,7 +35,7 @@ SHORT_TARGET_PATTERN = re.compile(
 )
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
+    "1d7b8d3b9d587ba316662fa7153fc7f783095f1ce39895adb3e453f63f54cdc7"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -1007,24 +1007,6 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def contains_credentials(value: str) -> bool:
-    patterns = (
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-        r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-        r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-        r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    return any(re.search(pattern, value) for pattern in patterns)
-
-
-def require_no_credentials(value: str, *, source: str) -> None:
-    if contains_credentials(value):
-        raise WorkflowError(f"{source} appears to contain credentials; refusing Agent Task")
-
-
 def parse_strict_json(value: str, *, description: str) -> Any:
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -1310,10 +1292,6 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
         or set(result) != expected_keys
     ):
         raise WorkflowError("Agent Task result has an unsupported schema or fields")
-    require_no_credentials(
-        json.dumps(result, ensure_ascii=False, sort_keys=True),
-        source="Agent Task result",
-    )
     return result
 
 
@@ -1820,7 +1798,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         max_iterations=max_iterations,
         pipeline=pipeline,
     )
-    require_no_credentials(prompt, source="Agent Task prompt")
     state = {
         "version": STATE_VERSION,
         "created_at": utc_now(),

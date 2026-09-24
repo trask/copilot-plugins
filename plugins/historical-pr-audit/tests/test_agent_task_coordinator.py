@@ -279,7 +279,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_current_policy(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea",
+            "1d7b8d3b9d587ba316662fa7153fc7f783095f1ce39895adb3e453f63f54cdc7",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY,
@@ -308,7 +308,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "optional",
         ):
             self.assertIn(text, prompt)
-        self.assertFalse(MODULE.contains_credentials(prompt))
 
     def test_artifacts_are_absolute_and_outside_repository(self):
         with tempfile.TemporaryDirectory() as directory:

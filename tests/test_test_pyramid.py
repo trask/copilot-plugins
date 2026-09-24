@@ -154,7 +154,7 @@ FAIL_CLOSED_COVERAGE = {
     "hosted review candidate artifact identity": (
         "plugins/copilot-review-loop/tests/test_copilot_review_loop.py",
         "AgentTaskCoordinatorTest",
-        "test_rejects_malformed_mismatched_and_credential_artifacts",
+        "test_rejects_malformed_and_mismatched_artifacts",
     ),
     "hosted review decision identity": (
         "plugins/copilot-review-loop/tests/test_hosted_review_candidate.py",

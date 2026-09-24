@@ -39,7 +39,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
+    "1d7b8d3b9d587ba316662fa7153fc7f783095f1ce39895adb3e453f63f54cdc7"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -124,24 +124,6 @@ def sha256_file(path: Path) -> str:
             f"could not read Agent Tasks runtime helper {path}: {error}"
         ) from error
     return digest.hexdigest()
-
-
-def contains_credentials(value: str) -> bool:
-    patterns = (
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-        r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-        r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-        r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    return any(re.search(pattern, value) for pattern in patterns)
-
-
-def require_no_credentials(value: str, *, source: str) -> None:
-    if contains_credentials(value):
-        raise WorkflowError(f"{source} appears to contain credentials")
 
 
 def parse_strict_json(value: str, *, description: str) -> Any:
@@ -1810,7 +1792,6 @@ def run_hosted_review_phase(
     )
     pr = state["pr"]
     prompt = hosted_review_prompt(pr, candidates)
-    require_no_credentials(prompt, source=f"hosted {phase} prompt")
     prompt_path = state_path.with_name(f"{state_path.stem}--{phase}-prompt.txt")
     result_path = state_path.with_name(f"{state_path.stem}--{phase}-result.json")
     if prompt_path.exists() or result_path.exists():
@@ -1869,7 +1850,6 @@ def run_hosted_review_phase(
     content = run(["git", "-C", str(repo_root), "show", f"{artifact['sha']}:{output_path}"]).stdout
     if len(content.encode("utf-8")) > MAX_REPORT_BYTES:
         raise WorkflowError("hosted review output exceeds 1 MiB")
-    require_no_credentials(content, source="hosted review output")
     payload = parse_strict_json(content, description=f"hosted {phase} output")
     field = "candidates" if candidates is None else "comments"
     if (

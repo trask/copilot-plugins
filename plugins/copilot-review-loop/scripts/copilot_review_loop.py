@@ -166,7 +166,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
+    "1d7b8d3b9d587ba316662fa7153fc7f783095f1ce39895adb3e453f63f54cdc7"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -1682,24 +1682,6 @@ def strict_json_file(path: Path, label: str) -> tuple[bytes, Any]:
         return content, json.loads(text, object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as error:
         raise WorkflowError(f"{label} is not valid JSON: {error}") from error
-
-
-def contains_credentials(value: str) -> bool:
-    patterns = (
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-        r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-        r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-        r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    return any(re.search(pattern, value) for pattern in patterns)
-
-
-def require_no_credentials(value: str, *, source: str) -> None:
-    if contains_credentials(value):
-        raise WorkflowError(f"{source} appears to contain credentials")
 
 
 def parse_strict_json(value: str, *, description: str) -> Any:
@@ -4429,10 +4411,6 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
         )
     ):
         raise WorkflowError("Agent Task result has an unsupported schema or fields")
-    require_no_credentials(
-        json.dumps(result, ensure_ascii=False, sort_keys=True),
-        source="Agent Task result",
-    )
     return result
 
 
@@ -5138,10 +5116,6 @@ def validate_generated_history(
         )
         if not paths or any(path.startswith(reserved) for path in paths):
             raise WorkflowError(f"fix commit {commit} changed an unexpected path")
-        require_no_credentials(
-            git(repo_root, "show", "-s", "--format=%B", commit),
-            source=f"fix commit {commit} message",
-        )
         paths_by_commit[commit] = paths
     return paths_by_commit
 
@@ -5372,7 +5346,6 @@ def validate_copilot_review_report(
     active_local_decisions: bool = False,
     hosted_decisions: bool = False,
 ) -> dict[str, Any]:
-    require_no_credentials(content, source="Copilot Review Loop report")
     report = parse_markdown_report(content, description="Copilot Review Loop report")
     fix_commits, verified_paths, historical_findings = review_fix_context(
         preflight,
@@ -7090,10 +7063,6 @@ def local_source_transition_evidence(
             raise WorkflowError(
                 f"local decision worker commit {commit} changed an unexpected path"
             )
-        require_no_credentials(
-            git(repo_root, "show", "-s", "--format=%B", commit),
-            source=f"local decision worker commit {commit} message",
-        )
         patch = run_bytes(
             [
                 "git",
@@ -7484,11 +7453,6 @@ def validate_hosted_candidate(
         for item in candidate["code_commits"] for path in item["changed_paths"]
     ):
         raise WorkflowError("hosted review code commits contain reserved Agent Task paths")
-    for commit in verified["commits"]:
-        require_no_credentials(
-            git(repo_root, "show", "-s", "--format=%B", commit),
-            source=f"candidate commit {commit} message",
-        )
     return {
         "task_id": task["id"], "task_url": task["url"],
         "session_id": completion["session"]["id"],
@@ -8692,10 +8656,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         if existing != previous_sweep and not bounded:
             raise WorkflowError("pipeline state changed during sweep preflight")
         require_pipeline_sweep_target(previous_sweep, preflight, target, repo_root)
-    require_no_credentials(
-        json.dumps(preflight, ensure_ascii=False, sort_keys=True),
-        source="Agent Task preflight",
-    )
     pr = preflight["pr"]
     clean_head = None
     policy_skip_head = None
@@ -9001,7 +8961,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 preflight, request_id=task_state["run_id"], iteration_allowance=1,
                 prior_history=state.get("history") or [],
             )
-            require_no_credentials(prompt, source="hosted Copilot review prompt")
             atomic_write_text(prompt_path, prompt)
             before_source = local_source_fingerprint(repo_root)
             before_github = github_decision_fingerprint(target, preflight)

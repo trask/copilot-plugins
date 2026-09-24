@@ -1103,7 +1103,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "acabf7430c0da236ed0da75e67069c39266298c89b4410097ee154a25c3258cb",
+            "7b01446cecd4d644fa69fa55997d1e8c86d015061820a69f4d71fcfcf81c9322",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -1488,7 +1488,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         self.assertEqual(payload["candidate"], saved["agent_task"]["candidate"])
         self.assertEqual("head_changed", saved["last_result"])
 
-    def test_nonzero_helper_without_result_retains_bounded_redacted_diagnostics(self):
+    def test_nonzero_helper_without_result_retains_bounded_diagnostics(self):
         directory = temporary_directory(self)
         state_path = directory / "state.json"
         args = MODULE.build_parser().parse_args(
@@ -1547,9 +1547,8 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             len(task["process"]["stdout"]["text"].encode("utf-8")),
             MODULE.MANAGED_OUTPUT_MAX_BYTES,
         )
-        self.assertNotIn("github_pat_", task["process"]["stdout"]["text"])
-        self.assertNotIn("secret-value", task["process"]["stderr"]["text"])
-        self.assertIn("<redacted>", task["process"]["stderr"]["text"])
+        self.assertTrue(task["process"]["stdout"]["text"].startswith("token=github_pat_"))
+        self.assertEqual(stderr, task["process"]["stderr"]["text"])
         payload = emitted(emit)
         self.assertEqual("invocation_abandoned", payload["result"])
         self.assertEqual(task["process"], payload["process"])
@@ -5357,17 +5356,22 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
         self.assertEqual("task-1", result["task"]["id"])
         self.assertEqual("in_progress", result["task"]["state"])
 
-    def test_unexpected_exception_redacts_credentials_from_the_result(self):
-        exit_code, result, stderr = self.invoke(
-            RuntimeError("Authorization: Bearer secret-value")
-        )
+    def test_unexpected_exception_keeps_error_detail(self):
+        detail = "Authorization: Basic example"
+        exit_code, result, stderr = self.invoke(RuntimeError(detail))
 
         self.assertEqual(2, exit_code)
-        self.assertEqual(
-            "operation failed; sensitive detail omitted",
-            result["error"]["message"],
-        )
-        self.assertNotIn("secret-value", stderr.getvalue())
+        self.assertIn(detail, result["error"]["message"])
+        self.assertIn(detail, stderr.getvalue())
+
+    def test_conflict_helper_accepts_credential_example_in_external_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prompt.txt"
+            example = "Resolve gproto+http://user:password@host:8080"
+            path.write_text(example, encoding="utf-8")
+            self.assertEqual(
+                example, CLOUD_MODULE.read_external_text(path, "prompt file")
+            )
 
     def test_keyboard_interrupt_keeps_the_existing_interrupted_result(self):
         exit_code, result, _stderr = self.invoke(KeyboardInterrupt())

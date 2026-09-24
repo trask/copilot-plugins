@@ -4012,7 +4012,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.92", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.93", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4162,17 +4162,16 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     MODULE.escape_terminal_controls(f"before{chr(code)}after"),
                 )
 
-    def test_failed_log_diagnostic_escapes_controls_and_redacts_credentials(self):
-        raw = b"\x1b]52;c;clipboard\x07HTTP 403\x1b[0m\nAuthorization: Bearer private-value\n"
+    def test_failed_log_diagnostic_escapes_controls_without_rewriting_text(self):
+        raw = b"\x1b]52;c;clipboard\x07HTTP 403\x1b[0m\nAuthorization: Basic example"
         process = MODULE.subprocess.CompletedProcess(["gh"], 1, b"untrusted log", raw)
         error = MODULE.failed_log_command_failure("could not read log", process)
         diagnostic = error.details["external_command_diagnostic"]
         self.assertEqual(
-            ascii("\\x1b]52;c;clipboard\\x07HTTP 403\\x1b[0m\n[REDACTED]\n"),
-            ascii(diagnostic["stderr"]["text"]),
+            MODULE.escape_terminal_controls(raw.decode()),
+            diagnostic["stderr"]["text"],
         )
         self.assertEqual(hashlib.sha256(raw).hexdigest(), diagnostic["stderr"]["sha256"])
-        self.assertNotIn("private-value", str(error))
         self.assertNotIn("untrusted log", str(error))
         self.assertNotIn("\x1b", str(error))
         self.assertNotIn("\x07", str(error))
@@ -6028,27 +6027,19 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             raised.exception.details["log_download"]["terminal_error"]["method"],
         )
 
-    def test_failed_log_diagnostic_redacts_secrets_headers_and_environment(self):
-        token = "ghp_" + ("A" * 40)
-        stderr = (
-            f"ordinary gh failure\n"
-            f"Authorization: Bearer {token}\n"
-            f"Cookie: session={token}\n"
-            f"GH_TOKEN={token}\n"
-            f"request token={token}\n"
-        ).encode()
+    def test_failed_log_diagnostic_preserves_command_output(self):
+        stderr = b"ordinary gh failure\nAuthorization: Basic example\nGH_TOKEN=example\n"
         completed = MODULE.subprocess.CompletedProcess(
             ["gh"], 1, b"useful stdout\n", stderr
         )
-
         error = MODULE.external_command_failure("download failed", completed)
-
         serialized = str(error)
         self.assertIn("ordinary gh failure", serialized)
         self.assertIn("useful stdout", serialized)
-        self.assertIn(MODULE.REDACTED_CREDENTIAL, serialized)
-        self.assertNotIn(token, serialized)
+        self.assertIn("Authorization: Basic example", serialized)
+        self.assertIn("GH_TOKEN=example", serialized)
         diagnostic = error.details["external_command_diagnostic"]
+        self.assertEqual(stderr.decode(), diagnostic["stderr"]["text"])
         self.assertEqual(
             MODULE.hashlib.sha256(stderr).hexdigest(),
             diagnostic["stderr"]["sha256"],
@@ -6742,17 +6733,6 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 preflight=self.preflight,
                 requested_model="gpt-5.6-sol",
             )
-
-    def test_rejects_credentials_in_result_report_and_logs(self):
-        for source, value in (
-            ("result", json.dumps(self.result()) + " token=secret-value"),
-            ("report", self.report() + " password=hunter2"),
-            ("log", "github_pat_abcdefghijklmnopqrstuvwxyz"),
-        ):
-            with self.subTest(source=source), self.assertRaisesRegex(
-                MODULE.WorkflowError, "credentials"
-            ):
-                MODULE.require_no_credentials(value, source=source)
 
     def test_rejects_dirty_local_drift_stale_head_and_stale_checks(self):
         drifted = dict(self.preflight["pr"])

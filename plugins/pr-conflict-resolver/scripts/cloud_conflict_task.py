@@ -260,19 +260,6 @@ def object_digest(data: Mapping[str, object]) -> str:
     return hashlib.sha256(canonical_json(data)).hexdigest()
 
 
-def contains_credentials(value: str) -> bool:
-    patterns = (
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-        r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-        r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-        r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    return any(re.search(pattern, value) for pattern in patterns)
-
-
 def require_exact_keys(
     value: object, expected: set[str], description: str
 ) -> Mapping[str, object]:
@@ -894,11 +881,6 @@ def validate_request(
                 "native stack members and guards must use the target repository",
                 "policy_rejected",
             )
-    if contains_credentials(canonical_json(request).decode("utf-8")):
-        raise ConflictError(
-            "conflict request contains credentials",
-            "credentials_rejected",
-        )
     return request
 
 
@@ -914,11 +896,6 @@ def read_external_text(path: Path, description: str) -> str:
         ) from None
     if not content.strip():
         raise ConflictError(f"{description} is empty", "policy_rejected")
-    if contains_credentials(content):
-        raise ConflictError(
-            f"{description} contains credentials",
-            "credentials_rejected",
-        )
     return content
 
 
@@ -3328,7 +3305,6 @@ def task_link(task: Mapping[str, object]) -> str | None:
     if (
         not isinstance(value, str)
         or not re.fullmatch(r"https://(?:api\.)?github\.com/\S+", value)
-        or contains_credentials(value)
     ):
         raise ConflictError("Agent Task URL is malformed", "task_failed")
     return value
@@ -4069,14 +4045,6 @@ def result_path_from_args(args: Sequence[str]) -> Path | None:
     return None
 
 
-def safe_error_message(value: str) -> str:
-    return (
-        "operation failed; sensitive detail omitted"
-        if contains_credentials(value)
-        else value
-    )
-
-
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -4122,7 +4090,7 @@ def main(
         result.task_state = result.task_state or progress.task_state
         result.error = {
             "code": error.code,
-            "message": safe_error_message(str(error)),
+            "message": str(error),
         }
         if isinstance(error, SourceHeadChanged):
             result.error.update(
@@ -4132,7 +4100,7 @@ def main(
                     "actual_head": error.actual_head,
                 }
             )
-        print(f"error: {safe_error_message(str(error))}", file=stderr)
+        print(f"error: {error}", file=stderr)
         exit_code = 2
     except Exception as error:
         result.status = "error"
@@ -4140,9 +4108,9 @@ def main(
         result.task_state = result.task_state or progress.task_state
         result.error = {
             "code": "unexpected_helper_error",
-            "message": safe_error_message(str(error)),
+            "message": str(error),
         }
-        print(f"error: {safe_error_message(str(error))}", file=stderr)
+        print(f"error: {error}", file=stderr)
         exit_code = 2
     if (
         _EXECUTION is not None
@@ -4166,7 +4134,7 @@ def main(
             result.status = "error"
             result.error = {
                 "code": "remote_observation_failed",
-                "message": safe_error_message(str(error)),
+                "message": str(error),
             }
             result.application_status = "not_started"
             exit_code = 2
@@ -4174,7 +4142,7 @@ def main(
         try:
             atomic_write_json(result_path, result.as_dict())
         except ConflictError as error:
-            print(f"error: {safe_error_message(str(error))}", file=stderr)
+            print(f"error: {error}", file=stderr)
             return 2
     return exit_code
 
@@ -4238,7 +4206,7 @@ def execution_main():
         )
     except BaseException as error:
         result_path = result_path_from_args(sys.argv[1:])
-        message = safe_error_message(f"{type(error).__name__}: {error}")
+        message = f"{type(error).__name__}: {error}"
         if result_path is not None and not result_path.exists():
             result = Result(
                 status="error",
@@ -4251,7 +4219,7 @@ def execution_main():
                 atomic_write_json(result_path, result.as_dict())
             except ConflictError as write_error:
                 print(
-                    f"error: {safe_error_message(str(write_error))}",
+                    f"error: {write_error}",
                     file=sys.stderr,
                 )
         print(f"error: {message}", file=sys.stderr)

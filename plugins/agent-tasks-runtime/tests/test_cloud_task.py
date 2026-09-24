@@ -1537,6 +1537,22 @@ class CurrentRuntimeApiTest(unittest.TestCase):
             prompt_file=prompt,
         )
 
+    def test_credential_example_does_not_block_dispatch_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            state = root / "state"
+            state.mkdir()
+            example = "Review gproto+http://user:password@host:8080"
+            options = replace(self.options(state), prompt=example)
+
+            MODULE.validate_policy_before_post(options, repo, options.result_file)
+            self.assertIn(
+                example,
+                MODULE.task_payload(options, MODULE.OUTPUT_REPORT_PATH)["prompt"],
+            )
+
     def test_current_cli_contracts_and_removed_compatibility_fail_during_parse(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

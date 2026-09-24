@@ -649,11 +649,6 @@ def validate_policy_before_post(
             f"result-file is a directory: {result_path}",
             "result_file_invalid",
         )
-    if contains_credentials(options.prompt):
-        raise CloudError(
-            "the marketplace worker prompt appears to contain credentials",
-            "credentials_rejected",
-        )
     if options.prompt_file is None:
         raise CloudError("--prompt-file is required", "policy_rejected")
     _require_path_outside_repository(
@@ -675,23 +670,6 @@ def _require_path_outside_repository(
         f"{option} must be outside the target repository",
         "policy_rejected",
     )
-
-def contains_credentials(value: str) -> bool:
-    sensitive_patterns = (
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-        r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-        r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-        r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    return any(re.search(pattern, value) for pattern in sensitive_patterns)
-
-def result_error_message(value: str) -> str:
-    if contains_credentials(value):
-        return "operation failed; sensitive detail was omitted from the result"
-    return value
 
 def atomic_write_json(path: Path, data: Mapping[str, object]) -> None:
     path = path.resolve()
@@ -3452,7 +3430,7 @@ def main(
     except CloudError as error:
         result.status = "error"
         result.error_code = error.code
-        result.error_message = result_error_message(str(error))
+        result.error_message = str(error)
         if progress.task_id is not None:
             result.task_id = progress.task_id
         if progress.last_state is not None:
@@ -3464,9 +3442,7 @@ def main(
     except BaseException as error:
         result.status = "error"
         result.error_code = "unexpected_helper_error"
-        result.error_message = result_error_message(
-            f"{type(error).__name__}: {error}"
-        )
+        result.error_message = f"{type(error).__name__}: {error}"
         if progress.task_id is not None:
             result.task_id = progress.task_id
         if progress.last_state is not None:
@@ -3496,7 +3472,7 @@ def main(
         except (OSError, ValueError, RuntimeError) as error:
             result.status = "error"
             result.error_code = "remote_observation_failed"
-            result.error_message = result_error_message(str(error))
+            result.error_message = str(error)
             result.application_status = "not_applied"
             code = 2
     if pipeline_call:
@@ -3568,7 +3544,7 @@ def execution_main():
         )
     except BaseException as error:
         result_path = _result_path_from_argv(sys.argv[1:])
-        message = result_error_message(f"{type(error).__name__}: {error}")
+        message = f"{type(error).__name__}: {error}"
         pipeline_call = any(
             token in pipeline_option_tokens(sys.argv[1:])
             for token in ("--pipeline-dispatch", "--pipeline-observe", "--pipeline-run")

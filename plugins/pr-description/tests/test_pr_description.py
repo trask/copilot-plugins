@@ -661,7 +661,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.94")
+        self.assertEqual(plugin["version"], "1.0.95")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -904,11 +904,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.WorkflowError, "schema or fields"):
             MODULE.load_agent_task_result(result_path)
 
-    def test_rejects_credentials_before_dispatch(self):
-        preflight = agent_task_preflight(body="token=github_pat_abcdefghijklmnopqrstuvwxyz")
-        prompt = MODULE.build_worker_prompt(preflight)
-        with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
-            MODULE.require_no_credentials(prompt, source="Agent Task prompt")
+    def test_prompt_preserves_credential_example(self):
+        example = "gproto+http://user:password@host:8080"
+        prompt = MODULE.build_worker_prompt(agent_task_preflight(body=example))
+        self.assertIn(example, prompt)
 
     def test_prompt_uses_dispatcher_assigned_artifact_paths(self):
         prompt = MODULE.build_worker_prompt(agent_task_preflight())
@@ -2008,7 +2007,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea",
+            "1d7b8d3b9d587ba316662fa7153fc7f783095f1ce39895adb3e453f63f54cdc7",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(

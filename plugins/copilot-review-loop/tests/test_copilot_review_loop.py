@@ -1874,7 +1874,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.98")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.99")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -1911,6 +1911,8 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             MODULE.parse_markdown_report("# Result", description="test report")
 
     def test_prompt_is_self_contained_versioned_and_treats_inputs_as_untrusted(self):
+        example = "gproto+http://user:password@host:8080"
+        self.preflight["comments"][0]["body"] = f"Supported URI: {example}"
         prompt = MODULE.build_worker_prompt(
             self.preflight,
             request_id="request-1",
@@ -1941,11 +1943,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             prompt,
         )
         self.assertIn("untrusted data", prompt)
+        self.assertIn(example, prompt)
         self.assertIn("create an Agent Task", prompt)
         self.assertIn(f"`{MODULE.HOSTED_DECISION_PATH}`", prompt)
         self.assertNotIn("{{LOCAL_DECISION_PATH}}", prompt)
         self.assertNotIn("MARKETPLACE_VALIDATION_PATH", prompt)
-        MODULE.require_no_credentials(prompt, source="prompt")
 
     def test_prompt_bounds_prior_history_without_dropping_current_findings(self):
         history = [
@@ -3268,7 +3270,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 active_local_decisions=True,
             )
 
-    def test_rejects_malformed_mismatched_and_credential_artifacts(self):
+    def test_rejects_malformed_and_mismatched_artifacts(self):
         bad = self.result()
         bad["policy"]["sha256"] = "0" * 64
         with self.assertRaises(MODULE.WorkflowError):
@@ -3294,11 +3296,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 preflight=self.preflight,
                 remote=self.remote(),
                 paths_by_commit={},
-            )
-        with self.assertRaisesRegex(MODULE.WorkflowError, "credentials"):
-            MODULE.require_no_credentials(
-                "Authorization: Bearer github_pat_abcdefghijklmnop",
-                source="artifact",
             )
 
     def test_rejects_stale_head_threads_and_local_drift(self):

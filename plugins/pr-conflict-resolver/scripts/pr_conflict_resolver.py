@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "acabf7430c0da236ed0da75e67069c39266298c89b4410097ee154a25c3258cb"
+    "7b01446cecd4d644fa69fa55997d1e8c86d015061820a69f4d71fcfcf81c9322"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@14"
@@ -7854,74 +7854,26 @@ def managed_retry_command(
     return " ".join(json.dumps(part) for part in command)
 
 
-def contains_credentials(value: str) -> bool:
-    patterns = (
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-        r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-        r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-        r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    return any(re.search(pattern, value) for pattern in patterns)
-
-
-def require_no_credentials(value: str, *, source: str) -> None:
-    if contains_credentials(value):
-        raise WorkflowError(f"{source} appears to contain credentials")
-
-
 MANAGED_OUTPUT_MAX_BYTES = 4096
 
 
-def sanitize_managed_output(value: str) -> dict[str, Any]:
-    patterns = (
-        (
-            r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-            "<redacted-token>",
-        ),
-        (
-            r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-            "<redacted-token>",
-        ),
-        (r"\bAKIA[0-9A-Z]{16}\b", "<redacted-key>"),
-        (
-            r"(?i)(\bAuthorization\s*:\s*)(?:Bearer|Basic)\s+\S+",
-            r"\1<redacted>",
-        ),
-        (
-            r"(?i)(\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*)\S+",
-            r"\1<redacted>",
-        ),
-        (
-            r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@",
-            r"\1<redacted>@",
-        ),
-        (
-            r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?"
-            r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-            "<redacted-private-key>",
-        ),
-    )
-    sanitized = value
-    for pattern, replacement in patterns:
-        sanitized = re.sub(pattern, replacement, sanitized, flags=re.DOTALL)
-    encoded = sanitized.encode("utf-8")
+def bounded_managed_output(value: str) -> dict[str, Any]:
+    encoded = value.encode("utf-8")
     truncated = len(encoded) > MANAGED_OUTPUT_MAX_BYTES
+    text = value
     if truncated:
         encoded = encoded[:MANAGED_OUTPUT_MAX_BYTES]
         while True:
             try:
-                sanitized = encoded.decode("utf-8")
+                text = encoded.decode("utf-8")
                 break
             except UnicodeDecodeError as error:
                 encoded = encoded[: error.start]
     return {
-        "text": sanitized,
+        "text": text,
         "bytes": len(value.encode("utf-8")),
         "truncated": truncated,
-        "sha256": hashlib.sha256(sanitized.encode("utf-8")).hexdigest(),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
     }
 
 
@@ -7930,8 +7882,8 @@ def managed_process_diagnostics(
 ) -> dict[str, Any]:
     return {
         "returncode": process.returncode,
-        "stdout": sanitize_managed_output(process.stdout or ""),
-        "stderr": sanitize_managed_output(process.stderr or ""),
+        "stdout": bounded_managed_output(process.stdout or ""),
+        "stderr": bounded_managed_output(process.stderr or ""),
     }
 
 
@@ -9042,7 +8994,6 @@ def _conflict_preflight(
         "native_stack": native_stack,
     }
     request["request_sha256"] = request_digest(request)
-    require_no_credentials(canonical_json(request), source="conflict request")
     return {
         "already_mergeable": False,
         "repository_root": str(repo_root),
@@ -9173,7 +9124,6 @@ def load_conflict_result(path: Path) -> dict[str, Any]:
         or value.get("schema") != CONFLICT_RESULT_SCHEMA
     ):
         raise WorkflowError("managed conflict result has unsupported fields")
-    require_no_credentials(canonical_json(value), source="managed conflict result")
     return value
 
 
@@ -10611,7 +10561,6 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
         require_external_path(path_value, repo_root)
     atomic_write_text(request_path, canonical_json(preflight["request"]) + "\n")
     prompt = build_conflict_prompt(preflight)
-    require_no_credentials(prompt, source="conflict worker prompt")
     atomic_write_text(prompt_path, prompt)
     state["attempts"] = prior_attempts + 1
     state["managed_attempts"] = prior_managed_attempts + 1

@@ -185,7 +185,7 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
+    "1d7b8d3b9d587ba316662fa7153fc7f783095f1ce39895adb3e453f63f54cdc7"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -1375,47 +1375,9 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-CREDENTIAL_PATTERNS = (
-    r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-    r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-    r"\bAKIA[0-9A-Z]{16}\b",
-    r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-    r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-    r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-)
-REDACTED_CREDENTIAL = "[REDACTED]"
-ENVIRONMENT_ASSIGNMENT_PATTERN = re.compile(
-    r"(?m)(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=([^\r\n]*)"
-)
-SENSITIVE_HEADER_PATTERN = re.compile(
-    r"(?im)^[ \t]*(authorization|proxy-authorization|cookie|set-cookie|"
-    r"x-api-key|x-github-token|private-token)[ \t]*:[^\r\n]*"
-)
-PRIVATE_KEY_BLOCK_PATTERN = re.compile(
-    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
-    r".*?(?:-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\Z)",
-    re.DOTALL,
-)
 TERMINAL_CONTROL_PATTERN = re.compile(
     r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r(?!\n)"
 )
-
-
-def contains_credentials(value: str) -> bool:
-    return any(re.search(pattern, value) for pattern in CREDENTIAL_PATTERNS)
-
-
-def redact_credentials(value: str) -> str:
-    redacted = PRIVATE_KEY_BLOCK_PATTERN.sub(REDACTED_CREDENTIAL, value)
-    for pattern in CREDENTIAL_PATTERNS:
-        redacted = re.sub(pattern, REDACTED_CREDENTIAL, redacted)
-    return redacted
-
-
-def require_no_credentials(value: str, *, source: str) -> None:
-    if contains_credentials(value):
-        raise WorkflowError(f"{source} appears to contain credentials")
 
 
 def escape_terminal_controls(value: str) -> str:
@@ -1425,25 +1387,10 @@ def escape_terminal_controls(value: str) -> str:
     )
 
 
-def sanitize_external_command_text(value: str) -> str:
-    sanitized = redact_credentials(value)
-    sanitized = SENSITIVE_HEADER_PATTERN.sub(
-        lambda match: f"{match.group(1)}: {REDACTED_CREDENTIAL}",
-        sanitized,
-    )
-    sanitized = ENVIRONMENT_ASSIGNMENT_PATTERN.sub(
-        lambda match: f"{match.group(1)}={REDACTED_CREDENTIAL}",
-        sanitized,
-    )
-    sanitized = escape_terminal_controls(sanitized)
-    require_no_credentials(sanitized, source="external command diagnostic")
-    return sanitized
-
-
 def external_command_stream_diagnostic(raw: bytes) -> dict[str, Any]:
     decoded = raw.decode("utf-8", errors="replace")
-    sanitized = sanitize_external_command_text(decoded)
-    encoded = sanitized.encode("utf-8")
+    escaped = escape_terminal_controls(decoded)
+    encoded = escaped.encode("utf-8")
     diagnostic: dict[str, Any] = {
         "byte_count": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
@@ -1452,7 +1399,7 @@ def external_command_stream_diagnostic(raw: bytes) -> dict[str, Any]:
         "retained_utf8_byte_limit": EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT,
         "truncated": len(encoded) > EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT,
     }
-    if sanitized.strip():
+    if escaped.strip():
         retained = encoded[:EXTERNAL_COMMAND_DIAGNOSTIC_TEXT_LIMIT].decode(
             "utf-8", errors="ignore"
         )
@@ -6824,7 +6771,7 @@ def fetch_failed_check_log(
                 "classification", "identity_mismatch"
             )
             error_sha256 = sha256_text(
-                sanitize_external_command_text(str(error))
+                escape_terminal_controls(str(error))
             )
             if classification == "identity_mismatch":
                 attempt = record_failed_log_download_attempt(
@@ -7691,10 +7638,6 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
         )
     ):
         raise WorkflowError("Agent Task result has an unsupported schema or fields")
-    require_no_credentials(
-        json.dumps(result, ensure_ascii=False, sort_keys=True),
-        source="Agent Task result",
-    )
     return result
 
 
@@ -8232,7 +8175,6 @@ def validate_ci_fix_semantic_artifact(
     *,
     remote: dict[str, Any],
 ) -> dict[str, Any]:
-    require_no_credentials(content, source="CI Fix Loop semantic artifact")
     if sha256_text(content) != remote["semantic_sha256"]:
         raise WorkflowError("CI Fix Loop semantic artifact digest does not match")
     artifact = parse_strict_json(
@@ -8574,7 +8516,6 @@ def validate_ci_fix_report(
     expected_validation_commands: list[dict[str, list[str]]] | None = None,
     require_validation_evidence: bool = True,
 ) -> dict[str, Any]:
-    require_no_credentials(content, source="CI Fix Loop report")
     report = parse_markdown_report(content, description="CI Fix Loop report")
     expected_keys = {
         "schema",
@@ -8954,7 +8895,6 @@ def read_ci_diagnosis(
     )
     if len(content.encode("utf-8")) > 32768:
         raise WorkflowError("hosted CI diagnosis exceeds 32768 bytes")
-    require_no_credentials(content, source="hosted CI diagnosis")
     payload = parse_strict_json(content, description="hosted CI diagnosis")
     failures = {item["key"]: item for item in preflight["check_snapshot"]["failures"]}
     if (
@@ -11509,7 +11449,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     requested_model=requested_model,
                 )
                 task_state["evidence_sha256"] = sha256_text(ci_evidence)
-                require_no_credentials(prompt, source="Agent Task prompt")
                 atomic_write_text(prompt_path, prompt)
                 command = [
                     sys.executable,

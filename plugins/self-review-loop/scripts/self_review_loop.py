@@ -77,7 +77,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
+    "1d7b8d3b9d587ba316662fa7153fc7f783095f1ce39895adb3e453f63f54cdc7"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -485,24 +485,6 @@ def sha256_file(path: Path) -> str:
             f"could not read Agent Tasks runtime helper {path}: {error}"
         ) from error
     return digest.hexdigest()
-
-
-def contains_credentials(value: str) -> bool:
-    patterns = (
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}\b",
-        r"(?i)\b(?:xox[baprs]|sk-[A-Za-z0-9]+)-[A-Za-z0-9-]{12,}\b",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"(?i)\bAuthorization\s*:\s*(?:Bearer|Basic)\s+\S+",
-        r"(?i)\b(?:password|passwd|token|api[_-]?key|secret)\s*[:=]\s*\S+",
-        r"(?i)https?://[^/\s:@]+:[^/\s@]+@",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    return any(re.search(pattern, value) for pattern in patterns)
-
-
-def require_no_credentials(value: str, *, source: str) -> None:
-    if contains_credentials(value):
-        raise WorkflowError(f"{source} appears to contain credentials")
 
 
 def parse_strict_json(value: str, *, description: str) -> Any:
@@ -2224,10 +2206,6 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
         or set(result) != candidate_keys
     ):
         raise WorkflowError("Agent Task result has an unsupported schema or fields")
-    require_no_credentials(
-        json.dumps(result, ensure_ascii=False, sort_keys=True),
-        source="Agent Task result",
-    )
     return result
 
 
@@ -3170,7 +3148,6 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
             preflight, max_iterations=1,
             prior_history=state.get("history") or [],
         )
-        require_no_credentials(prompt, source="Agent Task prompt")
         if resumed is None:
             atomic_write_text(prompt_path, prompt)
             state["agent_task"]["status"] = "running"
