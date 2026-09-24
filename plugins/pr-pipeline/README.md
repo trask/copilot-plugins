@@ -10,7 +10,7 @@ flowchart LR
 
     subgraph pipeline["Five-stage pipeline"]
         direction TB
-        conflict["1. Conflict Resolver<br/>request v4, result v5, receipt v3<br/>marketplace-conflict-worker@13"]
+        conflict["1. Conflict Resolver<br/>request v4, result v5, receipt v3<br/>marketplace-conflict-worker@14"]
         copilotReview["2. Copilot Review<br/>hosted Runtime result v5<br/>code-candidate@1"]
         selfReview["3. Self Review<br/>coordinator report v3<br/>code candidate policy @1"]
         ci["4. CI Fix<br/>coordinator report v7, receipt v3<br/>code candidate policy @1"]
@@ -26,7 +26,7 @@ flowchart LR
     scheduler --> conflict
 ```
 
-The scheduler runs these stages in order. A second sweep starts when the head or base changed during the first sweep and at least one stage is not clear at the final revisions. On unchanged revisions, it also starts when the sole uncleared stage is CI and fresh verification shows that its green or warning snapshot changed; no other unchanged-stage result starts another sweep. Conflict Resolver accepts a completed resolution at its verified PR head and checks live mergeability. An unrelated advance of the target branch does not discard that resolution or repeat the hosted task. A later sweep can refresh incomplete mergeability or CI snapshot evidence without resetting the stage budget.
+The scheduler runs these stages in order. A second sweep starts when the head or base changed during the first sweep and at least one stage is not clear at the final revisions. On unchanged revisions, it also starts when the sole uncleared stage is CI and fresh verification shows that its green or warning snapshot changed; no other unchanged-stage result starts another sweep. Conflict Resolver pins the base for hosted work, accepts a forward advance of the live target branch, and checks mergeability at the verified PR head. A rewritten base still blocks publication. A later sweep can refresh incomplete mergeability or CI snapshot evidence without resetting the stage budget.
 
 Every stage is an installed Python coordinator. The PR Pipeline custom agent calls `start` once and then calls `advance` in the same Copilot session until the run finishes. A local stage step has no elapsed-time deadline: it runs to a sealed result or explicit cancellation, then returns `continue`, `waiting`, or a final result. Conflict Resolver can prepare a native stack before dispatching a hosted task. When hosted work is active, the stage records its exact identity and the agent makes a later observation call; no local process needs to wait for the hosted task. No model translates a stage's command or exit status into clearance. Each coordinator consumes its own configured iteration allowance across the whole run. A nonzero exit or unfinished child blocks the Pipeline even if a clearance marker exists. An interrupted session leaves its run incomplete; a later session starts a fresh run, not an automatic continuation.
 

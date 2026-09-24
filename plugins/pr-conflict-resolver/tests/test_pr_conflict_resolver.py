@@ -134,6 +134,105 @@ class BaseDriftPublicationTest(unittest.TestCase):
         self.assertEqual("mergeable", publication["mergeability"])
 
 
+class LiveConflictBaseAdvanceTest(unittest.TestCase):
+    def test_stack_outside_dependent_follows_forward_trunk_advance(self):
+        old_base = "a" * 40
+        new_base = "d" * 40
+        head = "b" * 40
+        member = {
+            "pr_number": 7, "head_ref": "feature", "head_sha": head,
+            "direct_base_ref": "main", "direct_base_sha": old_base,
+            "observed_base_sha": old_base,
+        }
+        outside = {
+            "pr_number": 9, "repository": "owner/repo",
+            "head_ref": "outside", "head_sha": "e" * 40,
+            "base_ref": "main", "base_sha": old_base,
+        }
+        request = {
+            "repository": "owner/repo", "strategy": "native-stack",
+            "pull_request": {
+                "url": "https://github.com/owner/repo/pull/7",
+                "number": 7, "head_sha": head, "head_ref": "feature",
+                "base_sha": old_base, "base_ref": "main",
+            },
+            "guards": {"merge_methods": {
+                "merge_commit": True, "rebase_merge": True,
+                "squash_merge": True,
+            }},
+            "merge_base": old_base,
+            "native_stack": {
+                "trunk": {"ref": "main", "sha": old_base},
+                "members": [member], "outside_dependents": [outside],
+            },
+        }
+        preflight = {
+            "request": request, "identity": {"branch": "feature", "head": head},
+        }
+        current = {
+            "state": "OPEN", "number": 7, "head_sha": head,
+            "head_branch": "feature", "base_sha": new_base,
+            "base_branch": "main",
+        }
+        dependent = {
+            "number": 9, "head_sha": "e" * 40, "head_branch": "outside",
+            "base_sha": new_base, "base_branch": "main",
+        }
+        stack = {"members": [{
+            "number": 7, "head_branch": "feature", "head_sha": head,
+            "base_branch": "main", "base_sha": new_base,
+        }]}
+
+        def git_call(_root, *args):
+            return {
+                ("branch", "--show-current"): "feature",
+                ("rev-parse", "HEAD"): head,
+                ("status", "--porcelain=v1"): "",
+                ("merge-base", head, old_base): old_base,
+            }[args]
+
+        with (
+            mock.patch.object(MODULE, "git", side_effect=git_call),
+            mock.patch.object(MODULE, "parse_target", side_effect=lambda url: url),
+            mock.patch.object(
+                MODULE, "metadata_for",
+                side_effect=lambda url: current if url.endswith("/7") else dependent,
+            ),
+            mock.patch.object(
+                MODULE, "repository_merge_methods", return_value={
+                    "allow_merge_commit": True, "allow_rebase_merge": True,
+                    "allow_squash_merge": True,
+                },
+            ),
+            mock.patch.object(MODULE, "stack_membership", return_value={"stack": stack}),
+            mock.patch.object(MODULE, "base_ref_tip", return_value=new_base),
+            mock.patch.object(
+                MODULE, "external_stack_dependents",
+                return_value=[{"url": "https://github.com/owner/repo/pull/9"}],
+            ) as dependents,
+            mock.patch.object(MODULE, "commit_contains", return_value=True) as contains,
+        ):
+            self.assertEqual(
+                current, MODULE.require_live_conflict_guards(Path("repo"), preflight)
+            )
+            self.assertTrue(current["_candidate_base_advanced"])
+            self.assertEqual(2, contains.call_count)
+            contains.assert_any_call("owner/repo", old_base, new_base)
+            dependents.return_value.append(
+                {"url": "https://github.com/owner/repo/pull/10"}
+            )
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "outside dependents changed"
+            ):
+                MODULE.require_live_conflict_guards(Path("repo"), preflight)
+            dependents.return_value.pop()
+            contains.side_effect = [True, False]
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "outside dependents changed"
+            ):
+                MODULE.require_live_conflict_guards(Path("repo"), preflight)
+
+
 class WindowsSubprocessTest(unittest.TestCase):
     def test_embedded_loaders_accept_current_execution_runtime(self):
         resolver_execution = MODULE.load_execution_runtime(RUNTIME_SCRIPT)
@@ -1004,18 +1103,18 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "3bf07781cef792c00667e12c1df8b9ad6256b9ae2225ba6923aa4a3234e09319",
+            "80cf182d5d468b6e5ca3e93b4c2cbf7577e8b5fc7f82b9cdee59699940d71328",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
-            "7356c63041ed86a8ba01901ca2e85e49140296086314e190c5047383b49b626a",
+            "224d49d88c286af5f45120bb3491b73ebb8f8d6bf757c34f7878df7bfab6c239",
         )
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
             hashlib.sha256(CLOUD_SCRIPT.read_bytes()).hexdigest(),
         )
         self.assertEqual(MODULE.CONFLICT_POLICY_IDENTITY, CLOUD_MODULE.POLICY)
-        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@13")
+        self.assertEqual(MODULE.CONFLICT_POLICY, "marketplace-conflict-worker@14")
         self.assertEqual(MODULE.CONFLICT_RESULT_SCHEMA, CLOUD_MODULE.RESULT_SCHEMA)
         self.assertEqual(
             MODULE.CONFLICT_REQUEST_SCHEMA["id"],
@@ -4798,7 +4897,7 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
             policy=CLOUD_MODULE.POLICY,
         ).as_dict()
 
-        self.assertIn("Policy: marketplace-conflict-worker@13", prompt)
+        self.assertIn("Policy: marketplace-conflict-worker@14", prompt)
         self.assertIn(CLOUD_MODULE.OUTPUT_REPORT_PATH, prompt)
         self.assertIn("Do not run local validation through the dispatcher", prompt)
         self.assertNotIn("validation", result)

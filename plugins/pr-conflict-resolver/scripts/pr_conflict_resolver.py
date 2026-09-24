@@ -72,18 +72,19 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "3bf07781cef792c00667e12c1df8b9ad6256b9ae2225ba6923aa4a3234e09319"
+    "80cf182d5d468b6e5ca3e93b4c2cbf7577e8b5fc7f82b9cdee59699940d71328"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
-CONFLICT_POLICY = "marketplace-conflict-worker@13"
+CONFLICT_POLICY = "marketplace-conflict-worker@14"
 LEGACY_NO_TASK_POLICY = "marketplace-conflict-worker@11"
 PREVIOUS_NO_TASK_POLICY = "marketplace-conflict-worker@12"
+LAST_NO_TASK_POLICY = "marketplace-conflict-worker@13"
 CONFLICT_POLICY_SHA256 = (
-    "7356c63041ed86a8ba01901ca2e85e49140296086314e190c5047383b49b626a"
+    "224d49d88c286af5f45120bb3491b73ebb8f8d6bf757c34f7878df7bfab6c239"
 )
 CONFLICT_POLICY_IDENTITY = {
     "id": "marketplace-conflict-worker",
-    "version": 13,
+    "version": 14,
     "sha256": CONFLICT_POLICY_SHA256,
 }
 CONFLICT_REQUEST_SCHEMA = {
@@ -9888,8 +9889,22 @@ def require_live_conflict_guards(
         ):
             raise WorkflowError("native stack topology changed after cloud resolution")
         current_outside = []
-        for dependent in external_stack_dependents(current, stack):
+        dependents = external_stack_dependents(current, stack)
+        if len(dependents) != len(expected["outside_dependents"]):
+            raise WorkflowError("native stack outside dependents changed")
+        for dependent, pinned in zip(dependents, expected["outside_dependents"]):
             value = metadata_for(parse_target(dependent["url"]))
+            observed_base_sha = value["base_sha"]
+            if (
+                trunk_advanced
+                and pinned["pr_number"] == value["number"]
+                and pinned["base_ref"] == value["base_branch"] == expected["trunk"]["ref"]
+                and observed_base_sha != pinned["base_sha"]
+                and commit_contains(
+                    request["repository"], pinned["base_sha"], observed_base_sha
+                )
+            ):
+                observed_base_sha = pinned["base_sha"]
             current_outside.append(
                 {
                     "pr_number": value["number"],
@@ -9897,7 +9912,7 @@ def require_live_conflict_guards(
                     "head_ref": value["head_branch"],
                     "head_sha": value["head_sha"],
                     "base_ref": value["base_branch"],
-                    "base_sha": value["base_sha"],
+                    "base_sha": observed_base_sha,
                 }
             )
         if current_outside != expected["outside_dependents"]:
@@ -10786,6 +10801,7 @@ def require_later_conflict_sweep(
             and not (
                 task.get("policy") in {
                     LEGACY_NO_TASK_POLICY, PREVIOUS_NO_TASK_POLICY,
+                    LAST_NO_TASK_POLICY,
                 }
                 and state.get("last_result") == "mergeable"
                 and task.get("task_id") is None
@@ -11034,7 +11050,14 @@ def advance_bounded_conflict(
         raise WorkflowError("bounded stack member position or task identity changed")
     if task_id is not None and (
         not isinstance(result_task, dict)
-        or result_task.get("id") != task_id
+        or (
+            result_task.get("id") != task_id
+            and not (
+                process.returncode != 0
+                and result.get("status") == "error"
+                and result_task.get("id") is None
+            )
+        )
         or (
             task.get("task_id") is not None
             and (not native or phase != "dispatch")

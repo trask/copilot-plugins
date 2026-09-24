@@ -273,8 +273,169 @@ class BoundedPipelineTest(unittest.TestCase):
         self.published.assert_not_called()
         self.assertEqual("interrupted", MODULE.load_state(self.path)["agent_task"]["status"])
 
+    def test_helper_failure_without_task_id_preserves_stale_target_error(self):
+        self.assertEqual(0, MODULE.command_pipeline(self.args))
+        original = self.helper
+
+        def stale_target(command, **kwargs):
+            original(command, **kwargs)
+            result_path = Path(command[command.index("--result-file") + 1])
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["status"] = "error"
+            result["error"] = {
+                "code": "stale_target", "message": "pull request target changed",
+            }
+            result["task"]["id"] = None
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+        self.patch("run", side_effect=stale_target)
+        self.assertEqual(1, MODULE.command_pipeline(self.args))
+        state = MODULE.load_state(self.path)["agent_task"]
+        self.assertEqual("interrupted", state["status"])
+        self.assertEqual("task-1", state["task_id"])
+        self.assertEqual("stale_target", state["error"]["code"])
+        self.published.assert_not_called()
+
+    def test_helper_failure_cannot_hide_a_different_task_id(self):
+        self.assertEqual(0, MODULE.command_pipeline(self.args))
+        original = self.helper
+
+        def wrong_task(command, **kwargs):
+            original(command, **kwargs)
+            result_path = Path(command[command.index("--result-file") + 1])
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result["status"] = "error"
+            result["error"] = {"code": "stale_target", "message": "stale"}
+            result["task"]["id"] = "different-task"
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+        self.patch("run", side_effect=wrong_task)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "task identity changed"):
+            MODULE.command_pipeline(self.args)
+        self.published.assert_not_called()
+
 
 class BoundedBackendTest(unittest.TestCase):
+    def test_target_guard_allows_forward_base_without_replacing_pinned_snapshot(self):
+        request = existing.ManagedConflictCoordinatorTest().request()
+        old_base = request["pull_request"]["base_sha"]
+        new_base = "d" * 40
+        snapshot = CLOUD.LocalSnapshot(
+            Path("repo"), Path("control"), "owner/repo", "origin",
+            "feature", "b" * 40, "", None,
+        )
+        live = replace(CLOUD.request_pr_as_live(request), base_sha=new_base)
+        comparisons = []
+
+        def checked(_runner, command, **_kwargs):
+            if command[:2] == ["gh", "repo"]:
+                return json.dumps({
+                    "mergeCommitAllowed": True,
+                    "rebaseMergeAllowed": True,
+                    "squashMergeAllowed": True,
+                })
+            if command[:2] == ["gh", "api"]:
+                comparisons.append(command[2])
+                return json.dumps({
+                    "status": "ahead",
+                    "merge_base_commit": {"sha": request["merge_base"]},
+                })
+            self.fail(f"unexpected command: {command}")
+
+        with (
+            mock.patch.object(CLOUD, "resolve_pr", return_value=live),
+            mock.patch.object(CLOUD, "checked", side_effect=checked),
+        ):
+            CLOUD.require_target_fresh(subprocess.run, snapshot, request)
+        self.assertEqual([
+            f"repos/owner/repo/compare/{old_base}...{new_base}",
+            f"repos/owner/repo/compare/{old_base}...{'b' * 40}",
+        ], comparisons)
+        self.assertEqual(old_base, request["pull_request"]["base_sha"])
+
+    def test_target_guard_rejects_rewritten_base_and_retargeting(self):
+        request = existing.ManagedConflictCoordinatorTest().request()
+        snapshot = CLOUD.LocalSnapshot(
+            Path("repo"), Path("control"), "owner/repo", "origin",
+            "feature", "b" * 40, "", None,
+        )
+        live = replace(CLOUD.request_pr_as_live(request), base_sha="d" * 40)
+        with (
+            mock.patch.object(CLOUD, "resolve_pr", return_value=live),
+            mock.patch.object(CLOUD, "checked", return_value='{"status":"diverged"}'),
+            self.assertRaisesRegex(CLOUD.ConflictError, "base changed non-linearly"),
+        ):
+            CLOUD.require_target_fresh(subprocess.run, snapshot, request)
+        with (
+            mock.patch.object(
+                CLOUD, "resolve_pr",
+                return_value=replace(live, base_ref="other"),
+            ),
+            mock.patch.object(CLOUD, "checked") as checked,
+            self.assertRaisesRegex(CLOUD.ConflictError, "target changed"),
+        ):
+            CLOUD.require_target_fresh(subprocess.run, snapshot, request)
+        checked.assert_not_called()
+
+    def test_target_guard_reports_head_change_even_when_base_advanced(self):
+        request = existing.ManagedConflictCoordinatorTest().request()
+        snapshot = CLOUD.LocalSnapshot(
+            Path("repo"), Path("control"), "owner/repo", "origin",
+            "feature", "b" * 40, "", None,
+        )
+        live = replace(
+            CLOUD.request_pr_as_live(request),
+            head_sha="c" * 40, base_sha="d" * 40,
+        )
+        with (
+            mock.patch.object(CLOUD, "resolve_pr", return_value=live),
+            self.assertRaises(CLOUD.SourceHeadChanged),
+        ):
+            CLOUD.require_target_fresh(subprocess.run, snapshot, request)
+
+    def test_native_stack_trunk_can_advance_but_cannot_be_rewritten(self):
+        request = existing.ManagedConflictCoordinatorTest().request()
+        request["strategy"] = "native-stack"
+        request["native_stack"] = {
+            "trunk": {"ref": "main", "sha": "a" * 40},
+            "members": [{
+                "pr_number": 7, "repository": "owner/repo",
+                "head_ref": "feature", "head_sha": "b" * 40,
+                "direct_base_ref": "main",
+            }],
+            "outside_dependents": [],
+        }
+        snapshot = CLOUD.LocalSnapshot(
+            Path("repo"), Path("control"), "owner/repo", "origin",
+            "feature", "b" * 40, "", None,
+        )
+        live = CLOUD.request_pr_as_live(request)
+        comparison = ["ahead"]
+
+        def checked(_runner, command, **_kwargs):
+            if command[:2] == ["gh", "repo"]:
+                return json.dumps({
+                    "mergeCommitAllowed": True, "rebaseMergeAllowed": True,
+                    "squashMergeAllowed": True,
+                })
+            if command[2].startswith("repos/owner/repo/compare/"):
+                return json.dumps({
+                    "status": comparison[0],
+                    "merge_base_commit": {"sha": request["merge_base"]},
+                })
+            return json.dumps({"object": {"sha": "d" * 40}})
+
+        with (
+            mock.patch.object(CLOUD, "resolve_pr", return_value=live),
+            mock.patch.object(CLOUD, "checked", side_effect=checked),
+        ):
+            CLOUD.require_target_fresh(subprocess.run, snapshot, request)
+            comparison[0] = "diverged"
+            with self.assertRaisesRegex(CLOUD.ConflictError, "base changed non-linearly"):
+                CLOUD.require_target_fresh(subprocess.run, snapshot, request)
+
     def test_parse_unbounded_and_bounded_conflict_requests(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

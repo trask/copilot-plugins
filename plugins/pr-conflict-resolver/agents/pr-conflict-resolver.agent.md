@@ -25,7 +25,7 @@ Invoke that command directly and synchronously through the execution tool. Keep 
 
 The helper first proves a clean checkout at the exact PR head. An exact attached branch or detached head is reused. A different branch, stale head, dirty tree, or changed checkout blocks.
 
-For an ordinary PR, the helper freezes the head, live base, merge base, repository merge settings, strategy, source commits, iteration, and publication lease. It sends semantic conflict work to the pinned hosted worker, verifies the returned task and Git history, and publishes only the accepted code commits.
+For an ordinary PR, the helper freezes the head, base commit, merge base, repository merge settings, strategy, source commits, iteration, and publication lease. A forward advance of the live base leaves the pinned task valid; a rewritten base or changed source head does not. It sends semantic conflict work to the pinned hosted worker, verifies the returned task and Git history, and publishes only the accepted code commits.
 
 The worker discovers conflict locations from the pinned Git history. For a native-stack merge against an older base, it resolves the merge on a candidate branch against the current direct base; it does not have to reproduce the old tree. The controller verifies the source history, linear replay and candidate provenance without sending a precomputed path list. An exact-direct-base normalization still requires the recorded tree. A prompt that exceeds the Agent Task limit stops before dispatch.
 

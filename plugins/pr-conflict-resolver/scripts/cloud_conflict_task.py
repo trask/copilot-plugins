@@ -43,7 +43,7 @@ RECEIPT_SCHEMA = {
     "version": 3,
 }
 POLICY_ID = "marketplace-conflict-worker"
-POLICY_VERSION = 13
+POLICY_VERSION = 14
 POLICY_SPEC = {
     "id": POLICY_ID,
     "version": POLICY_VERSION,
@@ -62,7 +62,8 @@ POLICY_SPEC = {
     "output_is_advisory": True,
     "dispatcher_generated_receipt": True,
     "require_exact_request_identity": True,
-    "require_exact_target_identity": True,
+    "require_pinned_source_identity": True,
+    "live_base": "forward-advance-from-pinned-base",
     "require_mechanical_history_proof": True,
     "safe_direct_base_sync_merge_omission": True,
     "stale_base_merge": "hosted-worker-rebase-without-exact-old-tree",
@@ -1499,6 +1500,22 @@ def parse_json_output(value: str, description: str) -> Mapping[str, object]:
     return data
 
 
+def require_forward_base(
+    runner: Runner, root: Path, repository: str, previous: str, current: str
+) -> None:
+    comparison = parse_json_output(
+        checked(
+            runner,
+            ["gh", "api", f"repos/{repository}/compare/{previous}...{current}"],
+            cwd=root,
+            code="stale_target",
+        ),
+        "base ancestry data",
+    )
+    if comparison.get("status") not in {"ahead", "identical"}:
+        raise ConflictError("pull request base changed non-linearly", "stale_target")
+
+
 def require_target_fresh(
     runner: Runner, snapshot: LocalSnapshot, request: Mapping[str, object]
 ) -> None:
@@ -1506,17 +1523,21 @@ def require_target_fresh(
     current = resolve_pr(
         runner, snapshot.control_root, expected.repository, expected.number
     )
-    if (
-        current.head_sha != expected.head_sha
-        and replace(current, head_sha=expected.head_sha) == expected
-    ):
+    if current.head_sha != expected.head_sha and replace(
+        current, head_sha=expected.head_sha, base_sha=expected.base_sha
+    ) == expected:
         raise SourceHeadChanged(
             pr_number=expected.number,
             expected_head=expected.head_sha,
             actual_head=current.head_sha,
         )
-    if current != expected:
+    if replace(current, base_sha=expected.base_sha) != expected:
         raise ConflictError("pull request target changed", "stale_target")
+    if current.base_sha != expected.base_sha:
+        require_forward_base(
+            runner, snapshot.control_root, expected.repository,
+            expected.base_sha, current.base_sha,
+        )
     repository_data = parse_json_output(
         checked(
             runner,
@@ -1583,8 +1604,14 @@ def require_target_fresh(
         if (
             not isinstance(trunk_object, dict)
             or not isinstance(trunk_object.get("sha"), str)
+            or not SHA_RE.fullmatch(trunk_object["sha"])
         ):
             raise ConflictError("native stack trunk is unavailable", "stale_target")
+        if trunk_object["sha"] != expected_trunk["sha"]:
+            require_forward_base(
+                runner, snapshot.control_root, request["repository"],
+                expected_trunk["sha"], trunk_object["sha"],
+            )
         for item in [*stack["members"], *stack["outside_dependents"]]:
             live = resolve_pr(
                 runner,
