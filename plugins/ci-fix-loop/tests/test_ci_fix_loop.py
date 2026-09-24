@@ -36,6 +36,18 @@ SPEC = importlib.util.spec_from_file_location("ci_fix_loop", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+CONFLICT_SCRIPT = (
+    Path(__file__).parents[2]
+    / "pr-conflict-resolver"
+    / "scripts"
+    / "pr_conflict_resolver.py"
+)
+CONFLICT_SPEC = importlib.util.spec_from_file_location(
+    "pr_conflict_resolver_for_ci", CONFLICT_SCRIPT
+)
+assert CONFLICT_SPEC is not None and CONFLICT_SPEC.loader is not None
+CONFLICT_MODULE = importlib.util.module_from_spec(CONFLICT_SPEC)
+CONFLICT_SPEC.loader.exec_module(CONFLICT_MODULE)
 PERMISSION_SPEC = importlib.util.spec_from_file_location(
     "ci_fix_loop_permission", PERMISSION_SCRIPT
 )
@@ -604,7 +616,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
     def tearDown(self):
         MODULE.ACTIVE_GITHUB_MUTATION_POLICY = self.previous_policy
 
-    def fixture(self, root, *, write_artifact=True):
+    def fixture(self, root, *, write_artifact=True, failing=True):
         repo = root / "source workspace"
         repo.mkdir()
         repo = repo.resolve()
@@ -645,7 +657,9 @@ class SealedCiFixCommandTest(unittest.TestCase):
             "checks": {
                 "head_sha": "d" * 40,
                 "rollup": [],
-                "decision": {"decision": "green"},
+                "decision": {
+                    "decision": "failures" if failing else "green"
+                },
             },
             "native_stack": None,
             "active_owner": None,
@@ -773,7 +787,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertNotEqual(first["state"], second["state"])
             self.assertEqual(
                 set(first),
-                {"state", "result", "loop_result"},
+                {"state", "result", "loop_result", "stack_state"},
             )
             self.assertIn("a" * 32, first["state"])
             self.assertIn("b" * 32, second["state"])
@@ -832,27 +846,18 @@ class SealedCiFixCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="sealed v1 ") as directory:
             root = Path(directory)
             _, _, artifact_path, _, _, _ = self.fixture(root)
-            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-            artifact["schema"] = (
-                "github.copilot.ci-fix-loop-sealed-invocation.v1"
-            )
-            artifact["seal"] = MODULE.sealed_ci_fix_invocation_seal(artifact)
-            artifact_path.write_text(
-                json.dumps(artifact, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-                newline="\n",
-            )
-            artifact_path.with_name(f"{artifact_path.name}.sha256").write_text(
-                f"{MODULE.sha256_file(artifact_path)}\n",
-                encoding="ascii",
-                newline="\n",
-            )
-
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError,
-                "invocation artifact is malformed",
-            ):
-                MODULE.load_sealed_ci_fix_artifact(artifact_path)
+            for version in ("v1", "v5"):
+                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+                artifact["schema"] = (
+                    f"github.copilot.ci-fix-loop-sealed-invocation.{version}"
+                )
+                artifact["seal"] = MODULE.sealed_ci_fix_invocation_seal(artifact)
+                self.rewrite_artifact(artifact_path, artifact)
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "invocation artifact is malformed",
+                ):
+                    MODULE.load_sealed_ci_fix_artifact(artifact_path)
 
     def test_sealed_invocation_rejects_the_local_sol_model(self):
         with tempfile.TemporaryDirectory(prefix="sealed model ") as directory:
@@ -984,6 +989,524 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 "sealed_ci_fix_completed",
                 json.loads(output.getvalue())["result"],
             )
+
+    def test_clear_clicked_pr_does_not_inspect_or_modify_the_stack(self):
+        with tempfile.TemporaryDirectory(prefix="sealed clear ") as directory:
+            repo, state_path, artifact_path, _, snapshot, artifact = self.fixture(
+                Path(directory), failing=False
+            )
+            snapshot["native_stack"] = MODULE.sealed_ci_fix_stack_identity(
+                MODULE.parse_target("owner/repo#7"),
+                stack=native_stack(heads={
+                    5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+                }),
+            )
+            artifact = MODULE.sealed_ci_fix_artifact(
+                artifact_path=artifact_path,
+                snapshot=snapshot,
+                invocation_id="f" * 32,
+                owner_session_id="87654321-4321-4321-4321-cba987654321",
+            )
+            self.rewrite_artifact(artifact_path, artifact)
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, None, snapshot):
+                    stack.enter_context(patch)
+                predecessor = stack.enter_context(mock.patch.object(
+                    MODULE, "sealed_ci_fix_predecessor_clearance"
+                ))
+                loop = stack.enter_context(mock.patch.object(
+                    MODULE, "command_loop"
+                ))
+                propagation = stack.enter_context(mock.patch.object(
+                    MODULE, "sealed_ci_fix_descendant_propagation"
+                ))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    MODULE.consume_sealed_ci_fix_invocation(artifact_path)
+            predecessor.assert_not_called()
+            loop.assert_not_called()
+            propagation.assert_not_called()
+            self.assertFalse(state_path.exists())
+            self.assertEqual(
+                "no_ci_failures",
+                json.loads(Path(artifact["outputs"]["result"]).read_text(
+                    encoding="utf-8"
+                ))["outcome"]["workflow"]["result"],
+            )
+
+    def test_stack_snapshot_binds_trunk_and_inactive_members(self):
+        stack = native_stack(heads={
+            5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+        })
+        stack["members"][0]["state"] = "MERGED"
+        stack["members"][1]["base_branch"] = "main"
+        identity = MODULE.sealed_ci_fix_stack_identity(
+            MODULE.parse_target("owner/repo#7"), stack=stack
+        )
+        self.assertEqual("stack-id", identity["id"])
+        self.assertEqual("main", identity["trunk"])
+        self.assertEqual([7, 9], [
+            member["number"] for member in identity["members"]
+        ])
+        self.assertEqual(
+            {"number": 5, "state": "MERGED", "head_branch": "lower",
+             "base_branch": "main", "head_sha": "b" * 40},
+            identity["inactive_members"][0],
+        )
+
+    def rewrite_artifact(self, path, artifact):
+        path.write_text(
+            json.dumps(artifact, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8", newline="\n",
+        )
+        path.with_name(f"{path.name}.sha256").write_text(
+            f"{MODULE.sha256_file(path)}\n", encoding="ascii", newline="\n",
+        )
+
+    def test_failing_lower_pr_blocks_the_clicked_pr_without_a_fix(self):
+        with tempfile.TemporaryDirectory(prefix="sealed lower ") as directory:
+            repo, _, artifact_path, _, snapshot, artifact = self.fixture(
+                Path(directory)
+            )
+            snapshot["native_stack"] = MODULE.sealed_ci_fix_stack_identity(
+                MODULE.parse_target("owner/repo#7"),
+                stack=native_stack(heads={
+                    5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+                }),
+            )
+            artifact = MODULE.sealed_ci_fix_artifact(
+                artifact_path=artifact_path,
+                snapshot=snapshot,
+                invocation_id="f" * 32,
+                owner_session_id="87654321-4321-4321-4321-cba987654321",
+            )
+            self.rewrite_artifact(artifact_path, artifact)
+            lower = {
+                "state": "OPEN", "head_sha": "b" * 40,
+                "head_branch": "lower", "base_branch": "main",
+            }
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, None, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(mock.patch.object(
+                    MODULE, "metadata_for", return_value=lower,
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "fetch_rollup", return_value=("b" * 40, []),
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "fetch_workflow_runs", return_value={},
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "decide",
+                    return_value={"decision": "failures", "reason": "checks_failed"},
+                ))
+                loop = stack.enter_context(mock.patch.object(
+                    MODULE, "command_loop"
+                ))
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError, "lower PR #5 is not CI-clear"
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    MODULE.consume_sealed_ci_fix_invocation(artifact_path)
+            loop.assert_not_called()
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("predecessor_clearance", result["stage"])
+            self.assertEqual("failed", result["status"])
+
+    def test_missing_descendant_rebase_helper_stops_before_repair(self):
+        with tempfile.TemporaryDirectory(prefix="sealed resolver ") as directory:
+            repo, _, artifact_path, _, snapshot, _ = self.fixture(
+                Path(directory)
+            )
+            snapshot["native_stack"] = MODULE.sealed_ci_fix_stack_identity(
+                MODULE.parse_target("owner/repo#7"),
+                stack=native_stack(heads={
+                    5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+                }),
+            )
+            artifact = MODULE.sealed_ci_fix_artifact(
+                artifact_path=artifact_path,
+                snapshot=snapshot,
+                invocation_id="f" * 32,
+                owner_session_id="87654321-4321-4321-4321-cba987654321",
+            )
+            self.rewrite_artifact(artifact_path, artifact)
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, None, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(mock.patch.object(
+                    MODULE, "sealed_ci_fix_predecessor_clearance",
+                    return_value=[{
+                        "number": 5, "head_sha": "b" * 40,
+                        "decision": "green",
+                    }],
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "conflict_resolver_script",
+                    return_value=repo / "missing",
+                ))
+                loop = stack.enter_context(mock.patch.object(
+                    MODULE, "command_loop",
+                ))
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "descendant rebasing requires PR Conflict Resolver",
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    MODULE.consume_sealed_ci_fix_invocation(artifact_path)
+            loop.assert_not_called()
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("predecessor_clearance", result["stage"])
+            self.assertEqual("failed", result["status"])
+
+    def test_a_selected_fix_rebases_only_its_descendants(self):
+        with tempfile.TemporaryDirectory(prefix="sealed propagation ") as directory:
+            root = Path(directory)
+            repo, state_path, artifact_path, _, snapshot, artifact = self.fixture(
+                root
+            )
+            original = native_stack(heads={
+                5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+            })
+            updated = native_stack(heads={
+                5: "b" * 40, 7: "f" * 40, 9: "c" * 40,
+            })
+            published = native_stack(heads={
+                5: "b" * 40, 7: "f" * 40, 9: "a" * 40,
+            })
+            target = MODULE.parse_target("owner/repo#7")
+            snapshot["native_stack"] = MODULE.sealed_ci_fix_stack_identity(
+                target, stack=original
+            )
+            artifact = MODULE.sealed_ci_fix_artifact(
+                artifact_path=artifact_path,
+                snapshot=snapshot,
+                invocation_id="f" * 32,
+                owner_session_id="87654321-4321-4321-4321-cba987654321",
+            )
+            self.rewrite_artifact(artifact_path, artifact)
+
+            def loop(_arguments):
+                self.write_terminal_state(state_path)
+                state = MODULE.load_state(state_path)
+                state["pr"]["head_sha"] = "f" * 40
+                state["clean_at_head_sha"] = "f" * 40
+                state["accepted_pushes"] = [{
+                    "previous_head_sha": "d" * 40,
+                    "head_sha": "f" * 40,
+                    "commits": ["f" * 40],
+                    "kind": "fix",
+                }]
+                MODULE.save_state(state_path, state)
+                MODULE.emit({"result": "green", "state": str(state_path)})
+
+            lower = {
+                "state": "OPEN", "head_sha": "b" * 40,
+                "head_branch": "lower", "base_branch": "main",
+            }
+            fixed = {
+                "state": "OPEN", "head_sha": "f" * 40,
+                "head_branch": "middle", "base_branch": "lower",
+            }
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, None, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(mock.patch.object(
+                    MODULE, "metadata_for", side_effect=[lower, fixed],
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "fetch_rollup",
+                    return_value=("b" * 40, [{
+                        "class": "passed", "key": "build", "name": "build",
+                    }]),
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "read_native_stack",
+                    side_effect=[original, updated, updated, published],
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "local_identity",
+                    return_value={
+                        "status": "", "branch": "middle", "head": "f" * 40,
+                    },
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "verify_ci_clearance_snapshot",
+                    return_value={
+                        "clearance_verification": {"result": "current"}
+                    },
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "command_loop", side_effect=loop,
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "conflict_resolver_script",
+                    return_value=artifact_path,
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "commit_contains", return_value=True,
+                ))
+                requests = []
+
+                def publish(command, *, check):
+                    request_path = Path(
+                        command[command.index("--stack-request") + 1]
+                    )
+                    request = json.loads(request_path.read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        request,
+                        CONFLICT_MODULE.load_stack_request(
+                            str(request_path), operation="descendant-propagation"
+                        ),
+                    )
+                    requests.append(request)
+                    self.assertEqual([5, 7, 9], request["selected"])
+                    self.assertEqual(7, request["fixed_pr"])
+                    self.assertEqual("f" * 40, request["fixed_head"])
+                    self.assertEqual(
+                        [9],
+                        [
+                            member["number"]
+                            for member in CONFLICT_MODULE.propagation_stack(
+                                {
+                                    **request["source_stack"],
+                                    "members": [
+                                        {**member, "base_sha": "e" * 40}
+                                        for member in request["source_stack"]["members"]
+                                    ],
+                                },
+                                7, "f" * 40,
+                                request["selected"],
+                            )["members"]
+                        ],
+                    )
+                    self.assertEqual(
+                        "native_stack", request["owner"]["kind"]
+                    )
+                    return subprocess.CompletedProcess(
+                        command, 0,
+                        json.dumps({
+                            "result": "published",
+                            "members_published": [
+                                {"number": 9, "head_sha": "a" * 40},
+                            ],
+                        }),
+                        "",
+                    )
+
+                stack.enter_context(mock.patch.object(
+                    MODULE, "run", side_effect=publish,
+                ))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    MODULE.consume_sealed_ci_fix_invocation(artifact_path)
+            self.assertEqual(1, len(requests))
+            owner = MODULE.load_stack_state(
+                Path(artifact["outputs"]["stack_state"])
+            )
+            self.assertEqual("complete", owner["status"])
+            self.assertEqual([5, 7, 9], [
+                member["number"] for member in owner["members"]
+            ])
+            self.assertEqual("a" * 40, owner["members"][-1]["head_sha"])
+            outcome = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )["outcome"]
+            self.assertEqual("not_verified", outcome["descendant_ci"])
+            self.assertEqual([{"number": 9, "head_sha": "a" * 40}],
+                             outcome["descendant_propagation"]["members_published"])
+
+    def test_a_rerun_without_a_push_does_not_rebase_descendants(self):
+        with tempfile.TemporaryDirectory(prefix="sealed rerun ") as directory:
+            repo, state_path, artifact_path, _, snapshot, _ = self.fixture(
+                Path(directory)
+            )
+            original = native_stack(heads={
+                5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+            })
+            snapshot["native_stack"] = MODULE.sealed_ci_fix_stack_identity(
+                MODULE.parse_target("owner/repo#7"), stack=original
+            )
+            artifact = MODULE.sealed_ci_fix_artifact(
+                artifact_path=artifact_path,
+                snapshot=snapshot,
+                invocation_id="f" * 32,
+                owner_session_id="87654321-4321-4321-4321-cba987654321",
+            )
+            self.rewrite_artifact(artifact_path, artifact)
+
+            def loop(_arguments):
+                self.write_terminal_state(state_path)
+                state = MODULE.load_state(state_path)
+                state["pr"]["head_sha"] = "d" * 40
+                state["clean_at_head_sha"] = "d" * 40
+                MODULE.save_state(state_path, state)
+                MODULE.emit({"result": "green", "state": str(state_path)})
+
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, None, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(mock.patch.object(
+                    MODULE, "metadata_for",
+                    side_effect=[
+                        {
+                            "state": "OPEN", "head_sha": "b" * 40,
+                            "head_branch": "lower", "base_branch": "main",
+                        },
+                        {"state": "OPEN", "head_sha": "d" * 40},
+                    ],
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "fetch_rollup",
+                    return_value=("b" * 40, [{
+                        "class": "passed", "key": "build", "name": "build",
+                    }]),
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "read_native_stack", return_value=original,
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "conflict_resolver_script",
+                    return_value=artifact_path,
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "command_loop", side_effect=loop,
+                ))
+                propagate = stack.enter_context(mock.patch.object(
+                    MODULE, "command_stack_propagate",
+                ))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    MODULE.consume_sealed_ci_fix_invocation(artifact_path)
+            propagate.assert_not_called()
+            self.assertFalse(
+                Path(artifact["outputs"]["stack_state"]).exists()
+            )
+            self.assertIsNone(json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )["outcome"]["descendant_propagation"])
+
+    def test_changed_descendant_aborts_before_publication(self):
+        with tempfile.TemporaryDirectory(prefix="sealed drift ") as directory:
+            root = Path(directory)
+            state_path = write_state(
+                root,
+                pr={"head_sha": "f" * 40},
+                accepted_pushes=[{
+                    "previous_head_sha": "d" * 40,
+                    "head_sha": "f" * 40,
+                    "commits": ["f" * 40],
+                    "kind": "fix",
+                }],
+            )
+            initial = MODULE.sealed_ci_fix_stack_identity(
+                MODULE.parse_target("owner/repo#7"),
+                stack=native_stack(heads={
+                    5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+                }),
+            )
+            drifted = native_stack(heads={
+                5: "b" * 40, 7: "f" * 40, 9: "a" * 40,
+            })
+            target = MODULE.parse_target("owner/repo#7")
+            owner_path = root / "stack-state.json"
+            with (
+                mock.patch.object(
+                    MODULE, "metadata_for",
+                    return_value={
+                        "state": "OPEN", "head_sha": "f" * 40,
+                        "head_branch": "middle",
+                    },
+                ),
+                mock.patch.object(
+                    MODULE, "local_identity",
+                    return_value={
+                        "status": "", "branch": "middle", "head": "f" * 40,
+                    },
+                ),
+                mock.patch.object(
+                    MODULE, "read_native_stack", return_value=drifted,
+                ),
+                mock.patch.object(
+                    MODULE, "command_stack_propagate",
+                ) as propagate,
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "native stack or another member changed",
+                ),
+            ):
+                MODULE.sealed_ci_fix_descendant_propagation(
+                    target=target, initial=initial,
+                    initial_head="d" * 40,
+                    state_path=state_path,
+                    stack_state_path=owner_path,
+                    run_id="f" * 32,
+                    repo_root=root,
+                )
+            propagate.assert_not_called()
+            self.assertFalse(owner_path.exists())
+
+    def test_incomplete_rebase_is_not_reported_as_success(self):
+        with tempfile.TemporaryDirectory(prefix="sealed conflict ") as directory:
+            root = Path(directory)
+            state_path = write_state(
+                root,
+                pr={"head_sha": "f" * 40},
+                accepted_pushes=[{
+                    "previous_head_sha": "d" * 40,
+                    "head_sha": "f" * 40,
+                    "commits": ["f" * 40],
+                    "kind": "fix",
+                }],
+            )
+            target = MODULE.parse_target("owner/repo#7")
+            original = native_stack(heads={
+                5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+            })
+            updated = native_stack(heads={
+                5: "b" * 40, 7: "f" * 40, 9: "c" * 40,
+            })
+            owner_path = root / "stack-state.json"
+            with (
+                mock.patch.object(
+                    MODULE, "metadata_for",
+                    return_value={
+                        "state": "OPEN", "head_sha": "f" * 40,
+                        "head_branch": "middle",
+                    },
+                ),
+                mock.patch.object(
+                    MODULE, "local_identity",
+                    return_value={
+                        "status": "", "branch": "middle", "head": "f" * 40,
+                    },
+                ),
+                mock.patch.object(
+                    MODULE, "read_native_stack", return_value=updated,
+                ),
+                mock.patch.object(
+                    MODULE, "command_stack_propagate",
+                    side_effect=lambda _args: MODULE.emit({
+                        "result": "stopped",
+                        "detail": "rebase conflict on PR #9",
+                    }),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError, "rebase conflict on PR #9"
+                ),
+            ):
+                MODULE.sealed_ci_fix_descendant_propagation(
+                    target=target,
+                    initial=MODULE.sealed_ci_fix_stack_identity(
+                        target, stack=original
+                    ),
+                    initial_head="d" * 40,
+                    state_path=state_path,
+                    stack_state_path=owner_path,
+                    run_id="f" * 32,
+                    repo_root=root,
+                )
+            self.assertTrue(owner_path.is_file())
 
     def test_direct_command_ignores_retained_pr_state(self):
         with tempfile.TemporaryDirectory(prefix="sealed stateless ") as directory:
@@ -3489,7 +4012,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.84", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.85", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

@@ -71,13 +71,13 @@ LEGACY_HOSTED_DISPATCH_IDENTITY_SCHEMA = (
     "github.copilot.ci-fix-loop-hosted-dispatch-identity.v1"
 )
 SEALED_CI_FIX_SNAPSHOT_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-invocation-snapshot.v2"
+    "github.copilot.ci-fix-loop-sealed-invocation-snapshot.v3"
 )
 SEALED_CI_FIX_INVOCATION_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-invocation.v5"
+    "github.copilot.ci-fix-loop-sealed-invocation.v6"
 )
 SEALED_CI_FIX_RESULT_SCHEMA = (
-    "github.copilot.ci-fix-loop-sealed-result.v3"
+    "github.copilot.ci-fix-loop-sealed-result.v4"
 )
 SEALED_CI_FIX_RESULT_KEYS = {
     "schema",
@@ -9837,6 +9837,9 @@ def sealed_ci_fix_output_paths(
         "loop_result": str(
             artifact_path.with_name(f"{prefix}-loop-result.json")
         ),
+        "stack_state": str(
+            artifact_path.with_name(f"{prefix}-stack-state.json")
+        ),
     }
 
 
@@ -9902,19 +9905,24 @@ def sealed_ci_fix_state_identity(state_path: Path) -> dict[str, Any]:
 
 def sealed_ci_fix_stack_identity(
     target: dict[str, Any],
+    *,
+    stack: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    stack = read_native_stack(target)
+    if stack is None:
+        stack = read_native_stack(target)
     if stack is None:
         return None
     projected = open_native_stack(stack)
     require_linear_open_stack(projected)
     members = projected["members"]
-    if len(members) > 1:
+    if target["number"] not in {member["number"] for member in members}:
         raise WorkflowError(
-            "sealed direct CI Fix supports one pull request, not a native stack"
+            f"pull request #{target['number']} is not an open native-stack member"
         )
     return {
+        "id": projected["id"],
         "number": projected["number"],
+        "trunk": projected["trunk"],
         "members": [
             {
                 "number": member["number"],
@@ -9929,10 +9937,176 @@ def sealed_ci_fix_stack_identity(
             {
                 "number": member["number"],
                 "state": member["state"],
+                "head_branch": member["head_branch"],
+                "base_branch": member["base_branch"],
+                "head_sha": member["head_sha"],
             }
             for member in projected["inactive_members"]
         ],
     }
+
+
+def sealed_ci_fix_predecessor_clearance(
+    target: dict[str, Any], identity: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if identity is None:
+        return []
+    predecessors = []
+    for member in identity["members"]:
+        if member["number"] == target["number"]:
+            break
+        predecessor = parse_target(
+            f"{target['repo_name']}#{member['number']}"
+        )
+        live = metadata_for(predecessor)
+        if (
+            live["state"] != "OPEN"
+            or live["head_sha"].lower() != member["head_sha"].lower()
+            or live["head_branch"] != member["head_branch"]
+            or live["base_branch"] != member["base_branch"]
+        ):
+            raise WorkflowError(
+                f"lower PR #{member['number']} changed during CI preflight"
+            )
+        head, checks = fetch_rollup(live)
+        if head.lower() != member["head_sha"].lower():
+            raise WorkflowError(
+                f"lower PR #{member['number']} checks belong to another head"
+            )
+        decision = decide(
+            checks,
+            now=dt.datetime.now(dt.timezone.utc),
+            tracking={},
+            deadline_expired=True,
+            approval_runs=(
+                approval_blocked_runs(fetch_workflow_runs(live, head))
+                if not checks else []
+            ),
+        )
+        if decision["decision"] not in {"green", "no_checks"}:
+            raise WorkflowError(
+                f"lower PR #{member['number']} is not CI-clear "
+                f"({decision['reason']}); fix or clear it before running "
+                f"CI Fix on PR #{target['number']}"
+            )
+        predecessors.append(
+            {
+                "number": member["number"],
+                "head_sha": member["head_sha"],
+                "decision": decision["decision"],
+            }
+        )
+    if sealed_ci_fix_stack_identity(target) != identity:
+        raise WorkflowError("native stack changed during predecessor CI preflight")
+    return predecessors
+
+
+def sealed_ci_fix_descendant_propagation(
+    *,
+    target: dict[str, Any],
+    initial: dict[str, Any],
+    initial_head: str,
+    state_path: Path,
+    stack_state_path: Path,
+    run_id: str,
+    repo_root: Path,
+) -> dict[str, Any] | None:
+    state = load_state(state_path)
+    pushes = state.get("accepted_pushes", [])
+    if not isinstance(pushes, list):
+        raise WorkflowError("CI Fix accepted push evidence is malformed")
+    head = initial_head
+    for push in pushes:
+        if (
+            not isinstance(push, dict)
+            or push.get("previous_head_sha") != head
+            or push.get("kind") not in {"fix", "ci_rerun"}
+            or not isinstance(push.get("commits"), list)
+            or not push["commits"]
+            or SHA_PATTERN.fullmatch(str(push.get("head_sha") or "")) is None
+        ):
+            raise WorkflowError("CI Fix accepted push chain is malformed")
+        head = push["head_sha"]
+    live = metadata_for(target)
+    if (
+        live["state"] != "OPEN"
+        or live["head_sha"] != head
+        or (state.get("pr") or {}).get("head_sha") != head
+    ):
+        raise WorkflowError("selected PR moved outside the accepted CI Fix pushes")
+    if not pushes:
+        return None
+    if state.get("outcome") == "green":
+        clearance = verify_ci_clearance_snapshot(state)
+        if clearance["clearance_verification"]["result"] != "current":
+            raise WorkflowError(
+                "selected PR CI clearance changed before descendant propagation"
+            )
+    source = local_identity(repo_root)
+    if (
+        source["status"]
+        or source["branch"] != live["head_branch"]
+        or source["head"] != head
+    ):
+        raise WorkflowError(
+            "selected PR checkout changed before descendant propagation"
+        )
+    stack = read_native_stack(target)
+    current = sealed_ci_fix_stack_identity(target, stack=stack)
+    expected = copy.deepcopy(initial)
+    if current is None:
+        raise WorkflowError("selected PR left its native stack after CI Fix")
+    for member in expected["members"]:
+        if member["number"] == target["number"]:
+            member["head_sha"] = head
+    if current != expected:
+        raise WorkflowError("native stack or another member changed during CI Fix")
+    index = next(
+        index for index, member in enumerate(current["members"])
+        if member["number"] == target["number"]
+    )
+    if index == len(current["members"]) - 1:
+        return {"result": "no_descendants", "members_published": []}
+    owner = {
+        "version": STATE_VERSION,
+        "kind": STACK_STATE_KIND,
+        "status": "active",
+        "run_id": run_id,
+        "repo_root": str(repo_root),
+        "repository": target["repo_name"],
+        "target": {"number": target["number"], "pr_url": target["pr_url"]},
+        "stack_number": current["number"],
+        "topology_fingerprint": stack_topology_fingerprint(
+            open_native_stack(stack)
+        ),
+        "authorized_topology": stack_topology_fingerprint(stack),
+        "source_stack": copy.deepcopy(stack),
+        "members": copy.deepcopy(open_native_stack(stack)["members"]),
+        "stack_requests": {},
+        "stack_owner_pid": os.getpid(),
+        "stack_owner_recorded_at": time.time(),
+    }
+    atomic_create_text(
+        stack_state_path, json.dumps(owner, indent=2, sort_keys=True) + "\n"
+    )
+    results = capture_command(
+        command_stack_propagate,
+        argparse.Namespace(
+            state=str(stack_state_path),
+            fixed_pr=target["number"],
+            expected_head=head,
+            checkpoint_id=None,
+        ),
+    )
+    if len(results) != 1 or results[0].get("result") != "propagated":
+        result = results[0] if len(results) == 1 else {"result": "missing"}
+        raise WorkflowError(
+            f"descendant rebase did not complete: {result.get('detail') or result}"
+        )
+    owner = load_stack_state(stack_state_path)
+    owner["status"] = "complete"
+    save_state(stack_state_path, owner)
+    return results[0]
 
 
 def sealed_ci_fix_live_snapshot(
@@ -10395,7 +10569,9 @@ def finish_sealed_ci_fix_result(
         or current.get("steps")
         != {
             "identity_passes": 0,
+            "predecessors": None,
             "loop": None,
+            "propagation": None,
         }
         or current.get("outcome") is not None
         or current.get("outcome_sha256") is not None
@@ -10523,7 +10699,9 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
     started_at = utc_now()
     steps: dict[str, Any] = {
         "identity_passes": 0,
+        "predecessors": None,
         "loop": None,
+        "propagation": None,
     }
     running = sealed_ci_fix_result_payload(
         artifact_sha256=artifact_sha256,
@@ -10561,24 +10739,72 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
             if pass_number == 1:
                 stage = "identity_pass_2"
 
-        stage = "loop"
-        loop_args = build_parser().parse_args(
-            artifact["inner_argv"]["loop"][2:]
-        )
-        loop_args._command_argv = artifact["inner_argv"]["loop"][2:]
-        loop_args._sealed_initial_snapshot = request["initial_snapshot"]
-        loop_result = execute_managed_command(loop_args)
-        steps["loop"] = loop_result
-        validate_terminal_command_result(
-            loop_args,
-            output_paths["loop_result"],
-            loop_result,
-        )
-        if loop_result["status"] != "succeeded":
-            raise WorkflowError("sealed CI Fix loop returned a failed result")
+        initial = request["initial_snapshot"]
+        stack_identity = initial["native_stack"]
+        propagation = None
+        decision = initial["checks"]["decision"]
+        if decision["decision"] in {"green", "no_checks"}:
+            workflow = {
+                "result": "no_ci_failures",
+                "head_sha": initial["pull_request"]["head_sha"],
+            }
+        elif decision["decision"] != "failures":
+            stage = "ci_selection"
+            raise WorkflowError(
+                f"selected PR has no actionable CI failures "
+                f"({decision['reason']}): {decision['detail']}"
+            )
+        else:
+            stage = "predecessor_clearance"
+            steps["predecessors"] = sealed_ci_fix_predecessor_clearance(
+                target, stack_identity
+            )
+            if (
+                stack_identity is not None
+                and stack_identity["members"][-1]["number"] != target["number"]
+                and not conflict_resolver_script().is_file()
+            ):
+                raise WorkflowError(
+                    "descendant rebasing requires PR Conflict Resolver before "
+                    "repairing the selected PR"
+                )
+            stage = "loop"
+            loop_args = build_parser().parse_args(
+                artifact["inner_argv"]["loop"][2:]
+            )
+            loop_args._command_argv = artifact["inner_argv"]["loop"][2:]
+            loop_args._sealed_initial_snapshot = initial
+            loop_result = execute_managed_command(loop_args)
+            steps["loop"] = loop_result
+            validate_terminal_command_result(
+                loop_args,
+                output_paths["loop_result"],
+                loop_result,
+            )
+            if loop_result["status"] != "succeeded":
+                raise WorkflowError("sealed CI Fix loop returned a failed result")
+            workflow = loop_result["outcome"]
+            if stack_identity is not None:
+                stage = "propagation"
+                propagation = sealed_ci_fix_descendant_propagation(
+                    target=target,
+                    initial=stack_identity,
+                    initial_head=initial["pull_request"]["head_sha"],
+                    state_path=state_path,
+                    stack_state_path=output_paths["stack_state"],
+                    run_id=artifact["invocation_id"],
+                    repo_root=repo_root,
+                )
+                steps["propagation"] = propagation
         outcome = {
             "result": "sealed_ci_fix_completed",
-            "workflow": loop_result["outcome"],
+            "workflow": workflow,
+            "descendant_propagation": propagation,
+            "descendant_ci": (
+                "not_verified"
+                if propagation is not None and propagation.get("members_published")
+                else None
+            ),
             "result_file": str(result_path),
             "state": str(state_path),
             "github_mutation_policy": request["github_mutation_policy"]["id"],
@@ -10601,6 +10827,11 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
             "result": "sealed_ci_fix_failed",
             "stage": stage,
             "error": str(error),
+            "selected_pr_result": (
+                steps["loop"]["outcome"]
+                if stage == "propagation" and steps["loop"] is not None
+                else None
+            ),
             "result_file": str(result_path),
             "state": str(state_path),
             "github_mutation_policy": request["github_mutation_policy"]["id"],
@@ -12587,20 +12818,12 @@ def command_stack_start(args: argparse.Namespace) -> None:
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
     if getattr(args, "_sealed_single_only", False):
-        stack = read_native_stack(target)
-        if stack is not None:
-            projected = open_native_stack(stack)
-            require_linear_open_stack(projected)
-            if len(projected["members"]) > 1:
-                raise WorkflowError(
-                    "sealed direct CI Fix supports one pull request, not a "
-                    "native stack"
-                )
+        sealed_ci_fix_stack_identity(target)
         emit(
             {
                 "result": "single",
                 "target": target["pr_url"],
-                "reason": "sealed_single_pull_request",
+                "reason": "sealed_selected_pull_request",
                 "pr": {
                     "number": target["number"],
                     "pr_url": target["pr_url"],

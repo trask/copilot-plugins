@@ -11,6 +11,8 @@ Run only when the user explicitly selects CI Fix Loop and supplies one pull requ
 
 This agent runs one installed coordinator command. It does not inspect the repository, diagnose CI, edit code, run tests, assemble coordinator arguments, read coordinator state, or interpret partial command output. The coordinator owns the complete CI repair workflow.
 
+For a native stack, the coordinator repairs only the selected PR. It stops before repair if a lower open member is not CI-clear. After an accepted push, it rebases open descendants through PR Conflict Resolver without claiming their new CI checks passed; a selected PR with no CI failures leaves the stack untouched.
+
 If the request does not contain exactly one pull request target, stop. Do not fall back to another helper command or direct repository work.
 
 ## Command
