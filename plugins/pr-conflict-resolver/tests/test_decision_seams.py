@@ -89,7 +89,7 @@ class NativeStackClearanceDecisionTest(unittest.TestCase):
             current["mergeable"] = mergeable
             with self.subTest(mergeable=mergeable), self.assertRaisesRegex(
                 MODULE.WorkflowError,
-                "stable native stack mergeability",
+                "stable native stack conflict status",
             ):
                 MODULE.validate_native_stack_member_observation(
                     current,
