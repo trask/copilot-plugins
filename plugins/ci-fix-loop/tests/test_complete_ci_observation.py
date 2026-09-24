@@ -71,7 +71,7 @@ class CompleteCiObservationTest(unittest.TestCase):
             return {"permissions": dict.fromkeys(("admin", "maintain", "push", "triage", "pull"), True)}
         self.assertIn("actions/runs?", arguments[-1])
         return [{"workflow_runs": [
-            {**run, "event": "pull_request"} for run in self.runs.values()
+            {"event": "pull_request", **run} for run in self.runs.values()
         ]}]
 
     def fetch_run(self, pr, run_id):
@@ -157,6 +157,21 @@ class CompleteCiObservationTest(unittest.TestCase):
                 self.assertEqual(1, tasks)
                 self.assertEqual(0, imports)
                 self.assertEqual(1, state["iterations"])
+
+    def test_cloud_agent_workflow_at_same_head_does_not_discard_diagnosis(self):
+        agent = {
+            **self.old, "id": 3, "workflow_id": 20,
+            "name": "Running Copilot cloud agent", "event": "dynamic",
+            "conclusion": "success",
+        }
+        output, state, inspected, tasks, imports = self.flow(
+            after_task={"1": self.old, "3": agent}
+        )
+        self.assertEqual("warning", output["result"])
+        self.assertTrue(inspected["clear"])
+        self.assertEqual(1, tasks)
+        self.assertEqual(1, imports)
+        self.assertEqual(1, state["iterations"])
 
     def test_same_head_attempt_or_conclusion_changes_invalidate_diagnosis(self):
         for change in ({"run_attempt": 2}, {"conclusion": "cancelled"}, {"status": "in_progress"}):

@@ -417,6 +417,10 @@ FAILED_BASELINE_CONCLUSIONS = {
 }
 PASSED_BASELINE_CONCLUSIONS = {"SUCCESS"}
 APPROVAL_RUN_STATES = {"ACTION_REQUIRED", "WAITING"}
+PR_CHECK_WORKFLOW_EVENTS = frozenset({
+    "push", "pull_request", "pull_request_review", "pull_request_target",
+    "deployment", "deployment_status",
+})
 VERDICTS = ("pr_caused", "pre_existing", "flake")
 WORKING_ACTIONS = ("attribute", "rerun", "fix")
 STACK_CLEAR_OUTCOMES = {"cleared", "skipped"}
@@ -3611,6 +3615,8 @@ def approval_blocked_runs(payload: Any) -> list[dict[str, Any]]:
     blocked = []
     for entry in runs:
         if not isinstance(entry, dict):
+            continue
+        if entry.get("event") not in PR_CHECK_WORKFLOW_EVENTS:
             continue
         status = str(entry.get("status") or "").upper()
         conclusion = str(entry.get("conclusion") or "").upper()
@@ -8741,6 +8747,23 @@ def ci_snapshot_runs(
                 or not isinstance(run.get("event"), str) or not run["event"]
             ):
                 raise WorkflowError("CI workflow enumeration has invalid identity")
+            if run["event"] not in PR_CHECK_WORKFLOW_EVENTS:
+                continue
+            pull_requests = run.get("pull_requests")
+            if pull_requests is not None and (
+                not isinstance(pull_requests, list)
+                or any(
+                    not isinstance(pull_request, dict)
+                    or type(pull_request.get("number")) is not int
+                    for pull_request in pull_requests
+                )
+            ):
+                raise WorkflowError("CI workflow has invalid pull request association")
+            if pull_requests and not any(
+                pull_request["number"] == pr["number"]
+                for pull_request in pull_requests
+            ):
+                continue
             key = (run["workflow_id"], run["event"])
             newest[key] = max(newest.get(key, 0), run["id"])
     runs = ci_check_runs(pr, checks, include_successful=True)

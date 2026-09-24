@@ -3489,7 +3489,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.83", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.84", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -9317,11 +9317,14 @@ class ApprovalRunTest(unittest.TestCase):
         blocked = MODULE.approval_blocked_runs(
             {
                 "workflow_runs": [
-                    {"id": 1, "name": "CI", "status": "waiting"},
+                    {"id": 1, "name": "CI", "status": "waiting",
+                     "event": "pull_request"},
                     {"id": 2, "name": "Lint", "status": "completed",
-                     "conclusion": "action_required"},
+                     "conclusion": "action_required", "event": "pull_request"},
                     {"id": 3, "name": "Done", "status": "completed",
-                     "conclusion": "success"},
+                     "conclusion": "success", "event": "pull_request"},
+                    {"id": 4, "name": "Copilot cloud agent",
+                     "status": "waiting", "event": "dynamic"},
                 ]
             }
         )
@@ -9330,6 +9333,97 @@ class ApprovalRunTest(unittest.TestCase):
     def test_an_unexpected_payload_finds_nothing(self):
         self.assertEqual([], MODULE.approval_blocked_runs(None))
         self.assertEqual([], MODULE.approval_blocked_runs({"workflow_runs": None}))
+
+
+class PrCheckWorkflowSnapshotTest(unittest.TestCase):
+    def test_tracks_pr_checks_and_unrepresented_pr_workflows_but_not_cloud_agent_runs(self):
+        pr = {"head_sha": "1" * 40, "repo_name": "owner/repo", "number": 7}
+        checks = [
+            check("check:build/test-a", workflow_run_id=42),
+            check("check:build/test-b", klass="passed", workflow_run_id=42),
+            check("check:external", klass="passed"),
+        ]
+        run = {
+            "id": 42, "name": "Build", "status": "completed",
+            "conclusion": "failure", "run_attempt": 1,
+        }
+        companion = {**run, "id": 43, "name": "Companion"}
+        pages = [{"workflow_runs": [
+            {"id": 43, "workflow_id": 7, "event": "pull_request",
+             "head_sha": pr["head_sha"], "pull_requests": [{"number": 7}]},
+            {"id": 99, "workflow_id": 8, "event": "dynamic",
+             "head_sha": pr["head_sha"]},
+            {"id": 100, "workflow_id": 9, "event": "pull_request",
+             "head_sha": pr["head_sha"], "pull_requests": [{"number": 8}]},
+        ]}]
+        with (
+            mock.patch.object(
+                MODULE, "ci_run_identity", side_effect=lambda _, run_id: {
+                    42: run, 43: companion,
+                }[run_id],
+            ) as identity,
+            mock.patch.object(MODULE, "gh_json", return_value=pages),
+        ):
+            self.assertEqual(
+                {"42": run, "43": companion},
+                MODULE.ci_snapshot_runs(pr, checks),
+            )
+        self.assertEqual(
+            [mock.call(pr, 42), mock.call(pr, 43)], identity.call_args_list
+        )
+
+    def test_rejects_malformed_workflow_pr_association(self):
+        pr = {"head_sha": "1" * 40, "repo_name": "owner/repo", "number": 7}
+        pages = [{"workflow_runs": [{
+            "id": 43, "workflow_id": 7, "event": "pull_request",
+            "head_sha": pr["head_sha"], "pull_requests": "7",
+        }]}]
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=pages),
+            self.assertRaisesRegex(MODULE.WorkflowError, "invalid pull request association"),
+        ):
+            MODULE.ci_snapshot_runs(pr, [])
+
+    def test_unrelated_cloud_agent_run_does_not_invalidate_pr_check_snapshot(self):
+        pr = {"head_sha": "1" * 40, "repo_name": "owner/repo"}
+        checks = [check("check:build/test", workflow_run_id=42)]
+        rollup = MODULE.check_rollup_identity(checks)
+        run = {
+            "id": 42, "name": "Build", "status": "completed",
+            "conclusion": "failure", "run_attempt": 1,
+        }
+        preflight = {
+            "pr": pr,
+            "check_snapshot": {
+                "rollup_sha256": MODULE.sha256_text(
+                    json.dumps(rollup, separators=(",", ":"), sort_keys=True)
+                ),
+                "workflow_runs": {"42": run},
+            },
+        }
+        with (
+            mock.patch.object(MODULE, "fetch_rollup", return_value=(pr["head_sha"], checks)),
+            mock.patch.object(MODULE, "ci_run_identity", return_value=run),
+            mock.patch.object(
+                MODULE, "gh_json",
+                return_value=[{"workflow_runs": [{
+                    "id": 99, "workflow_id": 7, "event": "dynamic",
+                    "head_sha": pr["head_sha"],
+                }]}],
+            ),
+        ):
+            MODULE.require_live_check_snapshot(preflight)
+
+        with (
+            mock.patch.object(MODULE, "fetch_rollup", return_value=(pr["head_sha"], checks)),
+            mock.patch.object(
+                MODULE, "ci_run_identity",
+                return_value={**run, "run_attempt": 2},
+            ),
+            mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "snapshot changed"),
+        ):
+            MODULE.require_live_check_snapshot(preflight)
 
 
 class StateFileTest(unittest.TestCase):
@@ -10579,7 +10673,8 @@ class ChecksCommandTest(unittest.TestCase):
             path,
             ("head1", []),
             None,
-            {"workflow_runs": [{"id": 3, "name": "CI", "status": "waiting"}]},
+            {"workflow_runs": [{"id": 3, "name": "CI", "status": "waiting",
+                                "event": "pull_request"}]},
         )
         self.assertEqual("escalate", payload["result"])
         self.assertEqual("approval_required", payload["reason"])
