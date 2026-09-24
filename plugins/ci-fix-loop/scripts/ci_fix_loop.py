@@ -7632,7 +7632,13 @@ def candidate_git_repository(runtime: ModuleType) -> Any:
             check=False,
         )
 
-    return runtime.GitRepository(runner=runner)
+    class CandidateGitRepository(runtime.GitRepository):
+        def snapshot(
+            self, cwd: Path, *, allow_detached: bool = False
+        ) -> Any:
+            return super().snapshot(cwd, allow_detached=True)
+
+    return CandidateGitRepository(runner=runner)
 
 
 def validate_candidate_task_creation_failure_result(

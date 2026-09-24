@@ -4012,7 +4012,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.88", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.89", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -15656,6 +15656,71 @@ class CandidateContractTest(unittest.TestCase):
         self.assertEqual("frozen prompt", call.kwargs["options"].prompt)
         self.assertEqual(MODULE.AGENT_TASK_POLICY, call.kwargs["options"].policy)
         self.assertIs(MODULE.commit_contains, call.kwargs["base_is_ancestor"])
+
+    @mock.patch.object(MODULE, "ALLOW_DETACHED_CHECKOUT", True)
+    def test_guarded_import_fast_forwards_a_clean_detached_checkout(self):
+        runtime_path = (
+            Path(__file__).parents[2]
+            / "agent-tasks-runtime"
+            / "skills"
+            / "agent-tasks-runtime"
+            / "scripts"
+            / "cloud_task.py"
+        )
+        runtime = MODULE.load_cloud_task_runtime(runtime_path)
+        with tempfile.TemporaryDirectory() as directory:
+            repo_root = Path(directory).resolve() / "repo"
+            repo_root.mkdir()
+
+            def git(*arguments):
+                return MODULE.git(repo_root, *arguments)
+
+            git("init", "-q")
+            git("config", "user.name", "Test")
+            git("config", "user.email", "test@example.com")
+            git("remote", "add", "origin", "https://github.com/owner/repo.git")
+            source = repo_root / "source.txt"
+            source.write_text("source\n", encoding="utf-8")
+            git("add", "source.txt")
+            git("-c", "commit.gpgsign=false", "commit", "-qm", "source")
+            source_head = git("rev-parse", "HEAD")
+            source.write_text("fixed\n", encoding="utf-8")
+            git("add", "source.txt")
+            git("-c", "commit.gpgsign=false", "commit", "-qm", "fix")
+            code_tip = git("rev-parse", "HEAD")
+            git("checkout", "--detach", source_head)
+
+            preflight = copy.deepcopy(self.preflight)
+            preflight["identity"] = MODULE.local_identity(repo_root)
+            preflight["pr"]["head_sha"] = source_head
+            result_path = repo_root.parent / "candidate.json"
+            result_path.write_text("{}\n", encoding="utf-8")
+            repository = MODULE.candidate_git_repository(runtime)
+            repository.repository_name = mock.Mock(return_value="owner/repo")
+            verified = {"code_tip": code_tip}
+            with (
+                mock.patch.object(MODULE, "load_candidate_runtime", return_value=runtime),
+                mock.patch.object(MODULE, "candidate_git_repository", return_value=repository),
+                mock.patch.object(MODULE, "load_agent_task_result", return_value={}),
+                mock.patch.object(runtime, "verify_current_candidate", return_value=verified),
+            ):
+                self.assertTrue(
+                    MODULE.apply_verified_candidate_import(
+                        repo_root,
+                        helper=runtime_path,
+                        requested_model="gpt-5.6-sol",
+                        prompt="frozen prompt",
+                        result_path=result_path,
+                        result_sha256=MODULE.sha256_file(result_path),
+                        preflight=preflight,
+                        remote={"final_local_head": code_tip},
+                    )
+                )
+            self.assertEqual(
+                {"branch": "", "head": code_tip, "status": ""},
+                MODULE.local_identity(repo_root),
+            )
+            self.assertEqual("fixed\n", source.read_text(encoding="utf-8"))
 
     def test_candidate_cannot_change_frozen_build_wrappers(self):
         for path in ("gradlew", "gradle/wrapper/gradle-wrapper.jar", ".mvn/wrapper.xml"):
