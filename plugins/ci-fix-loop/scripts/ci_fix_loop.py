@@ -183,7 +183,7 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "d86fa0d04d0d080d5aa9b059c7d5ee258092e0d20abb606c59bbd6ec0ac3aba1"
+    "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -7456,6 +7456,7 @@ def verify_runtime_candidate(
             pull_request=snapshot,
             root=repo_root,
             git=candidate_git_repository(runtime),
+            base_is_ancestor=commit_contains,
         )
     except runtime.CloudError as error:
         raise WorkflowError(f"CI Fix candidate rejected: {error}") from error
@@ -9146,6 +9147,7 @@ def apply_verified_candidate_import(
             pull_request=snapshot,
             root=repo_root,
             git=candidate_git_repository(runtime),
+            base_is_ancestor=commit_contains,
         )
     except runtime.CloudError as error:
         raise WorkflowError(f"CI Fix candidate import rejected: {error}") from error

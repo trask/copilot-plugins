@@ -56,7 +56,7 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "d86fa0d04d0d080d5aa9b059c7d5ee258092e0d20abb606c59bbd6ec0ac3aba1"
+    "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -160,6 +160,26 @@ def gh_json(arguments: list[str], *, cwd: Path | None = None) -> Any:
         return json.loads(output) if output.strip() else None
     except json.JSONDecodeError as error:
         raise WorkflowError(f"gh returned invalid JSON: {error}") from error
+
+
+def live_base_contains(repository: str, ancestor: str, descendant: str) -> bool:
+    if (
+        not isinstance(repository, str)
+        or REPO_NAME_PATTERN.fullmatch(repository) is None
+        or not isinstance(ancestor, str)
+        or SHA_PATTERN.fullmatch(ancestor) is None
+        or not isinstance(descendant, str)
+        or SHA_PATTERN.fullmatch(descendant) is None
+    ):
+        raise WorkflowError("invalid Agent Task base comparison identity")
+    if ancestor == descendant:
+        return True
+    comparison = gh_json(
+        ["api", f"repos/{repository}/compare/{ancestor}...{descendant}"]
+    )
+    if not isinstance(comparison, dict) or not isinstance(comparison.get("status"), str):
+        raise WorkflowError("GitHub returned an invalid Agent Task base comparison")
+    return comparison["status"] in {"ahead", "identical"}
 
 
 def graphql(query: str, variables: dict[str, str | int | None]) -> Any:
@@ -1720,6 +1740,7 @@ def validate_success_result(
             pull_request=snapshot,
             root=repo_root,
             git=repository or runtime.GitRepository(),
+            base_is_ancestor=live_base_contains,
         )
     except runtime.CloudError as error:
         raise WorkflowError(f"description candidate rejected: {error}") from error

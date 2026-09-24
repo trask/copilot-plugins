@@ -593,6 +593,9 @@ class CandidateDispatcherTest(unittest.TestCase):
     def test_historical_merged_source_dispatches_on_its_immutable_head(self):
         self.check_candidate("trask-pr-audit-7", historical=True)
 
+    def test_candidate_accepts_only_proven_forward_base_advance(self):
+        self.check_candidate("feature", check_base_advance=True)
+
     def test_head_movement_during_preparation_does_not_start_a_task(self):
         self.check_candidate(None, drift_phase="preparation")
 
@@ -619,6 +622,7 @@ class CandidateDispatcherTest(unittest.TestCase):
         drift_fields=None,
         historical=False,
         managed=False,
+        check_base_advance=False,
     ):
         root = Path("C:/repo")
         base_sha = "1" * 40
@@ -895,6 +899,57 @@ class CandidateDispatcherTest(unittest.TestCase):
             envelope, options=options, pull_request=pull_request, root=root, git=repository,
         )
         self.assertEqual(verified["code_tip"], code_commit)
+        if check_base_advance:
+            frozen_pr = replace(pull_request, base_sha="0" * 40)
+            with self.assertRaisesRegex(MODULE.CloudError, "identity or policy"):
+                MODULE.verify_current_candidate(
+                    envelope, options=options, pull_request=frozen_pr,
+                    root=root, git=repository,
+                )
+            contains = mock.Mock(return_value=True)
+            verified = MODULE.verify_current_candidate(
+                envelope, options=options, pull_request=frozen_pr,
+                root=root, git=repository, base_is_ancestor=contains,
+            )
+            self.assertEqual(verified["code_tip"], code_commit)
+            contains.assert_called_once_with("owner/repo", frozen_pr.base_sha, pull_request.base_sha)
+            repository.head.side_effect = [code_commit]
+            imported = MODULE.guarded_fast_forward_candidate(
+                envelope, options=options, pull_request=frozen_pr,
+                root=root, git=repository, base_is_ancestor=contains,
+            )
+            self.assertEqual(imported["final_local_head"], code_commit)
+            repository.fast_forward.assert_called_once_with(snapshot, code_commit)
+            self.assertEqual(contains.call_count, 2)
+            contains.reset_mock()
+            contains.return_value = False
+            with self.assertRaisesRegex(MODULE.CloudError, "identity or policy"):
+                MODULE.verify_current_candidate(
+                    envelope, options=options, pull_request=frozen_pr,
+                    root=root, git=repository, base_is_ancestor=contains,
+                )
+            for field, value in (("head_sha", "9" * 40), ("base_ref", "other")):
+                changed = json.loads(json.dumps(envelope))
+                changed["pull_request"][field] = value
+                contains.reset_mock()
+                with self.subTest(field=field), self.assertRaisesRegex(
+                    MODULE.CloudError, "identity or policy"
+                ):
+                    MODULE.verify_current_candidate(
+                        changed, options=options, pull_request=frozen_pr,
+                        root=root, git=repository, base_is_ancestor=contains,
+                    )
+                contains.assert_not_called()
+            malformed = json.loads(json.dumps(envelope))
+            malformed["pull_request"]["base_sha"] = "invalid"
+            contains.reset_mock()
+            with self.assertRaisesRegex(MODULE.CloudError, "identity or policy"):
+                MODULE.verify_current_candidate(
+                    malformed, options=options, pull_request=frozen_pr,
+                    root=root, git=repository, base_is_ancestor=contains,
+                )
+            contains.assert_not_called()
+            repository.head.side_effect = None
         if historical:
             self.assertEqual(envelope["task"]["base_ref"], base_sha)
             return
@@ -936,6 +991,14 @@ class CandidateDispatcherTest(unittest.TestCase):
             root=root, git=repository,
         )
         self.assertEqual(historical["code_tip"], code_commit)
+        contains = mock.Mock(return_value=True)
+        with self.assertRaisesRegex(MODULE.CloudError, "identity or policy"):
+            MODULE.verify_candidate_result(
+                historical_result, options=historical_options,
+                pull_request=replace(historical_pr, base_sha="0" * 40),
+                root=root, git=repository, base_is_ancestor=contains,
+            )
+        contains.assert_not_called()
         repository.identity.return_value = MODULE.LocalIdentity("feature", base_sha, "", None)
         with self.assertRaisesRegex(MODULE.CloudError, "frozen audit branch"):
             MODULE.verify_candidate_result(

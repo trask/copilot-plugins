@@ -4012,7 +4012,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.86", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.87", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -15398,6 +15398,10 @@ class CandidateContractTest(unittest.TestCase):
         options = runtime.verify_current_candidate.call_args.kwargs["options"]
         self.assertEqual("frozen prompt", options.prompt)
         self.assertEqual(MODULE.AGENT_TASK_POLICY, options.policy)
+        self.assertIs(
+            MODULE.commit_contains,
+            runtime.verify_current_candidate.call_args.kwargs["base_is_ancestor"],
+        )
         return remote
 
     def test_accepts_zero_code_and_any_optional_report_content(self):
@@ -15463,6 +15467,13 @@ class CandidateContractTest(unittest.TestCase):
         }
         self.assertEqual({self.code: ["src/App.java"]}, coverage)
 
+    def test_forward_base_candidate_keeps_the_frozen_preflight(self):
+        result = self.result(code=False)
+        result["pull_request"]["base_sha"] = "5" * 40
+        remote = self.validate(result)
+        self.assertEqual(self.base, self.preflight["pr"]["base_sha"])
+        self.assertEqual([], remote["commits"])
+
     def test_guarded_import_uses_only_the_manifest_code_tip(self):
         result = self.result(output_paths=[MODULE.AGENT_TASK_OUTPUT_REPORT])
         remote = self.validate(result)
@@ -15509,6 +15520,7 @@ class CandidateContractTest(unittest.TestCase):
         self.assertEqual(result, call.args[0])
         self.assertEqual("frozen prompt", call.kwargs["options"].prompt)
         self.assertEqual(MODULE.AGENT_TASK_POLICY, call.kwargs["options"].policy)
+        self.assertIs(MODULE.commit_contains, call.kwargs["base_is_ancestor"])
 
     def test_candidate_cannot_change_frozen_build_wrappers(self):
         for path in ("gradlew", "gradle/wrapper/gradle-wrapper.jar", ".mvn/wrapper.xml"):

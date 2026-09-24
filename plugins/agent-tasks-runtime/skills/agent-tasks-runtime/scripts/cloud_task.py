@@ -1440,6 +1440,7 @@ def _resolve_git_path(root: Path, value: str) -> Path:
 def verify_candidate_result(
     result: Mapping[str, object], *, options: Options,
     pull_request: PullRequestSnapshot, root: Path, git: GitRepository,
+    base_is_ancestor: Callable[[str, str, str], bool] | None = None,
 ) -> dict[str, object]:
     """Recheck dispatcher provenance and fetched history for a candidate consumer."""
     report_only = options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
@@ -1459,13 +1460,19 @@ def verify_candidate_result(
         "number", "url", "base_repository", "base_ref", "base_sha",
         "head_repository", "head_ref", "head_sha",
     )}
+    candidate_pr = result.get("pull_request")
     if (
         result.get("schema") != {"id": RESULT_SCHEMA_ID, "version": 5}
         or result.get("status") != "success" or result.get("error") is not None
         or result.get("policy") != policy_metadata(options)
         or result.get("mode") != ("report_recommendation" if report_only else "code_candidate")
         or result.get("repository") != {"name_with_owner": repository}
-        or result.get("pull_request") != expected_pr
+        or not isinstance(candidate_pr, dict)
+        or set(candidate_pr) != set(expected_pr)
+        or any(
+            candidate_pr[name] != value
+            for name, value in expected_pr.items() if name != "base_sha"
+        )
         or result.get("requested_model") != options.model
         or result.get("report") is not None
         or result.get("attestation") != {"kind": "dispatcher_candidate", "structural_complete": True}
@@ -1475,6 +1482,16 @@ def verify_candidate_result(
         }
     ):
         raise CloudError("candidate consumer identity or policy mismatch", "candidate_invalid")
+    if candidate_pr["base_sha"] != pr.base_sha:
+        candidate_base = candidate_pr["base_sha"]
+        if (
+            options.allow_merged_pr
+            or base_is_ancestor is None
+            or not isinstance(candidate_base, str)
+            or SHA_PATTERN.fullmatch(candidate_base) is None
+            or base_is_ancestor(repository, pr.base_sha, candidate_base) is not True
+        ):
+            raise CloudError("candidate consumer identity or policy mismatch", "candidate_invalid")
     task, generated, completion = (result.get(name) for name in ("task", "generated", "completion"))
     if (
         not isinstance(task, dict) or not isinstance(task.get("id"), str) or not task["id"]
@@ -1549,6 +1566,7 @@ def verify_candidate_result(
 def verify_current_candidate(
     result: Mapping[str, object], *, options: Options,
     pull_request: PullRequestSnapshot, root: Path, git: GitRepository,
+    base_is_ancestor: Callable[[str, str, str], bool] | None = None,
 ) -> dict[str, object]:
     """Verify a current version-5 candidate against live Git history."""
     return verify_candidate_result(
@@ -1557,12 +1575,14 @@ def verify_current_candidate(
         pull_request=pull_request,
         root=root,
         git=git,
+        base_is_ancestor=base_is_ancestor,
     )
 
 
 def guarded_fast_forward_candidate(
     result: Mapping[str, object], *, options: Options,
     pull_request: PullRequestSnapshot, root: Path, git: GitRepository,
+    base_is_ancestor: Callable[[str, str, str], bool] | None = None,
 ) -> dict[str, object]:
     """Verify and fast-forward a clean source branch to the candidate code tip."""
     if options.policy != MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR:
@@ -1576,6 +1596,7 @@ def guarded_fast_forward_candidate(
         pull_request=pull_request,
         root=root,
         git=git,
+        base_is_ancestor=base_is_ancestor,
     )
     snapshot = git.snapshot(root)
     if (

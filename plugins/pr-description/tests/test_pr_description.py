@@ -658,7 +658,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.91")
+        self.assertEqual(plugin["version"], "1.0.92")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -786,6 +786,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 identity=self.identity,
             )
         verify_current_candidate.assert_called_once()
+        self.assertIs(
+            verify_current_candidate.call_args.kwargs["base_is_ancestor"],
+            MODULE.live_base_contains,
+        )
         expected = json.loads(report_content)["proposal"]
         proposal = MODULE.recommendation_from_outputs(
             preflight=self.preflight,
@@ -795,6 +799,52 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
         self.assertEqual(proposal["decision"], "keep")
         self.assertEqual(proposal["evidence"]["changed_files"], ["src/app.py"])
+
+    def test_candidate_accepts_only_proven_forward_base_advance(self):
+        result = self.result(self.proposal_report())
+        result["pull_request"]["base_sha"] = "5" * 40
+        frozen_base = self.preflight["pr"]["base"]["sha"]
+        for status, accepted in (
+            ("ahead", True), ("behind", False), ("diverged", False),
+        ):
+            with self.subTest(status=status), mock.patch.object(
+                MODULE, "gh_json", return_value={"status": status}
+            ) as compare:
+                if accepted:
+                    validate_description_result(
+                        result, preflight=self.preflight,
+                        requested_model="gpt-5.6-sol", identity=self.identity,
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        MODULE.WorkflowError, "candidate rejected"
+                    ):
+                        validate_description_result(
+                            result, preflight=self.preflight,
+                            requested_model="gpt-5.6-sol", identity=self.identity,
+                        )
+            compare.assert_called_once_with([
+                "api", f"repos/owner/repo/compare/{frozen_base}...{'5' * 40}",
+            ])
+
+        result["pull_request"]["head_sha"] = "9" * 40
+        with mock.patch.object(MODULE, "gh_json") as compare:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
+                validate_description_result(
+                    result, preflight=self.preflight,
+                    requested_model="gpt-5.6-sol", identity=self.identity,
+                )
+        compare.assert_not_called()
+
+    def test_hosted_base_comparison_fails_on_invalid_evidence(self):
+        base = self.preflight["pr"]["base"]["sha"]
+        with mock.patch.object(MODULE, "gh_json", return_value=None):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "invalid Agent Task base comparison"):
+                MODULE.live_base_contains("owner/repo", base, "5" * 40)
+        with mock.patch.object(MODULE, "gh_json") as compare:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "invalid Agent Task base comparison identity"):
+                MODULE.live_base_contains("owner/repo", base, "../unknown")
+        compare.assert_not_called()
 
     def test_rejects_policy_repository_pr_head_and_task_mismatches(self):
         mutations = {
@@ -1907,7 +1957,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "d86fa0d04d0d080d5aa9b059c7d5ee258092e0d20abb606c59bbd6ec0ac3aba1",
+            "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(

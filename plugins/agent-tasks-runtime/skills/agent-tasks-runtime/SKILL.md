@@ -111,10 +111,16 @@ Conflict Resolver has its own pinned runtime and versioned request contract.
 from Git and compares the task, session, prompt, repository, source and
 generated history with the frozen request. `verify_candidate_result(...)`
 remains as the compatibility name for current consumers.
+Current-PR consumers can pass `base_is_ancestor(repository, frozen_base,
+candidate_base)` to accept a dispatcher-observed forward base advance while
+keeping every other pull request field pinned. The callback must verify Git
+ancestry in the trusted repository. Without it, or for historical merged
+pull requests, the base SHA must match exactly.
 
 `guarded_fast_forward_candidate(...)` accepts only the code-candidate policy.
-It runs the same verification, requires a clean branch at the frozen pull
-request head, checks the identity again immediately before `git merge
+It accepts the same optional ancestry callback and runs the same verification.
+It requires a clean branch at the frozen pull request head, checks the identity
+again immediately before `git merge
 --ff-only`, and confirms the final HEAD. It never imports the output-only
 artifact commit and it does not reserve or lock a branch.
 

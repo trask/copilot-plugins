@@ -165,7 +165,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "d86fa0d04d0d080d5aa9b059c7d5ee258092e0d20abb606c59bbd6ec0ac3aba1"
+    "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -5158,6 +5158,7 @@ def apply_verified_import(
             pull_request=snapshot,
             root=repo_root,
             git=candidate_git_repository(runtime),
+            base_is_ancestor=live_base_contains,
         )
     except runtime.CloudError as error:
         raise WorkflowError(f"hosted review candidate import rejected: {error}") from error
@@ -7425,6 +7426,7 @@ def validate_hosted_candidate(
             pull_request=snapshot,
             root=repo_root,
             git=candidate_git_repository(runtime),
+            base_is_ancestor=live_base_contains,
         )
     except runtime.CloudError as error:
         raise WorkflowError(f"hosted review candidate rejected: {error}") from error

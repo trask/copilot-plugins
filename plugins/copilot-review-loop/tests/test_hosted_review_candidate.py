@@ -292,6 +292,52 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.assertFalse((self.repo / MODULE.HOSTED_DECISION_PATH).exists())
         self.assertEqual("", self.git("status", "--porcelain"))
 
+    def test_hosted_candidate_accepts_only_forward_base_drift(self):
+        tip = self.candidate()
+        self.result["pull_request"]["base_sha"] = "2" * 40
+        with mock.patch.object(
+            MODULE, "gh_json", return_value={"status": "ahead"}
+        ) as compare:
+            bundle = self.run_worker()
+        compare.assert_called_once_with(
+            ["api", f"repos/owner/repo/compare/{self.head}...{'2' * 40}"]
+        )
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value={"status": "ahead"}) as compare,
+            mock.patch.object(
+                MODULE, "candidate_git_repository", return_value=self.repository()
+            ),
+        ):
+            self.assertTrue(MODULE.apply_verified_import(
+                self.repo,
+                helper=RUNTIME_PATH,
+                requested_model="gpt-5.6-sol",
+                prompt=self.prompt,
+                result_path=self.result_path,
+                result_sha256=MODULE.sha256_file(self.result_path),
+                report_content=bundle["report_content"],
+                preflight=self.preflight,
+                remote=bundle["remote"],
+            ))
+        compare.assert_called_once()
+        self.assertEqual(tip, self.git("rev-parse", "HEAD"))
+
+    def test_hosted_candidate_rejects_non_forward_base_and_head_drift(self):
+        self.candidate()
+        self.result["pull_request"]["base_sha"] = "2" * 40
+        for status in ("behind", "diverged"):
+            with self.subTest(status=status), mock.patch.object(
+                MODULE, "gh_json", return_value={"status": status}
+            ):
+                with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
+                    self.run_worker()
+                self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+        self.result["pull_request"]["head_sha"] = "3" * 40
+        with mock.patch.object(MODULE, "gh_json") as compare:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"):
+                self.run_worker()
+        compare.assert_not_called()
+
     def test_identity_manifest_and_completion_drift_fail_before_import(self):
         self.candidate()
         original = copy.deepcopy(self.result)

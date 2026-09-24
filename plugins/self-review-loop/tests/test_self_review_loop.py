@@ -2079,7 +2079,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.70")
+        self.assertEqual(plugin["version"], "1.3.71")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -5511,7 +5511,9 @@ class CandidateContractTest(unittest.TestCase):
                 prompt="frozen prompt",
             )
         runtime.verify_current_candidate.assert_called_once()
-        options = runtime.verify_current_candidate.call_args.kwargs["options"]
+        kwargs = runtime.verify_current_candidate.call_args.kwargs
+        self.assertIs(kwargs["base_is_ancestor"], MODULE.live_base_contains)
+        options = kwargs["options"]
         self.assertEqual("frozen prompt", options.prompt)
         self.assertEqual(MODULE.AGENT_TASK_POLICY, options.policy)
         return remote
@@ -5560,6 +5562,8 @@ class CandidateContractTest(unittest.TestCase):
         self.assertEqual(self.output, fixed["generated_head"])
 
     def test_runtime_rejection_is_fail_closed(self):
+        result = self.result()
+        result["pull_request"]["head_sha"] = "9" * 40
         runtime = SimpleNamespace(
             CloudError=RuntimeError,
             PullRequestSnapshot=lambda **values: SimpleNamespace(**values),
@@ -5574,12 +5578,29 @@ class CandidateContractTest(unittest.TestCase):
             self.assertRaisesRegex(MODULE.WorkflowError, "candidate rejected"),
         ):
             MODULE.verify_runtime_candidate(
-                self.result(),
+                result,
                 helper=Path("cloud_task.py"),
                 repo_root=Path("repo"),
                 preflight=self.preflight,
                 requested_model="gpt-6-sol",
                 prompt="frozen prompt",
+            )
+
+    def test_hosted_base_comparison_accepts_only_forward_history(self):
+        self.validate(self.result())
+        for status, accepted in (
+            ("ahead", True), ("identical", True),
+            ("behind", False), ("diverged", False),
+        ):
+            with self.subTest(status=status), mock.patch.object(
+                MODULE, "gh_json", return_value={"status": status}
+            ) as compare:
+                self.assertIs(
+                    MODULE.live_base_contains("owner/repo", self.base, "5" * 40),
+                    accepted,
+                )
+            compare.assert_called_once_with(
+                ["api", f"repos/owner/repo/compare/{self.base}...{'5' * 40}"]
             )
 
     def test_runtime_manifest_coverage_excludes_output_commit(self):
@@ -5639,6 +5660,7 @@ class CandidateContractTest(unittest.TestCase):
         self.assertEqual(result, call.args[0])
         self.assertEqual("frozen prompt", call.kwargs["options"].prompt)
         self.assertEqual(MODULE.AGENT_TASK_POLICY, call.kwargs["options"].policy)
+        self.assertIs(call.kwargs["base_is_ancestor"], MODULE.live_base_contains)
 
 
 class SourceDriftClassificationTest(unittest.TestCase):

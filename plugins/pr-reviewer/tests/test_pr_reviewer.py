@@ -1234,6 +1234,27 @@ class ManagedCoordinatorTest(unittest.TestCase):
         with mock.patch.object(MODULE, "live_base_contains", return_value=False):
             self.assertFalse(MODULE.same_candidate_snapshot(self.pr, advanced))
         self.assertFalse(MODULE.same_snapshot(self.pr, advanced))
+        with mock.patch.object(MODULE, "live_base_contains") as contains:
+            self.assertFalse(MODULE.same_candidate_snapshot(
+                self.pr, {**advanced, "head_sha": "9" * 40}
+            ))
+        contains.assert_not_called()
+
+    def test_hosted_base_comparison_accepts_only_forward_history(self):
+        for status, accepted in (
+            ("ahead", True), ("identical", True),
+            ("behind", False), ("diverged", False),
+        ):
+            with self.subTest(status=status), mock.patch.object(
+                MODULE, "gh_json", return_value={"status": status}
+            ) as compare:
+                self.assertIs(
+                    MODULE.live_base_contains("owner/repo", "1" * 40, "3" * 40),
+                    accepted,
+                )
+            compare.assert_called_once_with(
+                ["api", f"repos/owner/repo/compare/{'1' * 40}...{'3' * 40}"]
+            )
 
     def hosted_check(
         self,
@@ -1288,6 +1309,7 @@ class ManagedCoordinatorTest(unittest.TestCase):
             phase = 1 if model == "gpt-5.6-sol" else 2
             self.assertEqual("gpt-5.6-sol" if len(commands) == 1 else "gpt-6-astra", model)
             self.assertEqual(MODULE.HOSTED_REVIEW_POLICY, kwargs["options"].policy)
+            self.assertIs(kwargs["base_is_ancestor"], MODULE.live_base_contains)
             return {
                 "task": result["task"], "completion": {"session": {"id": f"session-{phase}"}},
                 "candidate": {"phase": phase}, "artifact_commit": {
