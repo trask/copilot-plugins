@@ -3428,14 +3428,27 @@ def execute_native_stack(
     branches: set[str] = set()
     members = request["native_stack"]["members"]
     for index, member in enumerate(members):
+        prefix = options.result_file.with_name(
+            f"{options.result_file.stem}--member-{member['pr_number']}"
+        )
+        member_result_path = prefix.with_name(prefix.name + "--result.json")
+        if (
+            options.bounded_phase == "dispatch"
+            and index > 0
+            and not member_result_path.is_file()
+        ):
+            if member_result_path.with_name(
+                member_result_path.name + ".bounded-receipt.json"
+            ).exists():
+                raise ConflictError(
+                    "stack member dispatch already attempted", "ambiguous_dispatch"
+                )
+            stack_root_receipt(options, index, "preflight", None)
         require_target_fresh(runner, snapshot, request)
         require_local_unchanged(runner, snapshot)
         prove_native_stack_member_input(runner, snapshot.root, member)
         member_request = stack_member_request(request, member, base_sha)
         number = member["pr_number"]
-        prefix = options.result_file.with_name(
-            f"{options.result_file.stem}--member-{number}"
-        )
         prompt = (
             "Resolve only this member of the frozen native stack. Replay exactly "
             "the listed old commits, in order, onto the exact supplied base SHA. "
@@ -3469,7 +3482,7 @@ def execute_native_stack(
             pull_request_url=member_request["pull_request"]["url"],
             request_file=prefix.with_name(prefix.name + "--request.json"),
             prompt_file=prefix.with_name(prefix.name + "--prompt.txt"),
-            result_file=prefix.with_name(prefix.name + "--result.json"),
+            result_file=member_result_path,
             request=member_request,
             prompt=prompt,
         )
@@ -3898,13 +3911,27 @@ def execute_bounded(
     result.pull_request = pull_request_result(request)
     path = bounded_receipt_path(options)
     if request["strategy"] == "native-stack":
-        if options.bounded_phase == "dispatch" and not path.exists():
-            require_target_fresh(runner, snapshot, request)
-            require_local_unchanged(runner, snapshot)
-            if already_satisfied(runner, snapshot, request):
-                raise ConflictError("stack conflict was already satisfied", "stale_target")
-            fetch_pinned_inputs(runner, snapshot, request)
-            verify_frozen_ranges(runner, snapshot, request)
+        if options.bounded_phase == "dispatch":
+            if path.exists():
+                prior = read_json_file(path, "bounded dispatch receipt")
+                if (
+                    not isinstance(prior, dict)
+                    or prior.get("status") != "completed"
+                    or prior.get("strategy") != "native-stack"
+                    or prior.get("request_sha256") != request["request_sha256"]
+                    or prior.get("session") != options.bounded_session
+                ):
+                    raise ConflictError(
+                        "stack dispatch already attempted", "ambiguous_dispatch"
+                    )
+            else:
+                stack_root_receipt(options, 0, "preflight", None)
+                require_target_fresh(runner, snapshot, request)
+                require_local_unchanged(runner, snapshot)
+                if already_satisfied(runner, snapshot, request):
+                    raise ConflictError("stack conflict was already satisfied", "stale_target")
+                fetch_pinned_inputs(runner, snapshot, request)
+                verify_frozen_ranges(runner, snapshot, request)
         execute_native_stack(options, snapshot, runner, time.sleep, progress, result)
         return 0
     if options.bounded_phase == "dispatch":
@@ -3913,6 +3940,17 @@ def execute_bounded(
                 "dispatch already attempted; task identity may be unknown",
                 "ambiguous_dispatch",
             )
+        receipt = {
+            "session": options.bounded_session,
+            "request_id": request["request_id"],
+            "request_sha256": request["request_sha256"],
+            "repository": snapshot.repository,
+            "model": options.model,
+            "strategy": options.strategy,
+            "status": "preflight",
+            "task": None,
+        }
+        atomic_write_json(path, receipt)
         require_target_fresh(runner, snapshot, request)
         require_local_unchanged(runner, snapshot)
         fetch_pinned_inputs(runner, snapshot, request)
@@ -3921,16 +3959,7 @@ def execute_bounded(
         require_local_unchanged(runner, snapshot)
         if already_satisfied(runner, snapshot, request):
             raise ConflictError("conflict was already satisfied before dispatch", "stale_target")
-        receipt = {
-            "session": options.bounded_session,
-            "request_id": request["request_id"],
-            "request_sha256": request["request_sha256"],
-            "repository": snapshot.repository,
-            "model": options.model,
-            "strategy": options.strategy,
-            "status": "dispatching",
-            "task": None,
-        }
+        receipt["status"] = "dispatching"
         atomic_write_json(path, receipt)
         initial = start_task(runner, snapshot, options)
         receipt.update(

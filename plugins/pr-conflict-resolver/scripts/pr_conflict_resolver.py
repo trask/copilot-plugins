@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "80cf182d5d468b6e5ca3e93b4c2cbf7577e8b5fc7f82b9cdee59699940d71328"
+    "de8bee0a495224568be535fe2be8b1ed704a200a3cac806e00214a82c5b4ebb3"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@14"
@@ -11032,6 +11032,42 @@ def advance_bounded_conflict(
         raise WorkflowError("bounded conflict dispatch receipt is missing or mismatched")
     remote_task = receipt.get("task")
     result_task = result.get("task")
+    if receipt.get("status") == "preflight":
+        member_index = receipt.get("member_index")
+        native = request["strategy"] == "native-stack"
+        error = result.get("error")
+        if (
+            phase != "dispatch"
+            or process.returncode == 0
+            or result.get("status") != "error"
+            or remote_task is not None
+            or not isinstance(result_task, dict)
+            or result_task.get("id") is not None
+            or not isinstance(error, dict)
+            or not isinstance(error.get("code"), str)
+            or not isinstance(error.get("message"), str)
+            or (
+                native and (
+                    type(member_index) is not int
+                    or member_index != bounded.get("member_index", 0)
+                )
+            )
+            or (not native and member_index is not None)
+        ):
+            raise WorkflowError("bounded conflict preflight result is invalid")
+        known = bool(task.get("task_id"))
+        task["status"] = "interrupted" if known else "failed"
+        task["task_id_status"] = "known" if known else "not_created"
+        task["error"] = error
+        bounded["inflight"] = False
+        save_state(state_path, state)
+        emit({
+            "result": "invocation_abandoned" if known else "task_creation_failed",
+            "state": str(state_path), "task_id": task.get("task_id"),
+            "task_id_status": task["task_id_status"], "error": error,
+            "audit_files": task["audit_files"], "stage_outcome": "escalated",
+        })
+        return
     task_id = remote_task.get("id") if isinstance(remote_task, dict) else None
     native = request["strategy"] == "native-stack"
     member_index = receipt.get("member_index") if native else None

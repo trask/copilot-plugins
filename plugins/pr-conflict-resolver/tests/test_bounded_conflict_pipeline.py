@@ -236,6 +236,58 @@ class BoundedPipelineTest(unittest.TestCase):
             MODULE.command_pipeline(self.args)
         self.assertEqual(1, self.calls["run"].call_count)
 
+    def test_preflight_rejection_preserves_error_without_task(self):
+        def rejected(command, **kwargs):
+            result_path = Path(command[command.index("--result-file") + 1])
+            receipt_path = result_path.with_name(result_path.name + ".bounded-receipt.json")
+            receipt_path.write_text(json.dumps({
+                "session": "session-1", "request_id": self.request["request_id"],
+                "request_sha256": self.request["request_sha256"],
+                "repository": self.request["repository"], "model": self.request["model"],
+                "strategy": self.request["strategy"], "status": "preflight", "task": None,
+            }), encoding="utf-8")
+            result_path.write_text(json.dumps(CLOUD.Result(
+                status="error",
+                error={"code": "stale_target", "message": "pull request target changed"},
+                model=self.request["model"], repository=self.request["repository"],
+                strategy=self.request["strategy"], request_id=self.request["request_id"],
+                request_sha256=self.request["request_sha256"],
+                pull_request=self.request["pull_request"],
+            ).as_dict()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 2, "", "")
+
+        helper = self.patch("run", side_effect=rejected)
+        self.assertEqual(1, MODULE.command_pipeline(self.args))
+        state = MODULE.load_state(self.path)
+        self.assertEqual("failed", state["agent_task"]["status"])
+        self.assertEqual("not_created", state["agent_task"]["task_id_status"])
+        self.assertEqual("stale_target", state["agent_task"]["error"]["code"])
+        self.assertFalse(state["bounded_pipeline"]["inflight"])
+        self.published.assert_not_called()
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.command_pipeline(self.args)
+        self.assertEqual(1, helper.call_count)
+
+    def test_missing_preflight_receipt_does_not_prove_no_dispatch(self):
+        def missing(command, **kwargs):
+            result_path = Path(command[command.index("--result-file") + 1])
+            result_path.write_text(json.dumps(CLOUD.Result(
+                status="error",
+                error={"code": "stale_target", "message": "pull request target changed"},
+                model=self.request["model"], repository=self.request["repository"],
+                strategy=self.request["strategy"], request_id=self.request["request_id"],
+                request_sha256=self.request["request_sha256"],
+                pull_request=self.request["pull_request"],
+            ).as_dict()), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 2, "", "")
+
+        self.patch("run", side_effect=missing)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "receipt is missing"):
+            MODULE.command_pipeline(self.args)
+        self.assertEqual(
+            "unknown", MODULE.load_state(self.path)["agent_task"]["task_id_status"]
+        )
+
     def test_failed_execution_root_is_not_adopted(self):
         self.assertEqual(0, MODULE.command_pipeline(self.args))
         state = MODULE.load_state(self.path)
@@ -318,6 +370,58 @@ class BoundedPipelineTest(unittest.TestCase):
 
 
 class BoundedBackendTest(unittest.TestCase):
+    def test_preflight_receipt_precedes_target_guard_and_prevents_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = CLOUD.LocalSnapshot(
+                root / "repo", root, "owner/repo", "origin",
+                "feature", "b" * 40, "", None,
+            )
+            snapshot.root.mkdir()
+            for strategy in ("merge", "native-stack"):
+                with self.subTest(strategy=strategy):
+                    request = existing.ManagedConflictCoordinatorTest().request()
+                    request["strategy"] = strategy
+                    options = CLOUD.Options(
+                        strategy, "gpt-5.6-sol", request["pull_request"]["url"],
+                        root / f"{strategy}-request.json",
+                        root / f"{strategy}-prompt.txt",
+                        root / f"{strategy}-result.json",
+                        request, "prompt", "dispatch", "session-1",
+                    )
+                    with (
+                        mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": "session-1"}),
+                        mock.patch.object(CLOUD, "local_snapshot", return_value=snapshot),
+                        mock.patch.object(
+                            CLOUD, "require_target_fresh",
+                            side_effect=CLOUD.ConflictError(
+                                "pull request target changed", "stale_target"
+                            ),
+                        ) as guard,
+                        mock.patch.object(CLOUD, "start_task") as post,
+                    ):
+                        with self.assertRaisesRegex(CLOUD.ConflictError, "target changed"):
+                            CLOUD.execute_bounded(
+                                options, cwd=snapshot.root, runner=subprocess.run,
+                                progress=CLOUD.Progress(), result=CLOUD.Result(),
+                            )
+                        receipt = json.loads(
+                            CLOUD.bounded_receipt_path(options).read_text(encoding="utf-8")
+                        )
+                        self.assertEqual("preflight", receipt["status"])
+                        self.assertIsNone(receipt["task"])
+                        if strategy == "native-stack":
+                            self.assertEqual(0, receipt["member_index"])
+                        with self.assertRaisesRegex(
+                            CLOUD.ConflictError, "dispatch already attempted"
+                        ):
+                            CLOUD.execute_bounded(
+                                options, cwd=snapshot.root, runner=subprocess.run,
+                                progress=CLOUD.Progress(), result=CLOUD.Result(),
+                            )
+                        guard.assert_called_once()
+                        post.assert_not_called()
+
     def test_target_guard_allows_forward_base_without_replacing_pinned_snapshot(self):
         request = existing.ManagedConflictCoordinatorTest().request()
         old_base = request["pull_request"]["base_sha"]
@@ -737,6 +841,58 @@ class BoundedNativeStackTest(unittest.TestCase):
             self.assertEqual("dispatching", receipt["status"])
             self.assertEqual(0, receipt["member_index"])
             post.assert_called_once()
+
+    def test_second_member_preflight_rejection_keeps_member_position(self):
+        fixture = stack_tests.SequentialStackTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        options = replace(
+            fixture.options, bounded_phase="dispatch", bounded_session="session-1",
+        )
+        first_result = fixture.directory / "result--member-6--result.json"
+        first_result.write_text("{}", encoding="utf-8")
+        CLOUD.stack_root_receipt(
+            options, 0, "completed", {"id": "task-1", "state": "completed"},
+        )
+        guard_calls = 0
+
+        def guard(*_args):
+            nonlocal guard_calls
+            guard_calls += 1
+            if guard_calls == 2:
+                raise CLOUD.ConflictError("pull request target changed", "stale_target")
+
+        with (
+            mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": "session-1"}),
+            mock.patch.object(CLOUD, "local_snapshot", return_value=fixture.snapshot),
+            mock.patch.object(CLOUD, "require_target_fresh", side_effect=guard),
+            mock.patch.object(CLOUD, "require_local_unchanged"),
+            mock.patch.object(CLOUD, "prove_native_stack_member_input"),
+            mock.patch.object(
+                CLOUD, "completed_stack_member",
+                return_value=(
+                    {"id": "task-1", "state": "completed"},
+                    {"branch": "copilot/lower-task", "task": {
+                        "url": "https://github.com/owner/repo/tasks/task-1",
+                        "base_sha": fixture.trunk,
+                    }},
+                    {"new_sha": fixture.new_lower},
+                ),
+            ),
+            mock.patch.object(CLOUD, "start_task") as post,
+        ):
+            with self.assertRaisesRegex(CLOUD.ConflictError, "target changed"):
+                CLOUD.execute_bounded(
+                    options, cwd=fixture.root, runner=subprocess.run,
+                    progress=CLOUD.Progress(), result=CLOUD.Result(),
+                )
+        receipt = json.loads(
+            CLOUD.bounded_receipt_path(options).read_text(encoding="utf-8")
+        )
+        self.assertEqual("preflight", receipt["status"])
+        self.assertEqual(1, receipt["member_index"])
+        self.assertIsNone(receipt["task"])
+        post.assert_not_called()
 
 
 class BoundedNativeControllerTest(unittest.TestCase):
