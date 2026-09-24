@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "393696e4887db57b2f542d8f214ab0f9652aab523deca9a58ee077fbd16ab624"
+COMMON_SHA256 = "f51856368d892f8aadac1ac4ae68cd7aeced1fe1948b87c176683c09ca4ce9cd"
 
 
 def load_common() -> Any:
@@ -625,16 +625,27 @@ def read_pull_request(target: dict[str, Any]) -> dict[str, Any]:
     return common.read_pull_request(target, api=gh_json, base_tip=base_ref_tip)
 
 
-def read_pr_commits(target: dict[str, Any]) -> list[dict[str, Any]]:
-    return common.read_pr_commits(target, api=gh_json)
+def read_pr_commits(
+    target: dict[str, Any], *, repo_root: Path, base_sha: str, head_sha: str,
+) -> list[dict[str, Any]]:
+    return common.read_pr_commits(
+        target, repo_root=repo_root, base_sha=base_sha, head_sha=head_sha
+    )
 
 
-def snapshot_pr_commits(target: dict[str, Any]) -> dict[str, Any]:
-    return common.snapshot_pr_commits(target, read=read_pr_commits)
+def snapshot_pr_commits(
+    target: dict[str, Any], *, repo_root: Path, base_sha: str, head_sha: str,
+) -> dict[str, Any]:
+    return common.snapshot_pr_commits(
+        target, repo_root=repo_root, base_sha=base_sha, head_sha=head_sha,
+        read=read_pr_commits,
+    )
 
 
 def fetch_pr_head(repo_root: Path, target: dict[str, Any]) -> dict[str, Any]:
-    return common.fetch_pr_head(repo_root, target, remote_for=target_remote)
+    return common.fetch_pr_head(
+        repo_root, target, remote_for=target_remote, read=read_pull_request
+    )
 
 
 def checkout_fetched_head(repo_root: Path, head_sha: str) -> dict[str, Any]:
@@ -1279,7 +1290,10 @@ def run_pipeline(
                     head_sha=current_head,
                     started_at=utc_now(),
                 )
-                commits_before = snapshot_pr_commits(target)
+                commits_before = snapshot_pr_commits(
+                    target, repo_root=repo_root, base_sha=pr["base_sha"],
+                    head_sha=current_head,
+                )
                 started_head = current_head
             if bounded:
                 pending_stage = {
@@ -1329,7 +1343,11 @@ def run_pipeline(
             )
             if settled["result"] == "ready":
                 report_checkout_recovery(settled)
-            commits_after = snapshot_pr_commits(target)
+            after_pr = read_pull_request(target)
+            commits_after = snapshot_pr_commits(
+                target, repo_root=repo_root, base_sha=after_pr["base_sha"],
+                head_sha=after_pr["head_sha"],
+            )
             published_commits, commit_tracking_errors, history_rewritten = commits_added(
                 commits_before, commits_after
             )

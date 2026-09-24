@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "393696e4887db57b2f542d8f214ab0f9652aab523deca9a58ee077fbd16ab624"
+COMMON_SHA256 = "f51856368d892f8aadac1ac4ae68cd7aeced1fe1948b87c176683c09ca4ce9cd"
 
 
 def load_common() -> Any:
@@ -662,6 +662,7 @@ STACK_QUERY = (
     "            position"
     "            pullRequest {"
     "              number title headRefName baseRefName headRefOid isDraft state"
+    "              headRepository { nameWithOwner }"
     "              baseRef { target { oid } }"
     "              mergeRequirements { conditions {"
     "                __typename result"
@@ -703,7 +704,9 @@ def merge_conflict_result(member: dict[str, Any]) -> str:
     return "FAILED" if result == "FAILED" else "UNKNOWN"
 
 
-def parse_stack(raw: Any) -> dict[str, Any] | None:
+def parse_stack(
+    raw: Any, *, branch_tip: Callable[[str, str], str],
+) -> dict[str, Any] | None:
     """Turn one GraphQL stack into an ordered member snapshot.
 
     Draft and non-draft members are kept, because a stack is reviewed and
@@ -739,6 +742,11 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
         head_branch = member.get("headRefName")
         base_branch = member.get("baseRefName")
         head_sha = member.get("headRefOid")
+        state = member.get("state")
+        head_repo = member.get("headRepository")
+        head_repository = (
+            head_repo.get("nameWithOwner") if isinstance(head_repo, dict) else None
+        )
         base_ref = member.get("baseRef")
         base_target = base_ref.get("target") if isinstance(base_ref, dict) else None
         if (
@@ -756,22 +764,38 @@ def parse_stack(raw: Any) -> dict[str, Any] | None:
             or not base_branch
             or not isinstance(head_sha, str)
             or not head_sha
+            or (
+                state == "OPEN"
+                and (
+                    not isinstance(head_repository, str)
+                    or not common.REPO_NAME_PATTERN.fullmatch(head_repository)
+                )
+            )
         ):
             raise WorkflowError(
                 f"native stack member {number!r} is missing a required field"
             )
+        branch_sha = (
+            branch_tip(head_repository, head_branch)
+            if state == "OPEN" else head_sha
+        )
         members.append(
             {
                 "position": position,
                 "number": number,
                 "title": title,
                 "head_branch": head_branch,
+                "head_repository": head_repository,
                 "base_branch": base_branch,
-                "head_sha": head_sha,
+                "head_sha": branch_sha,
+                "head_pointer_stale": head_sha != branch_sha,
                 "base_sha": base_target.get("oid") if isinstance(base_target, dict) else None,
-                "conflict_status": merge_conflict_result(member),
+                "conflict_status": (
+                    merge_conflict_result(member)
+                    if state == "OPEN" and head_sha == branch_sha else "UNKNOWN"
+                ),
                 "is_draft": bool(member.get("isDraft")),
-                "state": member.get("state"),
+                "state": state,
             }
         )
     members.sort(
@@ -830,7 +854,12 @@ def read_native_stack(
     pull = repository_payload.get("pullRequest")
     if not isinstance(pull, dict):
         raise WorkflowError("the stack query returned no pull request")
-    return parse_stack(pull.get("stack"))
+    return parse_stack(
+        pull.get("stack"),
+        branch_tip=lambda source, branch: common.head_ref_tip(
+            source, branch, api=api
+        ),
+    )
 
 
 def topology_fingerprint(stack: dict[str, Any]) -> str:
@@ -895,6 +924,9 @@ def selection_from_stack(
         "startPullRequest": target["number"],
         "pullRequests": selected,
         "topologyFingerprint": topology_fingerprint(stack),
+        "sourceRepositories": [
+            member.get("head_repository") for member in stack["members"]
+        ],
         "sourceSnapshot": source_snapshot,
         "sourceStack": source_stack,
     }
@@ -967,6 +999,15 @@ def validate_selection(
             "result": "stopped",
             "reason": "topology_changed",
             "detail": "the native stack topology changed after target discovery",
+        }
+    repositories = kickoff.get("sourceRepositories")
+    if isinstance(repositories, list) and repositories != [
+        member.get("head_repository") for member in stack["members"]
+    ]:
+        return {
+            "result": "stopped",
+            "reason": "source_repository_changed",
+            "detail": "a native stack member's head repository changed",
         }
     return {
         "result": "ready",
@@ -1126,7 +1167,11 @@ class WorkerLauncher:
                 "reason": "worktree_is_not_owned_by_this_run",
                 "detail": f"{path} already exists",
             }
-        target = common.target_for(self.repository, number)
+        target = {
+            **common.target_for(self.repository, number),
+            "head_branch": request["head_branch"],
+            "head_repository": request["head_repository"],
+        }
         fetched = common.fetch_pr_head(self.repo_root, target)
         if fetched["result"] != "ready":
             return {"result": "failed", **fetched}
@@ -2068,6 +2113,8 @@ class StackPipeline:
             "pass": pass_number,
             "nonce": self.nonces(),
             "head_sha": member["head_sha"],
+            "head_branch": member.get("head_branch"),
+            "head_repository": member.get("head_repository", self.repository),
             "base_sha": self.base_sha_for(member),
             "arguments": arguments,
             "prompt": worker_prompt(target, arguments, scope=scope),
@@ -3324,7 +3371,13 @@ class StackPipeline:
             or clearance.get("trunk") != {"ref": stack["trunk"], "sha": pull_requests[0]["base_sha"]}
             or any(
                 member.get("state") != "OPEN"
-                or member.get("conflict_status") != "PASSED"
+                or (
+                    member.get("conflict_status") != "PASSED"
+                    and not (
+                        member.get("head_pointer_stale") is True
+                        and member.get("conflict_status") == "UNKNOWN"
+                    )
+                )
                 or member.get("base_sha") != item["base_sha"]
                 for member, item in zip(validation["selected"], pull_requests)
             )

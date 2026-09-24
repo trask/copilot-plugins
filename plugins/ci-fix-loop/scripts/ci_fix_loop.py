@@ -183,7 +183,7 @@ PROPAGATION_CONTAINMENT_RETRY_DELAYS = (1, 2, 4)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a"
+    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -258,6 +258,7 @@ MODEL_ALIASES = {
 }
 ACTIVE_GITHUB_MUTATION_POLICY = "allow"
 ALLOW_DETACHED_CHECKOUT = False
+VERIFIED_DETACHED_SOURCE: tuple[Path, str] | None = None
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REPORT_PATH_PATTERN = re.compile(
@@ -436,6 +437,7 @@ STACK_QUERY = (
     "            position"
     "            pullRequest {"
     "              number title headRefName baseRefName headRefOid isDraft state"
+    "              headRepository { nameWithOwner }"
     "            }"
     "          }"
     "        }"
@@ -2765,7 +2767,7 @@ def resolve_ci_fix_target(value: str, repo_root: Path) -> dict[str, Any]:
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
         "number,title,body,url,state,isDraft,headRefName,headRefOid,headRepositoryOwner,"
-        "headRepository,baseRefName,commits"
+        "headRepository,baseRefName"
     )
     metadata = gh_json(
         [
@@ -2805,34 +2807,20 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         raise WorkflowError(
             "pull request head repository is unavailable; it may have been deleted"
         )
-    head_sha = metadata.get("headRefOid")
-    if not isinstance(head_sha, str) or not head_sha:
-        raise WorkflowError("resolved PR metadata has no head commit")
     title = metadata.get("title")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
     body = metadata.get("body")
     if not isinstance(body, str):
         body = ""
-    raw_commits = metadata.get("commits")
-    if not isinstance(raw_commits, list):
-        raise WorkflowError("resolved PR metadata has no commit list")
-    commits = []
-    for index, commit in enumerate(raw_commits):
-        if not isinstance(commit, dict):
-            raise WorkflowError(f"resolved PR commit {index} is not an object")
-        sha = commit.get("oid")
-        headline = commit.get("messageHeadline")
-        if not isinstance(sha, str) or not sha:
-            raise WorkflowError(f"resolved PR commit {index} has no OID")
-        if not isinstance(headline, str):
-            raise WorkflowError(f"resolved PR commit {index} has no message headline")
-        commits.append({"sha": sha, "message": headline.strip()})
     upstream_repo_name = f"{resolved['owner']}/{resolved['repo']}"
     head_repo_name = f"{head_owner['login']}/{head_repository['name']}"
     base_branch = metadata.get("baseRefName")
     if not isinstance(base_branch, str) or not base_branch:
         raise WorkflowError("resolved PR metadata has no base branch")
+    head_sha = remote_head(head_owner["login"], head_repository["name"], metadata.get("headRefName"))
+    if head_sha is None:
+        raise WorkflowError("pull request head branch no longer exists")
     base_sha = base_ref_tip(upstream_repo_name, base_branch)
     return {
         "number": target["number"],
@@ -2847,13 +2835,13 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "head_repo": head_repository["name"],
         "head_branch": metadata["headRefName"],
         "head_sha": head_sha,
+        "reported_head_sha": metadata.get("headRefOid"),
         "base_branch": base_branch,
         "base_sha": base_sha,
         "is_fork": head_repo_name.lower() != upstream_repo_name.lower(),
         "head_repository": head_repo_name,
         "cross_repository": head_repo_name.lower() != upstream_repo_name.lower(),
         "is_draft": bool(metadata.get("isDraft")),
-        "commits": commits,
     }
 
 
@@ -2879,6 +2867,7 @@ def parse_native_stack(raw: Any) -> dict[str, Any] | None:
         head_branch = member.get("headRefName")
         base_branch = member.get("baseRefName")
         head_sha = member.get("headRefOid")
+        head_repository = member.get("headRepository")
         state = member.get("state")
         if (
             not isinstance(number, int)
@@ -2895,6 +2884,18 @@ def parse_native_stack(raw: Any) -> dict[str, Any] | None:
             raise WorkflowError(
                 f"native stack member {number!r} is missing a required field"
             )
+        if state == "OPEN":
+            repo_name = (
+                head_repository.get("nameWithOwner")
+                if isinstance(head_repository, dict)
+                else None
+            )
+            if not isinstance(repo_name, str) or not re.fullmatch(r"[^/\s]+/[^/\s]+", repo_name):
+                raise WorkflowError(f"native stack member {number} has no head repository")
+            owner, repo = repo_name.split("/")
+            head_sha = remote_head(owner, repo, head_branch)
+            if head_sha is None:
+                raise WorkflowError(f"native stack member {number} head branch no longer exists")
         members.append(
             {
                 "position": node.get("position"),
@@ -3138,8 +3139,54 @@ def reconcile_equivalent_local_head(
 def checkout_pr(
     repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
 ) -> bool:
+    global VERIFIED_DETACHED_SOURCE
+    VERIFIED_DETACHED_SOURCE = None
+    dirty = git(repo_root, "status", "--porcelain=v1")
+    if dirty:
+        raise WorkflowError(f"worktree is not clean:\n{dirty}")
     current_branch = git(repo_root, "branch", "--show-current")
     on_pr_branch = current_branch == metadata["head_branch"]
+    if metadata.get("reported_head_sha") != metadata["head_sha"]:
+        branch = metadata["head_branch"]
+        if run(["git", "check-ref-format", f"refs/heads/{branch}"], check=False).returncode:
+            raise WorkflowError(f"invalid head branch {branch!r}")
+        remote = fetch_remote_for(repo_root, f"{metadata['head_owner']}/{metadata['head_repo']}")
+        run(
+            ["git", "-C", str(repo_root), "fetch", "--no-tags", remote,
+             f"+refs/heads/{branch}:refs/agent-ci-fix/head"]
+        )
+        fetched = git(repo_root, "rev-parse", "refs/agent-ci-fix/head").lower()
+        if fetched != metadata["head_sha"]:
+            raise WorkflowError("PR head branch moved while fetching the checkout")
+        if remote_head(
+            metadata["head_owner"], metadata["head_repo"], branch
+        ) != fetched:
+            raise WorkflowError("PR head branch moved while verifying the checkout")
+        local_head = git(repo_root, "rev-parse", "HEAD").lower()
+        if on_pr_branch and local_head not in (
+            fetched, metadata["reported_head_sha"]
+        ):
+            ancestor = run([
+                "git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+                local_head, fetched,
+            ], check=False)
+            if ancestor.returncode != 0:
+                raise WorkflowError(
+                    "local work is not contained in the actual PR head; "
+                    "reconcile it before continuing"
+                )
+        if local_head != fetched or (current_branch and not on_pr_branch):
+            git(repo_root, "checkout", "--detach", fetched)
+        branch_after = git(repo_root, "branch", "--show-current")
+        if git(repo_root, "rev-parse", "HEAD").lower() != fetched:
+            raise WorkflowError("checkout did not reach the actual PR head")
+        if remote_head(
+            metadata["head_owner"], metadata["head_repo"], branch
+        ) != fetched:
+            raise WorkflowError("PR head branch moved after checkout")
+        if not branch_after:
+            VERIFIED_DETACHED_SOURCE = (repo_root.resolve(), fetched)
+        return branch_after == branch
     command = ["gh", "pr", "checkout", target["pr_url"]]
     if not on_pr_branch:
         command.append("--detach")
@@ -3170,16 +3217,16 @@ def fetch_remote_for(repo_root: Path, repo_name: str) -> str:
 def fetch_authoritative_diff(
     repo_root: Path, pr: dict[str, Any]
 ) -> tuple[str, str]:
-    command = ["gh", "pr", "diff", pr["pr_url"], "--repo", pr["repo_name"]]
-    result = run(command, check=False)
-    if result.returncode == 0:
-        return result.stdout, "github"
-
-    detail = result.stderr.strip() or result.stdout.strip() or "no output"
-    if not DIFF_TOO_LARGE_PATTERN.search(detail):
-        raise WorkflowError(
-            f"{' '.join(command)} failed ({result.returncode}): {detail}"
-        )
+    if pr.get("reported_head_sha", pr["head_sha"]) == pr["head_sha"]:
+        command = ["gh", "pr", "diff", pr["pr_url"], "--repo", pr["repo_name"]]
+        result = run(command, check=False)
+        if result.returncode == 0:
+            return result.stdout, "github"
+        detail = result.stderr.strip() or result.stdout.strip() or "no output"
+        if not DIFF_TOO_LARGE_PATTERN.search(detail):
+            raise WorkflowError(
+                f"{' '.join(command)} failed ({result.returncode}): {detail}"
+            )
 
     base_sha = pr["base_sha"]
     if (
@@ -3644,6 +3691,9 @@ def fetch_workflow_runs(pr: dict[str, Any], head_sha: str) -> Any:
 
 
 def fetch_rollup(pr: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    actual_head = remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"])
+    if actual_head is None:
+        raise WorkflowError("pull request head branch no longer exists")
     payload = gh_json(
         [
             "pr",
@@ -3660,7 +3710,55 @@ def fetch_rollup(pr: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     head_sha = payload.get("headRefOid")
     if not isinstance(head_sha, str) or not head_sha:
         raise WorkflowError("status check rollup response has no head commit")
-    return head_sha, normalize_rollup(payload.get("statusCheckRollup"))
+    if head_sha.lower() == actual_head:
+        checks = normalize_rollup(payload.get("statusCheckRollup"))
+        confirmed = remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"])
+        return (confirmed, checks if confirmed == actual_head else [])
+    repository = pr["repo_name"]
+    nodes = []
+    check_pages = gh_json([
+        "api", "--paginate", "--slurp",
+        f"repos/{repository}/commits/{actual_head}/check-runs?per_page=100",
+    ])
+    status = gh_json([
+        "api", f"repos/{repository}/commits/{actual_head}/status?per_page=100",
+    ])
+    if not isinstance(check_pages, list) or not isinstance(status, dict):
+        raise WorkflowError("current head checks have an invalid response")
+    for page in check_pages:
+        if not isinstance(page, dict) or not isinstance(page.get("check_runs"), list):
+            raise WorkflowError("current head check runs are unavailable")
+        for check in page["check_runs"]:
+            nodes.append({
+                "__typename": "CheckRun",
+                "name": check.get("name"),
+                "status": check.get("status"),
+                "conclusion": check.get("conclusion"),
+                "detailsUrl": check.get("details_url"),
+                "startedAt": check.get("started_at"),
+                "completedAt": check.get("completed_at"),
+            })
+    statuses = status.get("statuses")
+    if not isinstance(statuses, list):
+        raise WorkflowError("current head statuses are unavailable")
+    for entry in statuses:
+        if not isinstance(entry, dict):
+            raise WorkflowError("current head statuses are invalid")
+        nodes.append({
+            "__typename": "StatusContext",
+            "context": entry.get("context"),
+            "state": entry.get("state"),
+            "targetUrl": entry.get("target_url"),
+            "createdAt": entry.get("created_at"),
+            "description": entry.get("description"),
+        })
+    if not nodes or len(statuses) >= 100:
+        nodes.append({
+            "__typename": "CheckRun", "name": "Current head checks unavailable",
+            "status": "QUEUED",
+        })
+    confirmed = remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"])
+    return (confirmed, normalize_rollup(nodes) if confirmed == actual_head else [])
 
 
 def rerun_evidence_is_stale(
@@ -4544,7 +4642,20 @@ def command_preflight(args: argparse.Namespace) -> None:
             "PR head changed while the authoritative diff was fetched: expected "
             f"{metadata['head_sha']}, got {refreshed['head_sha']}"
         )
-    pr_commits = commit_provenance(repo_root, metadata["commits"])
+    merge_base = git(repo_root, "merge-base", metadata["base_sha"], metadata["head_sha"])
+    commit_shas = git(
+        repo_root, "rev-list", "--reverse", f"{merge_base}..{metadata['head_sha']}"
+    ).splitlines()
+    pr_commits = commit_provenance(
+        repo_root,
+        [
+            {
+                "sha": sha,
+                "message": git(repo_root, "show", "-s", "--format=%s", sha),
+            }
+            for sha in commit_shas
+        ],
+    )
 
     if state is None:
         state = {
@@ -5400,15 +5511,26 @@ def find_push_remote(repo_root: Path, owner: str, repo: str) -> str:
 
 
 def remote_head(owner: str, repo: str, branch: str) -> str | None:
+    if (not isinstance(branch, str) or not branch
+            or run(["git", "check-ref-format", f"refs/heads/{branch}"], check=False).returncode):
+        raise WorkflowError(f"invalid head branch {branch!r}")
     process = run(
-        ["gh", "api", f"repos/{owner}/{repo}/git/ref/heads/{branch}"], check=False
+        ["gh", "api", f"repos/{owner}/{repo}/git/ref/heads/"
+         f"{urllib.parse.quote(branch, safe='')}"], check=False
     )
     if process.returncode == 1 and "HTTP 404" in process.stderr:
         return None
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip()
         raise WorkflowError(f"failed to read remote ref: {detail}")
-    return json.loads(process.stdout)["object"]["sha"]
+    payload = json.loads(process.stdout)
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if (not isinstance(payload, dict)
+            or payload.get("ref") != f"refs/heads/{branch}"
+            or not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha.lower())):
+        raise WorkflowError("GitHub returned an invalid head branch identity")
+    return sha.lower()
 
 
 def wait_for_remote_head(
@@ -6038,14 +6160,18 @@ def command_publish(args: argparse.Namespace) -> None:
 
 def local_identity(repo_root: Path) -> dict[str, str]:
     branch = git(repo_root, "branch", "--show-current")
-    if not branch and not ALLOW_DETACHED_CHECKOUT:
+    head = git(repo_root, "rev-parse", "HEAD").lower()
+    if not branch and not (
+        ALLOW_DETACHED_CHECKOUT
+        or VERIFIED_DETACHED_SOURCE == (repo_root.resolve(), head)
+    ):
         raise WorkflowError(
             "the pull request checkout is detached; check out its head branch before "
             "starting CI Fix Loop"
         )
     return {
         "branch": branch,
-        "head": git(repo_root, "rev-parse", "HEAD").lower(),
+        "head": head,
         "status": git(repo_root, "status", "--porcelain=v1"),
     }
 
@@ -6898,7 +7024,11 @@ def agent_task_preflight(
             f"HEAD mismatch: local {identity['head']}, PR head {pr['head_sha']}"
         )
     if identity["branch"] != pr["head_branch"] and not (
-        ALLOW_DETACHED_CHECKOUT and not identity["branch"]
+        not identity["branch"]
+        and (
+            ALLOW_DETACHED_CHECKOUT
+            or VERIFIED_DETACHED_SOURCE == (repo_root.resolve(), identity["head"])
+        )
     ):
         raise WorkflowError(
             f"branch mismatch: local {identity['branch']!r}, "
@@ -6908,6 +7038,8 @@ def agent_task_preflight(
         record_coordinator_identity(state_path, repo_root, pr, identity)
     require_fork_head(pr)
     find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
+    if remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"]) != pr["head_sha"]:
+        raise WorkflowError("pull request head branch moved during CI preflight")
     repository = gh_json(["api", f"repos/{pr['repo_name']}"])
     viewer = gh_json(["api", "user"])
     permissions = repository.get("permissions") if isinstance(repository, dict) else None

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Callable
+from urllib.parse import quote
 
 
 DEFAULT_STAGE_MODEL = "gpt-6-sol"
@@ -785,11 +786,30 @@ def base_ref_tip(
     return sha
 
 
+def head_ref_tip(
+    repo_name: str,
+    head_branch: str,
+    *,
+    api: Callable[[list[str]], Any] = gh_json,
+) -> str:
+    payload = api([
+        "api", f"repos/{repo_name}/git/ref/heads/{quote(head_branch, safe='')}"
+    ])
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        raise WorkflowError(
+            f"the tip of head branch {head_branch!r} in {repo_name} has no commit SHA"
+        )
+    return sha.lower()
+
+
 def read_pull_request(
     target: dict[str, Any],
     *,
     api: Callable[[list[str]], Any] = gh_json,
     base_tip: Callable[..., str] = base_ref_tip,
+    head_tip: Callable[..., str] | None = None,
 ) -> dict[str, Any]:
     payload = api(
         [
@@ -799,8 +819,8 @@ def read_pull_request(
             "--repo",
             target["repo_name"],
             "--json",
-            "number,title,url,state,isDraft,headRefName,baseRefName,headRefOid"
-            + (",headRepository,headRepositoryOwner" if _EXECUTION is not None else ""),
+            "number,title,url,state,isDraft,headRefName,baseRefName,headRefOid,"
+            "headRepository,headRepositoryOwner",
         ]
     )
     if not isinstance(payload, dict):
@@ -808,6 +828,14 @@ def read_pull_request(
     base_branch = payload.get("baseRefName")
     if not isinstance(base_branch, str) or not base_branch:
         raise WorkflowError(f"{target['pr_url']} has no base branch")
+    head_branch = payload.get("headRefName")
+    head_repository = payload.get("headRepository")
+    head_owner = payload.get("headRepositoryOwner")
+    name = head_repository.get("name") if isinstance(head_repository, dict) else None
+    login = head_owner.get("login") if isinstance(head_owner, dict) else None
+    if not all(isinstance(value, str) and value for value in (head_branch, name, login)):
+        raise WorkflowError(f"{target['pr_url']} has no accessible head branch repository")
+    source_repository = f"{login}/{name}"
     return {
         "number": payload.get("number"),
         "title": payload.get("title"),
@@ -817,13 +845,11 @@ def read_pull_request(
         "repo": target["repo"],
         "state": payload.get("state"),
         "is_draft": bool(payload.get("isDraft")),
-        "head_branch": payload.get("headRefName"),
+        "head_branch": head_branch,
+        "head_repository": source_repository,
         "base_branch": base_branch,
         "base_sha": base_tip(target["repo_name"], base_branch),
-        "head_sha": payload.get("headRefOid"),
-        **({"head_repository": (
-            payload["headRepositoryOwner"]["login"] + "/" + payload["headRepository"]["name"]
-        )} if _EXECUTION is not None else {}),
+        "head_sha": (head_tip or head_ref_tip)(source_repository, head_branch, api=api),
     }
 
 
@@ -834,46 +860,44 @@ def commit_url(target: dict[str, Any], sha: str) -> str:
 def read_pr_commits(
     target: dict[str, Any],
     *,
-    api: Callable[[list[str]], Any] = gh_json,
+    repo_root: Path,
+    base_sha: str,
+    head_sha: str,
 ) -> list[dict[str, Any]]:
-    payload = api(
-        [
-            "pr",
-            "view",
-            str(target["number"]),
-            "--repo",
-            target["repo_name"],
-            "--json",
-            "commits",
-        ]
-    )
-    commits = payload.get("commits") if isinstance(payload, dict) else None
-    if not isinstance(commits, list):
-        raise WorkflowError(f"could not read commits for {target['pr_url']}")
-    result = []
-    for commit in commits:
-        if not isinstance(commit, dict):
-            continue
-        sha = commit.get("oid")
-        if not isinstance(sha, str) or not sha:
-            continue
-        result.append(
-            {
-                "sha": sha,
-                "title": commit.get("messageHeadline") or sha,
-                "url": commit_url(target, sha),
-            }
+    if not all(
+        re.fullmatch(r"[0-9a-fA-F]{40}", sha) for sha in (base_sha, head_sha)
+    ):
+        raise WorkflowError(f"could not read commits for {target['pr_url']}: invalid revision")
+    if not git_succeeds(repo_root, "cat-file", "-e", f"{base_sha}^{{commit}}"):
+        fetched = run(
+            ["git", "-C", str(repo_root), "fetch", "--quiet",
+             target_remote(repo_root, target), base_sha],
+            check=False,
         )
-    return result
+        if fetched.returncode != 0:
+            raise WorkflowError(f"could not fetch base commit {base_sha} for {target['pr_url']}")
+    if not git_succeeds(repo_root, "cat-file", "-e", f"{head_sha}^{{commit}}"):
+        raise WorkflowError(f"could not read source commit {head_sha} for {target['pr_url']}")
+    return [
+        {**commit, "url": commit_url(target, commit["sha"])}
+        for commit in local_commits_between(
+            repo_root, base_sha, head_sha, first_parent=False, strict=True
+        )
+    ]
 
 
 def snapshot_pr_commits(
     target: dict[str, Any],
     *,
+    repo_root: Path,
+    base_sha: str,
+    head_sha: str,
     read: Callable[..., list[dict[str, Any]]] = read_pr_commits,
 ) -> dict[str, Any]:
     try:
-        return {"commits": read(target)}
+        return {"commits": read(
+            target, repo_root=repo_root, base_sha=base_sha, head_sha=head_sha
+        )}
     except WorkflowError as error:
         return {"commits": [], "error": str(error)}
 
@@ -906,21 +930,28 @@ def commits_added(
 
 
 def local_commits_between(
-    repo_root: Path, base_sha: str | None, head_sha: str | None
+    repo_root: Path, base_sha: str | None, head_sha: str | None,
+    *, first_parent: bool = True, strict: bool = False,
 ) -> list[dict[str, str]]:
     if not base_sha or not head_sha or base_sha == head_sha:
         return []
     if not git_succeeds(repo_root, "merge-base", "--is-ancestor", base_sha, head_sha):
-        base_sha = git_or_none(repo_root, "merge-base", base_sha, head_sha)
+        base_sha = (
+            git(repo_root, "merge-base", base_sha, head_sha)
+            if strict else git_or_none(repo_root, "merge-base", base_sha, head_sha)
+        )
         if not base_sha:
             return []
-    output = git_or_none(
-        repo_root,
+    arguments = (
         "log",
         "--reverse",
-        "--first-parent",
+        *(["--first-parent"] if first_parent else []),
         "--format=%H%x09%s",
         f"{base_sha}..{head_sha}",
+    )
+    output = (git if strict else git_or_none)(
+        repo_root,
+        *arguments,
     )
     commits = []
     for line in (output or "").splitlines():
@@ -951,9 +982,16 @@ def fetch_pr_head(
     target: dict[str, Any],
     *,
     remote_for: Callable[[Path, dict[str, Any]], str] = target_remote,
+    read: Callable[..., dict[str, Any]] = read_pull_request,
+    head_tip: Callable[..., str] | None = None,
 ) -> dict[str, Any]:
-    remote = remote_for(repo_root, target)
-    reference = f"refs/pull/{target['number']}/head"
+    source = target
+    if not target.get("head_repository") or not target.get("head_branch"):
+        source = read(target)
+    head_repository = source["head_repository"]
+    head_branch = source["head_branch"]
+    remote = remote_for(repo_root, {**target, "repo_name": head_repository})
+    reference = f"refs/heads/{head_branch}"
     result = run(
         ["git", "-C", str(repo_root), "fetch", "--quiet", remote, reference],
         check=False,
@@ -971,6 +1009,13 @@ def fetch_pr_head(
             "result": "blocked",
             "reason": "checkout_failed",
             "detail": f"fetching {reference} did not produce FETCH_HEAD",
+        }
+    expected = (head_tip or head_ref_tip)(head_repository, head_branch)
+    if landed != expected:
+        return {
+            "result": "blocked",
+            "reason": "source_head_moved",
+            "detail": f"head branch {reference} moved while fetching: {landed} != {expected}",
         }
     return {"result": "ready", "head_sha": landed}
 

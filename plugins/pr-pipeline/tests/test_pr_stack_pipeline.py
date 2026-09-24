@@ -495,6 +495,19 @@ class TopologyTest(unittest.TestCase):
             MODULE.topology_fingerprint(moved),
         )
 
+    def test_a_changed_head_repository_blocks_the_selection(self):
+        original = stack()
+        moved = copy.deepcopy(original)
+        original["members"][0]["head_repository"] = "owner/repo"
+        moved["members"][0]["head_repository"] = "fork/repo"
+        selection = MODULE.selection_from_stack(
+            COMMON.target_for("owner/repo", 11), original,
+        )
+        self.assertEqual(
+            "source_repository_changed",
+            MODULE.validate_selection(selection, moved)["reason"],
+        )
+
     def test_frozen_selection_rejects_topology_drift(self):
         live = stack()
         selected = MODULE.selection_from_stack(
@@ -528,6 +541,7 @@ class TopologyTest(unittest.TestCase):
                                             "headRefName": "branch-11",
                                             "baseRefName": "main",
                                             "headRefOid": head_of(11),
+                                            "headRepository": {"nameWithOwner": "owner/repo"},
                                             "baseRefOid": "a" * 40,
                                             "baseRef": {"target": {"oid": BASE}},
                                             "mergeable": "MERGEABLE",
@@ -553,23 +567,50 @@ class TopologyTest(unittest.TestCase):
                 }
             }
         }
+        tips = {11: head_of(11), 12: head_of(12)}
+        def api(arguments):
+            if arguments[:2] == ["api", "graphql"]:
+                return payload
+            if arguments[0] == "api":
+                branch = arguments[1].split("/heads/", 1)[1]
+                number = int(branch.removeprefix("branch-"))
+                return {"object": {"sha": tips[number]}}
+            self.fail(f"unexpected request: {arguments}")
+
         live = MODULE.read_native_stack(
-            "owner/repo", 11, api=lambda arguments: payload
+            "owner/repo", 11, api=api
         )
         self.assertEqual(77, live["number"])
         self.assertEqual([11], [member["number"] for member in live["members"]])
         self.assertEqual(BASE, live["members"][0]["base_sha"])
         self.assertEqual("FAILED", live["members"][0]["conflict_status"])
+        self.assertEqual("owner/repo", live["members"][0]["head_repository"])
+        self.assertIn("headRepository { nameWithOwner }", MODULE.STACK_QUERY)
+        pull = payload["data"]["repository"]["pullRequest"]["stack"]["entries"]["nodes"][0]["pullRequest"]
+        pull["headRefOid"] = "7" * 40
+        stale = MODULE.read_native_stack("owner/repo", 11, api=api)["members"][0]
+        self.assertEqual(head_of(11), stale["head_sha"])
+        self.assertEqual("UNKNOWN", stale["conflict_status"])
+        self.assertTrue(stale["head_pointer_stale"])
+        tips[11] = "6" * 40
+        advanced = MODULE.read_native_stack("owner/repo", 11, api=api)
+        self.assertEqual("6" * 40, advanced["members"][0]["head_sha"])
+        selected = MODULE.selection_from_stack(COMMON.target_for("owner/repo", 11), live)
+        self.assertNotEqual(
+            selected["sourceSnapshot"], MODULE.stack_source_identity(advanced)[1]
+        )
+        self.assertEqual("ready", MODULE.validate_selection(selected, advanced)["result"])
+        tips[11] = head_of(11)
+        pull["headRefOid"] = head_of(11)
         self.assertIn("baseRef { target { oid } }", MODULE.STACK_QUERY)
         self.assertIn("PullRequestMergeConflictStateCondition { conflicts }", MODULE.STACK_QUERY)
         self.assertNotIn("headRefOid mergeable", MODULE.STACK_QUERY)
 
-        pull = payload["data"]["repository"]["pullRequest"]["stack"]["entries"]["nodes"][0]["pullRequest"]
         pull["mergeable"] = "CONFLICTING"
         pull["mergeRequirements"]["conditions"][0].update(result="PASSED", conflicts=[])
         pull["mergeRequirements"]["conditions"][1]["result"] = "FAILED"
         self.assertEqual("PASSED", MODULE.read_native_stack(
-            "owner/repo", 11, api=lambda arguments: payload,
+            "owner/repo", 11, api=api,
         )["members"][0]["conflict_status"])
         for conditions in (
             [], [{"__typename": "PullRequestMergeConflictStateCondition", "result": "UNKNOWN"}],
@@ -580,18 +621,18 @@ class TopologyTest(unittest.TestCase):
             with self.subTest(conditions=conditions):
                 pull["mergeRequirements"]["conditions"] = conditions
                 self.assertEqual("UNKNOWN", MODULE.read_native_stack(
-                    "owner/repo", 11, api=lambda arguments: payload,
+                    "owner/repo", 11, api=api,
                 )["members"][0]["conflict_status"])
         pull.pop("mergeRequirements")
         self.assertEqual("UNKNOWN", MODULE.read_native_stack(
-            "owner/repo", 11, api=lambda arguments: payload,
+            "owner/repo", 11, api=api,
         )["members"][0]["conflict_status"])
 
         native = payload["data"]["repository"]["pullRequest"]["stack"]
         nodes = native["entries"]["nodes"]
         nodes[0]["position"] = 1
         self.assertEqual([11], [member["number"] for member in MODULE.read_native_stack(
-            "owner/repo", 11, api=lambda arguments: payload,
+            "owner/repo", 11, api=api,
         )["members"]])
         next_node = copy.deepcopy(nodes[0])
         next_node["position"] = 2
@@ -602,13 +643,50 @@ class TopologyTest(unittest.TestCase):
         native["size"] = 2
         nodes.append(next_node)
         self.assertEqual([11, 12], [member["number"] for member in MODULE.read_native_stack(
-            "owner/repo", 11, api=lambda arguments: payload,
+            "owner/repo", 11, api=api,
         )["members"]])
         nodes[1]["position"] = 3
         with self.assertRaisesRegex(MODULE.WorkflowError, "positions are malformed"):
             MODULE.read_native_stack(
-                "owner/repo", 11, api=lambda arguments: payload
+                "owner/repo", 11, api=api
             )
+
+    def test_merged_prefix_does_not_look_up_a_deleted_head_branch(self):
+        historical = "7" * 40
+        def member(number, state, base_branch, repository):
+            return {
+                "number": number, "title": f"Pull request {number}",
+                "headRefName": f"branch-{number}", "baseRefName": base_branch,
+                "headRefOid": historical if state == "MERGED" else head_of(number),
+                "headRepository": repository, "state": state, "isDraft": False,
+            }
+        payload = {"data": {"repository": {"pullRequest": {"stack": {
+            "id": "S_1", "number": 77, "size": 2, "baseRefName": "main",
+            "entries": {"nodes": [
+                {"position": 0, "pullRequest": member(11, "MERGED", "main", None)},
+                {"position": 1, "pullRequest": member(
+                    12, "OPEN", "branch-11", {"nameWithOwner": "owner/repo"}
+                )},
+            ]},
+        }}}}}
+        requested = []
+        def api(arguments):
+            if arguments[:2] == ["api", "graphql"]:
+                return payload
+            requested.append(arguments[1])
+            self.assertEqual("repos/owner/repo/git/ref/heads/branch-12", arguments[1])
+            return {"object": {"sha": head_of(12)}}
+
+        live = MODULE.read_native_stack("owner/repo", 12, api=api)
+        self.assertEqual(historical, live["members"][0]["head_sha"])
+        self.assertEqual("UNKNOWN", live["members"][0]["conflict_status"])
+        self.assertEqual(head_of(12), live["members"][1]["head_sha"])
+        self.assertEqual(
+            [12], MODULE.selection_from_stack(
+                COMMON.target_for("owner/repo", 12), live
+            )["pullRequests"],
+        )
+        self.assertEqual(["repos/owner/repo/git/ref/heads/branch-12"], requested)
 
     def test_conflict_condition_requires_complete_consistent_paths(self):
         for result, conflicts, expected in (

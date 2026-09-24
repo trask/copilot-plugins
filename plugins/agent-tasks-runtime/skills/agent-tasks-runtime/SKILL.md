@@ -91,7 +91,7 @@ All repository analysis, edits, tests and internal corrections stay hosted. Loca
 
 ## Source binding and fresh execution
 
-Ordinary code-candidate consumers require an open PR and current source identity. A detached checkout is allowed only when HEAD already equals the frozen PR head; it is never realigned. Named branch, HEAD, clean-worktree and operation guards otherwise remain in force. Live source drift after task completion rejects acceptance while preserving the completed task identity as evidence.
+Ordinary consumers read an open PR's head from `refs/heads/<headRefName>` in the head repository, even when the PR record or `refs/pull/<number>/head` has not caught up. They fetch the code from that branch and reject a fetch or final observation that finds a different tip. A detached code-candidate checkout is allowed only when HEAD already equals the captured branch tip; it is never realigned. Named branch, HEAD, clean-worktree and operation guards otherwise remain in force. Live source drift after task completion rejects acceptance while preserving the completed task identity as evidence. Historical merged-PR snapshots continue to use their immutable recorded head.
 
 Historical Audit explicitly supplies `--allow-merged-pr` with its trusted immutable merged-PR snapshot. This code-candidate exception requires `trask-pr-audit-<number>` at that exact historical head and dispatches from the immutable SHA. Worker output cannot enable it. It does not relax ordinary open-PR guards or permit report-recommendation consumers to use merged sources.
 

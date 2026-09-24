@@ -196,7 +196,7 @@ class LiveConflictBaseAdvanceTest(unittest.TestCase):
             mock.patch.object(MODULE, "parse_target", side_effect=lambda url: url),
             mock.patch.object(
                 MODULE, "metadata_for",
-                side_effect=lambda url: current if url.endswith("/7") else dependent,
+                side_effect=lambda url, **kwargs: current if url.endswith("/7") else dependent,
             ),
             mock.patch.object(
                 MODULE, "repository_merge_methods", return_value={
@@ -1103,7 +1103,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "de8bee0a495224568be535fe2be8b1ed704a200a3cac806e00214a82c5b4ebb3",
+            "acabf7430c0da236ed0da75e67069c39266298c89b4410097ee154a25c3258cb",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -1915,7 +1915,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             mock.patch.object(
                 MODULE.PreflightRefStore,
                 "fetch",
-                side_effect=lambda _source, _role, expected=None: (
+                side_effect=lambda _source, _role, expected=None, remote=None: (
                     expected or metadata["base_sha"]
                 ),
             ),
@@ -1986,7 +1986,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             mock.patch.object(
                 MODULE.PreflightRefStore,
                 "fetch",
-                side_effect=lambda _source, _role, expected=None: (
+                side_effect=lambda _source, _role, expected=None, remote=None: (
                     expected or "base1"
                 ),
             ),
@@ -2046,7 +2046,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             mock.patch.object(
                 MODULE.PreflightRefStore,
                 "fetch",
-                side_effect=lambda _source, _role, expected=None: (
+                side_effect=lambda _source, _role, expected=None, remote=None: (
                     expected or "base1"
                 ),
             ),
@@ -2757,6 +2757,11 @@ def gh_conflict(result="FAILED", *, head="head1", base="main", paths=None):
 
 
 class PullRequestMetadataTest(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(MODULE, "remote_head", return_value="head1")
+        self.remote_head = patch.start()
+        self.addCleanup(patch.stop)
+
     def metadata(self, *, base_tip="live-tip", conflict=None, **overrides):
         target = MODULE.parse_target("owner/repo#7")
         with mock.patch.object(
@@ -2795,6 +2800,42 @@ class PullRequestMetadataTest(unittest.TestCase):
             metadata = MODULE.metadata_for(target)
         self.assertEqual("live-tip", metadata["base_sha"])
         tip.assert_called_once_with("owner/repo", "main")
+
+    def test_stale_pr_tracking_uses_source_branch_history_and_conflicts(self):
+        self.remote_head.return_value = "new-head"
+        code = {
+            "commits": [{"sha": "new-head", "message": "Restacked change"}],
+            "mergeable": "MERGEABLE",
+            "conflict_paths": [],
+            "merge_state_status": None,
+        }
+        with mock.patch.object(MODULE, "branch_code_snapshot", return_value=code) as snapshot:
+            metadata = self.metadata(commits=None, conflict={"data": None})
+        self.assertEqual("new-head", metadata["head_sha"])
+        self.assertEqual(code["commits"], metadata["commits"])
+        self.assertEqual("MERGEABLE", metadata["mergeable"])
+        self.assertEqual([], metadata["conflict_paths"])
+        snapshot.assert_called_once_with(
+            "owner/repo", "fork/repo", "live-tip", "new-head", repo_root=None
+        )
+        self.assertEqual(
+            [mock.call("fork", "repo", "feature")] * 2, self.remote_head.call_args_list
+        )
+
+    def test_actual_branch_movement_during_derivation_is_rejected(self):
+        self.remote_head.side_effect = ["new-head", "another-head"]
+        with mock.patch.object(MODULE, "branch_code_snapshot", return_value={}):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "moved while deriving"):
+                self.metadata()
+
+    def test_actual_base_movement_during_derivation_is_rejected(self):
+        self.remote_head.return_value = "new-head"
+        with mock.patch.object(MODULE, "branch_code_snapshot", return_value={}), \
+                mock.patch.object(MODULE, "gh_json", return_value=gh_metadata()), \
+                mock.patch.object(MODULE, "graphql", return_value=gh_conflict()), \
+                mock.patch.object(MODULE, "base_ref_tip", side_effect=["base1", "base2"]):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "moved while deriving"):
+                MODULE.metadata_for(MODULE.parse_target("owner/repo#7"))
 
     def test_rejects_a_non_object_response(self):
         target = MODULE.parse_target("owner/repo#7")
@@ -3293,7 +3334,7 @@ class StrategyChoiceTest(unittest.TestCase):
             mock.patch.object(
                 MODULE.PreflightRefStore,
                 "fetch",
-                side_effect=lambda _source, _role, expected=None: (
+                side_effect=lambda _source, _role, expected=None, remote=None: (
                     expected or metadata["base_sha"]
                 ),
             ),
@@ -3400,7 +3441,7 @@ class StrategyChoiceTest(unittest.TestCase):
                 return "0" * 40
             raise AssertionError(arguments)
 
-        def fetch_snapshot(source, _role, expected=None):
+        def fetch_snapshot(source, _role, expected=None, remote=None):
             if expected is not None:
                 return expected
             branch = source.removeprefix("refs/heads/")
@@ -3653,7 +3694,7 @@ class NativeStackPreflightSnapshotIntegrationTest(unittest.TestCase):
             "push",
             "-q",
             "origin",
-            "child:refs/pull/7/head",
+            "child:refs/heads/child",
         )
 
         self.git(self.seed, "checkout", "-q", "main")
@@ -3677,6 +3718,47 @@ class NativeStackPreflightSnapshotIntegrationTest(unittest.TestCase):
                 f"{result.stderr}"
             )
         return result.stdout.strip()
+
+    def test_branch_snapshot_derives_commits_and_mergeability_from_git(self):
+        before = self.git(self.seed, "status", "--porcelain")
+        snapshot = MODULE.branch_code_snapshot(
+            "owner/repo", "fork/repo", self.snapshot, self.child, repo_root=self.seed
+        )
+        self.assertEqual([{"sha": self.child, "message": "child"}], snapshot["commits"])
+        self.assertEqual("MERGEABLE", snapshot["mergeable"])
+        self.assertEqual([], snapshot["conflict_paths"])
+        self.assertEqual(before, self.git(self.seed, "status", "--porcelain"))
+        self.assertEqual(self.snapshot, self.git(self.seed, "rev-parse", "HEAD"))
+
+    def test_stale_pr_metadata_does_not_block_actual_branch(self):
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=gh_metadata(headRefOid=self.base)
+        ), mock.patch.object(
+            MODULE, "remote_head", return_value=self.child
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value=self.snapshot
+        ), mock.patch.object(MODULE, "graphql", return_value=gh_conflict()):
+            metadata = MODULE.live_mergeability(
+                MODULE.parse_target("owner/repo#7"), repo_root=self.seed, delays=()
+            )
+        self.assertEqual(self.child, metadata["head_sha"])
+        self.assertEqual([{"sha": self.child, "message": "child"}], metadata["commits"])
+        self.assertEqual("MERGEABLE", metadata["mergeable"])
+        self.assertEqual([], metadata["conflict_paths"])
+
+    def test_branch_snapshot_detects_actual_conflicts_without_checkout(self):
+        self.git(self.seed, "checkout", "-q", "child")
+        (self.seed / "base.txt").write_text("child edit\n", encoding="utf-8")
+        self.git(self.seed, "commit", "-q", "-am", "conflicting edit")
+        head = self.git(self.seed, "rev-parse", "HEAD")
+        snapshot = MODULE.branch_code_snapshot(
+            "owner/repo", "fork/repo", self.snapshot, head, repo_root=self.seed
+        )
+        self.assertEqual("CONFLICTING", snapshot["mergeable"])
+        self.assertEqual(["base.txt"], snapshot["conflict_paths"])
+        self.assertEqual([self.child, head], [commit["sha"] for commit in snapshot["commits"]])
+        self.assertEqual(head, self.git(self.seed, "rev-parse", "HEAD"))
+        self.assertEqual("", self.git(self.seed, "status", "--porcelain"))
 
     def test_missing_direct_base_is_fetched_into_an_isolated_cleaned_ref(self):
         self.assertNotEqual(
@@ -3731,10 +3813,13 @@ class NativeStackPreflightSnapshotIntegrationTest(unittest.TestCase):
         advanced = self.git(self.seed, "rev-parse", "HEAD")
         self.git(self.seed, "push", "-q", "origin", "main")
         request = {
+            "repository": "owner/repo",
             "strategy": "native-stack",
             "request_id": "request-moving-main",
             "pull_request": {
                 "number": 7,
+                "head_ref": "child",
+                "head_repository": "owner/repo",
                 "head_sha": self.child,
                 "base_ref": "main",
                 "base_sha": self.snapshot,
@@ -3743,6 +3828,7 @@ class NativeStackPreflightSnapshotIntegrationTest(unittest.TestCase):
                 "trunk": {"ref": "main", "sha": self.snapshot},
                 "members": [{
                     "pr_number": 7,
+                    "head_ref": "child",
                     "head_sha": self.child,
                     "direct_base_ref": "main",
                     "direct_base_sha": self.snapshot,
@@ -6290,44 +6376,83 @@ class FetchReferenceTest(unittest.TestCase):
                 MODULE.fetch_reference(Path("."), "origin", "main", "base1")
 
 
+class HostedBranchIdentityTest(unittest.TestCase):
+    def test_resolves_fork_branch_instead_of_stale_pr_commit(self):
+        metadata = gh_metadata(headRefOid="a" * 40, headRefName="topic/restacked")
+        metadata["headRepository"] = {"nameWithOwner": "fork/repo"}
+        with mock.patch.object(
+            CLOUD_MODULE,
+            "checked",
+            side_effect=[
+                json.dumps(metadata),
+                json.dumps({"object": {"sha": "b" * 40}}),
+                json.dumps({"object": {"sha": "c" * 40}}),
+            ],
+        ) as checked:
+            live = CLOUD_MODULE.resolve_pr(mock.Mock(), Path("."), "owner/repo", 7)
+        self.assertEqual("c" * 40, live.head_sha)
+        self.assertEqual(
+            ["gh", "api", "repos/fork/repo/git/ref/heads/topic%2Frestacked"],
+            checked.call_args.args[1],
+        )
+
+    def test_missing_actual_branch_commit_does_not_fall_back_to_pr_record(self):
+        metadata = gh_metadata(headRefOid="a" * 40)
+        metadata["headRepository"] = {"nameWithOwner": "fork/repo"}
+        with mock.patch.object(
+            CLOUD_MODULE,
+            "checked",
+            side_effect=[
+                json.dumps(metadata),
+                json.dumps({"object": {"sha": "b" * 40}}),
+                json.dumps({"object": {}}),
+            ],
+        ):
+            with self.assertRaises(CLOUD_MODULE.ConflictError):
+                CLOUD_MODULE.resolve_pr(mock.Mock(), Path("."), "owner/repo", 7)
+
+
 class CheckoutTest(unittest.TestCase):
+    def setUp(self):
+        for name in ("require_clean_worktree", "require_no_integration_in_progress", "fetch_preflight_ref"):
+            patch = mock.patch.object(MODULE, name)
+            setattr(self, name, patch.start())
+            self.addCleanup(patch.stop)
+
     def checkout(self, git_results):
         """Run the checkout with `git` answering the branch readings in turn."""
         with mock.patch.object(MODULE, "run") as runner, mock.patch.object(
             MODULE, "git", side_effect=git_results
-        ):
+        ) as git:
             attached = MODULE.checkout_pr_branch(
                 Path("."), MODULE.parse_target("owner/repo#7"), pr_metadata()
             )
-        return attached, runner
+        return attached, git
 
     def test_a_worktree_elsewhere_detaches_onto_the_head(self):
-        attached, runner = self.checkout(["other", "head1", "", "head1"])
+        attached, runner = self.checkout(["other", "head1", "", "", "head1"])
         self.assertFalse(attached)
-        self.assertEqual(
-            [
-                "gh",
-                "pr",
-                "checkout",
-                "https://github.com/owner/repo/pull/7",
-                "--detach",
-            ],
-            runner.call_args[0][0],
+        self.assertIn(
+            mock.call(Path("."), "checkout", "--detach", "head1"),
+            runner.call_args_list,
+        )
+        self.fetch_preflight_ref.assert_called_once_with(
+            Path("."), "https://github.com/fork/repo.git", "refs/heads/feature", "head1"
         )
 
     def test_an_exact_attached_checkout_is_reused(self):
         attached, runner = self.checkout(["feature", "head1"])
         self.assertTrue(attached)
-        runner.assert_not_called()
+        self.assertEqual(2, runner.call_count)
 
     def test_an_exact_detached_checkout_is_reused(self):
         attached, runner = self.checkout(["", "head1"])
         self.assertFalse(attached)
-        runner.assert_not_called()
+        self.assertEqual(2, runner.call_count)
 
     def test_landing_on_some_other_branch_is_refused(self):
         with mock.patch.object(MODULE, "run"), mock.patch.object(
-            MODULE, "git", side_effect=["other", "head1", "unrelated", "head1"]
+            MODULE, "git", side_effect=["other", "head1", "", "unrelated"]
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "branch mismatch"):
                 MODULE.checkout_pr_branch(
@@ -6336,9 +6461,9 @@ class CheckoutTest(unittest.TestCase):
 
     def test_local_work_ahead_of_the_pull_request_head_is_refused(self):
         with mock.patch.object(MODULE, "run"), mock.patch.object(
-            MODULE, "git", side_effect=["feature", "local9", "feature", "local9"]
-        ):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "HEAD mismatch"):
+            MODULE, "git", side_effect=["feature", "local9"]
+        ), mock.patch.object(MODULE, "is_ancestor", return_value=False):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "local work"):
                 MODULE.checkout_pr_branch(
                     Path("."), MODULE.parse_target("owner/repo#7"), pr_metadata()
                 )
@@ -6346,6 +6471,18 @@ class CheckoutTest(unittest.TestCase):
     def test_a_detached_head_is_not_read_as_another_line_of_work(self):
         with mock.patch.object(MODULE, "git", return_value=""):
             self.assertIsNone(MODULE.attached_to_other_branch(Path("."), "feature"))
+
+    def test_stale_tracked_head_detaches_without_resetting_the_named_branch(self):
+        with mock.patch.object(
+            MODULE, "git", side_effect=["feature", "old-head", "", "", "head1"]
+        ) as git:
+            attached = MODULE.checkout_pr_branch(
+                Path("."), MODULE.parse_target("owner/repo#7"),
+                pr_metadata(recorded_head_sha="old-head"),
+            )
+        self.assertFalse(attached)
+        self.assertIn(mock.call(Path("."), "checkout", "--detach", "head1"), git.call_args_list)
+        self.assertFalse(any(call.args[1] in {"reset", "update-ref"} for call in git.call_args_list))
 
 
 class ConflictPreflightIdentityTest(unittest.TestCase):
@@ -9424,6 +9561,7 @@ class HeadBranchHeldElsewhereTest(unittest.TestCase):
         self.git("worktree", "add", str(self.session), self.branch)
         self.metadata = pr_metadata(head_sha=self.head_sha)
         self.target = MODULE.parse_target("owner/repo#7")
+        self.git("config", f"url.{self.repo.as_posix()}.insteadOf", "https://github.com/fork/repo.git")
 
     def git(self, *arguments):
         process = subprocess.run(
@@ -9443,37 +9581,12 @@ class HeadBranchHeldElsewhereTest(unittest.TestCase):
         self.git("add", "--all")
         self.git("commit", "--no-gpg-sign", "--message", message)
 
-    def gh_checkout(self, command, cwd=None, **keywords):
-        """Stand in for `gh pr checkout`, which runs exactly these git checkouts.
-
-        Everything else the module runs is a real git command and is passed
-        through, so the checkout meets git's own rules about worktrees.
-        """
-        if command[0] != "gh":
-            return self.real_run(command, cwd=cwd, **keywords)
-        self.assertEqual(["gh", "pr", "checkout", self.target["pr_url"]], command[:4])
-        if "--detach" in command:
-            arguments = ["checkout", "--detach", self.head_sha]
-        else:
-            arguments = ["checkout", self.branch]
-        process = subprocess.run(
-            ["git", "-C", str(cwd or self.repo), *arguments],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-        if process.returncode != 0:
-            raise MODULE.WorkflowError(process.stderr.strip())
-        return process
-
     def test_the_checkout_reaches_the_head_the_branch_is_held_elsewhere(self):
-        with mock.patch.object(MODULE, "run", side_effect=self.gh_checkout):
-            attached = MODULE.checkout_pr_branch(
-                self.repo, self.target, self.metadata
-            )
+        attached = MODULE.checkout_pr_branch(self.repo, self.target, self.metadata)
         self.assertFalse(attached)
         self.assertEqual("", self.git("branch", "--show-current"))
         self.assertEqual(self.head_sha, self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.head_sha, self.git("rev-parse", self.branch))
 
 
 def stack_attempt_record(**overrides):
@@ -9699,7 +9812,7 @@ class ParseStackTest(unittest.TestCase):
 
 
 class StackMembershipTest(unittest.TestCase):
-    def membership(self, *, stack, default="main"):
+    def membership(self, *, stack, default="main", live_heads=None):
         payload = {
             "data": {
                 "repository": {
@@ -9708,9 +9821,20 @@ class StackMembershipTest(unittest.TestCase):
                 }
             }
         }
-        with mock.patch.object(MODULE, "graphql", return_value=payload) as query:
+        heads = {
+            item["pullRequest"]["headRefName"]: item["pullRequest"]["headRefOid"]
+            for item in (stack or {}).get("entries", {}).get("nodes", [])
+        }
+        if live_heads is not None:
+            heads = live_heads
+        with mock.patch.object(
+            MODULE, "graphql", return_value=payload
+        ) as query, mock.patch.object(
+            MODULE, "remote_head", side_effect=lambda _owner, _repo, branch: heads[branch]
+        ) as refs:
             result = MODULE.stack_membership(pr_metadata())
         self.query = query
+        self.refs = refs
         return result
 
     def test_a_null_stack_means_no_native_stack(self):
@@ -9731,6 +9855,29 @@ class StackMembershipTest(unittest.TestCase):
         }
         result = self.membership(stack=raw)
         self.assertEqual([5], [member["number"] for member in result["stack"]["members"]])
+
+    def test_restacked_open_head_is_authoritative_but_merged_prefix_stays_historical(self):
+        raw = {
+            "id": "S_1", "number": 100, "size": 2, "baseRefName": "main",
+            "entries": {"nodes": [
+                stack_entry(0, 3, "merged-a", "main", state="MERGED"),
+                stack_entry(1, 7, "feature", "main"),
+            ]},
+        }
+        code = {"commits": [{"sha": "restacked", "message": "change"}], "mergeable": "MERGEABLE"}
+        with mock.patch.object(MODULE, "base_ref_tip", return_value="live-base"), \
+                mock.patch.object(MODULE, "branch_code_snapshot", return_value=code):
+            result = self.membership(stack=raw, live_heads={"feature": "restacked"})
+        stack = result["stack"]
+        self.assertEqual("oid3", stack["inactive_members"][0]["head_sha"])
+        member = stack["members"][0]
+        self.assertEqual("restacked", member["head_sha"])
+        self.assertEqual("live-base", member["base_sha"])
+        self.assertEqual(["restacked"], member["commits"])
+        self.assertEqual("MERGEABLE", member["mergeable"])
+        self.assertEqual(
+            [mock.call("owner", "repo", "feature")] * 2, self.refs.call_args_list
+        )
 
     def test_merged_prefix_is_omitted_from_the_active_stack(self):
         raw = {

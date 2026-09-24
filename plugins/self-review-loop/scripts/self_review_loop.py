@@ -44,7 +44,6 @@ HUNK_PATTERN = re.compile(
     r"\+(?P<new>\d+)(?:,(?P<new_count>\d+))? @@"
 )
 CANDIDATE_KEYS = {"path", "line", "side", "body"}
-NON_FAST_FORWARD_PATTERN = re.compile(r"fast[- ]forward|divergent", re.IGNORECASE)
 SHARED_STATE_REPOSITORY_PATTERN = re.compile(
     r"^(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)$"
 )
@@ -78,7 +77,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a"
+    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -1187,7 +1186,7 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
 def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     fields = (
         "number,title,body,url,state,isDraft,headRefName,headRefOid,"
-        "headRepositoryOwner,headRepository,baseRefName,commits"
+        "headRepositoryOwner,headRepository,baseRefName"
     )
     metadata = gh_json(
         [
@@ -1222,29 +1221,15 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         raise WorkflowError(
             "pull request head repository is unavailable; it may have been deleted"
         )
-    head_sha = metadata.get("headRefOid")
-    if not isinstance(head_sha, str) or not head_sha:
-        raise WorkflowError("resolved PR metadata has no head commit")
+    head_sha = remote_head(head_owner["login"], head_repository["name"], metadata.get("headRefName"))
+    if head_sha is None:
+        raise WorkflowError("pull request head branch no longer exists")
     title = metadata.get("title")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
     body = metadata.get("body")
     if not isinstance(body, str):
         body = ""
-    raw_commits = metadata.get("commits")
-    if not isinstance(raw_commits, list):
-        raise WorkflowError("resolved PR metadata has no commit list")
-    commits = []
-    for index, commit in enumerate(raw_commits):
-        if not isinstance(commit, dict):
-            raise WorkflowError(f"resolved PR commit {index} is not an object")
-        sha = commit.get("oid")
-        headline = commit.get("messageHeadline")
-        if not isinstance(sha, str) or not sha:
-            raise WorkflowError(f"resolved PR commit {index} has no OID")
-        if not isinstance(headline, str):
-            raise WorkflowError(f"resolved PR commit {index} has no message headline")
-        commits.append({"sha": sha, "message": headline.strip()})
     base_branch = metadata.get("baseRefName")
     if not isinstance(base_branch, str) or not base_branch:
         raise WorkflowError("resolved PR metadata has no base branch")
@@ -1265,7 +1250,6 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "head_sha": head_sha,
         "base_branch": base_branch,
         "base_sha": base_sha,
-        "commits": commits,
     }
 
 
@@ -1323,6 +1307,8 @@ def agent_task_preflight(
     head_repository = f"{pr['head_owner']}/{pr['head_repo']}"
     require_fork_head(pr)
     find_push_remote(repo_root, pr["head_owner"], pr["head_repo"])
+    if remote_head(pr["head_owner"], pr["head_repo"], pr["head_branch"]) != pr["head_sha"].lower():
+        raise WorkflowError("pull request head branch moved during preflight")
     return {
         "repository_root": str(repo_root),
         "identity": identity,
@@ -1497,55 +1483,6 @@ def require_checkout_head(local_head: str, pr_head: str) -> None:
     )
 
 
-def checkout_pr(
-    repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
-) -> bool:
-    current_branch = git(repo_root, "branch", "--show-current")
-    on_pr_branch = current_branch == metadata["head_branch"]
-    command = ["gh", "pr", "checkout", target["pr_url"]]
-    if not on_pr_branch:
-        command.append("--detach")
-    try:
-        run(command, cwd=repo_root)
-    except WorkflowError as checkout_error:
-        if not on_pr_branch or not NON_FAST_FORWARD_PATTERN.search(str(checkout_error)):
-            raise
-        reconcile_equivalent_local_head(repo_root, metadata, checkout_error)
-    return on_pr_branch
-
-
-def reconcile_equivalent_local_head(
-    repo_root: Path,
-    metadata: dict[str, Any],
-    checkout_error: WorkflowError,
-) -> None:
-    local_head = git(repo_root, "rev-parse", "HEAD")
-    pr_head = metadata["head_sha"]
-    if local_head == pr_head:
-        raise checkout_error
-
-    try:
-        unique_merges = git(repo_root, "rev-list", "--merges", f"{pr_head}..{local_head}")
-        cherry = git(repo_root, "cherry", pr_head, local_head)
-    except WorkflowError:
-        raise checkout_error
-
-    unique_commits = [
-        line[2:].strip()
-        for line in cherry.splitlines()
-        if line.startswith("+ ") and line[2:].strip()
-    ]
-    if unique_merges or unique_commits:
-        unique = [line for line in unique_merges.splitlines() if line] + unique_commits
-        raise WorkflowError(
-            "head_moved: the PR branch was force-pushed and the clean local branch "
-            f"still has unique work ({', '.join(unique)}); local {local_head}, "
-            f"PR head {pr_head}"
-        ) from checkout_error
-
-    git(repo_root, "reset", "--hard", pr_head)
-
-
 def decode_diff_path(value: str) -> str | None:
     value = value.rstrip()
     if value == "/dev/null":
@@ -1640,7 +1577,27 @@ def parse_unified_diff(diff_text: str) -> dict[str, dict[str, set[int]]]:
 
 
 def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
-    return run(["gh", "pr", "diff", pr["pr_url"], "--repo", pr["repo_name"]]).stdout
+    repo_root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+    for label, repository, branch, sha in (
+        ("base", pr["repo_name"], pr["base_branch"], pr["base_sha"]),
+        ("head", f"{pr['head_owner']}/{pr['head_repo']}", pr["head_branch"], pr["head_sha"]),
+    ):
+        if run(["git", "check-ref-format", f"refs/heads/{branch}"], check=False).returncode:
+            raise WorkflowError(f"invalid PR branch {branch!r}")
+        ref = f"refs/agent-self-review/{label}"
+        git(repo_root, "fetch", "--no-tags", f"https://github.com/{repository}.git",
+            f"+refs/heads/{branch}:{ref}")
+        fetched = git(repo_root, "rev-parse", ref).lower()
+        if fetched != sha:
+            if label == "head" or run([
+                "git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+                sha, fetched,
+            ], check=False).returncode != 0:
+                raise WorkflowError("PR branch moved while fetching review diff")
+    return git(
+        repo_root, "diff", "--no-ext-diff", "--no-textconv", "--no-color",
+        "--find-renames", f"{pr['base_sha']}...{pr['head_sha']}", "--",
+    )
 
 
 def serialize_anchors(
@@ -2154,15 +2111,26 @@ def find_push_remote(repo_root: Path, owner: str, repo: str) -> str:
 
 
 def remote_head(owner: str, repo: str, branch: str) -> str | None:
+    if (not isinstance(branch, str) or not branch
+            or run(["git", "check-ref-format", f"refs/heads/{branch}"], check=False).returncode):
+        raise WorkflowError(f"invalid head branch {branch!r}")
     process = run(
-        ["gh", "api", f"repos/{owner}/{repo}/git/ref/heads/{branch}"], check=False
+        ["gh", "api", f"repos/{owner}/{repo}/git/ref/heads/"
+         f"{urllib.parse.quote(branch, safe='')}"], check=False
     )
     if process.returncode == 1 and "HTTP 404" in process.stderr:
         return None
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip()
         raise WorkflowError(f"failed to read remote ref: {detail}")
-    return json.loads(process.stdout)["object"]["sha"]
+    payload = json.loads(process.stdout)
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if (not isinstance(payload, dict)
+            or payload.get("ref") != f"refs/heads/{branch}"
+            or not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha.lower())):
+        raise WorkflowError("GitHub returned an invalid head branch identity")
+    return sha.lower()
 
 
 def wait_for_remote_head(

@@ -14,6 +14,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import urllib.parse
 import sys
 import tempfile
 from types import ModuleType
@@ -38,7 +39,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a"
+    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -357,12 +358,29 @@ def resolve_pr(target: dict[str, Any]) -> dict[str, Any]:
 
     base_identity = branch_identity(base, "base")
     head_identity = branch_identity(head, "head")
-    if base_identity["repository"].casefold() != target["repo_name"].casefold():
-        raise WorkflowError("resolved PR base repository does not match the target")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
     if not isinstance(body, str):
         raise WorkflowError("resolved PR metadata has no body")
+    for identity in (base_identity, head_identity):
+        branch = identity["ref"]
+        if run(["git", "check-ref-format", f"refs/heads/{branch}"], check=False).returncode:
+            raise WorkflowError(f"invalid PR branch {branch!r}")
+        payload = gh_json([
+            "api",
+            f"repos/{identity['repository']}/git/ref/heads/"
+            f"{urllib.parse.quote(branch, safe='')}",
+        ])
+        obj = payload.get("object") if isinstance(payload, dict) else None
+        sha = obj.get("sha") if isinstance(obj, dict) else None
+        if (not isinstance(payload, dict)
+                or payload.get("ref") != f"refs/heads/{branch}"
+                or not isinstance(sha, str)
+                or SHA_PATTERN.fullmatch(sha.lower()) is None):
+            raise WorkflowError(f"invalid live PR branch identity for {branch!r}")
+        identity["sha"] = sha.lower()
+    if base_identity["repository"].casefold() != target["repo_name"].casefold():
+        raise WorkflowError("resolved PR base repository does not match the target")
     if state != "open":
         rendered = state if isinstance(state, str) else "unknown"
         raise WorkflowError(f"pull request is {rendered}; only open pull requests are supported")
@@ -1114,24 +1132,35 @@ def enrich_review_thread_anchor_text(
 
 
 def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
-    return run(
-        ["gh", "pr", "diff", pr["pr_url"], "--repo", pr["repo_name"]]
-    ).stdout
+    repo_root = Path(
+        run(["git", "rev-parse", "--show-toplevel"]).stdout.strip()
+    )
+    for label in ("base", "head"):
+        identity = pr[label]
+        ref = f"refs/agent-pr-reviewer/{label}"
+        run([
+            "git", "-C", str(repo_root), "fetch", "--no-tags",
+            f"https://github.com/{identity['repository']}.git",
+            f"+refs/heads/{identity['ref']}:{ref}",
+        ])
+        fetched = run(
+            ["git", "-C", str(repo_root), "rev-parse", ref]
+        ).stdout.strip().lower()
+        if fetched != identity["sha"]:
+            if label == "head" or run([
+                "git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+                identity["sha"], fetched,
+            ], check=False).returncode != 0:
+                raise WorkflowError("PR branch moved while fetching review diff")
+    return run([
+        "git", "-C", str(repo_root), "diff", "--no-ext-diff", "--no-textconv",
+        "--no-color", "--find-renames",
+        f"{pr['base']['sha']}...{pr['head_sha']}", "--",
+    ]).stdout
 
 
 def fetch_changed_paths(pr: dict[str, Any]) -> list[str]:
-    files = gh_paginated(
-        f"repos/{pr['repo_name']}/pulls/{pr['number']}/files?per_page=100"
-    )
-    paths: list[str] = []
-    for item in files:
-        path = item.get("filename") if isinstance(item, dict) else None
-        if not isinstance(path, str) or not path:
-            raise WorkflowError("GitHub returned malformed PR file metadata")
-        paths.append(path)
-    if len(paths) != len(set(paths)):
-        raise WorkflowError("GitHub returned duplicate PR file metadata")
-    return paths
+    return sorted(parse_unified_diff(fetch_authoritative_diff(pr)))
 
 
 def write_output_file(path_value: str, text: str, description: str) -> str:

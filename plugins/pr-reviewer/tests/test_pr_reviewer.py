@@ -402,27 +402,53 @@ diff --git a/old.txt b/old.txt
         self.assertEqual(anchors["new.txt"]["RIGHT"], {1: 1, 2: 2})
         self.assertEqual(anchors["old.txt"]["LEFT"], {1: 1, 2: 2})
 
-    def test_fetches_the_authoritative_gh_pr_diff(self):
+    def test_fetches_the_actual_branch_diff(self):
         pr = {
             "repo_name": "owner/repo",
             "pr_url": "https://github.com/owner/repo/pull/42",
+            "base": {"repository": "owner/repo", "ref": "main", "sha": "1" * 40},
+            "head": {"repository": "fork/repo", "ref": "feature", "sha": "2" * 40},
+            "head_sha": "2" * 40,
         }
-        completed = mock.Mock(stdout=DIFF)
+        completed = [
+            mock.Mock(stdout="C:\\repo\n"),
+            mock.Mock(stdout=""),
+            mock.Mock(stdout="1" * 40),
+            mock.Mock(stdout=""),
+            mock.Mock(stdout="2" * 40),
+            mock.Mock(stdout=DIFF),
+        ]
 
-        with mock.patch.object(MODULE, "run", return_value=completed) as run:
+        with mock.patch.object(MODULE, "run", side_effect=completed) as run:
             result = MODULE.fetch_authoritative_diff(pr)
 
         self.assertEqual(result, DIFF)
-        run.assert_called_once_with(
-            [
-                "gh",
-                "pr",
-                "diff",
-                "https://github.com/owner/repo/pull/42",
-                "--repo",
-                "owner/repo",
-            ]
+        self.assertIn("https://github.com/fork/repo.git", run.call_args_list[3].args[0])
+        self.assertIn(f"{'1' * 40}...{'2' * 40}", run.call_args.args[0])
+
+    def test_forward_base_fetch_keeps_frozen_diff_base(self):
+        base, advanced, head = "1" * 40, "3" * 40, "2" * 40
+        pr = {
+            "base": {"repository": "owner/repo", "ref": "main", "sha": base},
+            "head": {"repository": "fork/repo", "ref": "feature", "sha": head},
+            "head_sha": head,
+        }
+        completed = [
+            SimpleNamespace(stdout="C:\\repo\n"),
+            SimpleNamespace(stdout=""),
+            SimpleNamespace(stdout=advanced),
+            SimpleNamespace(returncode=0),
+            SimpleNamespace(stdout=""),
+            SimpleNamespace(stdout=head),
+            SimpleNamespace(stdout=DIFF),
+        ]
+        with mock.patch.object(MODULE, "run", side_effect=completed) as run:
+            self.assertEqual(DIFF, MODULE.fetch_authoritative_diff(pr))
+        self.assertEqual(
+            ["git", "-C", "C:\\repo", "merge-base", "--is-ancestor", base, advanced],
+            run.call_args_list[3].args[0],
         )
+        self.assertIn(f"{base}...{head}", run.call_args.args[0])
 
     def test_decodes_git_quoted_utf8_paths(self):
         diff = """\
@@ -1092,15 +1118,21 @@ class ResolvePrTest(unittest.TestCase):
     def test_returns_the_pr_title(self):
         target = MODULE.parse_target("owner/repo#42")
 
+        metadata = self.metadata()
+        responses = [
+            metadata,
+            {"ref": "refs/heads/main", "object": {"sha": "3" * 40}},
+            {"ref": "refs/heads/feature", "object": {"sha": "4" * 40}},
+        ]
         with mock.patch.object(
-            MODULE, "gh_json", return_value=self.metadata()
+            MODULE, "gh_json", side_effect=responses
         ) as gh_json:
             result = MODULE.resolve_pr(target)
 
         self.assertEqual(result["title"], "Fix the reviewer")
-        self.assertEqual(result["head_sha"], "2" * 40)
+        self.assertEqual(result["head_sha"], "4" * 40)
         self.assertEqual(
-            gh_json.call_args.args[0],
+            gh_json.call_args_list[0].args[0],
             ["api", "repos/owner/repo/pulls/42"],
         )
 

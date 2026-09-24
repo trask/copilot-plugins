@@ -2079,7 +2079,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.71")
+        self.assertEqual(plugin["version"], "1.3.72")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -3306,6 +3306,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 ),
                 mock.patch.object(MODULE, "require_fork_head"),
                 mock.patch.object(MODULE, "find_push_remote"),
+                mock.patch.object(MODULE, "remote_head", return_value=self.head),
             ):
                 if allowed:
                     context = MODULE.agent_task_preflight(
@@ -3317,6 +3318,27 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 else:
                     with self.assertRaises(MODULE.WorkflowError):
                         MODULE.agent_task_preflight(self.repo_root, {}, allow_detached=True)
+
+    def test_preflight_rejects_actual_branch_movement_after_metadata(self):
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=self.preflight["pr"]),
+            mock.patch.object(
+                MODULE, "local_identity",
+                return_value={"branch": "", "head": self.head, "status": ""},
+            ),
+            mock.patch.object(
+                MODULE, "gh_json",
+                side_effect=[
+                    {"permissions": self.preflight["viewer"]["permissions"]},
+                    {"login": "viewer"},
+                ],
+            ),
+            mock.patch.object(MODULE, "require_fork_head"),
+            mock.patch.object(MODULE, "find_push_remote"),
+            mock.patch.object(MODULE, "remote_head", return_value="9" * 40),
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "moved during preflight"):
+                MODULE.agent_task_preflight(self.repo_root, {}, allow_detached=True)
 
     def test_candidate_import_fast_forwards_a_real_detached_checkout(self):
         def git(*arguments):
@@ -3795,21 +3817,18 @@ class PullRequestMetadataTest(unittest.TestCase):
             MODULE, "gh_json", return_value=payload
         ) as gh_json, mock.patch.object(
             MODULE, "base_ref_tip", return_value="live-tip"
+        ), mock.patch.object(
+            MODULE, "remote_head", return_value="actual-tip"
         ):
             metadata = MODULE.metadata_for(target)
 
-        self.assertEqual(
-            metadata["commits"],
-            [
-                {"sha": "one", "message": "First change"},
-                {"sha": "two", "message": "Second change"},
-            ],
-        )
+        self.assertEqual("actual-tip", metadata["head_sha"])
+        self.assertNotIn("commits", metadata)
         self.assertEqual(metadata["body"], "This changes the thing.")
         self.assertEqual(metadata["state"], "OPEN")
         self.assertFalse(metadata["is_draft"])
         self.assertIn("body", gh_json.call_args.args[0][-1])
-        self.assertIn("commits", gh_json.call_args.args[0][-1])
+        self.assertNotIn("commits", gh_json.call_args.args[0][-1])
 
     def test_base_sha_is_the_live_base_branch_tip_not_the_frozen_base_ref_oid(self):
         target = MODULE.parse_target("https://github.com/owner/repo/pull/7")
@@ -3832,7 +3851,9 @@ class PullRequestMetadataTest(unittest.TestCase):
             MODULE, "gh_json", return_value=payload
         ), mock.patch.object(
             MODULE, "base_ref_tip", return_value="live-tip"
-        ) as tip:
+        ) as tip, mock.patch.object(
+            MODULE, "remote_head", return_value="actual-tip"
+        ):
             metadata = MODULE.metadata_for(target)
         self.assertEqual("live-tip", metadata["base_sha"])
         tip.assert_called_once_with("owner/repo", "main")
@@ -4022,6 +4043,28 @@ class BaseRefTipTest(unittest.TestCase):
 
 
 class DiffAnchorTest(unittest.TestCase):
+    def test_forward_base_fetch_preserves_frozen_review_diff(self):
+        base, advanced, head = "1" * 40, "3" * 40, "2" * 40
+        pr = {
+            "repo_name": "owner/repo", "base_branch": "main", "base_sha": base,
+            "head_owner": "fork", "head_repo": "repo",
+            "head_branch": "feature", "head_sha": head,
+        }
+        with mock.patch.object(
+            MODULE, "git", side_effect=["C:\\repo", "", advanced, "", head, DIFF]
+        ) as git, mock.patch.object(
+            MODULE, "run", return_value=SimpleNamespace(returncode=0)
+        ) as run:
+            self.assertEqual(DIFF, MODULE.fetch_authoritative_diff(pr))
+        self.assertIn(
+            mock.call(
+                ["git", "-C", "C:\\repo", "merge-base", "--is-ancestor", base, advanced],
+                check=False,
+            ),
+            run.call_args_list,
+        )
+        self.assertIn(f"{base}...{head}", git.call_args.args)
+
     def test_parses_changed_lines_per_side(self):
         anchors = MODULE.parse_unified_diff(DIFF)
 
@@ -4344,106 +4387,6 @@ class HeadVerificationTest(unittest.TestCase):
             remote_head.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS) + 1
         )
         self.assertEqual(sleep.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS))
-
-    def test_keeps_the_existing_pr_branch_checked_out(self):
-        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
-        metadata = {"head_branch": "feature"}
-
-        with (
-            mock.patch.object(MODULE, "run") as run,
-            mock.patch.object(MODULE, "git", return_value="feature"),
-        ):
-            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
-
-        self.assertTrue(checked_out_branch)
-        self.assertEqual(
-            run.call_args,
-            mock.call(
-                ["gh", "pr", "checkout", target["pr_url"]],
-                cwd=Path("repo"),
-            ),
-        )
-
-    def test_realigns_equivalent_rebased_commits_after_force_push(self):
-        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
-        metadata = {"head_branch": "feature", "head_sha": "remote"}
-        checkout_error = MODULE.WorkflowError(
-            "gh pr checkout failed: fatal: Not possible to fast-forward, aborting."
-        )
-
-        with (
-            mock.patch.object(MODULE, "run", side_effect=checkout_error),
-            mock.patch.object(
-                MODULE,
-                "git",
-                side_effect=["feature", "local", "", "- local", ""],
-            ) as git,
-        ):
-            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
-
-        self.assertTrue(checked_out_branch)
-        self.assertEqual(
-            git.call_args_list,
-            [
-                mock.call(Path("repo"), "branch", "--show-current"),
-                mock.call(Path("repo"), "rev-parse", "HEAD"),
-                mock.call(Path("repo"), "rev-list", "--merges", "remote..local"),
-                mock.call(Path("repo"), "cherry", "remote", "local"),
-                mock.call(Path("repo"), "reset", "--hard", "remote"),
-            ],
-        )
-
-    def test_reports_head_moved_when_force_push_leaves_unique_work(self):
-        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
-        metadata = {"head_branch": "feature", "head_sha": "remote"}
-        checkout_error = MODULE.WorkflowError(
-            "gh pr checkout failed: fatal: Not possible to fast-forward, aborting."
-        )
-
-        with (
-            mock.patch.object(MODULE, "run", side_effect=checkout_error),
-            mock.patch.object(
-                MODULE,
-                "git",
-                side_effect=["feature", "local", "", "+ unique"],
-            ),
-        ):
-            with self.assertRaisesRegex(
-                MODULE.WorkflowError, "head_moved.*unique work.*unique"
-            ):
-                MODULE.checkout_pr(Path("repo"), target, metadata)
-
-    def test_checks_out_the_remote_pr_head_when_on_another_branch(self):
-        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
-        metadata = {"head_branch": "feature"}
-
-        with (
-            mock.patch.object(MODULE, "run") as run,
-            mock.patch.object(MODULE, "git", return_value="session-branch"),
-        ):
-            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
-
-        self.assertFalse(checked_out_branch)
-        self.assertEqual(
-            run.call_args,
-            mock.call(
-                ["gh", "pr", "checkout", target["pr_url"], "--detach"],
-                cwd=Path("repo"),
-            ),
-        )
-
-    def test_does_not_mask_other_checkout_failures(self):
-        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
-        metadata = {"head_branch": "feature"}
-        error = MODULE.WorkflowError("authentication failed")
-
-        with (
-            mock.patch.object(MODULE, "git", return_value="feature"),
-            mock.patch.object(MODULE, "run", side_effect=error),
-        ):
-            with self.assertRaisesRegex(MODULE.WorkflowError, "authentication failed"):
-                MODULE.checkout_pr(Path("repo"), target, metadata)
-
 
 class CommitProvenanceTest(unittest.TestCase):
     def test_returns_each_pr_commit_with_its_sorted_unique_file_set(self):

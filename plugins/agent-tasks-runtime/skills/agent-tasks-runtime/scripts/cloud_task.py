@@ -1130,10 +1130,11 @@ class GitRepository:
         )
         prefix = f"refs/cloud-agent-tasks/{request_id}"
         refs = PrTrackingRefs(f"{prefix}/default", f"{prefix}/pr-head")
-        source_head = (
-            f"refs/pull/{pull_request.number}/head"
+        source_head = f"refs/heads/{pull_request.head_ref}"
+        source_remote = (
+            f"https://github.com/{pull_request.head_repository}.git"
             if pull_request.cross_repository
-            else f"refs/heads/{pull_request.head_ref}"
+            else snapshot.remote
         )
         self._run(
             snapshot.root,
@@ -1141,6 +1142,12 @@ class GitRepository:
             "--no-tags",
             snapshot.remote,
             f"+refs/heads/{default_branch}:{refs.default}",
+        )
+        self._run(
+            snapshot.root,
+            "fetch",
+            "--no-tags",
+            source_remote,
             f"+{source_head}:{refs.head}",
         )
         fetched_head = self._run(
@@ -1161,17 +1168,21 @@ class GitRepository:
     ) -> None:
         if not pull_request.cross_repository:
             return
-        remote = self.matching_remote(root, repository)
-        pull_ref = f"refs/pull/{pull_request.number}/head"
-        output = self._run(root, "ls-remote", remote, pull_ref).stdout
+        source_ref = f"refs/heads/{pull_request.head_ref}"
+        output = self._run(
+            root,
+            "ls-remote",
+            f"https://github.com/{pull_request.head_repository}.git",
+            source_ref,
+        ).stdout
         refs: dict[str, str] = {}
         for line in output.splitlines():
             sha, separator, name = line.partition("\t")
             if separator:
                 refs[name] = sha.lower()
-        if refs.get(pull_ref) != pull_request.head_sha:
+        if refs.get(source_ref) != pull_request.head_sha:
             raise CloudError(
-                f"upstream {pull_ref} does not match pull request "
+                f"head repository {source_ref} does not match pull request "
                 f"#{pull_request.number} head {pull_request.head_sha}"
             )
 
@@ -1733,6 +1744,32 @@ def pull_request_base_tip(
         )
     return sha.lower()
 
+def pull_request_head_tip(
+    runner: Runner,
+    root: Path,
+    repository: str,
+    head_ref: str,
+) -> str:
+    encoded_ref = urllib.parse.quote(head_ref, safe="")
+    command = ["gh", "api", f"repos/{repository}/git/ref/heads/{encoded_ref}"]
+    result = run_process(runner, command, cwd=root)
+    if result.returncode != 0:
+        raise CloudError(_command_error(command, result))
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise CloudError(f"gh returned invalid head branch JSON: {error.msg}") from None
+    target = data.get("object") if isinstance(data, dict) else None
+    sha = target.get("sha") if isinstance(target, dict) else None
+    if (
+        not isinstance(data, dict)
+        or data.get("ref") != f"refs/heads/{head_ref}"
+        or not isinstance(sha, str)
+        or SHA_PATTERN.fullmatch(sha) is None
+    ):
+        raise CloudError(f"GitHub returned invalid head branch identity for {head_ref!r}")
+    return sha.lower()
+
 def resolve_pull_request(
     runner: Runner,
     root: Path,
@@ -1842,6 +1879,10 @@ def resolve_pull_request(
         repository,
         base_ref,
     )
+    if not allow_merged:
+        head_sha = pull_request_head_tip(
+            runner, root, head_repository, head_ref
+        )
     return PullRequestSnapshot(
         number,
         url,

@@ -178,7 +178,7 @@ class StackPublicationTest(unittest.TestCase):
             "resolve_repo_root": {"return_value": self.root},
             "local_object_source": {"return_value": None},
             "metadata_for": {"return_value": existing.pr_metadata(number=11)},
-            "stack_membership": {"side_effect": lambda *a: {
+            "stack_membership": {"side_effect": lambda *a, **kwargs: {
                 "stack": copy.deepcopy(self.stack), "default_branch": "main",
             }},
             "external_stack_dependents": {"return_value": []},
@@ -400,7 +400,7 @@ class StackPublicationTest(unittest.TestCase):
             mock.patch.object(
                 MODULE.PreflightRefStore,
                 "fetch",
-                side_effect=lambda source, _role, expected=None: (
+                side_effect=lambda source, _role, expected=None, remote=None: (
                     expected
                     or {
                         "refs/heads/fixed": "b" * 40,

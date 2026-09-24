@@ -48,6 +48,8 @@ class PullRequestResolutionTest(unittest.TestCase):
         }
 
     def test_uses_live_base_ref_tip_instead_of_stale_base_ref_oid(self):
+        live_head = "4" * 40
+
         def runner(command, **_kwargs):
             if command[:3] == ["gh", "pr", "view"]:
                 return subprocess.CompletedProcess(
@@ -64,17 +66,15 @@ class PullRequestResolutionTest(unittest.TestCase):
                     stderr="",
                 )
             if command[:2] == ["gh", "api"]:
-                self.assertEqual(
-                    command[2],
-                    "repos/owner/repo/git/ref/heads/release%2Fnext",
-                )
+                branch = command[2].rsplit("/", 1)[-1]
+                self.assertIn(branch, ("release%2Fnext", "feature"))
                 return subprocess.CompletedProcess(
                     command,
                     0,
                     stdout=json.dumps(
                         {
-                            "ref": "refs/heads/release/next",
-                            "object": {"sha": self.live_base},
+                            "ref": f"refs/heads/{'release/next' if branch == 'release%2Fnext' else 'feature'}",
+                            "object": {"sha": self.live_base if branch == "release%2Fnext" else live_head},
                         }
                     ),
                     stderr="",
@@ -90,6 +90,105 @@ class PullRequestResolutionTest(unittest.TestCase):
 
         self.assertEqual(self.live_base, pull_request.base_sha)
         self.assertNotEqual(self.stale_base, pull_request.base_sha)
+        self.assertEqual(live_head, pull_request.head_sha)
+        self.assertNotEqual(self.head, pull_request.head_sha)
+
+    def test_fork_reads_its_branch_and_merged_snapshot_keeps_frozen_head(self):
+        self.metadata.update(
+            state="MERGED",
+            headRepository={"nameWithOwner": "fork/repo"},
+            headRepositoryOwner={"login": "fork"},
+            isCrossRepository=True,
+        )
+        requested = []
+
+        def runner(command, **_kwargs):
+            requested.append(command)
+            if command[:3] == ["gh", "pr", "view"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps(self.metadata), "")
+            if command[:2] == ["git", "check-ref-format"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[:2] == ["gh", "api"]:
+                self.assertIn("repos/owner/repo/git/ref/heads/", command[2])
+                return subprocess.CompletedProcess(
+                    command, 0,
+                    json.dumps({"ref": "refs/heads/release/next",
+                                "object": {"sha": self.live_base}}), "",
+                )
+            self.fail(f"unexpected command {command}")
+
+        snapshot = MODULE.resolve_pull_request(
+            runner, self.root, "owner/repo",
+            MODULE.parse_pr_reference("owner/repo#7"), allow_merged=True,
+        )
+        self.assertEqual(self.head, snapshot.head_sha)
+        self.assertFalse(any("fork/repo" in part for command in requested for part in command))
+
+        self.metadata["state"] = "OPEN"
+        def open_runner(command, **_kwargs):
+            if command[:2] == ["gh", "api"] and "fork/repo" in command[2]:
+                self.assertEqual(command[2], "repos/fork/repo/git/ref/heads/feature")
+                return subprocess.CompletedProcess(
+                    command, 0,
+                    json.dumps({"ref": "refs/heads/feature",
+                                "object": {"sha": "4" * 40}}), "",
+                )
+            return runner(command, **_kwargs)
+
+        snapshot = MODULE.resolve_pull_request(
+            open_runner, self.root, "owner/repo",
+            MODULE.parse_pr_reference("owner/repo#7"),
+        )
+        self.assertEqual("4" * 40, snapshot.head_sha)
+
+    def test_fetched_fork_branch_must_match_live_head(self):
+        commands = []
+        def runner(command, **_kwargs):
+            commands.append(command)
+            if command[1] == "check-ref-format":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[1] == "fetch":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[1] == "rev-parse":
+                return subprocess.CompletedProcess(command, 0, self.head, "")
+            self.fail(f"unexpected command {command}")
+        git = MODULE.GitRepository(runner)
+        snapshot = MODULE.WorktreeSnapshot(self.root, "owner/repo", "origin", "feature", self.head)
+        pr = MODULE.PullRequestSnapshot(
+            7, self.metadata["url"], "OPEN", "owner/repo", "main",
+            self.live_base, "fork/repo", "feature", "4" * 40, True,
+        )
+        with self.assertRaisesRegex(MODULE.CloudError, "moved while it was fetched"):
+            git.fetch_pr_inputs(snapshot, "main", pr, "request")
+        self.assertIn(
+            ["git", "fetch", "--no-tags", "https://github.com/fork/repo.git",
+             "+refs/heads/feature:refs/cloud-agent-tasks/request/pr-head"],
+            commands,
+        )
+
+    def test_actual_branch_moving_after_capture_rejects_completion(self):
+        tips = iter(("4" * 40, "5" * 40))
+        def runner(command, **_kwargs):
+            if command[:3] == ["gh", "pr", "view"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps(self.metadata), "")
+            if command[:2] == ["git", "check-ref-format"]:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[:2] == ["gh", "api"]:
+                branch = command[2].rsplit("/", 1)[-1]
+                return subprocess.CompletedProcess(
+                    command, 0,
+                    json.dumps({
+                        "ref": f"refs/heads/{'release/next' if branch == 'release%2Fnext' else 'feature'}",
+                        "object": {"sha": self.live_base if branch == "release%2Fnext" else next(tips)},
+                    }), "",
+                )
+            self.fail(f"unexpected command {command}")
+
+        reference = MODULE.parse_pr_reference("owner/repo#7")
+        frozen = MODULE.resolve_pull_request(runner, self.root, "owner/repo", reference)
+        current = MODULE.resolve_pull_request(runner, self.root, "owner/repo", reference)
+        with self.assertRaisesRegex(MODULE.CloudError, "head_sha"):
+            MODULE.require_pr_unchanged(frozen, current, task_completed=True)
 
     def test_rejects_mismatched_live_base_ref_identity(self):
         runner = mock.Mock(

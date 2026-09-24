@@ -658,7 +658,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.92")
+        self.assertEqual(plugin["version"], "1.0.93")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -694,6 +694,10 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             "ref": "refs/heads/main",
             "object": {"type": "commit", "sha": live_base_sha},
         }
+        live_head = {
+            "ref": "refs/heads/feature",
+            "object": {"type": "commit", "sha": head_sha},
+        }
         with (
             mock.patch.object(
                 MODULE,
@@ -703,7 +707,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "gh_json",
-                side_effect=[payload, repository, {"login": "viewer"}, live_base],
+                side_effect=[payload, repository, {"login": "viewer"}, live_base, live_head],
             ),
         ):
             context = MODULE.agent_task_preflight(
@@ -763,7 +767,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 ],
             ),
             self.assertRaisesRegex(
-                MODULE.WorkflowError, "invalid live base branch identity"
+                MODULE.WorkflowError, "invalid live branch identity"
             ),
         ):
             MODULE.agent_task_preflight(
@@ -1957,7 +1961,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a",
+            "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(
@@ -2462,15 +2466,52 @@ class TargetParsingTest(unittest.TestCase):
             "html_url": "https://github.com/owner/repo/pull/7",
             "title": "Title",
             "body": None,
-            "head": {"sha": "head1"},
+            "head": {
+                "sha": "head1",
+                "ref": "feature",
+                "repo": {"full_name": "owner/repo"},
+            },
             "draft": False,
         }
-        with mock.patch.object(MODULE, "gh_json", return_value=payload) as gh_json:
+        with mock.patch.object(MODULE, "gh_json", return_value=payload) as gh_json, mock.patch.object(
+            MODULE, "live_branch_tip", return_value="actual-head"
+        ) as tip:
             metadata = MODULE.metadata_for(MODULE.parse_target("owner/repo#7"))
 
         self.assertEqual(metadata["body"], "")
-        self.assertEqual(metadata["head_sha"], "head1")
+        self.assertEqual(metadata["head_sha"], "actual-head")
         gh_json.assert_called_once_with(["api", "repos/owner/repo/pulls/7"])
+        tip.assert_called_once_with("owner/repo", "feature")
+
+    def test_file_paths_accept_forward_base_fetch_but_pin_original_base(self):
+        base, advanced, head = "1" * 40, "3" * 40, "2" * 40
+        preflight = {
+            "repository_root": "C:\\repo",
+            "pr": {
+                "base": {"repository": "owner/repo", "ref": "main", "sha": base},
+                "head": {"repository": "fork/repo", "ref": "feature", "sha": head},
+            },
+        }
+        def run(command, **_kwargs):
+            if "merge-base" in command:
+                return SimpleNamespace(returncode=0, stdout="")
+            if "diff" in command:
+                return SimpleNamespace(returncode=0, stdout="src/app.py\0docs/usage.md\0")
+            return SimpleNamespace(returncode=0, stdout="")
+
+        with mock.patch.object(MODULE, "run", side_effect=run) as process, mock.patch.object(
+            MODULE, "git", side_effect=[advanced, head]
+        ):
+            paths = MODULE.pull_request_file_paths(preflight)
+        self.assertEqual(["docs/usage.md", "src/app.py"], paths)
+        self.assertIn(
+            mock.call(
+                ["git", "-C", "C:\\repo", "merge-base", "--is-ancestor", base, advanced],
+                check=False,
+            ),
+            process.call_args_list,
+        )
+        self.assertIn(f"{base}...{head}", process.call_args.args[0])
 
     def test_the_refusal_names_the_way_out(self):
         """A message that names only the fault leaves the caller stuck.

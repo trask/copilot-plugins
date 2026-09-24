@@ -251,6 +251,11 @@ GitHub. Its
 machine-facing descendant propagation operation uses the same topology checks and
 atomic publisher after a lower stack member receives a CI fix.
 
+The source branch is authoritative before and after hosted work. If GitHub's
+PR record lags a native restack, the resolver derives commits and conflicts
+from the actual branch instead of blocking on that stale record. A real branch
+change during the run still stops publication.
+
 The plugin bundles and verifies its dedicated conflict Agent Tasks runtime.
 Authentication stays in local `gh api`; conflict analysis and validation stay
 in GitHub Agent Tasks.

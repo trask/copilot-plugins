@@ -40,7 +40,7 @@ class PublicationOutcomeTest(unittest.TestCase):
             "remote_publication_heads": {"side_effect": lambda *_: [
                 item["new_sha"] for item in self.refs
             ]},
-            "metadata_for": {"side_effect": lambda *_: copy.deepcopy(self.metadata)},
+            "metadata_for": {"side_effect": lambda *_, **kwargs: copy.deepcopy(self.metadata)},
             "commit_contains": {"return_value": True},
             "run": {"return_value": subprocess.CompletedProcess([], 0, "", "")},
             "git_try": {},

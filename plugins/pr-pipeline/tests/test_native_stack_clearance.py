@@ -57,8 +57,8 @@ class NativeStackClearanceTest(StackFixture):
             (CONFLICT, "require_no_integration_in_progress"): {},
             (CONFLICT, "checkout_pr_branch"): {},
             (CONFLICT, "conflict_preflight_identity"): {"return_value": {"head": self.stack["members"][0]["head_sha"]}},
-            (CONFLICT, "metadata_for"): {"side_effect": lambda target: copy.deepcopy(self.metadata[target["number"]])},
-            (CONFLICT, "stack_membership"): {"side_effect": lambda pr: {
+            (CONFLICT, "metadata_for"): {"side_effect": lambda target, **_kwargs: copy.deepcopy(self.metadata[target["number"]])},
+            (CONFLICT, "stack_membership"): {"side_effect": lambda pr, **_kwargs: {
                 "default_branch": "main", "stack": copy.deepcopy(self.stack),
             }},
             (CONFLICT, "base_ref_tip"): {"side_effect": lambda repo, branch: self.tips[branch]},
@@ -246,6 +246,19 @@ class NativeStackClearanceTest(StackFixture):
         for member in self.stack["members"]:
             member["mergeable"] = "UNKNOWN"
         self.assertEqual("complete", self.controller.final_snapshot()["result"])
+
+    def test_stale_pr_pointer_does_not_override_git_verified_stack_clearance(self):
+        self.phase()
+        self.fill_other_stages()
+        for member in self.stack["members"]:
+            member["conflict_status"] = "UNKNOWN"
+            member["head_pointer_stale"] = True
+        snapshot = self.controller.final_snapshot()
+        self.assertEqual("complete", snapshot["result"])
+        self.assertEqual(
+            "native_stack_clearance",
+            snapshot["pull_requests"][1]["stages"][0]["clearance_kind"],
+        )
 
     def test_snapshot_is_read_only_and_retains_no_state_without_accepted_evidence(self):
         self.phase()
@@ -526,7 +539,14 @@ class NativeStackClearanceTest(StackFixture):
         self.phase()
         self.fill_other_stages()
         original = copy.deepcopy(self.stack)
-        for mutation in ({"conflict_status": "UNKNOWN"}, {"conflict_status": "FAILED"}, {"state": "CLOSED"}, {"base_sha": "c" * 40}):
+        for mutation in (
+            {"conflict_status": "UNKNOWN"},
+            {"conflict_status": "UNKNOWN", "head_pointer_stale": False},
+            {"conflict_status": "FAILED"},
+            {"conflict_status": "FAILED", "head_pointer_stale": True},
+            {"state": "CLOSED"},
+            {"base_sha": "c" * 40},
+        ):
             closing = copy.deepcopy(original)
             closing["members"][1].update(mutation)
             with self.subTest(mutation=mutation), mock.patch.object(

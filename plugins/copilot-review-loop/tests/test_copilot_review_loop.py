@@ -1874,7 +1874,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.95")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.96")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -5260,11 +5260,13 @@ class MetadataTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "gh_json", return_value=metadata) as gh_json,
             mock.patch.object(MODULE, "base_ref_tip", return_value="live-tip"),
+            mock.patch.object(MODULE, "remote_head", return_value="actual-tip"),
         ):
             result = MODULE.metadata_for(target)
 
         self.assertEqual(result["title"], "Fix the review loop")
         self.assertEqual(result["head_repository"], "owner/repo")
+        self.assertEqual(result["head_sha"], "actual-tip")
         self.assertIn("title", gh_json.call_args.args[0][-1].split(","))
 
     def test_normalizes_same_repository_and_fork_head_identity(self):
@@ -5350,7 +5352,7 @@ class MetadataTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "remote_head",
-                side_effect=["1" * 40, "2" * 40],
+                side_effect=["1" * 40, "1" * 40, "2" * 40],
             ),
         ):
             fingerprint = MODULE.github_decision_fingerprint(
@@ -5422,10 +5424,12 @@ class MetadataTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "gh_json", return_value=metadata),
             mock.patch.object(MODULE, "base_ref_tip", return_value="live-tip") as tip,
+            mock.patch.object(MODULE, "remote_head", return_value="actual-tip"),
         ):
             result = MODULE.metadata_for(target)
 
         self.assertEqual("live-tip", result["base_sha"])
+        self.assertEqual("actual-tip", result["head_sha"])
         tip.assert_called_once_with("owner/repo", "main")
 
     def test_reports_a_deleted_head_repository(self):
@@ -6445,16 +6449,9 @@ class CheckoutHeadTest(unittest.TestCase):
 
         run.assert_not_called()
 
-    def test_accepts_local_head_ahead_of_pr(self):
-        completed = mock.Mock(returncode=0)
-        with mock.patch.object(MODULE, "run", return_value=completed) as run:
+    def test_local_head_ahead_of_pr_is_not_review_clearance(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "HEAD mismatch"):
             MODULE.verify_checkout_head(Path("repo"), "local123", "remote123")
-
-        self.assertEqual(run.call_args.kwargs, {"check": False})
-        self.assertEqual(
-            run.call_args.args[0][-4:],
-            ["merge-base", "--is-ancestor", "remote123", "local123"],
-        )
 
     def test_rejects_local_head_not_descended_from_pr(self):
         completed = mock.Mock(returncode=1, stderr="", stdout="")
@@ -6462,43 +6459,68 @@ class CheckoutHeadTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.WorkflowError, "HEAD mismatch"):
                 MODULE.verify_checkout_head(Path("repo"), "local123", "remote123")
 
-    def test_keeps_the_existing_pr_branch_checked_out(self):
-        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
-        metadata = {"head_branch": "feature", "head_sha": "remote123"}
-
+    def test_fetches_actual_fork_branch_and_detaches_from_old_pr_tracking_head(self):
+        actual, recorded = "4" * 40, "3" * 40
+        checkout = {"branch": "feature", "head": recorded}
+        def git_call(_root, *args):
+            if args[0] == "status":
+                return ""
+            if args[:2] == ("branch", "--show-current"):
+                return checkout["branch"]
+            if args[:2] == ("rev-parse", "HEAD"):
+                return checkout["head"]
+            if args[:2] == ("rev-parse", "refs/agent-copilot-review/head"):
+                return actual
+            if args[:2] == ("checkout", "--detach"):
+                checkout.update(branch="", head=actual)
+                return ""
+            if args[0] == "fetch":
+                return ""
+            raise AssertionError(args)
+        metadata = {
+            "head_branch": "feature", "head_sha": actual, "reported_head_sha": recorded,
+            "head_owner": "fork", "head_repo": "repo",
+        }
         with (
-            mock.patch.object(MODULE, "run") as run,
-            mock.patch.object(MODULE, "git", return_value="feature"),
+            mock.patch.object(MODULE, "run", return_value=mock.Mock(returncode=0)),
+            mock.patch.object(MODULE, "git", side_effect=git_call) as git,
+            mock.patch.object(MODULE, "remote_head", return_value=actual),
         ):
-            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
-
-        self.assertTrue(checked_out_branch)
-        self.assertEqual(
-            run.call_args,
-            mock.call(
-                ["gh", "pr", "checkout", target["pr_url"]],
-                cwd=Path("repo"),
-            ),
-        )
-
-    def test_checks_out_the_remote_pr_head_when_on_another_branch(self):
-        target = {"pr_url": "https://github.com/owner/repo/pull/7"}
-        metadata = {"head_branch": "feature", "head_sha": "remote123"}
-
-        with (
-            mock.patch.object(MODULE, "run") as run,
-            mock.patch.object(MODULE, "git", return_value="session-branch"),
-        ):
-            checked_out_branch = MODULE.checkout_pr(Path("repo"), target, metadata)
-
+            checked_out_branch = MODULE.checkout_pr(
+                Path("repo"), {"pr_url": "https://github.com/owner/repo/pull/7"}, metadata,
+            )
         self.assertFalse(checked_out_branch)
-        self.assertEqual(
-            run.call_args,
-            mock.call(
-                ["gh", "pr", "checkout", target["pr_url"], "--detach"],
-                cwd=Path("repo"),
-            ),
+        self.assertIn(
+            ("fetch", "--no-tags", "https://github.com/fork/repo.git",
+             "+refs/heads/feature:refs/agent-copilot-review/head"),
+            [call.args[1:] for call in git.call_args_list],
         )
+        self.assertIn(("checkout", "--detach", actual), [call.args[1:] for call in git.call_args_list])
+        self.assertFalse(any(call.args[1] in {"reset", "merge"} for call in git.call_args_list))
+
+    def test_rejects_branch_move_during_fetch(self):
+        metadata = {
+            "head_branch": "feature", "head_sha": "4" * 40,
+            "head_owner": "fork", "head_repo": "repo",
+        }
+        def git_call(_root, *args):
+            if args[0] == "status":
+                return ""
+            if args[0] == "branch":
+                return "feature"
+            if args[:2] == ("rev-parse", "HEAD"):
+                return "3" * 40
+            if args[:2] == ("rev-parse", "refs/agent-copilot-review/head"):
+                return "5" * 40
+            if args[0] == "fetch":
+                return ""
+            raise AssertionError(args)
+        with mock.patch.object(
+            MODULE, "run", return_value=mock.Mock(returncode=0)
+        ), mock.patch.object(MODULE, "git", side_effect=git_call) as git:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "moved while fetching"):
+                MODULE.checkout_pr(Path("repo"), {}, metadata)
+        self.assertFalse(any(call.args[1] == "checkout" for call in git.call_args_list))
 
     def test_does_not_mask_other_checkout_failures(self):
         target = {"pr_url": "https://github.com/owner/repo/pull/7"}
@@ -6506,7 +6528,7 @@ class CheckoutHeadTest(unittest.TestCase):
         error = MODULE.WorkflowError("authentication failed")
 
         with (
-            mock.patch.object(MODULE, "git", return_value="feature"),
+            mock.patch.object(MODULE, "git", return_value=""),
             mock.patch.object(MODULE, "run", side_effect=error),
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "authentication failed"):
@@ -9085,6 +9107,7 @@ class CopilotReviewTest(unittest.TestCase):
                 ),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(MODULE, "checkout_pr", return_value=True),
                 mock.patch.object(MODULE, "run"),
                 mock.patch.object(MODULE, "fetch_threads", return_value=[]),
                 mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
@@ -9110,6 +9133,7 @@ class PreflightTargetTest(unittest.TestCase):
         max_iterations=5,
         local_branch="branch",
         checked_out_branch=True,
+        observed_head=None,
         pipeline=None,
         state_path=None,
     ):
@@ -9149,7 +9173,13 @@ class PreflightTargetTest(unittest.TestCase):
                     MODULE, "resolve_repo_root", return_value=Path(directory)
                 ),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
-                mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(
+                    MODULE, "metadata_for",
+                    side_effect=[
+                        metadata,
+                        {**metadata, "head_sha": observed_head or metadata["head_sha"]},
+                    ],
+                ),
                 mock.patch.object(
                     MODULE, "checkout_pr", return_value=checked_out_branch
                 ),
@@ -9161,6 +9191,10 @@ class PreflightTargetTest(unittest.TestCase):
                 MODULE.command_preflight(args)
 
         return emit.call_args.args[0]
+
+    def test_preflight_rejects_head_move_while_reading_reviews(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "drifted"):
+            self.run_preflight(observed_head="new-head")
 
     def test_preflight_accepts_detached_checkout_from_another_branch(self):
         payload = self.run_preflight(
@@ -9196,6 +9230,7 @@ class PreflightTargetTest(unittest.TestCase):
                 ) as current_pr_target,
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(MODULE, "checkout_pr", return_value=True),
                 mock.patch.object(MODULE, "run"),
                 mock.patch.object(MODULE, "fetch_threads", return_value=[]),
                 mock.patch.object(MODULE, "fetch_reviews", return_value=[]),
@@ -9394,6 +9429,7 @@ class PreflightTargetTest(unittest.TestCase):
                 ),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(MODULE, "checkout_pr", return_value=True),
                 mock.patch.object(MODULE, "run"),
                 mock.patch.object(MODULE, "fetch_threads", return_value=threads),
                 mock.patch.object(
@@ -9560,6 +9596,7 @@ class PreflightTargetTest(unittest.TestCase):
                 ),
                 mock.patch.object(MODULE, "git", side_effect=fake_git),
                 mock.patch.object(MODULE, "metadata_for", return_value=metadata),
+                mock.patch.object(MODULE, "checkout_pr", return_value=True),
                 mock.patch.object(MODULE, "run"),
                 mock.patch.object(MODULE, "fetch_threads", return_value=threads),
                 mock.patch.object(MODULE, "fetch_reviews", return_value=[]),

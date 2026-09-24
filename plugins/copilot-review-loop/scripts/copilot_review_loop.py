@@ -165,7 +165,7 @@ TARGET_PATTERN = re.compile(
 )
 SHORT_TARGET_PATTERN = re.compile(r"^(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a"
+    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -2610,47 +2610,60 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         "head_owner": head_owner["login"],
         "head_repo": head_repository["name"],
         "head_branch": metadata["headRefName"],
-        "head_sha": metadata["headRefOid"],
+        "head_sha": remote_head(head_owner["login"], head_repository["name"], metadata["headRefName"]),
+        "reported_head_sha": metadata.get("headRefOid"),
         "base_branch": base_branch,
         "base_sha": base_sha,
     }
     result["head_repository"] = head_repository_identity(result)
+    if result["head_sha"] is None:
+        raise WorkflowError("pull request head branch no longer exists")
     return result
 
 
 def verify_checkout_head(repo_root: Path, local_head: str, pr_head: str) -> None:
     if local_head == pr_head:
         return
-    ancestor = run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "merge-base",
-            "--is-ancestor",
-            pr_head,
-            local_head,
-        ],
-        check=False,
-    )
-    if ancestor.returncode == 0:
-        return
-    if ancestor.returncode != 1:
-        detail = ancestor.stderr.strip() or ancestor.stdout.strip() or "no output"
-        raise WorkflowError(f"failed to compare local and PR heads: {detail}")
     raise WorkflowError(f"HEAD mismatch: local {local_head}, PR head {pr_head}")
 
 
 def checkout_pr(
     repo_root: Path, target: dict[str, Any], metadata: dict[str, Any]
 ) -> bool:
+    dirty = git(repo_root, "status", "--porcelain=v1")
+    if dirty:
+        raise WorkflowError(f"worktree is not clean:\n{dirty}")
     current_branch = git(repo_root, "branch", "--show-current")
     on_pr_branch = current_branch == metadata["head_branch"]
-    command = ["gh", "pr", "checkout", target["pr_url"]]
-    if not on_pr_branch:
-        command.append("--detach")
-    run(command, cwd=repo_root)
-    return on_pr_branch
+    local_head = git(repo_root, "rev-parse", "HEAD").lower()
+    expected = metadata["head_sha"]
+    branch = metadata["head_branch"]
+    if run(["git", "check-ref-format", f"refs/heads/{branch}"], check=False).returncode:
+        raise WorkflowError(f"invalid head branch {branch!r}")
+    ref = "refs/agent-copilot-review/head"
+    git(
+        repo_root, "fetch", "--no-tags",
+        f"https://github.com/{metadata['head_owner']}/{metadata['head_repo']}.git",
+        f"+refs/heads/{branch}:{ref}",
+    )
+    if git(repo_root, "rev-parse", ref).lower() != expected:
+        raise WorkflowError("PR head branch moved while fetching the checkout")
+    if remote_head(metadata["head_owner"], metadata["head_repo"], branch) != expected:
+        raise WorkflowError("PR head branch moved while verifying the checkout")
+    if on_pr_branch and local_head not in (expected, metadata.get("reported_head_sha")):
+        ancestor = run([
+            "git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+            local_head, expected,
+        ], check=False)
+        if ancestor.returncode != 0:
+            raise WorkflowError("local work is not contained in the actual PR head")
+    if local_head != expected or (current_branch and not on_pr_branch):
+        git(repo_root, "checkout", "--detach", expected)
+    if git(repo_root, "rev-parse", "HEAD").lower() != expected:
+        raise WorkflowError("checkout did not reach the actual PR head")
+    if remote_head(metadata["head_owner"], metadata["head_repo"], branch) != expected:
+        raise WorkflowError("PR head branch moved after checkout")
+    return git(repo_root, "branch", "--show-current") == branch
 
 
 def windows_process_is_running(pid: int) -> bool:
@@ -3039,6 +3052,9 @@ def command_preflight(args: argparse.Namespace) -> None:
         and not review_has_inline_findings(head_review, threads)
         and not parse_suppressed_comments(head_review.get("body"))
     )
+    require_live_pr_snapshot(
+        metadata, metadata_for(target), expected_head=head
+    )
     state = prior_state or {"version": STATE_VERSION, "created_at": utc_now()}
     state["iterations"] = int(state.get("iterations", 0))
     migrate_budget_counters(state)
@@ -3345,15 +3361,26 @@ def require_fork_head(pr: dict[str, Any], actual_head: str | None) -> None:
 
 
 def remote_head(owner: str, repo: str, branch: str) -> str | None:
+    if (not isinstance(branch, str) or not branch
+            or run(["git", "check-ref-format", f"refs/heads/{branch}"], check=False).returncode):
+        raise WorkflowError(f"invalid head branch {branch!r}")
     process = run(
-        ["gh", "api", f"repos/{owner}/{repo}/git/ref/heads/{branch}"], check=False
+        ["gh", "api", f"repos/{owner}/{repo}/git/ref/heads/"
+         f"{urllib.parse.quote(branch, safe='')}"], check=False
     )
     if process.returncode == 1 and "HTTP 404" in process.stderr:
         return None
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip()
         raise WorkflowError(f"failed to read remote ref: {detail}")
-    return json.loads(process.stdout)["object"]["sha"]
+    payload = json.loads(process.stdout)
+    obj = payload.get("object") if isinstance(payload, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if (not isinstance(payload, dict)
+            or payload.get("ref") != f"refs/heads/{branch}"
+            or not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha.lower())):
+        raise WorkflowError("GitHub returned an invalid head branch identity")
+    return sha.lower()
 
 
 def wait_for_remote_head(

@@ -1440,14 +1440,29 @@ def resolve_pr(
         if isinstance(base_object, dict)
         else None
     )
+    head_ref = data.get("headRefName")
+    if not REPO_RE.fullmatch(name_with_owner) or not isinstance(head_ref, str) or not head_ref:
+        raise ConflictError("open pull request head identity is invalid", "stale_target")
+    head_data = parse_json_output(
+        checked(
+            runner,
+            ["gh", "api", f"repos/{name_with_owner}/git/ref/heads/"
+             f"{urllib.parse.quote(head_ref, safe='')}"],
+            cwd=root,
+            code="stale_target",
+        ),
+        "head branch data",
+    )
+    head_object = head_data.get("object")
+    head_sha = head_object.get("sha") if isinstance(head_object, dict) else None
     live = LivePr(
         data.get("number"),
         data.get("url"),
         data.get("state"),
         repository,
         name_with_owner,
-        data.get("headRefName"),
-        str(data.get("headRefOid", "")).lower(),
+        head_ref,
+        str(head_sha or "").lower(),
         repository,
         base_ref,
         str(base_sha or "").lower(),
@@ -1677,7 +1692,7 @@ def fetch_pinned_inputs(
     inputs: list[tuple[str, str, str, bool]] = [
         (
             "source-head",
-            f"refs/pull/{request['pull_request']['number']}/head",
+            f"refs/heads/{request['pull_request']['head_ref']}",
             request["pull_request"]["head_sha"],
             True,
         ),
@@ -1701,7 +1716,7 @@ def fetch_pinned_inputs(
         inputs.extend(
             (
                 f"member-{member['pr_number']}",
-                f"refs/pull/{member['pr_number']}/head",
+                f"refs/heads/{member['head_ref']}",
                 member["head_sha"],
                 True,
             )
@@ -1719,12 +1734,18 @@ def fetch_pinned_inputs(
     targets: list[str] = []
     for role, source, expected_sha, require_tip in inputs:
         target = quarantine_ref(request_id, f"input-{role}")
+        remote = snapshot.remote
+        if (
+            role == "source-head"
+            and request["pull_request"]["head_repository"] != request["repository"]
+        ):
+            remote = f"https://github.com/{request['pull_request']['head_repository']}.git"
         git(
             runner,
             snapshot.root,
             "fetch",
             "--no-tags",
-            snapshot.remote,
+            remote,
             f"+{source}:{target}",
             code="stale_target",
         )

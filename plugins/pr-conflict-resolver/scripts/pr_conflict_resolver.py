@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "de8bee0a495224568be535fe2be8b1ed704a200a3cac806e00214a82c5b4ebb3"
+    "acabf7430c0da236ed0da75e67069c39266298c89b4410097ee154a25c3258cb"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@14"
@@ -537,7 +537,9 @@ def merged_predecessor(
     return matches[0] if matches else None
 
 
-def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
+def stack_membership(
+    pr: dict[str, Any], *, repo_root: Path | None = None
+) -> dict[str, Any]:
     """Read the repository default branch and whether this PR is a native stack.
 
     ``pullRequest.stack`` is the detection mechanism: non-null means a native
@@ -618,6 +620,30 @@ def stack_membership(pr: dict[str, Any]) -> dict[str, Any]:
     raw_stack = pull.get("stack")
     stack = parse_stack(raw_stack) if isinstance(raw_stack, dict) else None
     if stack is not None:
+        for member in stack["members"]:
+            if member["state"] != "OPEN":
+                continue
+            head = remote_head(
+                pr["upstream_owner"], pr["upstream_repo"], member["head_branch"]
+            )
+            if head is None:
+                raise WorkflowError(f"native stack member #{member['number']} branch is missing")
+            if head != member["head_sha"]:
+                base = base_ref_tip(pr["repo_name"], member["base_branch"])
+                code = branch_code_snapshot(
+                    pr["repo_name"], pr["repo_name"], base, head, repo_root=repo_root
+                )
+                if remote_head(
+                    pr["upstream_owner"], pr["upstream_repo"], member["head_branch"]
+                ) != head or base_ref_tip(pr["repo_name"], member["base_branch"]) != base:
+                    raise WorkflowError("native stack branches moved while deriving history")
+                member.update({
+                    "head_sha": head,
+                    "base_sha": base,
+                    "commits": [commit["sha"] for commit in code["commits"]],
+                    "commits_complete": True,
+                    "mergeable": code["mergeable"],
+                })
         inactive_members = [
             member for member in stack["members"] if member["state"] != "OPEN"
         ]
@@ -1110,7 +1136,50 @@ def resolve_target(value: str | None, repo_root: Path) -> dict[str, Any]:
     return parse_target(value) if value else current_pr_target(repo_root)
 
 
-def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
+def branch_code_snapshot(
+    repository: str,
+    head_repository: str,
+    base_sha: str,
+    head_sha: str,
+    *,
+    repo_root: Path | None = None,
+) -> dict[str, Any]:
+    """Derive history and file conflicts from exact branch commits, without checkout."""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha) or not re.fullmatch(
+        r"[0-9a-fA-F]{40}", base_sha
+    ):
+        raise WorkflowError("branch snapshot has an invalid commit SHA")
+    if repo_root is None:
+        with tempfile.TemporaryDirectory(prefix="pr-conflict-snapshot-") as directory:
+            root = Path(directory)
+            git(root, "init", "--bare", "--quiet")
+            return branch_code_snapshot(
+                repository, head_repository, base_sha, head_sha, repo_root=root
+            )
+    for remote_repository, sha in ((repository, base_sha), (head_repository, head_sha)):
+        if git_try(repo_root, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
+            git(
+                repo_root, "fetch", "--no-tags", "--no-write-fetch-head",
+                f"https://github.com/{remote_repository}.git", sha,
+            )
+    conflicts = merge_tree_conflicts(repo_root, head_sha, base_sha)
+    commits = git(
+        repo_root, "rev-list", "--reverse", "--topo-order", f"{base_sha}..{head_sha}"
+    ).splitlines()
+    return {
+        "commits": [
+            {"sha": sha, "message": conflict_commit_subject(repo_root, sha)}
+            for sha in commits
+        ],
+        "mergeable": "CONFLICTING" if conflicts else "MERGEABLE",
+        "conflict_paths": conflicts,
+        "merge_state_status": None,
+    }
+
+
+def metadata_for(
+    target: dict[str, Any], *, repo_root: Path | None = None
+) -> dict[str, Any]:
     fields = (
         "number,title,url,state,isDraft,mergeStateStatus,headRefName,"
         "headRefOid,headRepositoryOwner,headRepository,baseRefName,commits"
@@ -1140,9 +1209,15 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         raise WorkflowError(
             "pull request head repository is unavailable; it may have been deleted"
         )
-    head_sha = metadata.get("headRefOid")
-    if not isinstance(head_sha, str) or not head_sha:
+    recorded_head = metadata.get("headRefOid")
+    if not isinstance(recorded_head, str) or not recorded_head:
         raise WorkflowError("resolved PR metadata has no head commit")
+    head_branch = metadata.get("headRefName")
+    if not isinstance(head_branch, str) or not head_branch:
+        raise WorkflowError("resolved PR metadata has no head branch")
+    head_sha = remote_head(head_owner["login"], head_repository["name"], head_branch)
+    if head_sha is None:
+        raise WorkflowError("pull request source branch has been deleted")
     base_branch = metadata.get("baseRefName")
     if not isinstance(base_branch, str) or not base_branch:
         raise WorkflowError("resolved PR metadata has no base branch")
@@ -1150,6 +1225,35 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     title = metadata.get("title")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
+    result = {
+        "number": target["number"],
+        "title": title.strip(),
+        "pr_url": resolved["pr_url"],
+        "repo_name": resolved["repo_name"],
+        "upstream_owner": resolved["owner"],
+        "upstream_repo": resolved["repo"],
+        "state": metadata.get("state"),
+        "is_draft": bool(metadata.get("isDraft")),
+        "head_owner": head_owner["login"],
+        "head_repo": head_repository["name"],
+        "head_branch": head_branch,
+        "head_sha": head_sha,
+        "recorded_head_sha": recorded_head,
+        "base_branch": base_branch,
+        "base_sha": base_sha,
+    }
+    if head_sha != recorded_head:
+        result.update(branch_code_snapshot(
+            resolved["repo_name"],
+            f"{head_owner['login']}/{head_repository['name']}",
+            base_sha, head_sha, repo_root=repo_root,
+        ))
+        if (
+            remote_head(head_owner["login"], head_repository["name"], head_branch) != head_sha
+            or base_ref_tip(resolved["repo_name"], base_branch) != base_sha
+        ):
+            raise WorkflowError("source or base branch moved while deriving PR history")
+        return result
     raw_commits = metadata.get("commits")
     if not isinstance(raw_commits, list):
         raise WorkflowError("resolved PR metadata has no commit list")
@@ -1198,23 +1302,10 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
         mergeable = "UNKNOWN"
         conflict_paths = []
     return {
-        "number": target["number"],
-        "title": title.strip(),
-        "pr_url": resolved["pr_url"],
-        "repo_name": resolved["repo_name"],
-        "upstream_owner": resolved["owner"],
-        "upstream_repo": resolved["repo"],
-        "state": metadata.get("state"),
-        "is_draft": bool(metadata.get("isDraft")),
+        **result,
         "mergeable": mergeable,
         "conflict_paths": conflict_paths,
         "merge_state_status": metadata.get("mergeStateStatus"),
-        "head_owner": head_owner["login"],
-        "head_repo": head_repository["name"],
-        "head_branch": metadata["headRefName"],
-        "head_sha": head_sha,
-        "base_branch": base_branch,
-        "base_sha": base_sha,
         "commits": commits,
     }
 
@@ -1254,22 +1345,25 @@ def live_mergeability(
     *,
     delays: Iterable[float] = MERGEABILITY_RETRY_DELAYS,
     expected_head: str | None = None,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Read the file-conflict condition until GitHub evaluates the current head.
+    """Read file conflicts for the actual source branch.
 
     GitHub can return UNKNOWN after a push. Reading again gives its conflict
     condition time to settle without relying on aggregate mergeability.
 
     A read taken right after a push can also still describe the previous head, and
     that stale answer carries a settled mergeable value rather than UNKNOWN. Pass the
-    head SHA the answer has to describe so the wait covers that case too.
+    head SHA the answer has to describe so the wait covers that case too. When
+    PR tracking lags the branch, metadata derives conflicts from Git instead.
     """
-    metadata = metadata_for(target)
+    kwargs = {"repo_root": repo_root} if repo_root is not None else {}
+    metadata = metadata_for(target, **kwargs)
     for delay in delays:
         if mergeability_settled(metadata, expected_head):
             return metadata
         time.sleep(delay)
-        metadata = metadata_for(target)
+        metadata = metadata_for(target, **kwargs)
     return metadata
 
 
@@ -1840,7 +1934,8 @@ def find_remote(repo_root: Path, repo_name: str, *, push: bool) -> str:
 
 def remote_head(owner: str, repo: str, branch: str) -> str | None:
     process = run(
-        ["gh", "api", f"repos/{owner}/{repo}/git/ref/heads/{branch}"], check=False
+        ["gh", "api", f"repos/{owner}/{repo}/git/ref/heads/"
+         f"{urllib.parse.quote(branch, safe='')}"], check=False
     )
     if process.returncode == 1 and "HTTP 404" in process.stderr:
         return None
@@ -2331,7 +2426,8 @@ def checkout_pr_branch(
     cannot: git refuses to check a branch out in two worktrees of one repository,
     and the session worktree that opened the pull request is usually still
     holding it, so attaching would fail exactly when a conflict needs resolving.
-    An exact attached or detached checkout needs no GitHub CLI checkout.
+    An exact attached or detached checkout needs no fetch. Otherwise the
+    source branch is fetched and verified before detaching at its tip.
 
     Returns whether the worktree stayed attached to the head branch.
     """
@@ -2342,15 +2438,23 @@ def checkout_pr_branch(
         local_head == metadata["head_sha"]
     ):
         return on_pr_branch
-    command = ["gh", "pr", "checkout", target["pr_url"]]
-    if not on_pr_branch:
-        command.append("--detach")
-    run(command, cwd=repo_root)
-    stray = attached_to_other_branch(repo_root, metadata["head_branch"])
-    if stray is not None:
-        raise WorkflowError(
-            f"branch mismatch: local {stray!r}, PR head {metadata['head_branch']!r}"
-        )
+    require_clean_worktree(repo_root)
+    require_no_integration_in_progress(repo_root)
+    fetch_preflight_ref(
+        repo_root,
+        f"https://github.com/{metadata['head_owner']}/{metadata['head_repo']}.git",
+        f"refs/heads/{metadata['head_branch']}",
+        metadata["head_sha"],
+    )
+    if (
+        on_pr_branch
+        and local_head != metadata.get("recorded_head_sha")
+        and not is_ancestor(repo_root, local_head, metadata["head_sha"])
+    ):
+        raise WorkflowError("local work is not contained in the source branch; reconcile it first")
+    git(repo_root, "checkout", "--detach", metadata["head_sha"])
+    if git(repo_root, "branch", "--show-current"):
+        raise WorkflowError("branch mismatch after detached checkout")
     local_head = git(repo_root, "rev-parse", "HEAD")
     if local_head != metadata["head_sha"]:
         raise WorkflowError(
@@ -2358,7 +2462,7 @@ def checkout_pr_branch(
             "this resolver resolves the authoritative remote branch, so publish or "
             "reconcile local work before preflight"
         )
-    return on_pr_branch
+    return False
 
 
 def planned_stack_attempt(
@@ -8288,6 +8392,7 @@ class PreflightRefStore:
         role: str,
         *,
         expected: str | None = None,
+        remote: str | None = None,
     ) -> str:
         safe_role = re.sub(r"[^A-Za-z0-9._-]", "-", role)
         target = f"{self.prefix}/{safe_role}"
@@ -8296,7 +8401,7 @@ class PreflightRefStore:
             self.repo_root,
             "fetch",
             "--no-tags",
-            self.remote,
+            remote or self.remote,
             f"+{source}:{target}",
         )
         if result.returncode != 0:
@@ -8479,7 +8584,9 @@ def _aligned_native_stack_clearance(
     outside = external_stack_dependents(metadata, stack)
     for index, member in enumerate(stack["members"]):
         target = stack_member_target(metadata, member["number"])
-        current = live_mergeability(target, expected_head=member["head_sha"])
+        current = live_mergeability(
+            target, expected_head=member["head_sha"], repo_root=repo_root
+        )
         require_open_pull_request(current)
         direct_base_sha = (
             trunk_sha
@@ -8498,7 +8605,7 @@ def _aligned_native_stack_clearance(
             target,
         )
         preflight_refs.fetch(
-            f"refs/pull/{current['number']}/head",
+            f"refs/heads/{current['head_branch']}",
             f"clearance-member-head-{current['number']}",
             expected=current["head_sha"],
         )
@@ -8532,7 +8639,7 @@ def _aligned_native_stack_clearance(
             or base_ref_tip(current["repo_name"], current["head_branch"]) != current["head_sha"]
         ):
             raise WorkflowError("native stack changed during clearance observation")
-    refreshed_scope = stack_membership(metadata)
+    refreshed_scope = stack_membership(metadata, repo_root=repo_root)
     validate_native_stack_clearance_refresh(
         detection,
         refreshed_scope,
@@ -8611,11 +8718,13 @@ def _conflict_preflight(
     preflight_refs: PreflightRefStore,
 ) -> dict[str, Any]:
     if stack_request is not None:
-        current = metadata_for(target)
-        require_authorized_stack(stack_request, current, stack_membership(current).get("stack"))
+        current = metadata_for(target, repo_root=repo_root)
+        require_authorized_stack(
+            stack_request, current, stack_membership(current, repo_root=repo_root).get("stack")
+        )
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
-    metadata = live_mergeability(target)
+    metadata = live_mergeability(target, repo_root=repo_root)
     require_open_pull_request(metadata)
     checkout_pr_branch(repo_root, target, metadata)
     require_clean_worktree(repo_root)
@@ -8623,15 +8732,18 @@ def _conflict_preflight(
     remote = find_remote(repo_root, metadata["repo_name"], push=False)
     preflight_refs.remote = remote
     preflight_refs.fetch(
-        f"refs/pull/{metadata['number']}/head",
+        f"refs/heads/{metadata['head_branch']}",
         "invoked-head",
         expected=metadata["head_sha"],
+        **({
+            "remote": f"https://github.com/{metadata['head_owner']}/{metadata['head_repo']}.git"
+        } if f"{metadata['head_owner']}/{metadata['head_repo']}" != metadata["repo_name"] else {}),
     )
     preflight_refs.fetch(
         f"refs/heads/{metadata['base_branch']}",
         "invoked-base",
     )
-    detection = stack_membership(metadata)
+    detection = stack_membership(metadata, repo_root=repo_root)
     stack = detection["stack"]
     if stack_request is not None:
         require_authorized_stack(stack_request, metadata, stack)
@@ -8739,7 +8851,7 @@ def _conflict_preflight(
                     f"native stack member #{member['number']} has a stale direct base"
                 )
             preflight_refs.fetch(
-                f"refs/pull/{member['number']}/head",
+                f"refs/heads/{member['head_branch']}",
                 f"member-head-{member['number']}",
                 expected=member["head_sha"],
             )
@@ -9790,9 +9902,9 @@ def require_live_conflict_guards(
     request = preflight["request"]
     authorization = preflight.get("stack_request")
     if authorization is not None:
-        current = metadata_for(parse_target(request["pull_request"]["url"]))
+        current = metadata_for(parse_target(request["pull_request"]["url"]), repo_root=repo_root)
         require_authorized_stack(
-            authorization, current, stack_membership(current).get("stack")
+            authorization, current, stack_membership(current, repo_root=repo_root).get("stack")
         )
     identity = preflight["identity"]
     if (
@@ -9801,7 +9913,7 @@ def require_live_conflict_guards(
         or git(repo_root, "status", "--porcelain=v1")
     ):
         raise WorkflowError("local repository changed after conflict preflight")
-    current = metadata_for(parse_target(request["pull_request"]["url"]))
+    current = metadata_for(parse_target(request["pull_request"]["url"]), repo_root=repo_root)
     pr = request["pull_request"]
     base_advanced = current["base_sha"] != pr["base_sha"]
     if (
@@ -9830,7 +9942,7 @@ def require_live_conflict_guards(
     if merge_base != request["merge_base"]:
         raise WorkflowError("merge base changed after cloud resolution")
     if request["strategy"] == "native-stack":
-        detection = stack_membership(current)
+        detection = stack_membership(current, repo_root=repo_root)
         stack = detection["stack"]
         if authorization is not None:
             require_authorized_stack(authorization, current, stack)
@@ -10115,7 +10227,8 @@ def publish_conflict_result(
     if not pushed:
         raise WorkflowError("publication could not be verified")
     refreshed = live_mergeability(
-        parse_target(request["pull_request"]["url"]), expected_head=invoked["new_sha"]
+        parse_target(request["pull_request"]["url"]), expected_head=invoked["new_sha"],
+        repo_root=repo_root,
     )
     if refreshed["head_sha"] != invoked["new_sha"]:
         raise WorkflowError("pull request head did not reach the published commit")
@@ -10867,7 +10980,7 @@ def revalidate_pipeline_conflict(
     require_tools()
     require_clean_worktree(root)
     require_no_integration_in_progress(root)
-    metadata = live_mergeability(target)
+    metadata = live_mergeability(target, repo_root=root)
     identity_keys = (
         "number", "pr_url", "repo_name", "head_owner", "head_repo", "head_branch",
         "base_branch", "upstream_owner", "upstream_repo",
@@ -10876,7 +10989,7 @@ def revalidate_pipeline_conflict(
         raise WorkflowError("pipeline pull request identity or base branch changed")
     require_open_pull_request(metadata)
     conflict_preflight_identity(root, metadata)
-    detection = stack_membership(metadata)
+    detection = stack_membership(metadata, repo_root=root)
     stack = detection["stack"]
     if stack is None and metadata["base_branch"] != detection["default_branch"]:
         raise WorkflowError("pipeline non-default base has no native stack")

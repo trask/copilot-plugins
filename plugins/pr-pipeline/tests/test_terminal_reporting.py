@@ -234,13 +234,16 @@ class TerminalReportingTest(unittest.TestCase):
         ]
         output_sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         target = MODULE.build_target("owner", "repo", 7)
-        code_commits = MODULE.common.read_pr_commits(
-            target,
-            api=mock.Mock(return_value={"commits": [
-                {"oid": code_shas[0], "messageHeadline": "First review fix"},
-                {"oid": code_shas[1], "messageHeadline": "Second review fix"},
-            ]}),
-        )
+        with (
+            mock.patch.object(MODULE.common, "git_succeeds", return_value=True),
+            mock.patch.object(MODULE.common, "local_commits_between", return_value=[
+                {"sha": code_shas[0], "title": "First review fix"},
+                {"sha": code_shas[1], "title": "Second review fix"},
+            ]),
+        ):
+            code_commits = MODULE.common.read_pr_commits(
+                target, repo_root=Path("C:/repo"), base_sha=BASE, head_sha=HEAD,
+            )
         published, errors, rewritten = MODULE.commits_added(
             {"commits": [{"sha": HEAD}]},
             {"commits": [{"sha": HEAD}, *code_commits]},

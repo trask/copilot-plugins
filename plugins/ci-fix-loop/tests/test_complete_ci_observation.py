@@ -81,6 +81,7 @@ class CompleteCiObservationTest(unittest.TestCase):
         stack = contextlib.ExitStack()
         stack.enter_context(mock.patch.object(MODULE.subprocess, "Popen", side_effect=AssertionError("external execution")))
         stack.enter_context(mock.patch.object(MODULE, "metadata_for", return_value=self.preflight["pr"]))
+        stack.enter_context(mock.patch.object(MODULE, "remote_head", return_value=self.fixture.head))
         stack.enter_context(mock.patch.object(MODULE, "fetch_rollup", side_effect=lambda _: (self.fixture.head, self.live_checks)))
         stack.enter_context(mock.patch.object(MODULE, "fetch_workflow_run", side_effect=self.fetch_run))
         stack.enter_context(mock.patch.object(MODULE, "gh_json", side_effect=self.api))

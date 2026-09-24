@@ -121,6 +121,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             }),
             mock.patch.object(MODULE, "require_fork_head"),
             mock.patch.object(MODULE, "find_push_remote"),
+            mock.patch.object(MODULE, "remote_head", return_value=self.pr["head_sha"]),
             mock.patch.object(MODULE, "gh_json", side_effect=[
                 {"permissions": dict.fromkeys(("admin", "maintain", "push", "triage", "pull"), True)},
                 {"login": "viewer"},

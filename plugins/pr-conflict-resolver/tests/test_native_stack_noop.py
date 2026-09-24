@@ -111,8 +111,8 @@ class NativeStackNoopTest(unittest.TestCase):
         for name, options in {
             "require_tools": {},
             "checkout_pr_branch": {},
-            "metadata_for": {"side_effect": lambda target: copy.deepcopy(self.metadata[target["number"]])},
-            "stack_membership": {"side_effect": lambda pr: {
+            "metadata_for": {"side_effect": lambda target, **kwargs: copy.deepcopy(self.metadata[target["number"]])},
+            "stack_membership": {"side_effect": lambda pr, **kwargs: {
                 "default_branch": "main", "stack": copy.deepcopy(self.stack),
             }},
             "base_ref_tip": {"side_effect": lambda repo, branch: MODULE.git(

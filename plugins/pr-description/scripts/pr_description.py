@@ -56,7 +56,7 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "fa95c0fafe47490010ff70ffe8a1b5c7f210fbf85df92ed35896c76cad11dd4a"
+    "f4c560b274488ceb7db84f07fbb0955414b9ae56c3011e924581dd9a126449ea"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -1257,7 +1257,14 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
     title = metadata.get("title")
     body = metadata.get("body") or ""
     head = metadata.get("head")
-    head_sha = head.get("sha") if isinstance(head, dict) else None
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    head_repository = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    head_branch = head.get("ref") if isinstance(head, dict) else None
+    head_sha = (
+        live_branch_tip(head_repository, head_branch)
+        if isinstance(head_repository, str) and isinstance(head_branch, str)
+        else None
+    )
     is_draft = metadata.get("draft")
     if not isinstance(title, str) or not title.strip():
         raise WorkflowError("resolved PR metadata has no title")
@@ -1278,6 +1285,8 @@ def metadata_for(target: dict[str, Any]) -> dict[str, Any]:
 
 
 def live_branch_tip(repository: str, branch: str) -> str:
+    if run(["git", "check-ref-format", f"refs/heads/{branch}"], check=False).returncode:
+        raise WorkflowError(f"invalid branch {branch!r}")
     encoded_branch = urllib.parse.quote(branch, safe="")
     payload = gh_json(
         ["api", f"repos/{repository}/git/ref/heads/{encoded_branch}"]
@@ -1293,7 +1302,7 @@ def live_branch_tip(repository: str, branch: str) -> str:
         or not isinstance(sha, str)
         or SHA_PATTERN.fullmatch(sha.lower()) is None
     ):
-        raise WorkflowError("GitHub API returned an invalid live base branch identity")
+        raise WorkflowError("GitHub API returned an invalid live branch identity")
     return sha.lower()
 
 
@@ -1350,6 +1359,9 @@ def agent_task_preflight(
         base_identity["ref"],
     )
     head_identity = branch_identity(head, "head")
+    head_identity["sha"] = live_branch_tip(
+        head_identity["repository"], head_identity["ref"]
+    )
     if (
         base_identity["repository"].casefold() != target["repo_name"].casefold()
         or head_identity["sha"] != pr["head_sha"].lower()
@@ -1929,31 +1941,29 @@ def recommendation_from_outputs(
 
 def pull_request_file_paths(preflight: dict[str, Any]) -> list[str]:
     pr = preflight["pr"]
-    process = run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            "--slurp",
-            f"repos/{pr['repo_name']}/pulls/{pr['number']}/files",
-        ]
-    )
-    try:
-        pages = json.loads(process.stdout)
-    except json.JSONDecodeError as error:
-        raise WorkflowError(f"GitHub returned invalid PR file metadata: {error}") from error
-    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-        raise WorkflowError("GitHub returned malformed PR file metadata")
-    paths: list[str] = []
-    for page in pages:
-        for item in page:
-            filename = item.get("filename") if isinstance(item, dict) else None
-            if not isinstance(filename, str) or not filename:
-                raise WorkflowError("GitHub returned malformed PR file metadata")
-            paths.append(filename)
-    if len(paths) != len(set(paths)):
-        raise WorkflowError("GitHub returned duplicate PR file metadata")
-    return sorted(paths)
+    repo_root = Path(preflight["repository_root"])
+    for identity in (pr["base"], pr["head"]):
+        run([
+            "git", "-C", str(repo_root), "fetch", "--no-tags",
+            f"https://github.com/{identity['repository']}.git",
+            f"+refs/heads/{identity['ref']}:refs/agent-pr-description/"
+            f"{'base' if identity is pr['base'] else 'head'}",
+        ])
+        fetched = git(
+            repo_root, "rev-parse",
+            f"refs/agent-pr-description/{'base' if identity is pr['base'] else 'head'}",
+        )
+        if fetched.lower() != identity["sha"]:
+            if identity is pr["head"] or run([
+                "git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+                identity["sha"], fetched,
+            ], check=False).returncode != 0:
+                raise WorkflowError("PR branch moved while fetching changed files")
+    result = run([
+        "git", "-C", str(repo_root), "diff", "--name-only", "-z",
+        f"{pr['base']['sha']}...{pr['head']['sha']}", "--",
+    ])
+    return sorted(set(path for path in result.stdout.split("\0") if path))
 
 
 def store_proposal(

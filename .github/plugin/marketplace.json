@@ -11,55 +11,55 @@
     {
       "name": "agent-tasks-runtime",
       "description": "Shared GitHub Agent Tasks runtime for Trask pull request agents.",
-      "version": "1.0.38",
+      "version": "1.0.39",
       "source": "./plugins/agent-tasks-runtime"
     },
     {
       "name": "pr-reviewer",
       "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-      "version": "1.8.32",
+      "version": "1.8.33",
       "source": "./plugins/pr-reviewer"
     },
     {
       "name": "copilot-review-loop",
       "description": "Address Copilot pull request review comments, publish fixes, and repeat until the review is clean.",
-      "version": "1.1.95",
+      "version": "1.1.96",
       "source": "./plugins/copilot-review-loop"
     },
     {
       "name": "self-review-loop",
       "description": "Review a GitHub pull request, verify each finding independently, and commit the fixes without posting review comments.",
-      "version": "1.3.71",
+      "version": "1.3.72",
       "source": "./plugins/self-review-loop"
     },
     {
       "name": "pr-description",
       "description": "Review and update a pull request title and description through a managed GitHub Agent Task.",
-      "version": "1.0.92",
+      "version": "1.0.93",
       "source": "./plugins/pr-description"
     },
     {
       "name": "pr-pipeline",
       "description": "Drive one pull request or a selected native-stack suffix through conflict resolution, review, CI fixing, and description validation.",
-      "version": "1.5.64",
+      "version": "1.5.65",
       "source": "./plugins/pr-pipeline"
     },
     {
       "name": "pr-conflict-resolver",
       "description": "Resolve the merge conflicts on a pull request in one pass by keeping both sides' intent, then push the resolution.",
-      "version": "1.1.68",
+      "version": "1.1.69",
       "source": "./plugins/pr-conflict-resolver"
     },
     {
       "name": "ci-fix-loop",
       "description": "Run one sealed, stateless CI repair invocation against a frozen pull request head.",
-      "version": "1.6.87",
+      "version": "1.6.88",
       "source": "./plugins/ci-fix-loop"
     },
     {
       "name": "historical-pr-audit",
       "description": "Audit an already-merged GitHub pull request against its own historical snapshot, verify each finding independently, and commit the fixes on a separate audit branch.",
-      "version": "1.1.42",
+      "version": "1.1.43",
       "source": "./plugins/historical-pr-audit"
     }
   ]

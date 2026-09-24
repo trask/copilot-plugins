@@ -139,6 +139,11 @@ class ClearanceSnapshotTest(unittest.TestCase):
                 return repository
             if endpoint == "user":
                 return {"login": "viewer"}
+            if endpoint == "repos/owner/repo/git/ref/heads/feature":
+                return {
+                    "ref": "refs/heads/feature",
+                    "object": {"type": "commit", "sha": initial["pr"]["head_sha"]},
+                }
             self.assertEqual("repos/owner/repo/git/ref/heads/main", endpoint)
             return {"ref": "refs/heads/main", "object": {"type": "commit", "sha": tip}}
 

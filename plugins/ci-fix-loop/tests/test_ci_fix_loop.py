@@ -4012,7 +4012,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.87", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.88", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -7696,6 +7696,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     mock.patch.object(MODULE, "checkout_pr"),
                     mock.patch.object(MODULE, "require_fork_head"),
                     mock.patch.object(MODULE, "find_push_remote"),
+                    mock.patch.object(MODULE, "remote_head", return_value=self.head),
                     mock.patch.object(
                         MODULE,
                         "gh_json",
@@ -7761,6 +7762,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "local_identity", return_value=self.preflight["identity"]),
             mock.patch.object(MODULE, "require_fork_head"),
             mock.patch.object(MODULE, "find_push_remote"),
+            mock.patch.object(MODULE, "remote_head", return_value=self.head),
             mock.patch.object(
                 MODULE, "gh_json",
                 side_effect=[
@@ -8269,6 +8271,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(MODULE, "local_identity", return_value=identity),
             mock.patch.object(MODULE, "require_fork_head"),
             mock.patch.object(MODULE, "find_push_remote", return_value="origin"),
+            mock.patch.object(MODULE, "remote_head", return_value=self.head),
             mock.patch.object(
                 MODULE, "gh_json", side_effect=[
                     repository, {"login": "viewer"}, [{"workflow_runs": []}],
@@ -8986,19 +8989,134 @@ class PullRequestMetadataTest(unittest.TestCase):
             MODULE, "gh_json", return_value=ci_gh_metadata()
         ), mock.patch.object(
             MODULE, "base_ref_tip", return_value="live-tip"
-        ) as tip:
+        ) as tip, mock.patch.object(
+            MODULE, "remote_head", return_value="live-head"
+        ):
             metadata = MODULE.metadata_for(target)
         # The base commit is what baseline_conclusions attributes against, so it
         # must be the branch's live tip, never GitHub's frozen baseRefOid.
         self.assertEqual("live-tip", metadata["base_sha"])
         self.assertEqual("main", metadata["base_branch"])
+        self.assertEqual("live-head", metadata["head_sha"])
         tip.assert_called_once_with("owner/repo", "main")
+
+    def test_stale_pr_record_uses_fork_branch_tip(self):
+        target = MODULE.parse_target("owner/repo#7")
+        with mock.patch.object(
+            MODULE, "gh_json", return_value=ci_gh_metadata(headRefOid="3" * 40)
+        ), mock.patch.object(
+            MODULE, "base_ref_tip", return_value="2" * 40
+        ), mock.patch.object(
+            MODULE, "remote_head", return_value="4" * 40
+        ) as head:
+            metadata = MODULE.metadata_for(target)
+        self.assertEqual("4" * 40, metadata["head_sha"])
+        self.assertEqual("3" * 40, metadata["reported_head_sha"])
+        head.assert_called_once_with("fork", "repo", "feature")
+
+    def test_stale_rollup_reads_checks_at_actual_sha(self):
+        pr = {
+            "head_owner": "fork", "head_repo": "repo",
+            "head_branch": "feature", "repo_name": "owner/repo",
+            "pr_url": "https://github.com/owner/repo/pull/7",
+        }
+        responses = [
+            {"headRefOid": "3" * 40, "statusCheckRollup": [
+                {"name": "old", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]},
+            [{"check_runs": [{"name": "build", "status": "queued"}]}],
+            {"statuses": []},
+        ]
+        with mock.patch.object(MODULE, "remote_head", return_value="4" * 40), mock.patch.object(
+            MODULE, "gh_json", side_effect=responses
+        ) as api:
+            sha, checks = MODULE.fetch_rollup(pr)
+        self.assertEqual("4" * 40, sha)
+        self.assertEqual(["check:build"], [check["key"] for check in checks])
+        self.assertEqual("not_started", checks[0]["class"])
+        self.assertIn(f"/commits/{'4' * 40}/check-runs", api.call_args_list[1].args[0][-1])
+
+    def test_stale_rollup_with_no_current_checks_remains_pending(self):
+        pr = {
+            "head_owner": "fork", "head_repo": "repo",
+            "head_branch": "feature", "repo_name": "owner/repo",
+            "pr_url": "https://github.com/owner/repo/pull/7",
+        }
+        with mock.patch.object(MODULE, "remote_head", return_value="4" * 40), mock.patch.object(
+            MODULE, "gh_json", side_effect=[
+                {"headRefOid": "3" * 40, "statusCheckRollup": []},
+                [{"check_runs": []}], {"statuses": []},
+            ]
+        ):
+            _, checks = MODULE.fetch_rollup(pr)
+        self.assertEqual("not_started", checks[0]["class"])
+        self.assertEqual("Current head checks unavailable", checks[0]["name"])
+
+    def test_stale_rollup_api_failure_is_not_a_pending_empty_result(self):
+        pr = {
+            "head_owner": "fork", "head_repo": "repo",
+            "head_branch": "feature", "repo_name": "owner/repo",
+            "pr_url": "https://github.com/owner/repo/pull/7",
+        }
+        with mock.patch.object(MODULE, "remote_head", return_value="4" * 40), mock.patch.object(
+            MODULE, "gh_json", side_effect=[
+                {"headRefOid": "3" * 40, "statusCheckRollup": []},
+                MODULE.WorkflowError("GitHub authentication failed"),
+            ]
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "authentication failed"):
+                MODULE.fetch_rollup(pr)
+
+    def test_stale_record_detaches_from_diverged_named_branch_without_overwriting_it(self):
+        old, actual = "3" * 40, "4" * 40
+        trees = {old: "a" * 40, actual: "b" * 40}
+        self.assertNotEqual(trees[old], trees[actual])
+        branch = {"name": "feature", "head": old}
+        def git_call(_repo_root, *arguments):
+            if arguments[0] == "status":
+                return ""
+            if arguments[:2] == ("branch", "--show-current"):
+                return branch["name"]
+            if arguments[:2] == ("rev-parse", "HEAD"):
+                return branch["head"]
+            if arguments[:2] == ("rev-parse", "refs/agent-ci-fix/head"):
+                return actual
+            if arguments[0] == "rev-parse" and arguments[1].endswith("^{tree}"):
+                return trees[arguments[1][:-7]]
+            if arguments[:2] == ("checkout", "--detach"):
+                branch.update(name="", head=actual)
+                return ""
+            raise AssertionError(arguments)
+
+        metadata = {
+            "head_branch": "feature", "head_owner": "fork", "head_repo": "repo",
+            "reported_head_sha": old, "head_sha": actual,
+        }
+        with mock.patch.object(MODULE, "git", side_effect=git_call) as git, mock.patch.object(
+            MODULE, "run", return_value=SimpleNamespace(returncode=0)
+        ), mock.patch.object(
+            MODULE, "remote_head", return_value=actual
+        ), mock.patch.object(
+            MODULE, "fetch_remote_for", return_value="fork"
+        ):
+            self.assertFalse(MODULE.checkout_pr(Path("repo"), {}, metadata))
+            self.assertEqual(
+                {"branch": "", "head": actual, "status": ""},
+                MODULE.local_identity(Path("repo")),
+            )
+        self.assertIn(
+            ("checkout", "--detach", actual),
+            [call.args[1:] for call in git.call_args_list],
+        )
+        self.assertFalse(any(call.args[1] in {"reset", "merge"} for call in git.call_args_list))
 
     def test_a_missing_base_branch_is_rejected(self):
         target = MODULE.parse_target("owner/repo#7")
         with mock.patch.object(
             MODULE, "gh_json", return_value=ci_gh_metadata(baseRefName=None)
-        ), mock.patch.object(MODULE, "base_ref_tip", return_value="live-tip"):
+        ), mock.patch.object(MODULE, "base_ref_tip", return_value="live-tip"), mock.patch.object(
+            MODULE, "remote_head", return_value="live-head"
+        ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "no base branch"):
                 MODULE.metadata_for(target)
 
@@ -9042,6 +9160,17 @@ class AuthoritativeDiffTest(unittest.TestCase):
             returncode=returncode, stdout=stdout, stderr=stderr
         )
 
+    def test_stale_record_uses_local_diff_not_pr_diff(self):
+        pr = {**self.pr, "reported_head_sha": "3" * 40}
+        responses = [
+            self.response(),
+            self.response(stdout="false\n"),
+            self.response(stdout=DIFF),
+        ]
+        with mock.patch.object(MODULE, "run", side_effect=responses) as run:
+            result, source = MODULE.fetch_authoritative_diff(self.root, pr)
+        self.assertEqual((DIFF, "local_merge_base"), (result, source))
+        self.assertTrue(all(call.args[0][:2] != ["gh", "pr"] for call in run.call_args_list))
     def test_uses_the_github_rendered_diff_when_available(self):
         with mock.patch.object(
             MODULE, "run", return_value=self.response(stdout=DIFF)
@@ -12658,6 +12787,12 @@ class PreflightCommandTest(unittest.TestCase):
                 return head
             if arguments[0] == "branch":
                 return "feature"
+            if arguments[0] == "merge-base":
+                return "base1"
+            if arguments[0] == "rev-list":
+                return "c1"
+            if arguments[0] == "show":
+                return "Add a thing"
             raise AssertionError(f"unexpected git call: {arguments}")
 
         stack.enter_context(mock.patch.object(MODULE, "require_tools"))

@@ -351,7 +351,7 @@ class ConflictPipelineSweepTest(unittest.TestCase):
         patch = mock.patch.object(
             MODULE.PreflightRefStore,
             "fetch",
-            side_effect=lambda source, _role, expected=None: (
+            side_effect=lambda source, _role, expected=None, remote=None: (
                 expected
                 or {
                     "refs/heads/main": "d" * 40,

@@ -574,17 +574,11 @@ class TargetTest(unittest.TestCase):
         self.assertEqual(expected, MODULE.parse_target("#7", "owner/repo"))
 
     def test_reads_commit_links_for_the_pull_request(self):
-        with mock.patch.object(
-            MODULE,
-            "gh_json",
-            return_value={
-                "commits": [
-                    {
-                        "oid": HEAD,
-                        "messageHeadline": "Fix the thing",
-                    }
-                ]
-            },
+        with (
+            mock.patch.object(MODULE.common, "git_succeeds", return_value=True),
+            mock.patch.object(MODULE.common, "local_commits_between", return_value=[
+                {"sha": HEAD, "title": "Fix the thing"}
+            ]),
         ):
             self.assertEqual(
                 [
@@ -594,7 +588,9 @@ class TargetTest(unittest.TestCase):
                         "url": f"{target()['pr_url']}/commits/{HEAD}",
                     }
                 ],
-                MODULE.read_pr_commits(target()),
+                MODULE.read_pr_commits(
+                    target(), repo_root=Path("C:/repo"), base_sha=BASE, head_sha=HEAD
+                ),
             )
 
     def test_reads_the_live_base_branch_tip(self):
@@ -607,15 +603,45 @@ class TargetTest(unittest.TestCase):
             "headRefName": "feature",
             "baseRefName": "main",
             "headRefOid": HEAD,
+            "headRepository": {"name": "repo"},
+            "headRepositoryOwner": {"login": "owner"},
         }
         with mock.patch.object(
             MODULE,
             "gh_json",
-            side_effect=[payload, {"object": {"sha": BASE}}],
+            side_effect=[
+                payload, {"object": {"sha": BASE}}, {"object": {"sha": NEXT_HEAD}}
+            ],
         ):
             result = MODULE.read_pull_request(target())
 
         self.assertEqual(BASE, result["base_sha"])
+        self.assertEqual(NEXT_HEAD, result["head_sha"])
+        self.assertEqual("owner/repo", result["head_repository"])
+
+    def test_resolves_fork_branch_even_when_pull_request_oid_is_stale(self):
+        payload = {
+            "number": 7, "title": "Fork change", "url": target()["pr_url"],
+            "state": "OPEN", "headRefName": "feature/topic", "baseRefName": "main",
+            "headRefOid": HEAD, "headRepository": {"name": "repo"},
+            "headRepositoryOwner": {"login": "fork"},
+        }
+        def api(arguments):
+            if arguments[:2] == ["pr", "view"]:
+                return payload
+            if arguments[1] == "repos/owner/repo/git/ref/heads/main":
+                return {"object": {"sha": BASE}}
+            if arguments[1] == "repos/fork/repo/git/ref/heads/feature%2Ftopic":
+                return {"object": {"sha": NEXT_HEAD}}
+            self.fail(f"unexpected API call: {arguments}")
+
+        result = MODULE.common.read_pull_request(
+            target(), api=api, base_tip=lambda _repo, _branch: BASE,
+        )
+        self.assertEqual("fork/repo", result["head_repository"])
+        self.assertEqual("feature/topic", result["head_branch"])
+        self.assertEqual(NEXT_HEAD, result["head_sha"])
+        self.assertNotEqual(HEAD, result["head_sha"])
 
     def test_rejects_a_base_ref_without_a_commit(self):
         with mock.patch.object(MODULE, "gh_json", return_value={"object": {}}):
@@ -2144,8 +2170,8 @@ class SweepTest(unittest.TestCase):
             "ended_at": "end",
         }
 
-    def snapshot_commits(self, _target):
-        head = self.sync_heads[-1]
+    def snapshot_commits(self, _target, *, repo_root, base_sha, head_sha):
+        head = head_sha
         return {
             "commits": [
                 {
@@ -3760,10 +3786,19 @@ class WorktreeSafetyTest(unittest.TestCase):
         return local
 
     def sync(self, local: Path, remote: Path):
-        with mock.patch.object(MODULE, "target_remote", return_value=str(remote)):
+        with (
+            mock.patch.object(MODULE, "target_remote", return_value=str(remote)),
+            mock.patch.object(
+                MODULE.common, "head_ref_tip",
+                side_effect=lambda _repo, branch: self.git(remote, "rev-parse", f"refs/heads/{branch}"),
+            ),
+        ):
             return MODULE.sync_worktree(
-                local, target(), run_id="a" * 32,
+                local, self.source_target(), run_id="a" * 32,
             )
+
+    def source_target(self):
+        return {**target(), "head_branch": "feature", "head_repository": "owner/repo"}
 
     def test_divergent_detached_commit_is_retained_before_switching(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3796,10 +3831,9 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.git(local, "checkout", "-q", "-b", "feature", "FETCH_HEAD")
             self.git(local, "commit", "-q", "--allow-empty", "-m", "local only")
             local_tip = self.git(local, "rev-parse", "HEAD")
-            self.git(remote, "checkout", "-q", "-b", "rewritten", base)
+            self.git(remote, "checkout", "-q", "-B", "feature", base)
             self.git(remote, "commit", "-q", "--allow-empty", "-m", "rebased")
             new_head = self.git(remote, "rev-parse", "HEAD")
-            self.git(remote, "update-ref", "refs/pull/7/head", new_head)
 
             result = self.sync(local, remote)
 
@@ -3871,9 +3905,12 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.git(local, "checkout", "-q", "--detach", "FETCH_HEAD")
             self.git(local, "commit", "-q", "--allow-empty", "-m", "unpublished stage")
             local_tip = self.git(local, "rev-parse", "HEAD")
-            with mock.patch.object(MODULE, "target_remote", return_value=str(remote)):
+            with (
+                mock.patch.object(MODULE, "target_remote", return_value=str(remote)),
+                mock.patch.object(MODULE.common, "head_ref_tip", return_value=old_head),
+            ):
                 result = MODULE.settle_after_stage(
-                    local, target(), run_id="a" * 32, started_head_sha=old_head,
+                    local, self.source_target(), run_id="a" * 32, started_head_sha=old_head,
                 )
             self.assertEqual("stage_left_unpublished_commits", result["reason"])
             self.assertEqual(local_tip, self.git(local, "rev-parse", "HEAD"))
@@ -3885,13 +3922,17 @@ class WorktreeSafetyTest(unittest.TestCase):
             local = self.clone(root, remote)
             self.git(local, "fetch", "-q", str(remote), "refs/pull/7/head")
             self.git(local, "checkout", "-q", "--detach", "FETCH_HEAD")
-            self.git(remote, "checkout", "-q", "-b", "rewritten", base)
+            self.git(remote, "checkout", "-q", "-B", "feature", base)
             self.git(remote, "commit", "-q", "--allow-empty", "-m", "rebased")
             new_head = self.git(remote, "rev-parse", "HEAD")
-            self.git(remote, "update-ref", "refs/pull/7/head", new_head)
-            with mock.patch.object(MODULE, "target_remote", return_value=str(remote)):
+            with (
+                mock.patch.object(MODULE, "target_remote", return_value=str(remote)),
+                mock.patch.object(
+                    MODULE.common, "head_ref_tip", return_value=new_head,
+                ),
+            ):
                 result = MODULE.settle_after_stage(
-                    local, target(), run_id="a" * 32, started_head_sha=old_head,
+                    local, self.source_target(), run_id="a" * 32, started_head_sha=old_head,
                 )
             self.assertEqual("ready", result["result"])
             self.assertEqual(new_head, self.git(local, "rev-parse", "HEAD"))
@@ -3907,7 +3948,6 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.git(remote, "checkout", "-q", "feature")
             self.git(remote, "commit", "-q", "--allow-empty", "-m", "next")
             new_head = self.git(remote, "rev-parse", "HEAD")
-            self.git(remote, "update-ref", "refs/pull/7/head", new_head)
             self.git(remote, "checkout", "-q", "main")
 
             result = self.sync(local, remote)
@@ -3915,6 +3955,100 @@ class WorktreeSafetyTest(unittest.TestCase):
             self.assertEqual("ready", result["result"])
             self.assertNotEqual(old_head, new_head)
             self.assertEqual(new_head, self.git(local, "rev-parse", "HEAD"))
+
+    def test_stale_pull_ref_is_not_used_for_commit_tracking_or_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, base, old_head = self.make_remote(root)
+            local = self.clone(root, remote)
+            self.git(remote, "checkout", "-q", "feature")
+            self.git(remote, "commit", "-q", "--allow-empty", "-m", "branch source")
+            new_head = self.git(remote, "rev-parse", "HEAD")
+
+            synced = self.sync(local, remote)
+            commits = MODULE.read_pr_commits(
+                target(), repo_root=local, base_sha=base, head_sha=synced["head_sha"],
+            )
+
+            self.assertEqual(old_head, self.git(remote, "rev-parse", "refs/pull/7/head"))
+            self.assertEqual(new_head, synced["head_sha"])
+            self.assertEqual(new_head, self.git(local, "rev-parse", "HEAD"))
+            self.assertEqual([old_head, new_head], [commit["sha"] for commit in commits])
+
+    def test_branch_drift_during_fetch_blocks_before_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, _base, old_head = self.make_remote(root)
+            local = self.clone(root, remote)
+            self.git(remote, "checkout", "-q", "feature")
+            self.git(remote, "commit", "-q", "--allow-empty", "-m", "new remote head")
+            original = self.git(local, "rev-parse", "HEAD")
+            with (
+                mock.patch.object(MODULE, "target_remote", return_value=str(remote)),
+                mock.patch.object(MODULE.common, "head_ref_tip", return_value=old_head),
+            ):
+                result = MODULE.sync_worktree(
+                    local, self.source_target(), run_id="a" * 32,
+                )
+            self.assertEqual("source_head_moved", result["reason"])
+            self.assertEqual(original, self.git(local, "rev-parse", "HEAD"))
+
+    def test_post_publication_settlement_uses_branch_while_pull_ref_lags(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, base, old_head = self.make_remote(root)
+            local = self.clone(root, remote)
+            self.assertEqual("ready", self.sync(local, remote)["result"])
+            before = MODULE.read_pr_commits(
+                target(), repo_root=local, base_sha=base, head_sha=old_head,
+            )
+            self.git(remote, "checkout", "-q", "feature")
+            self.git(remote, "commit", "-q", "--allow-empty", "-m", "published change")
+            new_head = self.git(remote, "rev-parse", "HEAD")
+            with (
+                mock.patch.object(MODULE, "target_remote", return_value=str(remote)),
+                mock.patch.object(MODULE.common, "head_ref_tip", return_value=new_head),
+            ):
+                settled = MODULE.settle_after_stage(
+                    local, self.source_target(), run_id="a" * 32,
+                    started_head_sha=old_head,
+                )
+            after = MODULE.read_pr_commits(
+                target(), repo_root=local, base_sha=base, head_sha=settled["head_sha"],
+            )
+            added, errors, rewritten = MODULE.commits_added(
+                {"commits": before}, {"commits": after}
+            )
+            self.assertEqual("ready", settled["result"])
+            self.assertEqual(old_head, self.git(remote, "rev-parse", "refs/pull/7/head"))
+            self.assertEqual([new_head], [commit["sha"] for commit in added])
+            self.assertEqual([], errors)
+            self.assertFalse(rewritten)
+
+    def test_fork_source_fetches_the_fork_branch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, _base, old_head = self.make_remote(root)
+            local = self.clone(root, remote)
+            fork = root / "fork"
+            subprocess.run(
+                ["git", "clone", "-q", str(remote), str(fork)],
+                check=True, capture_output=True, text=True,
+            )
+            self.git(fork, "checkout", "-q", "feature")
+            self.git(fork, "commit", "-q", "--allow-empty", "-m", "fork change")
+            fork_head = self.git(fork, "rev-parse", "HEAD")
+            source = {**self.source_target(), "head_repository": "fork/repo"}
+            with (
+                mock.patch.object(MODULE, "target_remote", side_effect=lambda _repo, value: (
+                    str(fork) if value["repo_name"] == "fork/repo" else str(remote)
+                )),
+                mock.patch.object(MODULE.common, "head_ref_tip", return_value=fork_head),
+            ):
+                result = MODULE.sync_worktree(local, source, run_id="a" * 32)
+            self.assertEqual("ready", result["result"])
+            self.assertEqual(fork_head, result["head_sha"])
+            self.assertNotEqual(old_head, result["head_sha"])
 
 
 class AgentInstructionTest(unittest.TestCase):
