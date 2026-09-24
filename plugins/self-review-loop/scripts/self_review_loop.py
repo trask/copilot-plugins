@@ -77,7 +77,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "1d7b8d3b9d587ba316662fa7153fc7f783095f1ce39895adb3e453f63f54cdc7"
+    "ce622f8a26fb7e53747440a1f5456937e352e79b694d8e01456f297506a6116d"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -2833,6 +2833,34 @@ def bounded_review_pending(
     return True
 
 
+def bounded_review_failure(
+    process: subprocess.CompletedProcess[str], children_before: int | None,
+) -> str | None:
+    if process.returncode == 0 or children_before is None or _EXECUTION is None:
+        return None
+    children = _EXECUTION.children[children_before:]
+    terminal = children[0].terminal_result if len(children) == 1 else None
+    if not isinstance(terminal, dict) or terminal.get("exit_code") != process.returncode:
+        return None
+    payload = terminal.get("workflow_result")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != CANDIDATE_AGENT_TASK_RESULT_SCHEMA
+        or payload.get("status") != "error"
+    ):
+        return None
+    error = payload.get("error")
+    if (
+        not isinstance(error, dict)
+        or not isinstance(error.get("code"), str)
+        or not error["code"]
+        or not isinstance(error.get("message"), str)
+        or not error["message"]
+    ):
+        return None
+    return f"managed helper reported {error['code']}: {error['message']}"
+
+
 def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
     global ACTIVE_GITHUB_MUTATION_POLICY
 
@@ -3230,9 +3258,12 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
                     "pipeline_iteration": args.pipeline_iteration,
                 }
         if not result_path.is_file():
+            failure = bounded_review_failure(process, children_before)
             raise WorkflowError(
-                f"managed helper exited {process.returncode} without an atomic "
-                "result file"
+                failure or (
+                    f"managed helper exited {process.returncode} without an atomic "
+                    "result file"
+                )
             )
     except BaseException as error:
         state["agent_task"]["status"] = "failed"

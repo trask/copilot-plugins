@@ -44,10 +44,9 @@ PIPELINE_CHECKPOINT_SCHEMA = {
     "id": "github.copilot.agent-task-pipeline-checkpoint",
     "version": 1,
 }
-PIPELINE_REQUEST_TIMEOUT_SECONDS = 45
-PIPELINE_STAGE_TIMEOUT_SECONDS = 70
-_PIPELINE_DEADLINE: ContextVar[float | None] = ContextVar(
-    "pipeline_deadline", default=None
+PIPELINE_PROCESS_TIMEOUT_SECONDS = 300
+_PIPELINE_MODE: ContextVar[bool] = ContextVar(
+    "pipeline_mode", default=False
 )
 SHA_PATTERN = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 OUTPUT_DIRECTORY = ".github/agent-task-output"
@@ -838,12 +837,11 @@ def run_process(
 ) -> subprocess.CompletedProcess[str]:
     if _EXECUTION is not None:
         runner = _EXECUTION.run
-    deadline = _PIPELINE_DEADLINE.get()
-    if deadline is not None:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise CloudError("pipeline stage exceeded its deadline", "pipeline_timeout")
-        timeout = min(timeout, remaining) if timeout is not None else remaining
+    if _PIPELINE_MODE.get():
+        timeout = (
+            min(timeout, PIPELINE_PROCESS_TIMEOUT_SECONDS)
+            if timeout is not None else PIPELINE_PROCESS_TIMEOUT_SECONDS
+        )
     kwargs: dict[str, object] = {
         "capture_output": True,
         "text": True,
@@ -867,7 +865,10 @@ def run_process(
     except OSError as error:
         raise CloudError(f"could not run {command[0]}: {error}") from None
     except subprocess.TimeoutExpired:
-        raise CloudError(f"{command[0]} exceeded its request deadline", "api_timeout") from None
+        raise CloudError(
+            f"{command[0]} exceeded its subprocess timeout",
+            "api_timeout" if command[0] == "gh" else "process_timeout",
+        ) from None
 
 def _command_error(command: Sequence[str], result: subprocess.CompletedProcess[str]) -> str:
     detail = result.stderr.strip() or result.stdout.strip()
@@ -2961,7 +2962,7 @@ def execute(
                     payload=payload,
                     expected_status=201,
                     operation="start Agent Task",
-                    timeout=PIPELINE_REQUEST_TIMEOUT_SECONDS,
+                    timeout=PIPELINE_PROCESS_TIMEOUT_SECONDS,
                 )
             )
         except (TransientApiError, CloudError) as error:
@@ -3317,7 +3318,7 @@ def execute_pipeline_observe(
                 payload=None,
                 expected_status=200,
                 operation=f"poll Agent Task {task_id}",
-                timeout=PIPELINE_REQUEST_TIMEOUT_SECONDS,
+                timeout=PIPELINE_PROCESS_TIMEOUT_SECONDS,
             ),
             task_id,
         )
@@ -3386,7 +3387,7 @@ def main(
         options = parse_args(args)
         result_path = options.result_file
         token = (
-            _PIPELINE_DEADLINE.set(time.monotonic() + PIPELINE_STAGE_TIMEOUT_SECONDS)
+            _PIPELINE_MODE.set(True)
             if options.pipeline_mode is not None
             else None
         )
@@ -3406,7 +3407,7 @@ def main(
             )
         finally:
             if token is not None:
-                _PIPELINE_DEADLINE.reset(token)
+                _PIPELINE_MODE.reset(token)
     except KeyboardInterrupt:
         result.status = "interrupted"
         result.error_code = "interrupted"

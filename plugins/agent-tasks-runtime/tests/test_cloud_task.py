@@ -1250,10 +1250,11 @@ class PipelineStagesTest(unittest.TestCase):
         self.assertEqual(
             "pipeline_duplicate_dispatch", self.result()["error"]["code"]
         )
+        self.assertFalse(MODULE._PIPELINE_MODE.get())
         self.assertFalse(self.result_path.exists())
         self.assertEqual(1, self.api._request_once.call_count)
         self.assertEqual("POST", self.api._request_once.call_args.args[0])
-        self.assertEqual(45, self.api._request_once.call_args.kwargs["timeout"])
+        self.assertEqual(300, self.api._request_once.call_args.kwargs["timeout"])
 
     def test_report_policy_dispatch_and_active_observation_remain_bounded(self):
         self.api._request_once.return_value = self.initial
@@ -1265,6 +1266,7 @@ class PipelineStagesTest(unittest.TestCase):
         self.assertEqual("pending", self.result()["status"])
         self.assertFalse(self.result_path.exists())
         self.api._request_once.assert_called_once()
+        self.assertEqual(300, self.api._request_once.call_args.kwargs["timeout"])
 
     def test_report_observation_does_not_recheck_moving_fork_before_get(self):
         cross_repo_pull = replace(
@@ -1334,6 +1336,18 @@ class PipelineStagesTest(unittest.TestCase):
         self.assertEqual(1, self.api._request_once.call_count)
         self.assertEqual(2, self.invoke())
         self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(1, self.api._request_once.call_count)
+
+    def test_timed_out_post_is_unconfirmed_and_not_retried(self):
+        self.api._request_once.side_effect = MODULE.CloudError(
+            "gh exceeded its subprocess timeout", "api_timeout"
+        )
+        self.assertEqual(2, self.invoke())
+        self.assertEqual("pipeline_dispatch_unknown", self.result()["error"]["code"])
+        self.assertIn("gh exceeded its subprocess timeout", self.result()["error"]["message"])
+        self.assertFalse(self.result_path.exists())
+        self.assertEqual(300, self.api._request_once.call_args.kwargs["timeout"])
+        self.assertEqual(2, self.invoke())
         self.assertEqual(1, self.api._request_once.call_count)
 
     def test_terminal_post_response_never_seals_as_pending(self):
@@ -1499,27 +1513,62 @@ class PipelineStagesTest(unittest.TestCase):
         self.assertEqual(2, self.invoke("observe"))
         self.assertEqual(2, self.api._request_once.call_count)
 
-    def test_bounded_requests_keep_windows_no_window_and_timeout_flags(self):
-        self.assertLessEqual(MODULE.PIPELINE_STAGE_TIMEOUT_SECONDS, 75)
-        self.assertLessEqual(MODULE.PIPELINE_REQUEST_TIMEOUT_SECONDS, 60)
-        self.assertLess(
-            MODULE.PIPELINE_REQUEST_TIMEOUT_SECONDS,
-            MODULE.PIPELINE_STAGE_TIMEOUT_SECONDS,
-        )
-        runner = mock.Mock(return_value=subprocess.CompletedProcess(["gh"], 0, "", ""))
-        with mock.patch.object(MODULE.os, "name", "nt"):
-            MODULE.run_process(runner, ["gh", "api"], timeout=45)
-        self.assertEqual(45, runner.call_args.kwargs["timeout"])
-        self.assertEqual(
-            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
-            runner.call_args.kwargs["creationflags"],
-        )
-        token = MODULE._PIPELINE_DEADLINE.set(MODULE.time.monotonic() + 1)
+    def test_bounded_processes_keep_windows_no_window_and_independent_timeouts(self):
+        self.assertEqual(300, MODULE.PIPELINE_PROCESS_TIMEOUT_SECONDS)
+        elapsed = [0]
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(kwargs)
+            elapsed[0] += 90
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(MODULE.os, "name", "nt"),
+            mock.patch.object(MODULE, "time", SimpleNamespace(monotonic=lambda: elapsed[0])),
+        ):
+            token = MODULE._PIPELINE_MODE.set(True)
+            try:
+                for command in (["git", "status"], ["gh", "pr", "view"],
+                                ["gh", "api", "--method", "POST"],
+                                ["gh", "api", "--method", "GET"]):
+                    MODULE.run_process(
+                        runner, command,
+                        timeout=300 if command[-1] in ("POST", "GET") else None,
+                    )
+                self.assertGreater(elapsed[0], 300)
+            finally:
+                MODULE._PIPELINE_MODE.reset(token)
+        self.assertEqual([300] * 4, [call["timeout"] for call in calls])
+        self.assertTrue(all(
+            call["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            for call in calls
+        ))
+        MODULE.run_process(runner, ["git", "status"])
+        self.assertNotIn("timeout", calls[-1])
+
+    def test_pipeline_timeout_is_scoped_to_its_invocation(self):
+        runner = mock.Mock(return_value=subprocess.CompletedProcess(["git"], 0, "", ""))
+        token = MODULE._PIPELINE_MODE.set(True)
         try:
             MODULE.run_process(runner, ["git", "status"])
-            self.assertLessEqual(runner.call_args.kwargs["timeout"], 1)
+            self.assertEqual(300, runner.call_args.kwargs["timeout"])
         finally:
-            MODULE._PIPELINE_DEADLINE.reset(token)
+            MODULE._PIPELINE_MODE.reset(token)
+        MODULE.run_process(runner, ["git", "status"])
+        self.assertNotIn("timeout", runner.call_args.kwargs)
+
+    def test_git_timeout_reports_a_process_failure(self):
+        command = ["git", "fetch"]
+        runner = mock.Mock(side_effect=subprocess.TimeoutExpired(command, 300))
+        token = MODULE._PIPELINE_MODE.set(True)
+        try:
+            with self.assertRaisesRegex(MODULE.CloudError, "git exceeded its subprocess timeout") as raised:
+                MODULE.run_process(runner, command)
+        finally:
+            MODULE._PIPELINE_MODE.reset(token)
+        self.assertEqual("process_timeout", raised.exception.code)
+        self.assertEqual(300, runner.call_args.kwargs["timeout"])
 
 
 class CurrentRuntimeApiTest(unittest.TestCase):

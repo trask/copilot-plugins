@@ -2079,7 +2079,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.75")
+        self.assertEqual(plugin["version"], "1.3.76")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2895,6 +2895,68 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual(
                 "running", MODULE.load_state(Path(args.state))["agent_task"]["status"]
             )
+
+    def test_bounded_dispatch_reports_sealed_unknown_creation(self):
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            args.pipeline_run = "b" * 32
+            args.bounded_step = True
+            execution = SimpleNamespace(children=[], record_state=lambda *_: None)
+            original_run = MODULE.run.side_effect
+
+            def run(command, **kwargs):
+                if "--pipeline-dispatch" not in command:
+                    return original_run(command, **kwargs)
+                execution.children.append(SimpleNamespace(terminal_result={
+                    "exit_code": 1,
+                    "local_status": "failed",
+                    "workflow_result": {
+                        "schema": MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+                        "status": "error",
+                        "error": {
+                            "code": "pipeline_dispatch_unknown",
+                            "message": "gh exceeded its subprocess timeout",
+                        },
+                    },
+                }))
+                return MODULE.subprocess.CompletedProcess(command, 1, "", "")
+
+            with (
+                mock.patch.dict(
+                    MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "review-session"}
+                ),
+                mock.patch.object(MODULE, "_EXECUTION", execution),
+                mock.patch.object(MODULE, "run", side_effect=run),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "pipeline_dispatch_unknown: gh exceeded its subprocess timeout",
+                ):
+                    MODULE.command_pipeline(args)
+            state = MODULE.load_state(Path(args.state))["agent_task"]
+            self.assertEqual("failed", state["status"])
+            self.assertIn("pipeline_dispatch_unknown", state["error"])
+            self.assertEqual([], commands)
+            self.assertEqual([], emitted)
+
+    def test_bounded_failure_rejects_unmatched_or_malformed_evidence(self):
+        process = MODULE.subprocess.CompletedProcess(["gh"], 1, "", "")
+        terminal = {
+            "exit_code": 1,
+            "workflow_result": {
+                "schema": MODULE.CANDIDATE_AGENT_TASK_RESULT_SCHEMA,
+                "status": "error",
+                "error": {"code": "pipeline_dispatch_unknown", "message": "POST timed out"},
+            },
+        }
+        execution = SimpleNamespace(children=[SimpleNamespace(terminal_result=terminal)])
+        with mock.patch.object(MODULE, "_EXECUTION", execution):
+            self.assertIn("pipeline_dispatch_unknown", MODULE.bounded_review_failure(process, 0))
+            terminal["exit_code"] = 2
+            self.assertIsNone(MODULE.bounded_review_failure(process, 0))
+            terminal["exit_code"] = 1
+            terminal["workflow_result"]["schema"] = {}
+            self.assertIsNone(MODULE.bounded_review_failure(process, 0))
+            self.assertIsNone(MODULE.bounded_review_failure(process, 1))
 
     def test_bounded_pipeline_requires_session_and_hex_run(self):
         args = MODULE.build_parser().parse_args([
