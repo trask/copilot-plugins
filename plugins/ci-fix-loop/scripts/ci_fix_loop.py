@@ -35,6 +35,7 @@ STATE_VERSION = 1
 STACK_STATE_KIND = "native_stack"
 STACK_ENTRIES_PAGE = 100
 DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 DEFAULT_POLL_INTERVAL = 60
 DEFAULT_POLL_TIMEOUT = 300
 DEFAULT_NOT_STARTED_GRACE = 900
@@ -4173,10 +4174,9 @@ def whole_number(value: Any, fallback: int) -> int:
 def pipeline_scope(
     state: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any] | None:
-    """Keep one CI repair budget for the entire caller-supplied Pipeline run.
+    """Refresh the CI repair budget when the caller advances its sweep.
 
-    The outer iteration records the caller's position, not a fresh allowance.
-    Only a different opaque run token starts a new budget. Baselines never
+    A repeated or older position cannot refresh the allowance. Baselines never
     rewrite the durable per-pull-request count.
     """
     run = getattr(args, "pipeline_run", None)
@@ -4199,7 +4199,11 @@ def pipeline_scope(
         "iteration": max(
             (value for value in (seen, iteration) if value is not None), default=None
         ),
-        "baseline": run_baseline,
+        "baseline": (
+            spent
+            if seen is not None and iteration is not None and iteration > seen
+            else whole_number(recorded.get("baseline"), spent)
+        ),
         "run_baseline": run_baseline,
     }
 
@@ -4248,8 +4252,14 @@ def invocation_scope_for_pipeline(
 def absolute_iteration_cap(
     scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
 ) -> int | None:
-    """The CI cap bounds the whole run, independently of the outer sweep cap."""
-    return max_iterations if scope is not None else None
+    if scope is None:
+        return None
+    outer = (
+        pipeline_max_iterations
+        if type(pipeline_max_iterations) is int and pipeline_max_iterations > 0
+        else DEFAULT_PIPELINE_MAX_ITERATIONS
+    )
+    return max_iterations * outer
 
 
 def budget_spent(
@@ -4286,8 +4296,6 @@ def budget_charge_keys(kind: str, scope: dict[str, Any]) -> tuple[str, str]:
     run = scope["run"]
     iteration = scope.get("iteration")
     run_key = json.dumps([kind, run], separators=(",", ":"))
-    if kind == "pipeline":
-        return run_key, run_key
     return (
         json.dumps([kind, run, iteration], separators=(",", ":")),
         run_key,
@@ -4383,11 +4391,15 @@ def exhausted_budget(
 
 
 def budget_advanced(recorded: Any, scope: dict[str, Any] | None) -> bool:
-    """Whether the caller supplied a different run and therefore a fresh budget."""
+    """Whether the caller supplied a new run or a later sweep."""
     if scope is None:
         return False
     previous = recorded if isinstance(recorded, dict) else {}
-    return previous.get("run") != scope.get("run")
+    return previous.get("run") != scope.get("run") or (
+        type(previous.get("iteration")) is int
+        and type(scope.get("iteration")) is int
+        and scope["iteration"] > previous["iteration"]
+    )
 
 
 def charge_iteration(state: dict[str, Any], run_state: dict[str, Any]) -> bool:

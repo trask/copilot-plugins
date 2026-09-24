@@ -1874,7 +1874,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.96")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.97")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -3576,7 +3576,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertIsNone(MODULE.exhausted_budget(2, 2, 5, None))
         self.assertEqual(MODULE.exhausted_budget(5, 5, 5, None), "iteration")
         pipeline = {"run": "flight", "iteration": 1, "baseline": 0, "run_baseline": 0}
-        self.assertEqual(MODULE.absolute_iteration_cap(pipeline, 5, 3), 5)
+        self.assertEqual(MODULE.absolute_iteration_cap(pipeline, 5, 3), 15)
 
     def test_clean_no_op_wins_at_cap_but_comments_do_not_start_another_task(self):
         clean_path = self.directory / "clean-at-cap.json"
@@ -9612,32 +9612,103 @@ class PreflightTargetTest(unittest.TestCase):
 
 
 class PipelineBudgetTest(unittest.TestCase):
-    """The stage allowance belongs to the entire Pipeline run."""
+    """A later sweep gets a new allowance without resetting the run total."""
 
     def scope(self, state, **pipeline):
         return MODULE.pipeline_scope(state, SimpleNamespace(**pipeline))
 
-    def test_later_sweeps_can_spend_only_the_remaining_five_iteration_allowance(self):
+    def test_exhausted_sweep_still_reaches_preflight_in_the_next_sweep(self):
+        target = {
+            "owner": "owner",
+            "repo": "repo",
+            "number": 7,
+            "pr_url": "https://github.com/owner/repo/pull/7",
+        }
+        args = SimpleNamespace(
+            target="owner/repo#7",
+            state="state.json",
+            repo_root=None,
+            model="sol",
+            pipeline_run="run-a",
+            pipeline_iteration=2,
+            max_iterations=5,
+            github_mutation_policy="allow",
+            _pipeline_entry=True,
+        )
+        prior = {
+            "budget_scope": "pipeline",
+            "repo_root": "repo",
+            "github_mutation_policy": "allow",
+            "last_result": "max_iterations_reached",
+            "max_iterations": 5,
+            "iterations": 5,
+            "pr": {
+                "number": 7,
+                "repo_name": "owner/repo",
+                "head_sha": "a" * 40,
+            },
+            "queue": {
+                "id": "pr-7",
+                "status": "active",
+                "comments": [],
+                "batches": [],
+            },
+            "pipeline_budget": {
+                "run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0,
+            },
+        }
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=Path("repo")),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(MODULE, "invocation_state_path", return_value=(Path("state.json"), "id")),
+            mock.patch.object(MODULE, "require_outside_repository"),
+            mock.patch.object(Path, "is_file", return_value=True),
+            mock.patch.object(MODULE, "load_state", return_value=prior),
+            mock.patch.object(
+                MODULE, "wait_for_stable_review_preflight",
+                side_effect=MODULE.WorkflowError("preflight reached"),
+            ) as preflight,
+        ):
+            with self.assertRaisesRegex(MODULE.WorkflowError, "preflight reached"):
+                MODULE.command_agent_task(args)
+        preflight.assert_called_once()
+
+    def test_each_sweep_gets_five_iterations_without_refreshing_on_relaunch(self):
         state = {"iterations": 0, "budget_scope": "pipeline"}
-        for iteration in range(5):
-            scope = self.scope(
-                state, pipeline_run="run-a",
-                pipeline_iteration=1 if iteration < 3 else 2,
-            )
+        for sweep in (1, 2):
+            scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=sweep)
             state["pipeline_budget"] = scope
             scoped = MODULE.scoped_pipeline_budget(state, scope)
-            spent = MODULE.budget_spent(state, scoped, 0)
-            self.assertIsNone(MODULE.exhausted_budget(*spent, 5, 5))
-            MODULE.charge_iteration(state)
+            self.assertEqual(0, MODULE.budget_spent(state, scoped, 0)[0])
+            for _ in range(5):
+                spent = MODULE.budget_spent(state, scoped, 0)
+                self.assertIsNone(MODULE.exhausted_budget(
+                    *spent, 5, MODULE.absolute_iteration_cap(scope, 5, 2),
+                ))
+                MODULE.charge_iteration(state)
+            repeated = self.scope(state, pipeline_run="run-a", pipeline_iteration=sweep)
+            self.assertEqual(scope, repeated)
+            self.assertEqual(
+                "iteration" if sweep == 1 else "absolute",
+                MODULE.exhausted_budget(
+                    *MODULE.budget_spent(state, scoped, 0),
+                    5,
+                    MODULE.absolute_iteration_cap(scope, 5, 2),
+                ),
+            )
+        self.assertEqual(10, state["iterations"])
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
-        scoped = MODULE.scoped_pipeline_budget(state, scope)
-        self.assertEqual(0, scope["baseline"])
-        self.assertEqual(5, MODULE.budget_spent(state, scoped, 0)[1])
+        self.assertEqual(10, scope["baseline"])
+        self.assertEqual(0, scope["run_baseline"])
         self.assertEqual(
             "absolute",
             MODULE.exhausted_budget(
-                *MODULE.budget_spent(state, scoped, 0), 5,
-                MODULE.absolute_iteration_cap(scope, 5, 100),
+                *MODULE.budget_spent(
+                    state, MODULE.scoped_pipeline_budget(state, scope), 0,
+                ),
+                5,
+                MODULE.absolute_iteration_cap(scope, 5, 2),
             ),
         )
 
@@ -9685,7 +9756,7 @@ class PipelineBudgetTest(unittest.TestCase):
                 self.assertEqual(scope["baseline"], 7)
                 self.assertEqual(scope["iteration"], 4)
 
-    def test_a_genuine_advance_within_one_run_preserves_the_budget(self):
+    def test_a_genuine_advance_within_one_run_refreshes_the_sweep_budget(self):
         state = {
             "iterations": 9,
             "pipeline_budget": {"run": "run-a", "iteration": 2, "baseline": 7},
@@ -9693,7 +9764,7 @@ class PipelineBudgetTest(unittest.TestCase):
 
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
 
-        self.assertEqual(scope["baseline"], 7)
+        self.assertEqual(scope["baseline"], 9)
         self.assertEqual(scope["iteration"], 3)
 
     def test_a_new_run_resets_even_when_its_iteration_went_backwards(self):
@@ -9802,7 +9873,7 @@ class PipelineBudgetTest(unittest.TestCase):
 
 
 class DerivedCeilingTest(unittest.TestCase):
-    """The outer cap bounds the run; it does not replace the stage's own budget."""
+    """The outer cap bounds the number of sweep allowances."""
 
     SCOPE = {"run": "run-a", "iteration": 2, "baseline": 9, "run_baseline": 2}
 
@@ -9856,16 +9927,16 @@ class DerivedCeilingTest(unittest.TestCase):
 
         return emit.call_args.args[0]
 
-    def test_the_ceiling_is_the_stages_own_cap(self):
-        self.assertEqual(5, MODULE.absolute_iteration_cap(self.SCOPE, 5, 3))
-        self.assertEqual(10, MODULE.absolute_iteration_cap(self.SCOPE, 10, 2))
+    def test_the_ceiling_covers_each_sweeps_own_cap(self):
+        self.assertEqual(15, MODULE.absolute_iteration_cap(self.SCOPE, 5, 3))
+        self.assertEqual(20, MODULE.absolute_iteration_cap(self.SCOPE, 10, 2))
         self.assertIsNone(MODULE.absolute_iteration_cap(None, 5, 3))
 
-    def test_an_omitted_outer_cap_does_not_change_the_stage_allowance(self):
+    def test_an_omitted_outer_cap_uses_a_bounded_fallback(self):
         for value in (None, 0, -1, True, "3"):
             with self.subTest(value=value):
                 self.assertEqual(
-                    5,
+                    5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
                     MODULE.absolute_iteration_cap(self.SCOPE, 5, value),
                 )
 
@@ -9881,7 +9952,7 @@ class DerivedCeilingTest(unittest.TestCase):
                 "iterations": 12,
                 "pipeline_budget": {
                     "run": "run-a",
-                    "iteration": 2,
+                    "iteration": 1,
                     "baseline": 9,
                     "run_baseline": 9,
                 },
@@ -9892,7 +9963,7 @@ class DerivedCeilingTest(unittest.TestCase):
         )
 
         self.assertEqual(5, payload["max_iterations"])
-        self.assertEqual(3, payload["completed_run_iterations"])
+        self.assertEqual(0, payload["completed_run_iterations"])
         self.assertEqual("review_required", payload["result"])
         self.assertIsNone(payload["budget_exhausted"])
 
@@ -9914,16 +9985,16 @@ class DerivedCeilingTest(unittest.TestCase):
         )
 
         self.assertEqual(0, payload["completed_run_iterations"])
-        self.assertEqual(5, payload["absolute_cap"])
+        self.assertEqual(10, payload["absolute_cap"])
         self.assertEqual("absolute", payload["budget_exhausted"])
         self.assertEqual("max_iterations_reached", payload["result"])
 
-    def test_a_genuine_advance_preserves_both_baselines(self):
+    def test_a_genuine_advance_refreshes_only_the_sweep_baseline(self):
         state = {"iterations": 11, "pipeline_budget": dict(self.SCOPE)}
 
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
 
-        self.assertEqual(9, scope["baseline"])
+        self.assertEqual(11, scope["baseline"])
         self.assertEqual(2, scope["run_baseline"])
 
     def test_a_new_run_resets_both_budgets(self):

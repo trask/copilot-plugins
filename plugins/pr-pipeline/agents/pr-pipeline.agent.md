@@ -53,7 +53,7 @@ The helper runs at most two sweeps in this order:
 4. CI Fix
 5. PR Description
 
-Each deterministic stage coordinator owns its hosted tasks and fixed allowance. A second sweep is allowed only after head or base movement, or when CI alone needs fresh same-revision snapshot verification. Sweeps never reset a stage budget.
+Each deterministic stage coordinator owns its hosted tasks. A second sweep is allowed only after head or base movement, or when CI alone needs fresh same-revision snapshot verification. Copilot Review, Self Review, and CI Fix each receive a fresh iteration allowance on a later sweep, never from a relaunch within the same sweep.
 
 The published PR head, not the local branch, is the Pipeline's source of truth. The controller requires a clean checkout, retains a divergent local tip under a run-specific recovery ref, and checks out the fetched PR head before each stage. Retained local commits do not become part of the PR; unpublished commits left by a stage still block.
 

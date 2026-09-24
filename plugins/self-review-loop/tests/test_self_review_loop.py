@@ -2079,7 +2079,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
         plugin = json.loads(PLUGIN.read_text(encoding="utf-8"))
-        self.assertEqual(plugin["version"], "1.3.72")
+        self.assertEqual(plugin["version"], "1.3.73")
         self.assertNotIn("custom_agent", plugin)
 
     def test_standalone_parser_rejects_internal_execution_arguments(self):
@@ -2587,11 +2587,13 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 commands.append(command)
                 state = MODULE.load_state(Path(args.state))
                 self.assertEqual(
-                    min(len(commands) - 1, max_iterations),
+                    len(commands) - 1,
                     state["iterations"],
                 )
                 self.assertEqual(
-                    max_iterations - state["iterations"],
+                    max_iterations - (
+                        state["iterations"] - state["pipeline_budget"]["baseline"]
+                    ),
                     state["agent_task"]["allowed_iterations"],
                 )
                 self.assertEqual("sol", command[command.index("--model") + 1])
@@ -2971,7 +2973,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertEqual(2, len(calls))
             self.assertEqual(1, len(commands))
 
-    def test_pipeline_spends_its_budget_once_across_all_sweeps(self):
+    def test_pipeline_refreshes_its_budget_in_the_next_sweep(self):
         with self.pipeline_run(fixes=5) as (args, commands, emitted):
             MODULE.command_pipeline(args)
             self.assertEqual(3, len(commands))
@@ -2980,9 +2982,12 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             self.assertIsNone(MODULE.recorded_clean_at_head_sha(MODULE.load_state(Path(args.state))))
             args.pipeline_iteration = 2
             MODULE.command_pipeline(args)
-            self.assertEqual(3, len(commands))
-            self.assertEqual(3, emitted[-1]["iterations"])
-            self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
+            self.assertEqual(6, len(commands))
+            self.assertEqual(6, emitted[-1]["iterations"])
+            self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual(3, state["pipeline_budget"]["baseline"])
+            self.assertEqual(0, state["pipeline_budget"]["run_baseline"])
 
     def test_one_pass_budget_publishes_code_without_claiming_clean(self):
         with self.pipeline_run(fixes=2, max_iterations=1) as (args, commands, emitted):
@@ -3006,7 +3011,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         with mock.patch.object(MODULE.sys, "argv", argv):
             return MODULE.main()
 
-    def test_later_sweep_inspects_new_head_with_original_remaining_budget(self):
+    def test_later_sweep_inspects_new_head_with_fresh_budget(self):
         with self.pipeline_run() as (args, commands, emitted):
             self.assertEqual(0, self.pipeline_cli(args))
             first = MODULE.load_state(Path(args.state))
@@ -3019,7 +3024,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             second = MODULE.load_state(Path(args.state))
             self.assertEqual(3, len(commands))
             self.assertEqual(3, second["iterations"])
-            self.assertEqual(1, second["agent_task"]["allowed_iterations"])
+            self.assertEqual(3, second["agent_task"]["allowed_iterations"])
             self.assertEqual("9" * 40, second["agent_task"]["preflight"]["pr"]["head_sha"])
             self.assertEqual("9" * 40, MODULE.recorded_clean_at_head_sha(second))
             self.assertNotEqual(first["agent_task"]["run_id"], second["agent_task"]["run_id"])
@@ -3071,7 +3076,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
                     self.assertEqual(5, sleep.call_count)
 
-    def test_later_sweep_new_head_does_not_replenish_exhausted_budget(self):
+    def test_later_sweep_new_head_gets_a_fresh_budget(self):
         with self.pipeline_run(max_iterations=2) as (args, commands, emitted):
             self.assertEqual(0, self.pipeline_cli(args))
             self.pipeline_live["head_sha"] = "9" * 40
@@ -3080,10 +3085,11 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             emitted.clear()
             self.assertEqual(0, self.pipeline_cli(args))
             state = MODULE.load_state(Path(args.state))
-            self.assertEqual(2, len(commands))
-            self.assertEqual(2, state["iterations"])
-            self.assertEqual("max_iterations_reached", emitted[-1]["stage_outcome"])
-            self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
+            self.assertEqual(3, len(commands))
+            self.assertEqual(3, state["iterations"])
+            self.assertEqual(2, state["pipeline_budget"]["baseline"])
+            self.assertEqual("cleared", emitted[-1]["stage_outcome"])
+            self.assertIsNotNone(MODULE.recorded_clean_at_head_sha(state))
 
     def test_later_sweep_rejects_same_or_older_completed_sweep(self):
         with self.pipeline_run(fixes=0) as (args, commands, emitted):

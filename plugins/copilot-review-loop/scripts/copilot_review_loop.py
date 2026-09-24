@@ -42,6 +42,7 @@ GH_REVIEWER_ALIAS_VERSION = (2, 88, 0)
 COPILOT_REQUEST_RETRY_DELAYS = (2, 4, 8, 16)
 STATE_VERSION = 3
 DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_PIPELINE_MAX_ITERATIONS = 2
 DEFAULT_WATCH_TIMEOUT = 7200.0
 DEFAULT_MAX_WATCH_INTERVAL = 300.0
 DEFAULT_STABILITY_POLLS = 2
@@ -2778,7 +2779,7 @@ def whole_number(value: Any, fallback: int) -> int:
 def pipeline_scope(
     state: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any] | None:
-    """Keep one stage allowance for the entire Pipeline run."""
+    """Refresh the stage allowance only when the caller advances its sweep."""
 
     run = getattr(args, "pipeline_run", None)
     if not run:
@@ -2802,7 +2803,11 @@ def pipeline_scope(
     return {
         "run": run,
         "iteration": highest,
-        "baseline": whole_number(recorded.get("baseline"), published),
+        "baseline": (
+            published
+            if type(seen) is int and type(iteration) is int and iteration > seen
+            else whole_number(recorded.get("baseline"), published)
+        ),
         "run_baseline": run_baseline,
     }
 
@@ -2810,10 +2815,14 @@ def pipeline_scope(
 def absolute_iteration_cap(
     scope: dict[str, Any] | None, max_iterations: int, pipeline_max_iterations: Any
 ) -> int | None:
-    """Pipeline sweeps do not multiply the stage's configured allowance."""
     if scope is None:
         return None
-    return max_iterations
+    outer = (
+        pipeline_max_iterations
+        if type(pipeline_max_iterations) is int and pipeline_max_iterations > 0
+        else DEFAULT_PIPELINE_MAX_ITERATIONS
+    )
+    return max_iterations * outer
 
 
 def budget_spent(
@@ -8649,25 +8658,6 @@ def command_agent_task(args: argparse.Namespace) -> None:
         if existing is not None:
             require_completed_pipeline_sweep(existing, args, target, repo_root)
             previous_sweep = existing
-            if existing.get("last_result") == "max_iterations_reached":
-                existing["pipeline_budget"] = pipeline_scope(existing, args)
-                save_state(state_path, existing)
-                emit({
-                    "result": "max_iterations_reached",
-                    "state": str(state_path),
-                    "pr": existing["pr"]["pr_url"],
-                    "pr_number": existing["pr"]["number"],
-                    "pr_title": existing["pr"]["title"],
-                    "session_title": (
-                        f"Copilot Review Loop: {existing['pr']['number']} - "
-                        f"{existing['pr']['title']}"
-                    ),
-                    "head_sha": existing["pr"]["head_sha"],
-                    "iterations": existing["iterations"],
-                    "stage_outcome": "carried",
-                    "pending_comments": existing["queue"]["comments"],
-                })
-                return
     retained_task = (
         existing.get("agent_task") if isinstance(existing, dict) else None
     )

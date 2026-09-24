@@ -7557,7 +7557,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
     def test_managed_iterations_share_the_budget_and_stop_at_the_cap(self):
         self.check_managed_iteration_budget(pipeline=False)
 
-    def test_managed_pipeline_sweeps_share_one_budget_without_multiplication(self):
+    def test_managed_pipeline_sweeps_each_get_their_own_budget(self):
         self.check_managed_iteration_budget(pipeline=True)
 
     def check_managed_iteration_budget(self, *, pipeline):
@@ -7664,11 +7664,17 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(2, helper_calls)
-        self.assertEqual("max_iterations_reached", emit.call_args.args[0]["result"])
+        self.assertEqual(3 if pipeline else 2, helper_calls)
+        self.assertEqual(
+            "nothing_to_publish" if pipeline else "max_iterations_reached",
+            emit.call_args.args[0]["result"],
+        )
         state = MODULE.load_state(state_path)
-        self.assertEqual(2, state["iterations"])
-        self.assertEqual("max_iterations_reached", state["escalation"]["reason"])
+        self.assertEqual(3 if pipeline else 2, state["iterations"])
+        self.assertEqual(
+            None if pipeline else "max_iterations_reached",
+            (state.get("escalation") or {}).get("reason"),
+        )
         if pipeline:
             self.assertEqual(3, state["pipeline_budget"]["iteration"])
 
@@ -12257,7 +12263,7 @@ class CommitSuppressionTest(unittest.TestCase):
 
 
 class PipelineBudgetTest(unittest.TestCase):
-    """One CI repair budget covers every sweep of a Pipeline run."""
+    """Each sweep gets a CI repair budget within the Pipeline run."""
 
     RECORDED = {"run": "run-a", "iteration": 2, "baseline": 1, "run_baseline": 1}
 
@@ -12328,15 +12334,15 @@ class PipelineBudgetTest(unittest.TestCase):
         )
         self.assertEqual((0, 0), MODULE.budget_spent(state, scope))
 
-    def test_the_pipeline_advancing_keeps_the_whole_run_budget(self):
+    def test_the_pipeline_advancing_refreshes_the_sweep_budget(self):
         state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
 
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
 
         self.assertEqual(
-            {"run": "run-a", "iteration": 3, "baseline": 1, "run_baseline": 1}, scope
+            {"run": "run-a", "iteration": 3, "baseline": 9, "run_baseline": 1}, scope
         )
-        self.assertEqual((8, 8), MODULE.budget_spent(state, scope))
+        self.assertEqual((0, 8), MODULE.budget_spent(state, scope))
 
     def test_a_relaunch_inside_one_iteration_buys_nothing(self):
         state = {"iterations": 9, "pipeline_budget": dict(self.RECORDED)}
@@ -12450,7 +12456,7 @@ class PipelineBudgetTest(unittest.TestCase):
                     MODULE.exhausted_budget({"iterations": 5}, scope, 5, 10)
                 )
 
-    def test_only_a_different_run_can_reset_the_budget(self):
+    def test_only_a_later_sweep_or_different_run_can_reset_the_budget(self):
         """Enumerate the inputs to a reset instead of claiming the property in prose.
 
         A repeat of one position stays inert no matter what this loop did in
@@ -12491,26 +12497,26 @@ class PipelineBudgetTest(unittest.TestCase):
         }
 
         same = self.scope(state, pipeline_run="2026-05-01/7", pipeline_iteration=3)
-        self.assertEqual(0, same["baseline"])
+        self.assertEqual(2, same["baseline"])
         for other in ("2026-05-01/8", "2026-04-01/7", "7", "run", " 2026-05-01/7"):
             with self.subTest(other=other):
                 scope = self.scope(state, pipeline_run=other, pipeline_iteration=3)
                 self.assertEqual(4, scope["baseline"])
                 self.assertEqual(4, scope["run_baseline"])
 
-    def test_an_omitted_outer_cap_does_not_change_the_ci_cap(self):
+    def test_an_omitted_outer_cap_uses_a_bounded_fallback(self):
         scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
         for value in (None, 0, -1, True, "3"):
             with self.subTest(value=value):
                 self.assertEqual(
-                    5,
+                    5 * MODULE.DEFAULT_PIPELINE_MAX_ITERATIONS,
                     MODULE.absolute_iteration_cap(scope, 5, value),
                 )
 
-    def test_the_outer_cap_never_multiplies_the_ci_cap(self):
+    def test_the_outer_cap_covers_each_sweeps_ci_cap(self):
         scope = {"run": "run-a", "iteration": 1, "baseline": 0, "run_baseline": 0}
-        self.assertEqual(5, MODULE.absolute_iteration_cap(scope, 5, 3))
-        self.assertEqual(10, MODULE.absolute_iteration_cap(scope, 10, 2))
+        self.assertEqual(15, MODULE.absolute_iteration_cap(scope, 5, 3))
+        self.assertEqual(20, MODULE.absolute_iteration_cap(scope, 10, 2))
 
     def test_there_is_no_ceiling_without_a_pipeline(self):
         self.assertIsNone(MODULE.absolute_iteration_cap(None, 5, 3))
@@ -12550,7 +12556,7 @@ class PipelineBudgetTest(unittest.TestCase):
             "iteration", MODULE.exhausted_budget({"iterations": 95}, scope, 5, 10)
         )
 
-    def test_the_running_total_survives_a_pipeline_iteration(self):
+    def test_each_sweep_spends_against_its_own_budget_and_the_run_total(self):
         state = {"iterations": 0}
         head = 0
         for iteration in (1, 2, 3):
@@ -12571,9 +12577,9 @@ class PipelineBudgetTest(unittest.TestCase):
                         "budget_head_key": scope["_charge_key"],
                     },
                 )
-        self.assertEqual(5, state["iterations"])
-        self.assertEqual((5, 5), MODULE.budget_spent(state, scope))
-        self.assertEqual("absolute", MODULE.exhausted_budget(state, scope, 5, cap))
+        self.assertEqual(9, state["iterations"])
+        self.assertEqual((3, 9), MODULE.budget_spent(state, scope))
+        self.assertIsNone(MODULE.exhausted_budget(state, scope, 5, cap))
 
     def test_legacy_iteration_baseline_cannot_hide_whole_run_spending(self):
         state = {
@@ -12585,7 +12591,7 @@ class PipelineBudgetTest(unittest.TestCase):
         MODULE.migrate_budget_counters(state)
         scope = self.scope(state, pipeline_run="run-a", pipeline_iteration=3)
         scope = MODULE.scoped_budget(state, "pipeline", scope)
-        self.assertEqual((8, 8), MODULE.budget_spent(state, scope))
+        self.assertEqual((0, 8), MODULE.budget_spent(state, scope))
 
     def test_preflight_takes_the_position_and_defaults_it_to_absent(self):
         parser = MODULE.build_parser()
@@ -12669,10 +12675,11 @@ class BudgetAdvancedTest(unittest.TestCase):
 
     RECORDED = {"run": "run-a", "iteration": 2, "baseline": 3, "run_baseline": 1}
 
-    def test_only_a_new_run_counts_as_a_budget_advance(self):
+    def test_a_new_run_or_later_sweep_counts_as_a_budget_advance(self):
         for scope in (
             {"run": "run-b", "iteration": 1},
             {"run": "run-b", "iteration": 99},
+            {"run": "run-a", "iteration": 3},
         ):
             with self.subTest(scope=scope):
                 self.assertTrue(MODULE.budget_advanced(self.RECORDED, scope))
@@ -12681,8 +12688,6 @@ class BudgetAdvancedTest(unittest.TestCase):
         for recorded, scope in (
             (self.RECORDED, {"run": "run-a", "iteration": 2}),
             (self.RECORDED, {"run": "run-a", "iteration": 1}),
-            (self.RECORDED, {"run": "run-a", "iteration": 3}),
-            (self.RECORDED, {"run": "run-a", "iteration": 99}),
             (self.RECORDED, {"run": "run-a", "iteration": None}),
             (self.RECORDED, None),
             (None, None),
@@ -13168,7 +13173,7 @@ class PreflightCommandTest(unittest.TestCase):
 
         self.assertEqual(2, moved["iteration"])
 
-    def test_a_pipeline_iteration_keeps_the_head_it_already_charged(self):
+    def test_a_later_sweep_can_charge_the_same_head_again(self):
         path = self.root / "state.json"
         with contextlib.ExitStack() as stack:
             self.preflight(
@@ -13193,12 +13198,18 @@ class PreflightCommandTest(unittest.TestCase):
             )
 
         self.assertEqual(1, len(MODULE.load_state(path)["budget_charged_heads"]))
-        self.assertEqual(1, advanced["iteration"])
-        self.assertEqual("reused", advanced["budget_origin"])
+        self.assertEqual(2, advanced["iteration"])
+        self.assertEqual("fresh", advanced["budget_origin"])
         complete = json.loads(
             Path(advanced["preflight_path"]).read_text(encoding="utf-8")
         )
-        self.assertEqual(1, complete["completed_iterations"])
+        self.assertEqual(0, complete["completed_iterations"])
+        state = MODULE.load_state(path)
+        self.assertTrue(MODULE.charge_iteration(state, state["run"]))
+        self.assertEqual(2, len(state["budget_charged_heads"]))
+        self.assertEqual((1, 2), MODULE.budget_spent(
+            state, MODULE.scoped_budget(state, "pipeline", state["pipeline_budget"]),
+        ))
 
     def test_standalone_and_pipeline_budgets_do_not_spend_each_other(self):
         path = self.root / "state.json"

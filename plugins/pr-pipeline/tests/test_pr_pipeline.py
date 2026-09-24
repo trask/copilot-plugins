@@ -4067,7 +4067,7 @@ class AgentInstructionTest(unittest.TestCase):
             text,
         )
         self.assertIn("at most two sweeps", text)
-        self.assertIn("Sweeps never reset a stage budget", text)
+        self.assertIn("each receive a fresh iteration allowance on a later sweep", text)
         self.assertIn('start "<target>"', text)
         self.assertIn('advance "<target>" --run-id "<run_id>"', text)
         self.assertIn("Invoke each helper call synchronously", text)

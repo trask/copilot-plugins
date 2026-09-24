@@ -1950,10 +1950,8 @@ def absolute_iteration_cap(
 ) -> int | None:
     """Bound the total work one outer run may spend on a pull request.
 
-    Derived from the caller's own cap rather than hardcoded, so raising the outer
-    iteration limit raises this with it. It is enforced even though the caller
-    advancing its own loop at most that many times already implies it, because a
-    bound that depends on a peer behaving is not a bound.
+    Each sweep gets the stage allowance. The outer cap bounds their total even
+    if the caller advances beyond its intended sweep count.
 
     Only the outer cap is optional. Omitting it falls back rather than removing the
     ceiling, so a caller cannot lift the bound by leaving the value out.
@@ -3073,8 +3071,6 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
         absolute_cap = absolute_iteration_cap(
             pipeline, max_iterations, args.pipeline_max_iterations,
         )
-        if pipeline_mode:
-            absolute_cap = max_iterations
         iteration_spent, run_spent = budget_spent(state, scope)
         remaining = max_iterations - iteration_spent
         if absolute_cap is not None:
@@ -3623,7 +3619,9 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
             )
             if exhausted_budget(
                 current, budget, max_iterations,
-                max_iterations if pipeline_mode else None,
+                absolute_iteration_cap(
+                    budget, max_iterations, args.pipeline_max_iterations,
+                ) if pipeline_mode else None,
             ) is not None:
                 report = {**report, "outcome": "max_iterations_reached"}
         review = current["review"]
