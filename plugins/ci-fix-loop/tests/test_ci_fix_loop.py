@@ -4012,7 +4012,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.91", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.92", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -4086,7 +4086,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         expected = (
             "first\n\t\\x1b[31mfailed\\x1b[0m\n"
             "\\x1b]52;c;clipboard\\x07\\x1b]0;title\\x1b\\"
-            "\\x9b2J\\x00\\x08\\x0dhidden\n[REDACTED]\n"
+            "\\x9b2J\\x00\\x08\\x0dhidden\n"
+            "github_pat_abcdefghijklmnopqrstuvwxyz\n"
         )
         for fallback in (None, "transient", "empty"):
             with self.subTest(fallback=fallback):
@@ -5855,7 +5856,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             attempt["attempt"] for attempt in evidence_records[0]["attempts"]
         ])
 
-    def test_failed_log_redacts_real_credentials_before_persistence(self):
+    def test_failed_log_preserves_downloaded_text_before_persistence(self):
         check = self.preflight["check_snapshot"]["failures"][0]
         destination = self.root.parent / f"{self.root.name}-redacted.log"
         self.addCleanup(destination.unlink, missing_ok=True)
@@ -5875,15 +5876,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 repo_root=self.root,
             )
 
-        self.assertEqual(
-            f"before {MODULE.REDACTED_CREDENTIAL} after\n",
-            content,
-        )
-        self.assertNotIn(secret, content)
+        self.assertEqual(f"before {secret} after\n", content)
         self.assertEqual(content, destination.read_text(encoding="utf-8"))
-        MODULE.require_no_credentials(content, source="redacted test log")
 
-    def test_failed_log_redacts_complete_private_key_material(self):
+    def test_failed_log_does_not_rewrite_multiline_text(self):
         check = self.preflight["check_snapshot"]["failures"][0]
         completed = MODULE.subprocess.CompletedProcess(
             ["gh"],
@@ -5904,12 +5900,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ):
             content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
 
-        self.assertEqual(
-            f"before\n{MODULE.REDACTED_CREDENTIAL}\nafter\n",
-            content,
-        )
-        self.assertNotIn("private-base64-material", content)
-        MODULE.require_no_credentials(content, source="redacted private key log")
+        self.assertIn("private-base64-material", content)
+        self.assertEqual(5, len(content.splitlines()))
 
     def test_failed_log_retains_masked_and_placeholder_diagnostics(self):
         check = self.preflight["check_snapshot"]["failures"][0]
@@ -5929,11 +5921,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ):
             content = MODULE.fetch_failed_check_log(self.preflight["pr"], check)
 
-        self.assertEqual(2, content.count(MODULE.REDACTED_CREDENTIAL))
-        self.assertIn("checkout ", content)
-        self.assertIn("test ", content)
-        self.assertIn(" failed", content)
-        MODULE.require_no_credentials(content, source="redacted test log")
+        self.assertIn("checkout Authorization: Basic ******", content)
+        self.assertIn("test TOKEN=CONFIGURATION_SERVER failed", content)
 
     def test_failed_log_download_error_hashes_stdout_without_retaining_text(self):
         check = self.preflight["check_snapshot"]["failures"][0]
