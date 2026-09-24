@@ -78,6 +78,12 @@ class HostedEvidenceTest(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.WorkflowError, "exact job/attempt"):
                     MODULE.controller_ci_evidence(preflight)
 
+    def test_large_log_drift_is_rejected_without_reading_or_sanitizing_it(self):
+        preflight = self.preflight("x" * (MODULE.MAX_INLINE_CI_EVIDENCE_BYTES + 1))
+        self.path.write_text("y" * (MODULE.MAX_INLINE_CI_EVIDENCE_BYTES + 1), encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "identity changed"):
+            MODULE.controller_ci_evidence(preflight)
+
     def test_log_drift_and_unavailable_log_stop_before_dispatch(self):
         preflight = self.preflight("original failure\n")
         self.path.write_text("different log", encoding="utf-8")

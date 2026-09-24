@@ -7125,26 +7125,55 @@ def controller_ci_evidence(
         path = failure.get("log_path")
         if not isinstance(path, str) or not path:
             raise WorkflowError("failed-check evidence has no retained log")
-        try:
-            content = Path(path).read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise WorkflowError("failed-check evidence log is unavailable") from error
-        if sha256_text(content) != failure["log_sha256"]:
-            raise WorkflowError("failed-check evidence log identity changed")
-        text = sanitize_external_command_text(content)
         reference = parse_run_reference(failure.get("url"))
         run_id = reference.get("run_id") if reference else None
         run_identity = (snapshot.get("workflow_runs") or {}).get(str(run_id))
-        records.append({
-            "check_key": failure["key"],
-            "url": failure.get("url"),
-            "run": run_identity,
-            "job": reference,
-            "log_sha256": failure["log_sha256"],
-            "sanitized_log_sha256": sha256_text(text),
-            "utf8_bytes": len(text.encode("utf-8")),
-            "text": text,
-        })
+        run = (
+            {"id": run_identity["id"], "run_attempt": run_identity["run_attempt"]}
+            if isinstance(run_identity, dict)
+            and "id" in run_identity and "run_attempt" in run_identity
+            else run_identity
+        )
+        log_path = Path(path)
+        try:
+            if log_path.stat().st_size > MAX_INLINE_CI_EVIDENCE_BYTES:
+                digest = hashlib.sha256()
+                size = 0
+                with log_path.open("r", encoding="utf-8") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), ""):
+                        encoded = chunk.encode("utf-8")
+                        digest.update(encoded)
+                        size += len(encoded)
+                if digest.hexdigest() != failure["log_sha256"]:
+                    raise WorkflowError("failed-check evidence log identity changed")
+                record = {
+                    "check_key": failure["key"],
+                    "url": failure.get("url"),
+                    "run": run,
+                    "job": reference,
+                    "log_sha256": failure["log_sha256"],
+                    "utf8_bytes": size,
+                    "retrieve_full_log": True,
+                    "omitted_utf8_bytes": size,
+                }
+            else:
+                content = log_path.read_text(encoding="utf-8")
+                if sha256_text(content) != failure["log_sha256"]:
+                    raise WorkflowError("failed-check evidence log identity changed")
+                text = sanitize_external_command_text(content)
+                record = {
+                    "check_key": failure["key"],
+                    "url": failure.get("url"),
+                    "run": run,
+                    "job": reference,
+                    "log_sha256": failure["log_sha256"],
+                    "sanitized_log_sha256": sha256_text(text),
+                    "utf8_bytes": len(text.encode("utf-8")),
+                    "text": text,
+                }
+        except (OSError, UnicodeError) as error:
+            raise WorkflowError("failed-check evidence log is unavailable") from error
+        records.append(record)
     def render():
         return json.dumps({"logs": records}, ensure_ascii=False, sort_keys=True)
 
@@ -7153,10 +7182,12 @@ def controller_ci_evidence(
             prompt_fits is None or prompt_fits(evidence)
         )
 
-    # Full logs that do not fit are retrieved by immutable job/attempt identity.
+    # Omitted logs are retrieved by exact job and attempt identity.
     for record in sorted(records, key=lambda item: item["utf8_bytes"], reverse=True):
         if fits(render()):
             break
+        if "text" not in record:
+            continue
         if (
             not isinstance(record["run"], dict)
             or type(record["run"].get("run_attempt")) is not int
@@ -7172,6 +7203,19 @@ def controller_ci_evidence(
     evidence = render()
     if not fits(evidence):
         raise WorkflowError("failed-check evidence identities exceed the inline limit")
+    if any(
+        record.get("retrieve_full_log")
+        and (
+            not isinstance(record["run"], dict)
+            or type(record["run"].get("run_attempt")) is not int
+            or not isinstance(record["job"], dict)
+            or not record["job"].get("job_id")
+        )
+        for record in records
+    ):
+        raise WorkflowError(
+            "failed-check evidence exceeds the inline limit without an exact job/attempt reference"
+        )
     require_no_credentials(evidence, source="hosted CI evidence")
     return evidence
 
@@ -7240,7 +7284,7 @@ def build_worker_prompt(
         },
         "failures": [
             {key: failure.get(key) for key in (
-                "key", "name", "workflow", "url", "conclusion",
+                "key", "name", "workflow", "conclusion",
                 "baseline_conclusion", "log_sha256",
             )}
             for failure in snapshot["failures"]
