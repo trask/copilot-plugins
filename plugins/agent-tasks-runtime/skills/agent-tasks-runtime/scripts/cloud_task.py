@@ -55,6 +55,7 @@ REPORT_PATH_PLACEHOLDER = "{{MARKETPLACE_REPORT_PATH}}"
 SEMANTIC_PATH_PLACEHOLDER = "{{MARKETPLACE_SEMANTIC_PATH}}"
 VALIDATION_PATH_PLACEHOLDER = "{{MARKETPLACE_VALIDATION_PATH}}"
 PR_CONTEXT_MARKER = "----- /cloud source pull request -----"
+DEFAULT_CONTEXT_MARKER = "----- /cloud source default branch -----"
 POLICY_MARKER = "----- marketplace agent worker policy -----"
 RESULT_SCHEMA_ID = "github.copilot.agent-task-result"
 CANDIDATE_RESULT_SCHEMA_VERSION = 5
@@ -168,6 +169,40 @@ CANDIDATE_POLICY_SELECTORS = {
     MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
     MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
 }
+DEFAULT_CODE_POLICY_ID = "marketplace-agent-default-branch-code-candidate-worker"
+DEFAULT_REPORT_POLICY_ID = "marketplace-agent-default-branch-report-recommendation-worker"
+DEFAULT_CODE_POLICY_SELECTOR = f"{DEFAULT_CODE_POLICY_ID}@1"
+DEFAULT_REPORT_POLICY_SELECTOR = f"{DEFAULT_REPORT_POLICY_ID}@1"
+DEFAULT_POLICY_SPECS = {
+    DEFAULT_CODE_POLICY_SELECTOR: {
+        **MARKETPLACE_CODE_CANDIDATE_POLICY_SPEC,
+        "id": DEFAULT_CODE_POLICY_ID,
+        "source": "verified-default-branch-immutable-sha",
+        "require_unchanged_pr_head": False,
+        "require_verified_default_branch_before_dispatch": True,
+        "allow_default_branch_advance_after_dispatch": True,
+    },
+    DEFAULT_REPORT_POLICY_SELECTOR: {
+        **MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SPEC,
+        "id": DEFAULT_REPORT_POLICY_ID,
+        "source": "verified-default-branch-immutable-sha",
+        "require_unchanged_pr_head": False,
+        "require_verified_default_branch_before_dispatch": True,
+        "allow_default_branch_advance_after_dispatch": True,
+    },
+}
+DEFAULT_POLICY_HASHES = {
+    selector: hashlib.sha256(
+        json.dumps(spec, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+    ).hexdigest()
+    for selector, spec in DEFAULT_POLICY_SPECS.items()
+}
+CANDIDATE_POLICY_SELECTORS.update(DEFAULT_POLICY_SPECS)
+REPORT_POLICY_SELECTORS = {
+    MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
+    DEFAULT_REPORT_POLICY_SELECTOR,
+}
+CODE_POLICY_SELECTORS = CANDIDATE_POLICY_SELECTORS - REPORT_POLICY_SELECTORS
 REMOVED_OPTIONS = {
     "--dispatch-only",
     "--monitor-only",
@@ -218,6 +253,7 @@ class Options:
     prompt_file: Path | None = None
     pipeline_mode: str | None = None
     pipeline_run: str | None = None
+    default_branch: bool = False
 
 
 @dataclass(frozen=True)
@@ -297,6 +333,7 @@ class ResultEnvelope:
     repository: str | None = None
     request_id: str | None = None
     pull_request: PullRequestSnapshot | None = None
+    source: Mapping[str, object] | None = None
     policy: Mapping[str, object] | None = None
     task_id: str | None = None
     task_url: str | None = None
@@ -345,6 +382,7 @@ class ResultEnvelope:
                 else None
             ),
             "pull_request": pull_request,
+            **({"source": self.source} if self.source is not None else {}),
             "requested_model": self.requested_model,
             "policy": self.policy,
             "task": {
@@ -402,6 +440,7 @@ def parse_args(args: Sequence[str]) -> Options:
     report = False
     apply_with_report = False
     allow_merged_pr = False
+    default_branch = False
     model_alias = "sol"
     prompt_file: Path | None = None
     pull_request: PrReference | None = None
@@ -434,6 +473,12 @@ def parse_args(args: Sequence[str]) -> Options:
             continue
         if token == "--allow-merged-pr":
             allow_merged_pr = True
+            index += 1
+            continue
+        if token == "--default-branch":
+            if default_branch:
+                raise CloudError("--default-branch may be specified only once", "policy_rejected")
+            default_branch = True
             index += 1
             continue
         if token in {"--pipeline-dispatch", "--pipeline-observe"}:
@@ -511,12 +556,15 @@ def parse_args(args: Sequence[str]) -> Options:
             f"unknown policy {policy!r}; expected one of {expected}",
             "policy_unknown",
         )
-    if pull_request is None or prompt_file is None or result_file is None:
+    if prompt_file is None or result_file is None or (pull_request is None) != default_branch:
         raise CloudError(
-            "candidate policies require --pr, --prompt-file, and --result-file",
+            "candidate policies require exactly one of --pr or --default-branch, "
+            "plus --prompt-file and --result-file",
             "policy_rejected",
         )
-    if policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR:
+    if default_branch != (policy in DEFAULT_POLICY_SPECS):
+        raise CloudError("source selector does not match the candidate policy", "policy_rejected")
+    if policy in CODE_POLICY_SELECTORS:
         if not apply_with_report or report:
             raise CloudError(
                 f"{policy} requires --apply-with-report",
@@ -532,6 +580,8 @@ def parse_args(args: Sequence[str]) -> Options:
             "--allow-merged-pr is valid only for code candidates",
             "policy_rejected",
         )
+    if default_branch and pipeline_mode is not None:
+        raise CloudError("default-branch candidates do not support pipeline stages", "policy_rejected")
     if (pipeline_mode is None) != (pipeline_run is None):
         raise CloudError(
             "pipeline stages require --pipeline-run and a stage flag",
@@ -549,6 +599,7 @@ def parse_args(args: Sequence[str]) -> Options:
         prompt_file=prompt_file,
         pipeline_mode=pipeline_mode,
         pipeline_run=pipeline_run,
+        default_branch=default_branch,
     )
 
 def parse_pr_reference(value: str) -> PrReference:
@@ -594,14 +645,17 @@ def read_prompt_file(value: str) -> str:
     return prompt
 
 def mode_name(options: Options) -> str:
-    if options.policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR:
+    if options.policy in CODE_POLICY_SELECTORS:
         return "code_candidate"
-    if options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR:
+    if options.policy in REPORT_POLICY_SELECTORS:
         return "report_recommendation"
     raise CloudError("a current candidate policy is required", "policy_required")
 
 
 def policy_metadata(options: Options) -> dict[str, object]:
+    if options.policy in DEFAULT_POLICY_SPECS:
+        spec = DEFAULT_POLICY_SPECS[options.policy]
+        return {"id": spec["id"], "version": 1, "sha256": DEFAULT_POLICY_HASHES[options.policy]}
     if options.policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR:
         return {
             "id": MARKETPLACE_CODE_CANDIDATE_POLICY_ID,
@@ -1139,6 +1193,23 @@ class GitRepository:
             )
         return refs
 
+    def fetch_default_source(
+        self, snapshot: WorktreeSnapshot, source: BaseSnapshot, request_id: str
+    ) -> None:
+        self._require_valid_branch(snapshot.root, source.branch, "default")
+        tracking_ref = f"refs/cloud-agent-tasks/{request_id}/default"
+        self._run(
+            snapshot.root, "fetch", "--no-tags", snapshot.remote,
+            f"+refs/heads/{source.branch}:{tracking_ref}",
+        )
+        fetched = self.ref_sha(snapshot.root, tracking_ref)
+        if fetched != source.sha:
+            raise CloudError(
+                f"default branch moved while it was fetched: expected {source.sha}, "
+                f"observed {fetched}; the Agent Task was not started",
+                "stale_default_branch",
+            )
+
     def verify_fork_head(
         self,
         root: Path,
@@ -1434,8 +1505,11 @@ def verify_candidate_result(
 ) -> dict[str, object]:
     """Recheck dispatcher provenance and fetched history for a candidate consumer."""
     report_only = options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
-    if options.policy not in CANDIDATE_POLICY_SELECTORS:
-        raise CloudError("consumer requires a candidate policy", "policy_rejected")
+    if options.policy not in {
+        MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR,
+        MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
+    } or options.default_branch:
+        raise CloudError("PR consumer requires a PR candidate policy", "policy_rejected")
     pr = pull_request
     if pr.state != ("MERGED" if options.allow_merged_pr else "OPEN"):
         raise CloudError("candidate source state is not authorized by the caller", "stale_pr_head")
@@ -1482,11 +1556,73 @@ def verify_candidate_result(
             or base_is_ancestor(repository, pr.base_sha, candidate_base) is not True
         ):
             raise CloudError("candidate consumer identity or policy mismatch", "candidate_invalid")
+    submitted = task_payload(options, OUTPUT_REPORT_PATH, pr)["prompt"]
+    return _verify_candidate_evidence(
+        result, options=options, root=root, git=git, repository=repository,
+        source_ref=source_ref, source_sha=pr.head_sha, submitted=submitted,
+    )
+
+def verify_default_branch_candidate(
+    result: Mapping[str, object], *, options: Options,
+    source: BaseSnapshot, repository: str, local_head_sha: str,
+    root: Path, git: GitRepository,
+) -> dict[str, object]:
+    """Recheck a frozen default-branch candidate without consulting the moving default ref."""
+    if (
+        not options.default_branch or options.policy not in DEFAULT_POLICY_SPECS
+        or options.pull_request is not None or options.allow_merged_pr
+        or options.report != (options.policy == DEFAULT_REPORT_POLICY_SELECTOR)
+        or options.apply_with_report == options.report
+        or not isinstance(repository, str)
+        or re.fullmatch(r"[^/\s]+/[^/\s]+", repository) is None
+        or not isinstance(source, BaseSnapshot)
+        or not isinstance(source.branch, str) or not source.branch
+        or not isinstance(source.sha, str) or re.fullmatch(r"[0-9a-f]{40}", source.sha) is None
+        or not isinstance(local_head_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", local_head_sha) is None
+    ):
+        raise CloudError("default candidate source is invalid", "candidate_invalid")
+    report_only = options.policy == DEFAULT_REPORT_POLICY_SELECTOR
+    expected_source = {
+        "kind": "default_branch", "repository": repository,
+        "ref": f"refs/heads/{source.branch}", "sha": source.sha,
+    }
+    if (
+        result.get("schema") != {"id": RESULT_SCHEMA_ID, "version": 5}
+        or result.get("status") != "success" or result.get("error") is not None
+        or result.get("policy") != policy_metadata(options)
+        or result.get("mode") != ("report_recommendation" if report_only else "code_candidate")
+        or result.get("repository") != {"name_with_owner": repository}
+        or result.get("pull_request") is not None
+        or result.get("source") != expected_source
+        or result.get("requested_model") != options.model
+        or result.get("report") is not None
+        or result.get("attestation") != {"kind": "dispatcher_candidate", "structural_complete": True}
+        or result.get("application") != {
+            "status": "not_applicable" if report_only else "not_applied",
+            "final_local_head": local_head_sha,
+        }
+    ):
+        raise CloudError("default candidate identity or policy mismatch", "candidate_invalid")
+    submitted = task_payload(
+        options, OUTPUT_REPORT_PATH, default_source=source, repository=repository,
+    )["prompt"]
+    return _verify_candidate_evidence(
+        result, options=options, root=root, git=git, repository=repository,
+        source_ref=source.sha, source_sha=source.sha, submitted=submitted,
+    )
+
+def _verify_candidate_evidence(
+    result: Mapping[str, object], *, options: Options, root: Path,
+    git: GitRepository, repository: str, source_ref: str,
+    source_sha: str, submitted: object,
+) -> dict[str, object]:
+    report_only = options.policy in REPORT_POLICY_SELECTORS
     task, generated, completion = (result.get(name) for name in ("task", "generated", "completion"))
     if (
         not isinstance(task, dict) or not isinstance(task.get("id"), str) or not task["id"]
         or task.get("state") != "completed"
-        or task.get("base_ref") != source_ref or task.get("base_sha") != pr.head_sha
+        or task.get("base_ref") != source_ref or task.get("base_sha") != source_sha
         or not isinstance(generated, dict)
         or not isinstance(generated.get("branch"), str) or not generated["branch"]
         or not isinstance(generated.get("head_sha"), str)
@@ -1495,7 +1631,6 @@ def verify_candidate_result(
         or set(completion) != {"request", "task", "session", "repository", "refs"}
     ):
         raise CloudError("candidate task completion is malformed", "candidate_invalid")
-    submitted = task_payload(options, OUTPUT_REPORT_PATH, pr)["prompt"]
     prompt_hash = hashlib.sha256(str(submitted).encode("utf-8")).hexdigest()
     session, completed_task, repo_identity = (
         completion.get(name) for name in ("session", "task", "repository")
@@ -1532,13 +1667,13 @@ def verify_candidate_result(
                     raise ValueError("timezone missing")
             except ValueError as error:
                 raise CloudError("candidate completion timestamp invalid", "candidate_invalid") from error
-    commits = git.cloud_commits(root, pr.head_sha, generated["head_sha"])
-    history = git.candidate_history(root, pr.head_sha, commits, report_only=report_only)
+    commits = git.cloud_commits(root, source_sha, generated["head_sha"])
+    history = git.candidate_history(root, source_sha, commits, report_only=report_only)
     manifest = {
         "schema": CANDIDATE_MANIFEST_SCHEMA,
         "repository": {"name_with_owner": repository},
         "task": {"id": task["id"], "session_id": session["id"]},
-        "base": {"ref": source_ref, "sha": pr.head_sha},
+        "base": {"ref": source_ref, "sha": source_sha},
         "generated": {"ref": generated["branch"], "head_sha": generated["head_sha"],
                       "code_tip_sha": history.code_head},
         "code_commits": list(history.code_commits),
@@ -1547,7 +1682,7 @@ def verify_candidate_result(
     code_commits = [entry["sha"] for entry in history.code_commits]
     if result.get("candidate") != manifest or generated.get("commits") != code_commits:
         raise CloudError("candidate manifest differs from fetched history", "candidate_invalid")
-    if generated["head_sha"] != (commits[-1] if commits else pr.head_sha):
+    if generated["head_sha"] != (commits[-1] if commits else source_sha):
         raise CloudError("candidate generated tip differs from history", "candidate_invalid")
     return {"task": task, "completion": completion, "candidate": manifest,
             "commits": code_commits, "code_tip": history.code_head,
@@ -1567,6 +1702,36 @@ def verify_current_candidate(
         git=git,
         base_is_ancestor=base_is_ancestor,
     )
+
+
+def guarded_fast_forward_default_candidate(
+    result: Mapping[str, object], *, options: Options,
+    source: BaseSnapshot, repository: str, executor_head_sha: str,
+    root: Path, git: GitRepository,
+) -> dict[str, object]:
+    """Import only verified code commits into a clean branch at the frozen source."""
+    if options.policy != DEFAULT_CODE_POLICY_SELECTOR or not options.default_branch:
+        raise CloudError("only default-branch code candidates can be imported", "policy_rejected")
+    snapshot = git.snapshot(root)
+    if snapshot.repository != repository or snapshot.head != source.sha:
+        raise CloudError("import branch is not at the frozen default source", "local_drift")
+    verified = verify_default_branch_candidate(
+        result, options=options, source=source, repository=repository,
+        local_head_sha=executor_head_sha, root=root, git=git,
+    )
+    git.require_unchanged(snapshot)
+    code_tip = verified["code_tip"]
+    if code_tip != source.sha:
+        git.fast_forward(snapshot, code_tip)
+        git.require_clean(root)
+        git.require_no_operation(root)
+        if git.head(root) != code_tip:
+            raise CloudError("candidate import did not reach the verified code tip", "local_drift")
+    return {
+        **verified,
+        "application": "fast_forwarded" if code_tip != source.sha else "no_changes",
+        "final_local_head": code_tip,
+    }
 
 
 def guarded_fast_forward_candidate(
@@ -2301,9 +2466,14 @@ def repository_base(api: ApiClient, repository: str) -> BaseSnapshot:
     )
     if not isinstance(repository_data, dict):
         raise CloudError("GitHub returned invalid repository metadata")
+    reported_name = repository_data.get("full_name")
+    if not isinstance(reported_name, str) or reported_name.casefold() != repository.casefold():
+        raise CloudError("GitHub returned a different repository", "source_identity_mismatch")
     default_branch = repository_data.get("default_branch")
     if not isinstance(default_branch, str) or not default_branch:
         raise CloudError("GitHub returned no valid default branch")
+    if re.fullmatch(r"[^\s~^:?*\\\[]+", default_branch) is None:
+        raise CloudError("GitHub returned an invalid default branch")
     encoded_branch = urllib.parse.quote(default_branch, safe="")
     ref_data = api.request_json(
         "GET",
@@ -2311,28 +2481,59 @@ def repository_base(api: ApiClient, repository: str) -> BaseSnapshot:
         expected_status=200,
         operation=f"resolve {repository}'s default branch",
     )
-    if not isinstance(ref_data, dict) or not isinstance(ref_data.get("object"), dict):
+    if (
+        not isinstance(ref_data, dict)
+        or ref_data.get("ref") != f"refs/heads/{default_branch}"
+        or not isinstance(ref_data.get("object"), dict)
+    ):
         raise CloudError("GitHub returned invalid default-branch metadata")
     sha = ref_data["object"].get("sha")
     if not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha):
         raise CloudError("GitHub returned an invalid default-branch commit")
     return BaseSnapshot(default_branch, sha.lower())
 
+def verified_default_source(
+    api: ApiClient,
+    git: GitRepository,
+    snapshot: WorktreeSnapshot,
+    request_id: str,
+) -> BaseSnapshot:
+    source = repository_base(api, snapshot.repository)
+    git.fetch_default_source(snapshot, source, request_id)
+    return source
+
+def require_default_source_unchanged(
+    api: ApiClient, repository: str, frozen: BaseSnapshot
+) -> None:
+    current = repository_base(api, repository)
+    if current != frozen:
+        raise CloudError(
+            f"default branch moved before dispatch: expected {frozen.branch}@{frozen.sha}, "
+            f"observed {current.branch}@{current.sha}; the Agent Task was not started",
+            "stale_default_branch",
+        )
+
 def build_candidate_policy_prompt(
     prompt: str,
     *,
     policy: str,
 ) -> str:
-    if policy == MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR:
-        policy_hash = MARKETPLACE_CODE_CANDIDATE_POLICY_HASH
+    if policy in CODE_POLICY_SELECTORS:
+        policy_hash = (
+            DEFAULT_POLICY_HASHES[policy] if policy in DEFAULT_POLICY_SPECS
+            else MARKETPLACE_CODE_CANDIDATE_POLICY_HASH
+        )
         history_instruction = (
             "Put substantive code, test, documentation, or configuration changes "
             "in zero or more linear single-parent commits. You may then create one "
             "final single-parent artifact commit whose changed paths are all under "
             f"`{OUTPUT_DIRECTORY}/`. The artifact commit is optional. "
         )
-    elif policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR:
-        policy_hash = MARKETPLACE_REPORT_RECOMMENDATION_POLICY_HASH
+    elif policy in REPORT_POLICY_SELECTORS:
+        policy_hash = (
+            DEFAULT_POLICY_HASHES[policy] if policy in DEFAULT_POLICY_SPECS
+            else MARKETPLACE_REPORT_RECOMMENDATION_POLICY_HASH
+        )
         history_instruction = (
             "Do not create code, test, documentation, or configuration commits. "
             "Create exactly one final single-parent artifact commit directly on "
@@ -2379,6 +2580,16 @@ def build_pr_prompt(prompt: str, pull_request: PullRequestSnapshot) -> str:
         f"{prompt}"
     )
 
+def build_default_prompt(prompt: str, repository: str, source: BaseSnapshot) -> str:
+    return (
+        f"{DEFAULT_CONTEXT_MARKER}\n"
+        f"Source repository: {repository}\n"
+        f"Source default ref: refs/heads/{source.branch}\n"
+        f"Exact source SHA: {source.sha}\n"
+        f"{DEFAULT_CONTEXT_MARKER}\n\n"
+        f"{prompt}"
+    )
+
 def task_base_ref(pull_request: PullRequestSnapshot) -> str:
     if pull_request.state == "MERGED" or pull_request.cross_repository:
         return pull_request.head_sha
@@ -2410,6 +2621,9 @@ def task_payload(
     options: Options,
     report_path: str | None = None,
     pull_request: PullRequestSnapshot | None = None,
+    *,
+    default_source: BaseSnapshot | None = None,
+    repository: str | None = None,
     **_removed: object,
 ) -> dict[str, object]:
     if options.policy not in CANDIDATE_POLICY_SELECTORS:
@@ -2419,6 +2633,10 @@ def task_payload(
     prompt = render_artifact_paths(options.prompt, report_path=report_path)
     if pull_request is not None:
         prompt = build_pr_prompt(prompt, pull_request)
+    if default_source is not None:
+        if not options.default_branch or repository is None or pull_request is not None:
+            raise CloudError("default source does not match the request", "policy_rejected")
+        prompt = build_default_prompt(prompt, repository, default_source)
     prompt = build_candidate_policy_prompt(prompt, policy=options.policy)
     payload: dict[str, object] = {
         "prompt": prompt,
@@ -2427,6 +2645,8 @@ def task_payload(
     }
     if pull_request is not None:
         payload["base_ref"] = task_base_ref(pull_request)
+    if default_source is not None:
+        payload["base_ref"] = default_source.sha
     return payload
 
 def start_task(
@@ -2844,7 +3064,7 @@ def execute(
     result: ResultEnvelope | None = None,
 ) -> int:
     progress = progress or Progress()
-    if options.result_file is None or options.pull_request is None:
+    if options.result_file is None or (options.pull_request is None and not options.default_branch):
         raise AssertionError("candidate invocation lost required paths")
     if options.pipeline_mode == "observe":
         return execute_pipeline_observe(
@@ -2853,9 +3073,7 @@ def execute(
         )
     git = GitRepository(runner, path_exists)
     api = ApiClient(runner, sleep, wall_clock)
-    report_only = (
-        options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
-    )
+    report_only = options.policy in REPORT_POLICY_SELECTORS
     if options.pipeline_mode == "dispatch":
         if (
             pipeline_checkpoint_path(options.result_file).exists()
@@ -2889,13 +3107,24 @@ def execute(
     progress.result_path = options.result_file
     progress.request_id = request_id
     progress.repository = repository
-    pull_request = resolve_pull_request(
-        runner,
-        root,
-        repository,
-        options.pull_request,
-        allow_merged=options.allow_merged_pr,
-    )
+    pull_request = None
+    default_source = None
+    if options.default_branch:
+        if snapshot is None:
+            snapshot = WorktreeSnapshot(
+                root, repository, git.matching_remote(root, repository),
+                git.branch(root, allow_detached=True), git.head(root),
+            )
+        default_source = verified_default_source(api, git, snapshot, request_id)
+        if not report_only:
+            git.require_unchanged(snapshot)
+    else:
+        if options.pull_request is None:
+            raise AssertionError("PR candidate lost its reference")
+        pull_request = resolve_pull_request(
+            runner, root, repository, options.pull_request,
+            allow_merged=options.allow_merged_pr,
+        )
     if options.allow_merged_pr:
         if snapshot is None:
             raise AssertionError("historical candidate lost its worktree snapshot")
@@ -2916,14 +3145,14 @@ def execute(
         require_pr_unchanged(pull_request, refreshed, full_identity=True)
         pull_request = refreshed
         git.require_historical_unchanged(snapshot, {snapshot.head})
-    elif report_only:
+    elif report_only and not options.default_branch:
         refreshed = resolve_pull_request(
             runner, root, repository, options.pull_request
         )
         require_pr_unchanged(pull_request, refreshed)
         pull_request = refreshed
         git.verify_fork_head(root, repository, pull_request)
-    else:
+    elif not options.default_branch:
         if snapshot is None:
             raise AssertionError("code candidate lost its worktree snapshot")
         base = repository_base(api, repository)
@@ -2941,13 +3170,26 @@ def execute(
 
     if result is not None:
         result.pull_request = pull_request
+        if default_source is not None:
+            result.source = {
+                "kind": "default_branch",
+                "repository": repository,
+                "ref": f"refs/heads/{default_source.branch}",
+                "sha": default_source.sha,
+            }
     policy_identity = git.identity(root)
-    payload = task_payload(options, OUTPUT_REPORT_PATH, pull_request)
+    payload = task_payload(
+        options, OUTPUT_REPORT_PATH, pull_request,
+        default_source=default_source, repository=repository,
+    )
     submitted_prompt = payload["prompt"]
     if not isinstance(submitted_prompt, str):
         raise AssertionError("Agent Task payload lost its prompt")
     if _EXECUTION is not None:
         _EXECUTION.record_dispatch(options.result_file, request_id, repository)
+    if default_source is not None:
+        git.require_identity_unchanged(root, policy_identity)
+        require_default_source_unchanged(api, repository, default_source)
     if options.pipeline_mode == "dispatch":
         identity = pipeline_identity(
             options, root, repository, pull_request, policy_identity, submitted_prompt,
@@ -2995,8 +3237,8 @@ def execute(
         result.task_state = str(initial["state"])
         link = initial.get("html_url") or initial.get("url")
         result.task_url = link if isinstance(link, str) and link else None
-        result.task_base_ref = task_base_ref(pull_request)
-        result.task_base_sha = pull_request.head_sha
+        result.task_base_ref = default_source.sha if default_source else task_base_ref(pull_request)
+        result.task_base_sha = default_source.sha if default_source else pull_request.head_sha
         if _EXECUTION is not None:
             _EXECUTION.record_dispatch(
                 options.result_file,
@@ -3034,7 +3276,8 @@ def execute(
         result.task_url = link if isinstance(link, str) and link else result.task_url
     return collect_completed_task(
         options, git=git, api=api, runner=runner, root=root,
-        repository=repository, pull_request=pull_request, snapshot=snapshot,
+        repository=repository, pull_request=pull_request, default_source=default_source,
+        snapshot=snapshot,
         policy_identity=policy_identity, request_id=request_id,
         task_id=str(initial["id"]), submitted_prompt=submitted_prompt,
         final=final, result=result, stderr=stderr,
@@ -3048,7 +3291,8 @@ def collect_completed_task(
     runner: Runner,
     root: Path,
     repository: str,
-    pull_request: PullRequestSnapshot,
+    pull_request: PullRequestSnapshot | None,
+    default_source: BaseSnapshot | None = None,
     snapshot: WorktreeSnapshot | None,
     policy_identity: LocalIdentity,
     request_id: str,
@@ -3058,11 +3302,13 @@ def collect_completed_task(
     result: ResultEnvelope | None,
     stderr: TextIO,
 ) -> int:
-    report_only = options.policy == MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR
+    report_only = options.policy in REPORT_POLICY_SELECTORS
     refs = resolve_generated_refs(final)
     if result is not None:
         result.generated_branch = refs.head
-    expected_base = task_base_ref(pull_request)
+    if pull_request is None and default_source is None:
+        raise AssertionError("candidate lost its source")
+    expected_base = default_source.sha if default_source else task_base_ref(pull_request)
     if refs.base is None or refs.base != expected_base:
         raise CloudError(
             f"task {final['id']} used base branch {refs.base}, but the "
@@ -3071,7 +3317,7 @@ def collect_completed_task(
 
     if options.pipeline_mode == "observe":
         git.require_identity_unchanged(root, policy_identity)
-    else:
+    elif pull_request is not None:
         validate_policy_before_mutation(
             git,
             policy_identity,
@@ -3082,6 +3328,8 @@ def collect_completed_task(
             pull_request,
             allow_merged_pr=options.allow_merged_pr,
         )
+    else:
+        git.require_identity_unchanged(root, policy_identity)
     if options.allow_merged_pr:
         if snapshot is None:
             raise AssertionError("historical candidate lost its snapshot")
@@ -3096,7 +3344,8 @@ def collect_completed_task(
         )
     tracking_ref = git.fetch_generated(snapshot, refs.head, request_id)
     generated_head = git.ref_sha(root, tracking_ref)
-    all_commits = git.cloud_commits(root, pull_request.head_sha, tracking_ref)
+    base_sha = default_source.sha if default_source else pull_request.head_sha
+    all_commits = git.cloud_commits(root, base_sha, tracking_ref)
     completion = validate_fresh_completion(
         final,
         expected_task_id=task_id,
@@ -3109,12 +3358,12 @@ def collect_completed_task(
     )
     history = git.candidate_history(
         root,
-        pull_request.head_sha,
+        base_sha,
         all_commits,
         report_only=report_only,
     )
     expected_generated_head = (
-        all_commits[-1] if all_commits else pull_request.head_sha
+        all_commits[-1] if all_commits else base_sha
     )
     if generated_head != expected_generated_head:
         raise CloudError(
@@ -3129,7 +3378,7 @@ def collect_completed_task(
             "id": completion["task"]["id"],
             "session_id": completion["session"]["id"],
         },
-        "base": {"ref": expected_base, "sha": pull_request.head_sha},
+        "base": {"ref": expected_base, "sha": base_sha},
         "generated": {
             "ref": refs.head,
             "head_sha": generated_head,

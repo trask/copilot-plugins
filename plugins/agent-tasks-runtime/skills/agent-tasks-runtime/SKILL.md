@@ -1,11 +1,11 @@
 ---
 name: agent-tasks-runtime
-description: Internal GitHub Agent Tasks runtime dependency for Trask pull request agents. Use only when maintaining or diagnosing those agents' shared cloud execution backend.
+description: Internal GitHub Agent Tasks runtime dependency for Trask cloud workers. Use only when maintaining or diagnosing their shared execution backend.
 ---
 
 # Agent Tasks Runtime
 
-This is the shared runtime dependency for Trask PR agents, not a user workflow. Consumer coordinators discover it through `copilot skill list --json`, verify the exact source digest, and invoke the helper. Do not invoke its scripts manually during an agent workflow.
+This is the shared runtime dependency for Trask cloud workers, not a user workflow. Consumer coordinators discover it through `copilot skill list --json`, verify the exact source digest, and invoke the helper. Do not invoke its scripts manually during an agent workflow.
 
 `scripts/execution.py` is the shared foreground execution library. Consumer
 entrypoints pin its source bytes. Pipeline and Conflict use this library for
@@ -73,7 +73,15 @@ that did not run, and mocked coverage is not native qualification.
 
 `marketplace-agent-report-recommendation-worker@1` forbids code commits and requires exactly one final output-only commit. PR Description and both PR Reviewer phases use it.
 
-Both return `github.copilot.agent-task-result` version 5 and `github.copilot.agent-task-candidate-manifest` version 1. The dispatcher binds the fresh completed task and its only session to the requested repository, actual model, complete submitted prompt, source and generated ref. It derives commit SHAs, parents, trees, patch digests, changed paths and the code tip from Git. Completion evidence retains timestamps and the final API response digest. Consumers rederive and compare provenance with their own frozen requests before import or publication.
+`marketplace-agent-default-branch-code-candidate-worker@1` and
+`marketplace-agent-default-branch-report-recommendation-worker@1` use the same
+code and report history rules without a source PR. Call the helper with
+`--default-branch` instead of `--pr`, plus `--prompt-file`, `--result-file`,
+the matching `--policy`, and `--apply-with-report` or `--report`. These
+selectors cannot be combined with merged-PR or Pipeline stage options. The
+original PR selectors and their policy hashes are unchanged.
+
+All four return `github.copilot.agent-task-result` version 5 and `github.copilot.agent-task-candidate-manifest` version 1. The dispatcher binds the fresh completed task and its only session to the requested repository, actual model, complete submitted prompt, source and generated ref. It derives commit SHAs, parents, trees, patch digests, changed paths and the code tip from Git. Completion evidence retains timestamps and the final API response digest. Consumers rederive and compare provenance with their own frozen requests before import or publication.
 
 The final artifact commit is excluded from `candidate.generated.code_tip_sha`. The dispatcher never imports candidate commits. Unsafe paths, mixed code/output commits, nonlinear history, extra sessions, source/model/prompt drift and incomplete execution fail closed.
 
@@ -94,6 +102,16 @@ All repository analysis, edits, tests and internal corrections stay hosted. Loca
 Ordinary consumers read an open PR's head from `refs/heads/<headRefName>` in the head repository, even when the PR record or `refs/pull/<number>/head` has not caught up. They fetch the code from that branch and reject a fetch or final observation that finds a different tip. A detached code-candidate checkout is allowed only when HEAD already equals the captured branch tip; it is never realigned. Named branch, HEAD, clean-worktree and operation guards otherwise remain in force. Live source drift after task completion rejects acceptance while preserving the completed task identity as evidence. Historical merged-PR snapshots continue to use their immutable recorded head.
 
 Historical Audit explicitly supplies `--allow-merged-pr` with its trusted immutable merged-PR snapshot. This code-candidate exception requires `trask-pr-audit-<number>` at that exact historical head and dispatches from the immutable SHA. Worker output cannot enable it. It does not relax ordinary open-PR guards or permit report-recommendation consumers to use merged sources.
+
+Default-branch dispatch resolves the authenticated repository's current default
+branch and SHA, fetches the named ref and checks its tip, then reads the live
+default branch again immediately before POST. It submits the frozen SHA as the
+task's `base_ref`. A change before POST rejects dispatch; a change after POST
+does not invalidate generated history rooted at that SHA. No-PR results have
+`pull_request: null` and `source: {"kind":"default_branch",
+"repository":"owner/repo","ref":"refs/heads/main","sha":"<frozen SHA>"}`.
+The task and manifest base refs and SHAs are the frozen SHA. The helper leaves
+the local checkout untouched, including in report mode.
 
 Standalone calls are fresh. The executable rejects caller-supplied task IDs,
 prior results, generic resume or monitor modes, and retired policy selectors
@@ -123,6 +141,15 @@ It requires a clean branch at the frozen pull request head, checks the identity
 again immediately before `git merge
 --ff-only`, and confirms the final HEAD. It never imports the output-only
 artifact commit and it does not reserve or lock a branch.
+
+`verify_default_branch_candidate(...)` takes the caller's frozen
+`BaseSnapshot`, repository, and independently observed executor
+`local_head_sha`. It checks the policy, source, prompt, task/session identity,
+manifest and fetched Git history without requiring the named default branch to
+remain at the frozen SHA. `guarded_fast_forward_default_candidate(...)` accepts
+only the default-branch code policy. It requires a clean, named target branch
+at the frozen SHA, rechecks the candidate, then fast-forwards only to its code
+tip. Report artifacts are never imported. Publication stays with the caller.
 
 The repository owns the Runtime source-pin specification in
 `tools/runtime-loader-pins.json`. Run

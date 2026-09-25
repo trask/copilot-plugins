@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "agent-tasks-runtime",
-  "description": "Shared GitHub Agent Tasks runtime for Trask pull request agents.",
-  "version": "1.0.41",
+  "description": "Shared GitHub Agent Tasks runtime for Trask cloud workers.",
+  "version": "1.0.42",
   "author": {
     "name": "Trask Stalnaker"
   },

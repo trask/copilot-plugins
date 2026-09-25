@@ -1,7 +1,7 @@
 {
   "name": "ci-fix-loop",
   "description": "Run one sealed, stateless CI repair invocation against a frozen pull request head.",
-  "version": "1.6.96",
+  "version": "1.6.97",
   "author": {
     "name": "Trask Stalnaker"
   },

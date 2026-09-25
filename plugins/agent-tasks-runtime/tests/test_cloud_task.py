@@ -1109,6 +1109,313 @@ class CandidateDispatcherTest(unittest.TestCase):
         self.check_candidate("feature", managed=True)
 
 
+class DefaultBranchCandidateTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path("C:/repo")
+        self.source = MODULE.BaseSnapshot("main", "1" * 40)
+        self.local_head = "0" * 40
+        self.code_tip = "2" * 40
+        self.artifact = "3" * 40
+        self.git = mock.Mock()
+        self.git.snapshot.return_value = MODULE.WorktreeSnapshot(
+            self.root, "owner/repo", "origin", "owner-branch", self.local_head,
+        )
+        self.git.root.return_value = self.root
+        self.git.repository_name.return_value = "owner/repo"
+        self.git.matching_remote.return_value = "origin"
+        self.git.branch.return_value = "owner-branch"
+        self.git.head.return_value = self.local_head
+        self.git.identity.return_value = MODULE.LocalIdentity(
+            "owner-branch", self.local_head, "", None,
+        )
+        self.git.fetch_generated.return_value = "refs/cloud-agent-tasks/request-1/generated"
+        self.git.ref_sha.return_value = self.artifact
+        self.git.cloud_commits.return_value = [self.code_tip, self.artifact]
+        self.code_metadata = {
+            "sha": self.code_tip, "parent_sha": self.source.sha,
+            "tree_sha": "a" * 40, "patch_sha256": "b" * 64,
+            "changed_paths": ["src/fixture.py"],
+        }
+        self.artifact_metadata = {
+            "sha": self.artifact, "parent_sha": self.code_tip,
+            "tree_sha": "c" * 40, "patch_sha256": "d" * 64,
+            "changed_paths": [MODULE.OUTPUT_REPORT_PATH],
+        }
+        self.git.candidate_history.return_value = MODULE.CandidateHistory(
+            self.code_tip, (self.code_metadata,), self.artifact_metadata,
+        )
+        self.api = mock.Mock(last_response_sha256="e" * 64)
+        self.result_path = Path("C:/state/result.json")
+
+    def options(self, *, report=False):
+        return MODULE.Options(
+            report=report, model="gpt-5.6-sol", prompt="Investigate.",
+            apply_with_report=not report, default_branch=True,
+            result_file=self.result_path, prompt_file=Path("C:/state/prompt.txt"),
+            policy=(
+                MODULE.DEFAULT_REPORT_POLICY_SELECTOR if report
+                else MODULE.DEFAULT_CODE_POLICY_SELECTOR
+            ),
+        )
+
+    def test_cli_requires_explicit_exclusive_source_and_matching_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prompt = Path(directory) / "prompt.txt"
+            prompt.write_text("Investigate.", encoding="utf-8")
+            common = ["--prompt-file", str(prompt),
+                      "--result-file", str(Path(directory) / "result.json")]
+            for selector, mode in (
+                (MODULE.DEFAULT_CODE_POLICY_SELECTOR, "--apply-with-report"),
+                (MODULE.DEFAULT_REPORT_POLICY_SELECTOR, "--report"),
+            ):
+                options = MODULE.parse_args([
+                    mode, "--default-branch", *common, "--policy", selector,
+                ])
+                self.assertTrue(options.default_branch)
+                self.assertIsNone(options.pull_request)
+                self.assertEqual(selector, options.policy)
+                self.assertEqual(
+                    MODULE.task_payload(
+                        options, MODULE.OUTPUT_REPORT_PATH,
+                        default_source=self.source, repository="owner/repo",
+                    )["base_ref"], self.source.sha,
+                )
+                for extra in (
+                    ["--pr", "owner/repo#1"],
+                    ["--allow-merged-pr"],
+                    ["--pipeline-dispatch", "--pipeline-run", "a" * 32],
+                    ["--default-branch"],
+                ):
+                    with self.subTest(selector=selector, extra=extra), self.assertRaises(MODULE.CloudError):
+                        MODULE.parse_args([mode, "--default-branch", *extra,
+                                           *common, "--policy", selector])
+                with self.assertRaises(MODULE.CloudError):
+                    MODULE.parse_args([mode, *common, "--policy", selector])
+            with self.assertRaises(MODULE.CloudError):
+                MODULE.parse_args([
+                    "--report", "--default-branch", *common,
+                    "--policy", MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
+                ])
+
+    def test_repository_default_snapshot_rejects_wrong_repository_or_ref(self):
+        def api(repository_name="owner/repo", branch_ref="refs/heads/main"):
+            client = mock.Mock()
+            client.request_json.side_effect = [
+                {"full_name": repository_name, "default_branch": "main"},
+                {"ref": branch_ref, "object": {"sha": self.source.sha}},
+            ]
+            return client
+        self.assertEqual(
+            MODULE.repository_base(api(), "owner/repo"), self.source,
+        )
+        with self.assertRaisesRegex(MODULE.CloudError, "different repository"):
+            MODULE.repository_base(api(repository_name="wrong/repo"), "owner/repo")
+        with self.assertRaisesRegex(MODULE.CloudError, "default-branch metadata"):
+            MODULE.repository_base(api(branch_ref="refs/heads/other"), "owner/repo")
+
+    def test_success_freezes_sha_and_never_applies_or_pushes(self):
+        self._check_result(report=False)
+
+    def _check_result(self, *, report=False, no_change=False):
+        if no_change:
+            self.git.ref_sha.return_value = self.source.sha
+            self.git.cloud_commits.return_value = []
+            self.git.candidate_history.return_value = MODULE.CandidateHistory(
+                self.source.sha, (), None,
+            )
+        if report:
+            self.git.cloud_commits.return_value = [self.artifact]
+            self.git.candidate_history.return_value = MODULE.CandidateHistory(
+                self.source.sha, (), {
+                    **self.artifact_metadata, "parent_sha": self.source.sha,
+                },
+            )
+        result = MODULE.ResultEnvelope()
+        options = self.options(report=report)
+        with (
+            mock.patch.object(MODULE, "_EXECUTION", None),
+            mock.patch.object(MODULE, "GitRepository", return_value=self.git),
+            mock.patch.object(MODULE, "ApiClient", return_value=self.api),
+            mock.patch.object(MODULE, "repository_base",
+                              side_effect=[self.source, self.source]) as base,
+            mock.patch.object(MODULE, "start_task") as start,
+            mock.patch.object(MODULE, "monitor_task") as monitor,
+            mock.patch.object(MODULE, "validate_policy_before_post"),
+        ):
+            payload = MODULE.task_payload(
+                options, MODULE.OUTPUT_REPORT_PATH,
+                default_source=self.source, repository="owner/repo",
+            )
+            task = {
+                "id": "task-1", "state": "completed",
+                "created_at": "2026-09-18T12:00:00Z",
+                "completed_at": "2026-09-18T12:03:00Z",
+                "repository": {"id": 11, "full_name": "owner/repo"},
+                "owner": {"id": 12, "login": "owner"},
+                "artifacts": [{"type": "branch", "provider": "github",
+                               "data": {"head_ref": "copilot/task-1", "base_ref": self.source.sha}}],
+                "sessions": [{
+                    "id": "session-1", "task_id": "task-1", "state": "completed",
+                    "created_at": "2026-09-18T12:00:01Z",
+                    "completed_at": "2026-09-18T12:03:00Z",
+                    "model": "sweagent-capi:gpt-5.6-sol",
+                    "base_ref": self.source.sha, "head_ref": "copilot/task-1",
+                    "repository": {"id": 11, "full_name": "owner/repo"},
+                    "owner": {"id": 12, "login": "owner"},
+                    "prompt": payload["prompt"],
+                }],
+            }
+            start.return_value = {**task, "state": "queued"}
+            monitor.side_effect = lambda api, repo, initial, progress, sleep, stopped: task
+            code = MODULE.execute(
+                options, cwd=self.root, uuid_factory=lambda: "request-1",
+                result=result, stderr=io.StringIO(),
+            )
+            base.assert_has_calls([mock.call(self.api, "owner/repo")] * 2)
+            start.assert_called_once_with(self.api, "owner/repo", payload)
+        self.assertEqual(code, 0)
+        envelope = result.as_dict()
+        self.assertEqual(envelope["source"], {
+            "kind": "default_branch", "repository": "owner/repo",
+            "ref": "refs/heads/main", "sha": self.source.sha,
+        })
+        self.assertIsNone(envelope["pull_request"])
+        self.assertEqual(envelope["task"]["base_ref"], self.source.sha)
+        self.assertEqual(envelope["candidate"]["base"], {
+            "ref": self.source.sha, "sha": self.source.sha,
+        })
+        expected_tip = self.source.sha if report or no_change else self.code_tip
+        self.assertEqual(envelope["candidate"]["generated"]["code_tip_sha"], expected_tip)
+        self.assertEqual(envelope["generated"]["commits"], [] if report or no_change else [self.code_tip])
+        self.assertEqual(envelope["application"], {
+            "status": "not_applicable" if report else "not_applied",
+            "final_local_head": self.local_head,
+        })
+        self.git.fast_forward.assert_not_called()
+        self.git.align_to_pr.assert_not_called()
+        self.git.fetch_default_source.assert_called_once_with(
+            self.git.snapshot.return_value if not report else
+            MODULE.WorktreeSnapshot(self.root, "owner/repo", "origin",
+                                    "owner-branch", self.local_head),
+            self.source, "request-1",
+        )
+        self.assertEqual(
+            MODULE.verify_default_branch_candidate(
+                envelope, options=options, source=self.source,
+                repository="owner/repo", local_head_sha=self.local_head,
+                root=self.root, git=self.git,
+            )["code_tip"], expected_tip,
+        )
+        return envelope, options
+
+    def test_no_change_candidate_keeps_source_as_code_tip(self):
+        self._check_result(no_change=True)
+
+    def test_report_only_requires_artifact_and_has_no_code_tip(self):
+        envelope, options = self._check_result(report=True)
+        self.assertEqual(envelope["candidate"]["artifact_commit"]["sha"], self.artifact)
+        with self.assertRaisesRegex(MODULE.CloudError, "only default-branch code"):
+            MODULE.guarded_fast_forward_default_candidate(
+                envelope, options=options, source=self.source,
+                repository="owner/repo", executor_head_sha=self.local_head,
+                root=self.root, git=self.git,
+            )
+
+    def test_frozen_default_moving_before_post_blocks_dispatch(self):
+        options = self.options()
+        with (
+            mock.patch.object(MODULE, "GitRepository", return_value=self.git),
+            mock.patch.object(MODULE, "ApiClient", return_value=self.api),
+            mock.patch.object(MODULE, "repository_base",
+                              side_effect=[self.source, MODULE.BaseSnapshot("main", "9" * 40)]),
+            mock.patch.object(MODULE, "start_task") as start,
+            mock.patch.object(MODULE, "validate_policy_before_post"),
+        ):
+            with self.assertRaisesRegex(MODULE.CloudError, "moved before dispatch") as error:
+                MODULE.execute(options, cwd=self.root, uuid_factory=lambda: "request-1")
+        self.assertEqual(error.exception.code, "stale_default_branch")
+        start.assert_not_called()
+
+    def test_fetched_source_mismatch_blocks_dispatch(self):
+        commands = []
+        def runner(command, **kwargs):
+            commands.append(command)
+            if command[1] == "check-ref-format" or command[1] == "fetch":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[1] == "rev-parse":
+                return subprocess.CompletedProcess(command, 0, "9" * 40, "")
+            self.fail(f"unexpected command {command}")
+        git = MODULE.GitRepository(runner)
+        snapshot = MODULE.WorktreeSnapshot(
+            self.root, "owner/repo", "origin", "owner-branch", self.local_head,
+        )
+        with mock.patch.object(MODULE, "start_task") as start:
+            with self.assertRaisesRegex(MODULE.CloudError, "moved while it was fetched"):
+                git.fetch_default_source(snapshot, self.source, "request-1")
+        start.assert_not_called()
+        self.assertIn(
+            ["git", "fetch", "--no-tags", "origin",
+             "+refs/heads/main:refs/cloud-agent-tasks/request-1/default"],
+            commands,
+        )
+
+    def test_mismatched_identity_and_manifest_fail_closed(self):
+        envelope, options = self._check_result()
+        for section, field, value in (
+            ("source", "sha", "9" * 40),
+            ("source", "repository", "other/repo"),
+            ("task", "base_sha", "9" * 40),
+            ("task", "id", "foreign-task"),
+            ("completion", "session", {"id": "foreign-session"}),
+            ("completion", "refs", {"base": "9" * 40, "generated": "copilot/task-1"}),
+            ("candidate", "code_commits", []),
+            ("candidate", "artifact_commit", None),
+            ("candidate", "generated", {"ref": "copilot/task-1",
+                                       "head_sha": self.artifact, "code_tip_sha": self.artifact}),
+        ):
+            changed = json.loads(json.dumps(envelope))
+            changed[section][field] = value
+            with self.subTest(section=section, field=field), self.assertRaises(MODULE.CloudError):
+                MODULE.verify_default_branch_candidate(
+                    changed, options=options, source=self.source,
+                    repository="owner/repo", local_head_sha=self.local_head,
+                    root=self.root, git=self.git,
+                )
+        with self.assertRaisesRegex(MODULE.CloudError, "PR consumer"):
+            MODULE.verify_candidate_result(
+                envelope, options=options,
+                pull_request=mock.Mock(), root=self.root, git=self.git,
+            )
+
+    def test_guarded_import_targets_only_code_tip_on_frozen_branch(self):
+        envelope, options = self._check_result()
+        self.git.snapshot.return_value = MODULE.WorktreeSnapshot(
+            self.root, "owner/repo", "origin", "owner-branch", self.source.sha,
+        )
+        self.git.head.return_value = self.code_tip
+        imported = MODULE.guarded_fast_forward_default_candidate(
+            envelope, options=options, source=self.source,
+            repository="owner/repo", executor_head_sha=self.local_head,
+            root=self.root, git=self.git,
+        )
+        self.git.fast_forward.assert_called_once_with(
+            self.git.snapshot.return_value, self.code_tip,
+        )
+        self.assertEqual(imported["final_local_head"], self.code_tip)
+        self.assertNotEqual(imported["final_local_head"], self.artifact)
+        self.git.fast_forward.reset_mock()
+        self.git.snapshot.return_value = replace(
+            self.git.snapshot.return_value, head="9" * 40,
+        )
+        with self.assertRaisesRegex(MODULE.CloudError, "frozen default source"):
+            MODULE.guarded_fast_forward_default_candidate(
+                envelope, options=options, source=self.source,
+                repository="owner/repo", executor_head_sha=self.local_head,
+                root=self.root, git=self.git,
+            )
+        self.git.fast_forward.assert_not_called()
+
+
 class PipelineStagesTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(dir=Path.cwd())
