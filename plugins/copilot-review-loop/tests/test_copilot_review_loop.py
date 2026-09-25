@@ -1877,7 +1877,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.101")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.102")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -4346,10 +4346,110 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         fresh.assert_called_once()
         next_arguments = next_iteration.call_args.args[0]
         self.assertTrue(next_arguments.resume)
+        self.assertEqual(str(state_path), next_arguments.state)
         self.assertEqual(next_arguments.max_iterations, 5)
         self.assertEqual("pipeline-run", next_arguments.pipeline_run)
         self.assertEqual(2, next_arguments.pipeline_iteration)
         self.assertEqual(["watch", "terminal_review", "next_iteration"], events)
+
+    def test_standalone_follow_up_review_keeps_invocation_until_clean(self):
+        target = MODULE.parse_target("owner/repo#7")
+        run = "original-run"
+        base = self.directory / "owner--repo--7.json"
+        args = self.arguments(None)
+        args.state = None
+        args._invocation_run = run
+        args._coordinator_target = target
+        args.new_invocation = True
+        with mock.patch.object(MODULE, "default_state_path", return_value=base):
+            state_path, _ = MODULE.invocation_state_path(
+                target,
+                SimpleNamespace(
+                    state=None, pipeline_run=None, invocation_run=run,
+                    new_invocation=False,
+                ),
+            )
+            args._coordinator_state_path = state_path
+            MODULE.save_state(
+                state_path,
+                {
+                    "version": MODULE.STATE_VERSION,
+                    "iterations": 1,
+                    "max_iterations": 5,
+                    "pr": copy.deepcopy(self.preflight["pr"]),
+                    "queue": {
+                        "id": "pr-7",
+                        "status": "published",
+                        "comments": [{**self.comment, "status": "handled"}],
+                        "batches": [],
+                    },
+                    "agent_task": {
+                        "status": "completed", "invocation_id": run,
+                    },
+                    "monitoring": {
+                        "status": "requested", "head_sha": self.head,
+                    },
+                },
+            )
+            observed = []
+
+            def watch(_args):
+                state = MODULE.load_state(state_path)
+                result = (
+                    {"result": MODULE.WATCHER_REVIEW_COMMENTS, "comment_ids": [18]}
+                    if not observed
+                    else {
+                        "result": MODULE.WATCHER_REVIEW_CLEAN,
+                        "clean_at_head_sha": self.fix,
+                        "comment_ids": [],
+                    }
+                )
+                if result["result"] == MODULE.WATCHER_REVIEW_CLEAN:
+                    state["clean_at_head_sha"] = self.fix
+                    state["clean_at_base_sha"] = self.base
+                MODULE.watcher_result(state, result)
+                MODULE.save_state(state_path, state)
+                observed.append(result["result"])
+
+            def follow_up(next_args):
+                self.assertEqual(str(state_path), next_args.state)
+                self.assertEqual(run, next_args.invocation_run)
+                self.assertFalse(next_args.new_invocation)
+                resolved, invocation_id = MODULE.invocation_state_path(
+                    target, next_args
+                )
+                self.assertEqual(state_path, resolved)
+                self.assertEqual(run, invocation_id)
+                state = MODULE.load_state(resolved)
+                self.assertEqual(1, state["iterations"])
+                state["iterations"] += 1
+                state["pr"]["head_sha"] = self.fix
+                state["queue"]["comments"] = [
+                    {**self.comment, "id": 18, "status": "handled"}
+                ]
+                state["monitoring"] = {
+                    "status": "requested", "head_sha": self.fix,
+                }
+                MODULE.save_state(resolved, state)
+                MODULE.continue_after_review_request(next_args, resolved)
+
+            with (
+                mock.patch.object(MODULE, "command_watch", side_effect=watch),
+                mock.patch.object(MODULE, "wait_for_fresh_copilot_state"),
+                mock.patch.object(MODULE, "command_agent_task", side_effect=follow_up),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.continue_after_review_request(args, state_path)
+                MODULE.require_terminal_agent_task_clearance(args)
+
+        self.assertEqual(
+            [MODULE.WATCHER_REVIEW_COMMENTS, MODULE.WATCHER_REVIEW_CLEAN],
+            observed,
+        )
+        self.assertEqual(2, MODULE.load_state(state_path)["iterations"])
+        self.assertEqual("loop_completed", emit.call_args.args[0]["result"])
+        self.assertEqual(str(state_path), emit.call_args.args[0]["state"])
+        self.assertEqual([state_path], list(self.directory.glob("*invocation*.json")))
 
     def test_post_apply_review_only_monitor_persists_findings_without_managed_task(
         self,

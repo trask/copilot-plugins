@@ -8382,6 +8382,10 @@ def continue_after_review_request(
             )
             return
         next_args = argparse.Namespace(**vars(args))
+        next_args.state = str(state_path)
+        next_args.new_invocation = False
+        if not getattr(args, "pipeline_run", None):
+            next_args.invocation_run = getattr(args, "_invocation_run", None)
         command_agent_task(next_args)
         return
     emit(
@@ -8720,6 +8724,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
     repo_root = resolve_repo_root(args.repo_root)
     target = resolve_target(args.target, repo_root)
     state_path, invocation_id = invocation_state_path(target, args)
+    args._invocation_run = invocation_id
     args._coordinator_state_path = state_path
     args._coordinator_target = target
     require_outside_repository(state_path, repo_root)
