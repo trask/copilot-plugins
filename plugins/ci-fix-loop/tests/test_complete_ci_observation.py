@@ -147,6 +147,7 @@ class CompleteCiObservationTest(unittest.TestCase):
         new = {**self.old, "id": 3, "workflow_id": 20, "name": "New unobserved workflow"}
         for candidate in (False, True):
             with self.subTest(candidate=candidate):
+                self.runs = {"1": self.old}
                 self.state_path = self.fixture.root / f"new-failure-{candidate}.json"
                 output, state, inspected, tasks, imports = self.flow(
                     after_task={"1": self.old, "3": new}, candidate=candidate,
@@ -177,6 +178,7 @@ class CompleteCiObservationTest(unittest.TestCase):
     def test_same_head_attempt_or_conclusion_changes_invalidate_diagnosis(self):
         for change in ({"run_attempt": 2}, {"conclusion": "cancelled"}, {"status": "in_progress"}):
             with self.subTest(change=change):
+                self.runs = {"1": self.old}
                 self.state_path = self.fixture.root / f"changed-{next(iter(change))}.json"
                 output, state, inspected, _, imports = self.flow(after_task={"1": {**self.old, **change}})
                 self.assertEqual("ci_changed", output["result"])

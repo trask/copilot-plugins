@@ -270,12 +270,15 @@ the review, description, or other PR Pipeline stages. A pull request outside a
 native stack keeps the single-PR behavior.
 
 The plugin verifies the shared Agent Tasks runtime. Authentication stays in
-local `gh api`; CI diagnosis, edits, and validation stay in GitHub Agent Tasks.
+local `gh api`; the local controller investigates retained logs, while hosted
+Agent Tasks diagnoses the failures against the checkout, edits, and validates.
 
-The controller supplies sanitized, attempt-bound logs directly to the worker.
-Large logs carry exact retrieval references rather than truncated excerpts or
-a local model summary. Test moves, skip-like strings and wrapper edits are not
-local semantic vetoes; the hosted worker must preserve test execution and coverage.
+The controller keeps attempt-bound logs on disk and uses its configured model
+(Sol by default) to prepare a compact, free-form CI briefing. The hosted worker
+receives that unverified briefing and a failed-check inventory, not the logs.
+It checks suggested commands against its Linux checkout before running them.
+Test moves, skip-like strings and wrapper edits are not local semantic vetoes;
+the hosted worker must preserve test execution and coverage.
 
 CI Fix Loop considers all checks, not just required checks. The hosted worker
 diagnoses failures; the local controller rechecks live identity and permissions

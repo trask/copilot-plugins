@@ -1746,6 +1746,22 @@ class WindowsSubprocessTest(unittest.TestCase):
         self.assertEqual(environment[f"GIT_CONFIG_KEY_{index}"], "core.hooksPath")
         self.assertEqual(environment[f"GIT_CONFIG_VALUE_{index}"], os.devnull)
 
+    def test_run_with_timeout_hides_windows_console_processes(self):
+        completed = MODULE.subprocess.CompletedProcess(["copilot"], 0, "briefing", "")
+        with (
+            mock.patch.object(MODULE, "IS_WINDOWS", True),
+            mock.patch.object(
+                MODULE.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True
+            ),
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed) as launch,
+        ):
+            self.assertEqual(
+                completed, MODULE.run(["copilot"], input_text="inspect logs", timeout=1800)
+            )
+        self.assertEqual(0x08000000, launch.call_args.kwargs["creationflags"])
+        self.assertEqual(1800, launch.call_args.kwargs["timeout"])
+        self.assertEqual("inspect logs", launch.call_args.kwargs["input"])
+
     def test_run_leaves_non_windows_process_options_unchanged(self):
         completed = MODULE.subprocess.CompletedProcess(["formatter"], 0, "", "")
         with (
@@ -3547,6 +3563,12 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             "stack_guard": None,
             "check_snapshot": snapshot,
         }
+        self.local_briefing = mock.patch.object(
+            MODULE, "local_ci_briefing",
+            return_value="Widget test failed with AssertionError: expected 2.",
+        )
+        self.local_briefing_mock = self.local_briefing.start()
+        self.addCleanup(self.local_briefing.stop)
         self.hosted_helper = mock.patch.object(
             MODULE,
             "run_hosted_helper",
@@ -4012,7 +4034,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.94", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.95", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -7030,8 +7052,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "require_live_check_snapshot",
                 side_effect=(
-                    [None, changed_error] if changed == "publication"
-                    else changed_error if changed else None
+                    [None, None, changed_error] if changed == "publication"
+                    else [None, changed_error] if changed else None
                 ),
             ),
             mock.patch.object(
@@ -7517,7 +7539,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ]
         self.assertEqual(1, len(pushes))
         apply_import.assert_called_once()
-        self.assertEqual(2, check_snapshot.call_count)
+        self.assertEqual(3, check_snapshot.call_count)
         self.assertEqual("published", emit.call_args.args[0]["result"])
         self.assertEqual(
             commit, MODULE.load_state(state_path)["agent_task"]["published_head_sha"]

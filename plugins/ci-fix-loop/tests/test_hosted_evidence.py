@@ -1,9 +1,10 @@
-import copy
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "ci_fix_loop.py"
@@ -12,7 +13,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-class HostedEvidenceTest(unittest.TestCase):
+class LocalCiBriefingTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -26,137 +27,90 @@ class HostedEvidenceTest(unittest.TestCase):
                 "url": "https://github.com/owner/repo/actions/runs/11/job/22",
                 "log_path": str(self.path), "log_sha256": MODULE.sha256_text(text),
             }],
-            "workflow_runs": {"11": {
-                "id": 11, "workflow_id": 33, "head_sha": "a" * 40, "run_attempt": 3,
-                "status": "completed", "conclusion": "failure", "name": "Build",
-            }},
+            "workflow_runs": {"11": {"run_attempt": 3}},
             "head_sha": "a" * 40,
         }}
 
-    def test_small_log_sends_failure_context_not_complete_log(self):
-        text = (
-            "routine line\n" * 20
-            + "CouchbaseProtostellarTargetsTest.preservesConfiguredTargetForLegacyCore FAILED\n"
-            "java.lang.NoClassDefFoundError: com/couchbase/client/core/util/CouchbaseConnectionStrings\n"
-            "Caused by: java.lang.ClassNotFoundException: CouchbaseConnectionStrings\n"
-            + "routine line\n" * 20
-        )
-        evidence = json.loads(MODULE.controller_ci_evidence(self.preflight(text)))
-        record = evidence["logs"][0]
-        excerpt = evidence["excerpts"][0]
-        self.assertIn("CouchbaseProtostellarTargetsTest", excerpt["text"])
-        self.assertIn("NoClassDefFoundError", excerpt["text"])
-        self.assertNotIn("routine line\n" * 20, excerpt["text"])
-        self.assertEqual("a" * 40, record["head_sha"])
-        self.assertEqual(3, record["run"]["run_attempt"])
-        self.assertEqual(MODULE.sha256_text(text), record["log_sha256"])
-        self.assertNotIn(str(self.path), json.dumps(evidence))
+    def test_local_agent_uses_read_only_search_without_receiving_log_text(self):
+        preflight = self.preflight("Error in a 100MB log\n")
+        briefing = "The widget failed.\nReproduce on Linux: ./gradlew test"
+        with mock.patch.object(
+            MODULE, "run",
+            return_value=subprocess.CompletedProcess([], 0, briefing, ""),
+        ) as run:
+            self.assertEqual(
+                briefing, MODULE.local_ci_briefing(preflight, model="gpt-5.6-sol")
+            )
+        command = run.call_args.args[0]
+        self.assertEqual("copilot", command[0])
+        self.assertEqual("gpt-5.6-sol", command[command.index("--model") + 1])
+        self.assertIn("--available-tools=view,rg,glob", command)
+        self.assertIn("--disallow-temp-dir", command)
+        self.assertIn("--disable-builtin-mcps", command)
+        self.assertIn("--no-custom-instructions", command)
+        self.assertNotIn("--max-ai-credits", command)
+        self.assertNotIn("Error in a 100MB log", run.call_args.kwargs["input_text"])
+        self.assertIn(self.path.name, run.call_args.kwargs["input_text"])
+        self.assertEqual(self.path.parent, run.call_args.kwargs["cwd"])
+        self.assertEqual(MODULE.LOCAL_CI_TRIAGE_TIMEOUT_SECONDS, run.call_args.kwargs["timeout"])
+        self.assertEqual("false", run.call_args.kwargs["env"]["COPILOT_ALLOW_ALL"])
 
-    def test_large_logs_include_errors_at_any_position(self):
-        for position in ("first", "middle", "last"):
-            with self.subTest(position=position):
-                padding = "routine build output\n" * 4000
-                error = "NoClassDefFoundError: CouchbaseConnectionStrings\n"
-                text = error + padding if position == "first" else (
-                    padding + error if position == "last" else padding + error + padding
-                )
-                evidence = json.loads(MODULE.controller_ci_evidence(self.preflight(text)))
-                record = evidence["logs"][0]
-                self.assertLessEqual(
-                    len(json.dumps(evidence).encode("utf-8")),
-                    MODULE.MAX_INLINE_CI_EVIDENCE_BYTES,
-                )
-                self.assertNotIn("text", record)
-                self.assertNotIn("retrieve_full_log", record)
-                self.assertIn("NoClassDefFoundError", evidence["excerpts"][0]["text"])
-                self.assertEqual(len(text.encode("utf-8")), record["utf8_bytes"])
-                self.assertEqual(3, record["run"]["run_attempt"])
-                self.assertEqual(22, record["job"]["job_id"])
-                self.assertEqual(MODULE.sha256_text(text), record["log_sha256"])
+    def test_rejects_missing_drifted_or_changed_logs_and_bad_briefings(self):
+        preflight = self.preflight("Error in job\n")
+        with mock.patch.object(MODULE, "run") as run:
+            self.path.write_text("different log\n", encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.WorkflowError, "identity changed"):
+                MODULE.local_ci_briefing(preflight, model="gpt-5.6-sol")
+            run.assert_not_called()
+        self.path.write_text("Error in job\n", encoding="utf-8")
+        for response in ("", "x" * (MODULE.LOCAL_CI_BRIEFING_MAX_BYTES + 1),
+                         str(self.path), "\ud800", "failure\x1b[31m"):
+            with self.subTest(response=response[:20]), mock.patch.object(
+                MODULE, "run",
+                return_value=subprocess.CompletedProcess([], 0, response, ""),
+            ), self.assertRaises(MODULE.WorkflowError):
+                MODULE.local_ci_briefing(preflight, model="gpt-5.6-sol")
 
-    def test_debug_noise_does_not_displace_deep_test_failure(self):
-        noise = (
-            "2026-09-24T03:18:40.6294963Z DEBUG Failed to propagate context "
-            "because previous context is set\n"
-        ) * 4000
-        failure = (
-            "2026-09-24T03:38:46.8853740Z CouchbaseProtostellarTargetsTest > "
-            "preservesConfiguredTargetForLegacyCore() FAILED\n"
-            "2026-09-24T03:38:46.8854726Z     java.lang.NoClassDefFoundError: "
-            "io/opentelemetry/javaagent/instrumentation/couchbase/common/v3_1/"
-            "CouchbaseConnectionStrings\n"
-        )
-        evidence = json.loads(MODULE.controller_ci_evidence(
-            self.preflight(noise + failure + noise)
-        ))
-        self.assertEqual(8002, evidence["logs"][0]["line_count"])
-        self.assertTrue(any(
-            "NoClassDefFoundError" in excerpt["text"]
-            and "CouchbaseProtostellarTargetsTest" in excerpt["text"]
-            for excerpt in evidence["excerpts"]
-        ))
+        def change_log(*_args, **_kwargs):
+            self.path.write_text("changed after investigation\n", encoding="utf-8")
+            return subprocess.CompletedProcess([], 0, "A plausible test failure", "")
 
-    def test_missing_attempt_or_job_remains_visible_without_retrieval(self):
-        source = self.preflight("routine output\n" * 4000)
-        for field in ("job", "attempt"):
-            with self.subTest(field=field):
-                preflight = copy.deepcopy(source)
-                if field == "job":
-                    preflight["check_snapshot"]["failures"][0]["url"] = "https://example.test/check"
-                else:
-                    preflight["check_snapshot"]["workflow_runs"]["11"].pop("run_attempt")
-                record = json.loads(MODULE.controller_ci_evidence(preflight))["logs"][0]
-                if field == "job":
-                    self.assertIsNone(record["job"])
-                else:
-                    self.assertNotIn("run_attempt", record["run"])
+        with mock.patch.object(MODULE, "run", side_effect=change_log), self.assertRaisesRegex(
+            MODULE.WorkflowError, "identity changed"
+        ):
+            MODULE.local_ci_briefing(preflight, model="gpt-5.6-sol")
 
-    def test_log_drift_and_unavailable_log_stop_before_dispatch(self):
-        preflight = self.preflight("original failure\n")
-        self.path.write_text("different log", encoding="utf-8")
-        with self.assertRaisesRegex(MODULE.WorkflowError, "identity changed"):
-            MODULE.controller_ci_evidence(preflight)
         self.path.unlink()
-        with self.assertRaisesRegex(MODULE.WorkflowError, "unavailable"):
-            MODULE.controller_ci_evidence(preflight)
+        with mock.patch.object(MODULE, "run") as run, self.assertRaisesRegex(
+            MODULE.WorkflowError, "missing"
+        ):
+            MODULE.local_ci_briefing(preflight, model="gpt-5.6-sol")
+        run.assert_not_called()
 
-    def test_identical_errors_are_shared_across_checks(self):
-        preflight = self.preflight(
-            "WidgetTest.testMethod FAILED\nNoClassDefFoundError: MissingClass\n"
-        )
-        other = preflight["check_snapshot"]["failures"][0].copy()
-        other["key"] = "check:Build/java17"
-        preflight["check_snapshot"]["failures"].append(other)
-        evidence = json.loads(MODULE.controller_ci_evidence(preflight))
-        self.assertEqual(1, len(evidence["excerpts"]))
-        self.assertEqual(2, len(evidence["excerpts"][0]["occurrences"]))
-        self.assertEqual([0], evidence["logs"][0]["excerpt_ids"])
-        self.assertEqual([0], evidence["logs"][1]["excerpt_ids"])
+    def test_nonzero_exit_and_timeout_fail_before_dispatch(self):
+        preflight = self.preflight("Error in job\n")
+        with mock.patch.object(
+            MODULE, "run", return_value=subprocess.CompletedProcess([], 2, "", "failure")
+        ), self.assertRaisesRegex(MODULE.WorkflowError, "exited with code 2"):
+            MODULE.local_ci_briefing(preflight, model="gpt-5.6-sol")
+        with mock.patch.object(
+            MODULE, "run", side_effect=subprocess.TimeoutExpired("copilot", 10)
+        ), self.assertRaisesRegex(MODULE.WorkflowError, "timed out"):
+            MODULE.local_ci_briefing(preflight, model="gpt-5.6-sol")
 
-    def test_distinct_exceptions_are_not_grouped(self):
-        preflight = self.preflight("WidgetTest.testMethod FAILED\nNoClassDefFoundError: First\n")
-        other_path = self.path.with_name("other.log")
-        other_text = "WidgetTest.testMethod FAILED\nNoClassDefFoundError: Second\n"
-        other_path.write_text(other_text, encoding="utf-8", newline="\n")
-        other = preflight["check_snapshot"]["failures"][0].copy()
-        other.update(key="check:Build/java17", log_path=str(other_path),
-                     log_sha256=MODULE.sha256_text(other_text))
-        preflight["check_snapshot"]["failures"].append(other)
-        evidence = json.loads(MODULE.controller_ci_evidence(preflight))
-        self.assertEqual(2, len(evidence["excerpts"]))
-
-    def test_long_line_is_bounded_and_log_hash_covers_all_bytes(self):
-        text = "FAILED " + "x" * 100000 + "\n"
-        evidence = json.loads(MODULE.controller_ci_evidence(self.preflight(text)))
-        self.assertLess(len(evidence["excerpts"][0]["text"]), 600)
-        self.assertEqual(len(text.encode()), evidence["logs"][0]["utf8_bytes"])
-        self.assertEqual(MODULE.sha256_text(text), evidence["logs"][0]["log_sha256"])
-
-    def test_oversized_identity_set_fails_explicitly(self):
-        preflight = self.preflight("error: build failed\n")
-        entry = preflight["check_snapshot"]["failures"][0]
-        preflight["check_snapshot"]["failures"] = [
-            {**entry, "key": f"check:{index}:" + "x" * 512} for index in range(200)
-        ]
-        with self.assertRaisesRegex(MODULE.WorkflowError, "identities exceed"):
-            MODULE.controller_ci_evidence(preflight)
+    def test_evidence_keeps_all_checks_distinct_without_interpreting_briefing(self):
+        preflight = self.preflight("Widget failed\n")
+        preflight["check_snapshot"]["failures"].append({
+            **preflight["check_snapshot"]["failures"][0],
+            "key": "check:Other",
+        })
+        briefing = "Maybe both checks share a root cause, but I only inspected one."
+        evidence = json.loads(MODULE.controller_ci_evidence(preflight, briefing=briefing))
+        self.assertEqual(2, evidence["total_failed_checks"])
+        self.assertEqual(2, evidence["included_checks"])
+        self.assertEqual(0, evidence["omitted_checks"])
+        self.assertEqual(["check:Build/tests", "check:Other"],
+                         [check["key"] for check in evidence["checks"]])
+        self.assertEqual(briefing, evidence["local_briefing"])
+        self.assertEqual({"11": 3}, evidence["run_attempts"])
+        self.assertNotIn(str(self.path), json.dumps(evidence))
