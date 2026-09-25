@@ -28,6 +28,9 @@ CCR_V2_REVIEW = (
 CCR_V2_RESOLVED_REVIEW = (
     Path(__file__).parent / "fixtures" / "ccr-v2-resolved-only-review.json"
 )
+CCR_V2_OVERVIEW_REVIEW = (
+    Path(__file__).parent / "fixtures" / "ccr-v2-overview-recommendation-review.json"
+)
 LEGACY_REVIEW_DETAILS = (
     Path(__file__).parent / "fixtures" / "legacy-review-details-review.json"
 )
@@ -1874,7 +1877,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.100")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.101")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -2178,6 +2181,58 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             paths_by_commit={},
         )
         self.assertEqual(report["outcome"], "no_changes")
+
+    def test_overview_only_no_change_finishes_without_another_review(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        review["commit_id"] = self.head
+        review["id"] = 29
+        preflight = copy.deepcopy(self.preflight)
+        preflight["comments"] = MODULE.review_body_feedback(review)
+        preflight["comment_identities"] = [
+            MODULE.comment_identity(preflight["comments"][0])
+        ]
+        state_path = self.directory / "overview-agent-task.json"
+        helper = self.directory / "cloud-task.py"
+        helper.write_text("# pinned helper\n", encoding="utf-8")
+        target = MODULE.parse_target("owner/repo#7")
+        emitted = []
+        args = self.arguments(state_path)
+        args.github_mutation_policy = "allow"
+        with (
+            mock.patch.object(MODULE, "require_tools"),
+            mock.patch.object(MODULE, "resolve_repo_root", return_value=self.repo_root),
+            mock.patch.object(MODULE, "resolve_target", return_value=target),
+            mock.patch.object(
+                MODULE, "wait_for_stable_review_preflight", return_value=preflight
+            ),
+            mock.patch.object(MODULE, "require_live_comments",
+                              return_value=preflight["comments"]),
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(MODULE, "metadata_for", return_value=preflight["pr"]),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[review]),
+            mock.patch.object(MODULE, "local_identity",
+                              return_value=preflight["identity"]),
+            mock.patch.object(MODULE, "require_live_pr_snapshot"),
+            mock.patch.object(MODULE, "apply_verified_import", return_value=False),
+            mock.patch.object(MODULE, "remote_head", return_value=self.head),
+            mock.patch.object(MODULE, "wait_for_remote_head", return_value=self.head),
+            mock.patch.object(MODULE, "wait_for_live_pr_snapshot",
+                              return_value=preflight["pr"]),
+            mock.patch.object(MODULE, "verify_publish", return_value={}),
+            mock.patch.object(MODULE, "request_copilot") as request_review,
+            mock.patch.object(MODULE, "emit", emitted.append),
+        ):
+            MODULE.command_agent_task(args)
+        saved = MODULE.load_state(state_path)
+        request_review.assert_not_called()
+        self.assertEqual(emitted[-1]["result"], "loop_completed")
+        self.assertEqual(emitted[-1]["stage_outcome"], "cleared")
+        self.assertEqual(saved["clean_at_head_sha"], self.head)
+        self.assertEqual(saved["last_result"], "overview_no_change")
+        self.assertEqual(saved["overview_no_change_clearance"]["review_id"], 29)
+        self.assertIsNone(
+            MODULE.terminal_agent_task_clearance_error(saved, target)
+        )
 
     def test_finding_key_covers_every_full_identity_field(self):
         identity = self.preflight["comment_identities"][0]
@@ -5991,6 +6046,51 @@ class CarryOverProgressTest(unittest.TestCase):
 
 
 class SuppressedCommentTest(unittest.TestCase):
+    def test_queues_actionable_overview_without_inventing_a_location(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        comments = MODULE.review_body_feedback(review)
+
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0]["source"], "overview")
+        self.assertEqual(comments[0]["review_id"], review["id"])
+        self.assertIsNone(comments[0]["path"])
+        self.assertIsNone(comments[0]["line"])
+        self.assertIsNone(comments[0]["thread_id"])
+        self.assertEqual(
+            comments[0]["body"],
+            "The promotion workflow runs the Python tests without installing "
+            "the newly required Copilot SDK.",
+        )
+        self.assertEqual(
+            comments[0]["review_body_sha256"],
+            MODULE.sha256_text(review["body"]),
+        )
+        self.assertEqual(
+            MODULE.review_body_feedback(review)[0]["id"], comments[0]["id"]
+        )
+
+    def test_actionable_overview_and_suppressed_finding_both_enter_queue(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        review["body"] += (
+            "\n<details><summary>Suppressed comments (1)</summary>\n"
+            "**src/a.py:2**\n* Fix this too.\n</details>"
+        )
+        comments = MODULE.review_body_feedback(review)
+        self.assertEqual([item["source"] for item in comments], [
+            "suppressed", "overview",
+        ])
+        self.assertNotEqual(comments[0]["id"], comments[1]["id"])
+
+    def test_resolved_only_overview_does_not_queue_feedback(self):
+        review = json.loads(CCR_V2_RESOLVED_REVIEW.read_text(encoding="utf-8"))
+        review["id"] = 10
+        self.assertEqual(MODULE.review_body_feedback(review), [])
+
+    def test_recommendation_without_text_is_not_clean(self):
+        body = "<!-- ccr-overview-v2 -->\n### Changes recommended\n\n**Review effort:** Balanced"
+        with self.assertRaisesRegex(MODULE.WorkflowError, "without feedback"):
+            MODULE.overview_recommendation(body)
+
     def test_parses_current_overview_and_review_details_body(self):
         review = json.loads(CURRENT_REVIEW_DETAILS.read_text(encoding="utf-8"))
         self.assertEqual(
@@ -7878,6 +7978,35 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertEqual(saved["clean_at_head_sha"], "head")
         self.assertEqual(MODULE.stage_outcome(saved), "cleared")
 
+    def test_preflight_queues_overview_only_review_instead_of_clearing(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        review["commit_id"] = "head"
+        payload, saved = self.run_preflight(reviews=[review])
+        self.assertEqual(payload["result"], "ready")
+        self.assertFalse(payload["head_review_clean"])
+        self.assertIsNone(saved["clean_at_head_sha"])
+        self.assertEqual(saved["queue"]["comments"][0]["source"], "overview")
+
+    def test_preflight_keeps_inline_and_overview_feedback(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        review["commit_id"] = "head"
+        thread = {
+            "id": "thread-1",
+            "isResolved": False,
+            "comments": {"nodes": [{
+                "databaseId": 1,
+                "url": "https://example.test/comment/1",
+                "author": {"login": "copilot-pull-request-reviewer[bot]", "id": "BOT_1"},
+                "pullRequestReview": {"databaseId": review["id"]},
+                "body": "Fix the other issue.",
+            }]},
+        }
+        payload, _ = self.run_preflight(threads=[thread], reviews=[review])
+        self.assertEqual(
+            [item["source"] for item in payload["queue"]["comments"]],
+            ["thread", "overview"],
+        )
+
     def test_preflight_records_a_clean_head_with_only_human_threads(self):
         review = {
             "id": 10,
@@ -8032,6 +8161,14 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertIsNone(payload["clean_at_head_sha"])
         self.assertIsNone(saved.get("clean_at_head_sha"))
 
+    def test_watch_leaves_no_marker_for_overview_only_review(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        payload, saved = self.run_watch(review_comments=[], body=review["body"])
+        self.assertEqual(payload["result"], "review_comments")
+        self.assertEqual(payload["overview_comment_count"], 1)
+        self.assertEqual(payload["suppressed_comment_count"], 0)
+        self.assertIsNone(saved.get("clean_at_head_sha"))
+
     def test_watch_routes_ccr_v2_body_only_feedback_without_clean_marker(self):
         review = json.loads(CCR_V2_REVIEW.read_text(encoding="utf-8"))
         payload, saved = self.run_watch(review_comments=[], body=review["body"])
@@ -8064,6 +8201,7 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertEqual(payload["result"], "review_no_comments")
         self.assertEqual(payload["suppressed_comment_count"], 0)
         self.assertEqual(saved["clean_at_head_sha"], "head")
+
 
     def run_watch(self, *, review_comments, body):
         state = {
@@ -8225,6 +8363,217 @@ class CleanAtHeadShaTest(unittest.TestCase):
         self.assertNotIn("stage_outcome", payload)
 
 
+class OverviewNoChangeClearanceTest(unittest.TestCase):
+    def setUp(self):
+        self.review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        self.target = MODULE.parse_target("open-telemetry/shared-workflows#416")
+        self.head = self.review["commit_id"]
+        self.comment = MODULE.review_body_feedback(self.review)[0]
+        self.comment["status"] = "handled"
+        self.state = {
+            "version": MODULE.STATE_VERSION,
+            "pr": {
+                "pr_url": self.target["pr_url"],
+                "repo_name": self.target["repo_name"],
+                "number": self.target["number"],
+                "head_sha": self.head,
+                "base_sha": "2" * 40,
+            },
+            "queue": {
+                "id": "pr-416",
+                "status": "published",
+                "comments": [self.comment],
+                "batches": [],
+            },
+            "agent_task": {"status": "completed"},
+            "history": [{
+                "id": self.comment["id"],
+                "review_id": self.review["id"],
+                "outcome": "no_change",
+            }],
+            "clean_at_head_sha": self.head,
+            "clean_at_base_sha": "2" * 40,
+            "last_result": "overview_no_change",
+            "overview_no_change_clearance": {
+                "kind": "overview_no_change",
+                "repo_name": self.target["repo_name"],
+                "number": 416,
+                "head_sha": self.head,
+                "review_id": self.review["id"],
+                "body_sha256": MODULE.sha256_text(self.review["body"]),
+            },
+        }
+
+    def test_verified_overview_no_change_clears_without_another_review(self):
+        self.assertIsNone(
+            MODULE.terminal_agent_task_clearance_error(self.state, self.target)
+        )
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value={
+                "head_sha": self.head
+            }),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[self.review]),
+        ):
+            MODULE.require_current_overview_review(self.state, self.target)
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                MODULE.save_state(path, self.state)
+                with mock.patch.object(MODULE, "emit") as emit:
+                    MODULE.command_status(SimpleNamespace(state=str(path), current=False))
+        result = emit.call_args.args[0]
+        self.assertEqual(result["stage_outcome"], "cleared")
+        self.assertEqual(result["clean_at_head_sha"], self.head)
+        self.assertEqual(
+            result["overview_no_change_clearance"]["review_id"], self.review["id"]
+        )
+
+    def test_modified_or_later_review_invalidates_clearance(self):
+        variants = [
+            {**self.review, "id": self.review["id"] + 1},
+            {**self.review, "body": self.review["body"] + "\nNew feedback."},
+        ]
+        for review in variants:
+            with self.subTest(review=review["id"]):
+                with (
+                    mock.patch.object(MODULE, "metadata_for", return_value={
+                        "head_sha": self.head
+                    }),
+                    mock.patch.object(MODULE, "fetch_reviews", return_value=[review]),
+                ):
+                    self.assertIn(
+                        "older review",
+                        MODULE.current_overview_review_error(self.state, self.target),
+                    )
+        with mock.patch.object(MODULE, "metadata_for", return_value={
+            "head_sha": "3" * 40
+        }):
+            self.assertIn(
+                "older head",
+                MODULE.current_overview_review_error(self.state, self.target),
+            )
+
+    def test_status_does_not_report_stale_overview_proof_as_clear(self):
+        later = {**self.review, "id": self.review["id"] + 1}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            MODULE.save_state(path, self.state)
+            with (
+                mock.patch.object(MODULE, "metadata_for", return_value={
+                    "head_sha": self.head
+                }),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=[
+                    self.review, later
+                ]),
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_status(SimpleNamespace(state=str(path), current=False))
+        payload = emit.call_args.args[0]
+        self.assertEqual(payload["stage_outcome"], "escalated")
+        self.assertIsNone(payload["clean_at_head_sha"])
+        self.assertIn("older review", payload["clearance_error"])
+
+    def test_fresh_invocation_reuses_only_current_overview_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "open-telemetry--shared-workflows--416.json"
+            previous_path = root / (
+                "open-telemetry--shared-workflows--416--invocation-"
+                + "a" * 16 + ".json"
+            )
+            MODULE.save_state(previous_path, self.state)
+            preflight = {
+                "pr": self.state["pr"],
+                "comments": [MODULE.review_body_feedback(self.review)[0]],
+            }
+            args = SimpleNamespace(
+                repo_root=str(root / "repo"), target="open-telemetry/shared-workflows#416",
+                state=None, pipeline_run=None, invocation_run="next-run",
+                new_invocation=False, model="sol", bounded_step=False,
+                github_mutation_policy="allow",
+            )
+            (root / "repo").mkdir()
+            with (
+                mock.patch.object(MODULE, "default_state_path", return_value=base),
+                mock.patch.object(MODULE, "require_tools"),
+                mock.patch.object(MODULE, "resolve_repo_root", return_value=root / "repo"),
+                mock.patch.object(MODULE, "resolve_target", return_value=self.target),
+                mock.patch.object(MODULE, "wait_for_stable_review_preflight",
+                                  return_value=preflight),
+                mock.patch.object(MODULE, "metadata_for",
+                                  return_value={"head_sha": self.head}),
+                mock.patch.object(MODULE, "fetch_reviews", return_value=[self.review]),
+                mock.patch.object(MODULE, "run_hosted_decision_worker") as worker,
+                mock.patch.object(MODULE, "emit") as emit,
+            ):
+                MODULE.command_agent_task(args)
+                worker.assert_not_called()
+                result = emit.call_args.args[0]
+                self.assertEqual(result["stage_outcome"], "cleared")
+                self.assertEqual(result["iterations"], 0)
+                new_state = MODULE.load_state(Path(result["state"]))
+                self.assertIsNone(
+                    MODULE.terminal_agent_task_clearance_error(new_state, self.target)
+                )
+                args.state = str(root / (
+                    "open-telemetry--shared-workflows--416--invocation-"
+                    + "b" * 16 + ".json"
+                ))
+                args.invocation_run = None
+                args.pipeline_run = "another-pipeline-run"
+                MODULE.command_agent_task(args)
+                worker.assert_not_called()
+                pipeline_result = emit.call_args.args[0]
+                self.assertEqual(pipeline_result["stage_outcome"], "cleared")
+                self.assertEqual(pipeline_result["state"], args.state)
+                with mock.patch.object(
+                    MODULE, "fetch_reviews",
+                    return_value=[{**self.review, "id": self.review["id"] + 1}],
+                ):
+                    self.assertIsNone(MODULE.reusable_overview_no_change_state(
+                        Path(result["state"]), preflight, self.target
+                    ))
+                with mock.patch.object(
+                    MODULE, "metadata_for", return_value={"head_sha": "3" * 40}
+                ):
+                    self.assertIsNone(MODULE.reusable_overview_no_change_state(
+                        Path(result["state"]), preflight, self.target
+                    ))
+                with mock.patch.object(
+                    MODULE, "fetch_reviews", return_value=[self.review]
+                ):
+                    self.assertIsNone(MODULE.reusable_overview_no_change_state(
+                        Path(result["state"]),
+                        {**preflight, "comments": preflight["comments"] * 2},
+                        self.target,
+                    ))
+
+    def test_incomplete_or_foreign_proof_cannot_clear(self):
+        for changed in (
+            {"kind": "other"}, {"repo_name": "someone/else"}, {"number": 417},
+            {"review_id": self.review["id"] + 1},
+            {"head_sha": "3" * 40},
+            {"body_sha256": "0" * 64},
+        ):
+            with self.subTest(changed=changed):
+                state = copy.deepcopy(self.state)
+                state["overview_no_change_clearance"].update(changed)
+                self.assertIsNotNone(
+                    MODULE.terminal_agent_task_clearance_error(state, self.target)
+                )
+        for key, value in (
+            ("clean_at_head_sha", None),
+            ("agent_task", {"status": "running"}),
+            ("queue", {"id": "pr-416", "status": "active",
+                       "comments": [self.comment], "batches": []}),
+        ):
+            with self.subTest(key=key):
+                state = copy.deepcopy(self.state)
+                state[key] = value
+                self.assertIsNotNone(
+                    MODULE.terminal_agent_task_clearance_error(state, self.target)
+                )
+
+
 class StageProgressTest(unittest.TestCase):
     def test_progress_command_records_each_supported_live_substate(self):
         for phase in sorted(MODULE.STAGE_PROGRESS_PHASES):
@@ -8373,7 +8722,7 @@ class StageOutcomeTest(unittest.TestCase):
         # Clears only through the marker, so without one it must defer, not clear.
         marker_clears = set(MODULE.CLEAN_PREFLIGHT_RESULTS) | set(
             MODULE.WATCHER_CLEAN_RESULTS
-        )
+        ) | set(MODULE.WORKER_CLEAR_RESULTS)
         mapped = set(MODULE.STAGE_OUTCOME_BY_RESULT)
         classified = pending | marker_clears | mapped
 

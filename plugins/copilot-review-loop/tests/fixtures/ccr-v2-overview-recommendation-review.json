@@ -1,0 +1,12 @@
+{
+  "id": 5312959103,
+  "commit_id": "18677c58f0d8133d4a62919b865e68174005d762",
+  "submitted_at": "2026-09-25T03:30:16Z",
+  "state": "COMMENTED",
+  "html_url": "https://github.com/open-telemetry/shared-workflows/pull/416#pullrequestreview-5312959103",
+  "body": "<!-- ccr-overview-v2 -->\n\n## Copilot review overview\n\n### \ud83d\udfe1 Changes recommended\n\nThe promotion workflow runs the Python tests without installing the newly required Copilot SDK.\n\n*Get a fresh assessment by requesting another Copilot review.*\n\n**Review effort:** Balanced  \n**Findings:** None\n\n<details>\n<summary><strong>Resolved since last review (1)</strong></summary>\n\n- [Preserve body errors when SDK stop fails](#discussion_r4100031113)\n</details>",
+  "user": {
+    "login": "copilot-pull-request-reviewer[bot]",
+    "node_id": "BOT_1"
+  }
+}
