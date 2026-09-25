@@ -12621,19 +12621,14 @@ def command_loop(args: argparse.Namespace) -> None:
     target = resolve_target(args.target, repo_root)
     state_path = cli_path(args.state) if args.state else default_state_path(target)
     require_outside_repository(state_path, repo_root)
-    remaining_wait = max(0.0, float(args.wait_timeout))
     try:
         while True:
-            wait_args = argparse.Namespace(**vars(args))
-            wait_args.wait_timeout = remaining_wait
-            wait_started = time.monotonic()
             preflight = wait_for_stable_ci_preflight(
-                wait_args,
+                args,
                 repo_root=repo_root,
                 target=target,
                 state_path=state_path,
             )
-            remaining_wait = max(0.0, remaining_wait - (time.monotonic() - wait_started))
             require_sealed_initial_preflight(args, preflight)
             iteration_args = argparse.Namespace(**vars(args))
             iteration_args._preflight = preflight
@@ -14773,6 +14768,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-timeout",
         type=float,
         default=DEFAULT_COORDINATOR_WAIT_TIMEOUT,
+        help="maximum seconds to wait for stable CI checks in each loop iteration",
     )
     loop.add_argument(
         "--stability-polls",

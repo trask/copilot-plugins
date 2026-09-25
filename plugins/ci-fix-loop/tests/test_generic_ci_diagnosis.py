@@ -482,7 +482,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             self.assertIsNone(MODULE.stage_outcome(changed))
         self.assertIsNone(MODULE.stage_outcome({**state, "ci_warnings": []}))
 
-    def test_controller_observes_after_recommendation_and_keeps_one_wait_budget(self):
+    def test_controller_observes_after_recommendation_with_a_wait_budget_per_iteration(self):
         repository = self.root / "repo"
         repository.mkdir()
         args = MODULE.build_parser().parse_args([
@@ -514,7 +514,6 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             mock.patch.object(
                 MODULE, "retry_diagnosed_ci", return_value="observing_retry",
             ) as retry,
-            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 10, 10, 30, 30, 35]),
             mock.patch.object(MODULE, "emit") as emit,
         ):
             # capture_command requires emit to append to its active capture.
@@ -523,7 +522,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
                 if MODULE._EMIT_CAPTURE_STACK else None
             )
             MODULE.command_loop(args)
-        self.assertEqual([60, 50, 30], [
+        self.assertEqual([60, 60, 60], [
             call.args[0].wait_timeout for call in observe.call_args_list
         ])
         self.assertEqual(2, record.call_count)

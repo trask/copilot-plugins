@@ -4034,7 +4034,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.95", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.96", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -8374,7 +8374,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
                 MODULE,
                 "wait_for_stable_ci_preflight",
                 side_effect=[first, second],
-            ),
+            ) as wait,
             mock.patch.object(
                 MODULE, "command_agent_task", side_effect=run_iteration
             ),
@@ -8382,6 +8382,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         ):
             MODULE.command_loop(args)
 
+        self.assertEqual(
+            [MODULE.DEFAULT_COORDINATOR_WAIT_TIMEOUT] * 2,
+            [call.args[0].wait_timeout for call in wait.call_args_list],
+        )
         self.assertEqual(
             dispatched,
             [first["check_snapshot"]["sha256"], second["check_snapshot"]["sha256"]],
