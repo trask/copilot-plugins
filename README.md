@@ -49,11 +49,12 @@ python <installed-helper> execution-status --handle <same-absolute-path>
 python <installed-helper> execution-cancel --handle <same-absolute-path>
 ```
 
-Pipeline and Stack use `run`, Reviewer uses `run` with explicit
-`--post-pending-review` authority, and other standalone workflows use
-`agent-task`. Sealed CI derives its handle from its v3 artifact. Its controls
-accept that exact artifact instead of `--handle` and retain original-session
-admission. Runtime remains an internal dependency, not a standalone workflow.
+Pipeline and Stack use `run`. Reviewer uses `run` to create a pending review by
+default; `--read-only` returns findings without posting. Other standalone
+workflows use `agent-task`. Sealed CI derives its handle from its v3 artifact.
+Its controls accept that exact artifact instead of `--handle` and retain
+original-session admission. Runtime remains an internal dependency, not a
+standalone workflow.
 
 Use the official execution tool's documented asynchronous mode. Tool-level
 detachment requires the user's explicit request to continue after client exit.

@@ -2269,7 +2269,7 @@ def command_run(args: argparse.Namespace) -> None:
     command_check(args, result_sink=checked.update)
     if not checked:
         raise WorkflowError("review check returned no structured result")
-    if checked["result"] != "ready" or not args.post_pending_review:
+    if checked["result"] != "ready" or args.read_only:
         emit(checked)
         return
     if _EXECUTION is not None:
@@ -2287,10 +2287,10 @@ def command_run(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    foreground = subparsers.add_parser("run", help="run hosted review with explicit pending-review authority")
+    foreground = subparsers.add_parser("run", help="run hosted review and create a pending review")
     foreground.add_argument("target")
-    foreground.add_argument("--post-pending-review", action="store_true",
-                            help="authorize the existing guarded pending-review creation, never submission")
+    foreground.add_argument("--read-only", action="store_true",
+                            help="report findings without creating a pending review")
     foreground.set_defaults(
         model="sol",
         repo_root=None,

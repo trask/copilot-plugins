@@ -132,14 +132,17 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
     def test_all_evaluator_rejections_end_without_posting(self):
         instructions = AGENT.read_text(encoding="utf-8")
 
-        self.assertIn("Omit it for read-only findings", instructions)
+        self.assertIn("Include `--read-only` only when the user explicitly requests", instructions)
         self.assertIn("The posting guard uses only the verified hosted result", instructions)
 
     def test_parser_rejects_fixed_model_and_internal_posting_arguments(self):
         parser = MODULE.build_parser()
         args = parser.parse_args(["run", "42"])
         self.assertEqual("sol", args.model)
+        self.assertFalse(args.read_only)
+        self.assertTrue(parser.parse_args(["run", "42", "--read-only"]).read_only)
         for arguments in (
+            ["run", "42", "--post-pending-review"],
             ["run", "42", "--model", "sol"],
             ["run", "42", "--repo-root", "repo"],
             ["run", "42", "--execution-handle", "handle"],
@@ -201,9 +204,9 @@ class ThinCoordinatorInstructionsTest(unittest.TestCase):
 
 
 class ForegroundDriverTest(unittest.TestCase):
-    def run_driver(self, result, *, authorize=False, failure=None):
+    def run_driver(self, result, *, read_only=False, failure=None):
         arguments = SimpleNamespace(target="owner/repo#42", model="sol",
-                                    repo_root=None, post_pending_review=authorize)
+                                    repo_root=None, read_only=read_only)
         calls = []
 
         def checked(args, *, result_sink):
@@ -223,22 +226,22 @@ class ForegroundDriverTest(unittest.TestCase):
             MODULE.command_run(arguments)
         return calls, emit.call_args.args[0]
 
-    def test_ready_does_not_grant_posting_permission(self):
-        calls, output = self.run_driver({"result": "ready"})
+    def test_read_only_ready_does_not_post(self):
+        calls, output = self.run_driver({"result": "ready"}, read_only=True)
         self.assertEqual([], calls)
         self.assertEqual("ready", output["result"])
 
-    def test_empty_or_existing_pending_never_posts_even_with_permission(self):
+    def test_empty_or_existing_pending_never_posts(self):
         for result in ("no_findings", "existing_pending_review"):
             with self.subTest(result=result):
-                calls, output = self.run_driver({"result": result}, authorize=True)
+                calls, output = self.run_driver({"result": result})
                 self.assertEqual([], calls)
                 self.assertEqual(result, output["result"])
 
-    def test_authorized_post_uses_only_exact_check_identity(self):
+    def test_default_post_uses_only_exact_check_identity(self):
         checked = {"result": "ready", "head_sha": "abc", "state": "state.json",
                    "run_id": "run", "comments_file": "comments.json", "pr_number": 42}
-        calls, output = self.run_driver(checked, authorize=True)
+        calls, output = self.run_driver(checked)
         self.assertEqual(1, len(calls))
         self.assertEqual({"target": "owner/repo#42", "expected_head": "abc",
                           "state": "state.json", "run_id": "run",
@@ -251,7 +254,7 @@ class ForegroundDriverTest(unittest.TestCase):
         checked = {"result": "ready", "head_sha": "abc", "state": "state.json",
                    "run_id": "run", "comments_file": "comments.json"}
         with self.assertRaisesRegex(MODULE.WorkflowError, "created but unverified"):
-            self.run_driver(checked, authorize=True,
+            self.run_driver(checked,
                             failure=MODULE.WorkflowError("created but unverified"))
 
     def test_cancel_fences_pending_review_creation(self):
@@ -265,7 +268,7 @@ class ForegroundDriverTest(unittest.TestCase):
             mock.patch.object(MODULE, "command_post") as post,
         ):
             with self.assertRaisesRegex(MODULE.WorkflowError, "local stop"):
-                MODULE.command_run(SimpleNamespace(post_pending_review=True))
+                MODULE.command_run(SimpleNamespace(read_only=False))
             post.assert_not_called()
 
 

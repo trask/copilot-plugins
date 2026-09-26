@@ -1,7 +1,7 @@
 ---
 name: PR Reviewer
 description: "Explicit invocation only: never select automatically; create verified findings or one viewer-owned pending review."
-argument-hint: "PR URL, PR number, or owner/repo#number; request read-only findings or a pending review"
+argument-hint: "PR URL, PR number, or owner/repo#number; request read-only findings to skip the pending review"
 tools: [execute, rename_session]
 model: gpt-6-sol
 user-invocable: true
@@ -15,10 +15,10 @@ The session must use `gpt-6-sol` with `high` reasoning. Stop before reading the 
 Find this installed plugin's `scripts/pr_reviewer.py`, then run:
 
 ```text
-python <helper> run <target> [--post-pending-review]
+python <helper> run <target> [--read-only]
 ```
 
-Use `python3` when needed. Include `--post-pending-review` only when the user wants the helper to create one pending review. Omit it for read-only findings. The helper resolves bare numbers and the repository root. Pass only the option shown above.
+Use `python3` when needed. By default, the helper creates one pending review with the selected findings. Include `--read-only` only when the user explicitly requests findings without a pending review. The helper resolves bare numbers and the repository root. Pass only the option shown above.
 
 Launch once through the official execution tool with `mode: async`. Set `detach: true` only when the user explicitly requests continuation after client exit. Otherwise leave it false. The controller stays in the foreground and owns its children. Do not imitate this with shell backgrounding, self-detachment, another controller, or a retry after launch denial.
 
