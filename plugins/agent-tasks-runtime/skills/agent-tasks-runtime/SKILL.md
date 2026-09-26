@@ -72,6 +72,7 @@ that did not run, and mocked coverage is not native qualification.
 `marketplace-agent-code-candidate-worker@1` permits zero or more linear single-parent code commits and an optional final output-only commit under `.github/agent-task-output/`. Review, Self Review, CI Fix and Historical Audit use it.
 
 `marketplace-agent-report-recommendation-worker@1` forbids code commits and requires exactly one final output-only commit. PR Description and both PR Reviewer phases use it.
+If a completed report worker leaves its generated branch at the source commit, Runtime reports `missing_output_commit` with the task URL and session log selector. GitHub provides no session-specific web link for these tasks unless the API returns one.
 
 `marketplace-agent-default-branch-code-candidate-worker@1` and
 `marketplace-agent-default-branch-report-recommendation-worker@1` use the same

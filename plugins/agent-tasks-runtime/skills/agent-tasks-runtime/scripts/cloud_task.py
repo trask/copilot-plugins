@@ -3356,6 +3356,22 @@ def collect_completed_task(
         generated_ref=refs.head,
         raw_task_response_sha256=getattr(api, "last_response_sha256", None),
     )
+    if report_only and not all_commits:
+        session_id = completion["session"]["id"]
+        session_url = final["sessions"][0].get("html_url")
+        session_reference = (
+            session_url
+            if isinstance(session_url, str) and session_url
+            else f"{session_id} (gh agent-task view {session_id} --log)"
+        )
+        raise CloudError(
+            "completed Agent Task generated zero commits; report recommendation "
+            "requires one final output artifact commit. "
+            f"Task: https://github.com/{repository}/tasks/"
+            f"{urllib.parse.quote(task_id, safe='')}; "
+            f"session: {session_reference}",
+            "missing_output_commit",
+        )
     history = git.candidate_history(
         root,
         base_sha,

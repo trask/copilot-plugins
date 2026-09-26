@@ -683,6 +683,65 @@ class DetachedCandidateCheckoutTest(unittest.TestCase):
 
 
 class CandidateDispatcherTest(unittest.TestCase):
+    def test_report_worker_completed_without_commits_identifies_task_and_session(self):
+        root = Path("C:/repo")
+        base_sha = "1" * 40
+        snapshot = MODULE.WorktreeSnapshot(root, "owner/repo", "origin", "feature", base_sha)
+        pull_request = MODULE.PullRequestSnapshot(
+            7, "https://github.com/owner/repo/pull/7", "OPEN",
+            "owner/repo", "main", "4" * 40, "owner/repo", "feature", base_sha, False,
+        )
+        options = MODULE.Options(
+            report=True, model="gpt-5.6-sol", prompt="Describe the PR",
+            policy=MODULE.MARKETPLACE_REPORT_RECOMMENDATION_POLICY_SELECTOR,
+        )
+        git = mock.Mock()
+        git.fetch_generated.return_value = "refs/cloud-agent-tasks/request-1/generated"
+        git.ref_sha.return_value = base_sha
+        git.cloud_commits.return_value = []
+        api = mock.Mock(last_response_sha256="e" * 64)
+        final = {
+            "id": "task-1",
+            "state": "completed",
+            "artifacts": [{
+                "type": "branch", "provider": "github",
+                "data": {"head_ref": "copilot/task-1", "base_ref": "feature"},
+            }],
+            "sessions": [{"id": "session-1"}],
+        }
+
+        for session_url in (None, "https://github.com/owner/repo/pull/7/agent-sessions/session-1"):
+            with self.subTest(session_url=session_url):
+                if session_url is not None:
+                    final["sessions"][0]["html_url"] = session_url
+                with (
+                    mock.patch.object(MODULE, "validate_policy_before_mutation"),
+                    mock.patch.object(
+                        MODULE, "validate_fresh_completion",
+                        return_value={"session": {"id": "session-1"}},
+                    ) as validate,
+                    self.assertRaises(MODULE.CloudError) as raised,
+                ):
+                    MODULE.collect_completed_task(
+                        options, git=git, api=api, runner=mock.Mock(), root=root,
+                        repository="owner/repo", pull_request=pull_request,
+                        snapshot=snapshot, policy_identity=MODULE.LocalIdentity(
+                            "feature", base_sha, "", None,
+                        ),
+                        request_id="request-1", task_id="task-1",
+                        submitted_prompt="Managed prompt", final=final,
+                        result=MODULE.ResultEnvelope(), stderr=io.StringIO(),
+                    )
+                self.assertEqual(raised.exception.code, "missing_output_commit")
+                self.assertIn("completed Agent Task generated zero commits", str(raised.exception))
+                self.assertIn("https://github.com/owner/repo/tasks/task-1", str(raised.exception))
+                self.assertIn(
+                    session_url or "session-1 (gh agent-task view session-1 --log)",
+                    str(raised.exception),
+                )
+                validate.assert_called_once()
+                git.candidate_history.assert_not_called()
+
     def test_derives_manifest_without_reading_or_applying_worker_output(self):
         self.check_candidate("feature")
 

@@ -2007,7 +2007,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "9d6112b8f788ed44dc7bf41f8bad78508a8c24e997777b2ea7637c4e7f50e96d",
+            "9bb0e0b54808bf0c9543789dde5aa5731f81b2f348f4da54e93b1b4ec4affdd5",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(
