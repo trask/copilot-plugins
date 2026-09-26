@@ -4034,7 +4034,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.99", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.100", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -10108,6 +10108,129 @@ class StateFileTest(unittest.TestCase):
     def test_refuses_to_work_without_an_iteration(self):
         with self.assertRaises(MODULE.WorkflowError):
             MODULE.active_run({})
+
+
+class AtomicWriteTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    def write(self, kind, path, value):
+        if kind == "state":
+            MODULE.save_state(path, {"version": MODULE.STATE_VERSION, "value": value})
+        else:
+            MODULE.atomic_write_text(path, value + "\n")
+
+    def permission_error(self, code):
+        error = PermissionError(13, "replacement denied")
+        error.winerror = code
+        return error
+
+    def test_windows_sharing_denial_retries_same_temporary_file(self):
+        original_replace = MODULE.os.replace
+        for kind in ("state", "text"):
+            for code in (5, 32):
+                with self.subTest(kind=kind, code=code):
+                    path = self.root / f"{kind}-{code}"
+                    self.write(kind, path, "old")
+                    before = path.read_bytes()
+                    attempts = []
+
+                    def fail_twice(source, destination):
+                        self.assertEqual(before, path.read_bytes())
+                        attempts.append((source, Path(source).read_bytes()))
+                        if len(attempts) < 3:
+                            raise self.permission_error(code)
+                        original_replace(source, destination)
+
+                    with (
+                        mock.patch.object(MODULE, "IS_WINDOWS", True),
+                        mock.patch.object(MODULE.os, "replace", side_effect=fail_twice),
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                    ):
+                        self.write(kind, path, "new")
+                    self.assertEqual(
+                        [mock.call(0.01), mock.call(0.02)], sleep.call_args_list
+                    )
+                    self.assertEqual([attempts[0]] * 3, attempts)
+                    self.assertNotEqual(before, path.read_bytes())
+                    self.assertEqual([], list(self.root.glob("*.tmp")))
+
+    def test_exhaustion_preserves_destination_and_original_error(self):
+        for kind in ("state", "text"):
+            for code in (5, 32):
+                with self.subTest(kind=kind, code=code):
+                    path = self.root / f"{kind}-{code}"
+                    self.write(kind, path, "old")
+                    before = path.read_bytes()
+                    error = self.permission_error(code)
+                    with (
+                        mock.patch.object(MODULE, "IS_WINDOWS", True),
+                        mock.patch.object(
+                            MODULE.os, "replace", side_effect=error
+                        ) as replace,
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                        self.assertRaises(PermissionError) as raised,
+                    ):
+                        self.write(kind, path, "new")
+                    self.assertIs(error, raised.exception)
+                    self.assertEqual(6, replace.call_count)
+                    self.assertEqual(
+                        [
+                            mock.call(delay)
+                            for delay in MODULE.WINDOWS_REPLACE_RETRY_DELAYS
+                        ],
+                        sleep.call_args_list,
+                    )
+                    self.assertEqual(before, path.read_bytes())
+                    self.assertEqual([], list(self.root.glob("*.tmp")))
+
+    def test_other_failures_are_not_retried(self):
+        for kind in ("state", "text"):
+            for windows, error in (
+                (False, self.permission_error(5)),
+                (True, self.permission_error(33)),
+                (True, PermissionError(13, "no Windows code")),
+                (True, FileNotFoundError(2, "missing")),
+                (True, OSError(28, "disk full")),
+            ):
+                with self.subTest(kind=kind, windows=windows, error=repr(error)):
+                    path = self.root / kind
+                    self.write(kind, path, "old")
+                    before = path.read_bytes()
+                    with (
+                        mock.patch.object(MODULE, "IS_WINDOWS", windows),
+                        mock.patch.object(MODULE.os, "replace", side_effect=error) as replace,
+                        mock.patch.object(MODULE.time, "sleep") as sleep,
+                        self.assertRaises(OSError) as raised,
+                    ):
+                        self.write(kind, path, "new")
+                    self.assertIs(error, raised.exception)
+                    replace.assert_called_once()
+                    sleep.assert_not_called()
+                    self.assertEqual(before, path.read_bytes())
+                    self.assertEqual([], list(self.root.glob("*.tmp")))
+
+    @unittest.skipUnless(MODULE.IS_WINDOWS, "requires Windows file sharing")
+    def test_windows_reader_release_allows_replacement(self):
+        for kind in ("state", "text"):
+            with self.subTest(kind=kind):
+                path = self.root / kind
+                self.write(kind, path, "old")
+                before = path.read_bytes()
+                with path.open("r", encoding="utf-8") as reader:
+                    def release_reader(_delay):
+                        self.assertEqual(before, path.read_bytes())
+                        reader.close()
+
+                    with mock.patch.object(
+                        MODULE.time, "sleep", side_effect=release_reader
+                    ) as sleep:
+                        self.write(kind, path, "new")
+                sleep.assert_called_once_with(0.01)
+                self.assertNotEqual(before, path.read_bytes())
+                self.assertEqual([], list(self.root.glob("*.tmp")))
 
 
 class ArchiveRunTest(unittest.TestCase):
