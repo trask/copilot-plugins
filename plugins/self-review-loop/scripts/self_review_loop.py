@@ -77,7 +77,7 @@ VALIDATION_SOURCE_NAMES = {
     "tox.ini",
 }
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "9bb0e0b54808bf0c9543789dde5aa5731f81b2f348f4da54e93b1b4ec4affdd5"
+    "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"
@@ -2337,13 +2337,26 @@ def candidate_self_review_report(
 
 
 def candidate_review_outcome(
-    repo_root: Path, remote: dict[str, Any], *, allowed_iterations: int
+    repo_root: Path, remote: dict[str, Any], *, allowed_iterations: int,
+    helper: Path,
 ) -> dict[str, Any]:
     artifact = remote["candidate_manifest"]["artifact_commit"]
     commits = remote["commits"]
     if artifact is None or AGENT_TASK_OUTPUT_RESULT not in artifact["changed_paths"]:
         if commits:
             return {"outcome": "continue", "iterations_used": 1}
+        verified = {
+            "artifact_commit": artifact,
+            "commits": commits,
+            "task": {"id": remote["task_id"]},
+            "completion": remote["completion"],
+            "candidate": remote["candidate_manifest"],
+        }
+        runtime = load_candidate_runtime(helper)
+        try:
+            runtime.require_output_commit(verified, purpose="Self Review clean outcome")
+        except runtime.CloudError as error:
+            raise WorkflowError(f"Self Review candidate rejected [{error.code}]: {error}") from error
         raise WorkflowError("Self Review candidate has no clean outcome or code commits")
     content = git(repo_root, "show", f"{artifact['sha']}:{AGENT_TASK_OUTPUT_RESULT}")
     if len(content.encode("utf-8")) > 4096:
@@ -3357,7 +3370,8 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
         )
         report_content = None
         report = candidate_review_outcome(
-            repo_root, remote, allowed_iterations=allowed_iterations
+            repo_root, remote, allowed_iterations=allowed_iterations,
+            helper=helper,
         )
         state["agent_task"]["review_outcome"] = report
         save_state(state_path, state)

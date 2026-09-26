@@ -9,16 +9,28 @@ from test_self_review_loop import MODULE
 
 class HostedOutcomeTest(unittest.TestCase):
     def setUp(self):
-        self.remote = {"commits": [], "candidate_manifest": {"artifact_commit": {
-            "sha": "a" * 40, "changed_paths": [MODULE.AGENT_TASK_OUTPUT_RESULT],
-        }}}
+        self.remote = {
+            "commits": [],
+            "task_id": "task-1",
+            "completion": {"session": {"id": "session-1"}},
+            "candidate_manifest": {
+                "repository": {"name_with_owner": "owner/repo"},
+                "artifact_commit": {
+                    "sha": "a" * 40, "changed_paths": [MODULE.AGENT_TASK_OUTPUT_RESULT],
+                },
+            },
+        }
+        self.helper = (
+            Path(__file__).parents[2] / "agent-tasks-runtime"
+            / "skills" / "agent-tasks-runtime" / "scripts" / "cloud_task.py"
+        )
 
     def outcome(self, outcome, used):
         with mock.patch.object(MODULE, "git", return_value=json.dumps(
             {"outcome": outcome, "iterations_used": used}
         )) as read:
             result = MODULE.candidate_review_outcome(
-                Path("repo"), self.remote, allowed_iterations=5
+                Path("repo"), self.remote, allowed_iterations=5, helper=self.helper,
             )
         self.assertEqual(
             (Path("repo"), "show", f"{'a' * 40}:{MODULE.AGENT_TASK_OUTPUT_RESULT}"),
@@ -40,15 +52,21 @@ class HostedOutcomeTest(unittest.TestCase):
 
     def test_missing_outcome_is_not_clean_even_without_code(self):
         self.remote["candidate_manifest"]["artifact_commit"] = None
-        with self.assertRaisesRegex(MODULE.WorkflowError, "no clean outcome or code"):
-            MODULE.candidate_review_outcome(Path("repo"), self.remote, allowed_iterations=5)
+        with self.assertRaisesRegex(MODULE.WorkflowError, r"\[missing_output_commit\]") as raised:
+            MODULE.candidate_review_outcome(
+                Path("repo"), self.remote, allowed_iterations=5, helper=self.helper,
+            )
+        self.assertIn("https://github.com/owner/repo/tasks/task-1", str(raised.exception))
+        self.assertIn("gh agent-task view session-1 --log", str(raised.exception))
 
     def test_verified_code_counts_as_one_pass_without_outcome(self):
         self.remote["commits"] = ["b" * 40, "c" * 40]
         self.remote["candidate_manifest"]["artifact_commit"] = None
         self.assertEqual(
             {"outcome": "continue", "iterations_used": 1},
-            MODULE.candidate_review_outcome(Path("repo"), self.remote, allowed_iterations=5),
+            MODULE.candidate_review_outcome(
+                Path("repo"), self.remote, allowed_iterations=5, helper=self.helper,
+            ),
         )
 
     def test_code_cannot_claim_clean_in_the_same_pass(self):

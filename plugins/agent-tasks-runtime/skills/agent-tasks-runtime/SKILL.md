@@ -70,6 +70,7 @@ that did not run, and mocked coverage is not native qualification.
 ## Current contracts
 
 `marketplace-agent-code-candidate-worker@1` permits zero or more linear single-parent code commits and an optional final output-only commit under `.github/agent-task-output/`. Review, Self Review, CI Fix and Historical Audit use it.
+Consumers that require a workflow outcome artifact call `require_output_commit` after verifying candidate provenance. It rejects a missing output commit with `missing_output_commit`, the task URL, and the session log selector, while leaving optional-output consumers unchanged. Self Review requires that artifact only when no code was committed.
 
 `marketplace-agent-report-recommendation-worker@1` forbids code commits and requires exactly one final output-only commit. PR Description and both PR Reviewer phases use it.
 If a completed report worker leaves its generated branch at the source commit, Runtime reports `missing_output_commit` with the task URL and session log selector. GitHub provides no session-specific web link for these tasks unless the API returns one.
@@ -130,6 +131,8 @@ Conflict Resolver has its own pinned runtime and versioned request contract.
 from Git and compares the task, session, prompt, repository, source and
 generated history with the frozen request. `verify_candidate_result(...)`
 remains as the compatibility name for current consumers.
+`require_output_commit(verified, purpose=...)` returns a verified candidate's
+output commit or raises `missing_output_commit` with task and session details.
 Current-PR consumers can pass `base_is_ancestor(repository, frozen_base,
 candidate_base)` to accept a dispatcher-observed forward base advance while
 keeping every other pull request field pinned. The callback must verify Git

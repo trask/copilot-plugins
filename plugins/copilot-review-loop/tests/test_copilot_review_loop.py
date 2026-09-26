@@ -1329,6 +1329,33 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.hosted_worker = hosted_patch.start()
         self.addCleanup(hosted_patch.stop)
 
+    def test_missing_hosted_decisions_reports_task_and_session(self):
+        runtime = MODULE.load_cloud_task_runtime(
+            SCRIPT.parents[2] / "agent-tasks-runtime"
+            / "skills" / "agent-tasks-runtime" / "scripts" / "cloud_task.py"
+        )
+        for commits in ([], [self.fix]):
+            with self.subTest(commits=commits):
+                verified = {
+                    "artifact_commit": None,
+                    "commits": commits,
+                    "task": {"id": "task-1"},
+                    "completion": {"session": {"id": "session-1"}},
+                    "candidate": {"repository": {"name_with_owner": "owner/repo"}},
+                }
+                with (
+                    mock.patch.object(runtime, "verify_current_candidate", return_value=verified),
+                    self.assertRaisesRegex(MODULE.WorkflowError, r"\[missing_output_commit\]") as raised,
+                ):
+                    MODULE.validate_hosted_candidate(
+                        {"generated": {"head_sha": self.head}},
+                        runtime=runtime, repo_root=self.repo_root,
+                        preflight=self.preflight, requested_model="gpt-5.6-sol",
+                        prompt="review",
+                    )
+                self.assertIn("https://github.com/owner/repo/tasks/task-1", str(raised.exception))
+                self.assertIn("gh agent-task view session-1 --log", str(raised.exception))
+
     def hosted_worker_result(self, **arguments):
         bundle = self.hosted_bundle(**arguments, session_id="hosted-session")
         result = self.result()
@@ -1877,7 +1904,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.104")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.105")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(

@@ -1704,6 +1704,31 @@ def verify_current_candidate(
     )
 
 
+def require_output_commit(
+    verified: Mapping[str, object], *, purpose: str
+) -> Mapping[str, object]:
+    """Require an output commit from a verified candidate for a workflow result."""
+    artifact = verified["artifact_commit"]
+    if artifact is not None:
+        return artifact
+    task_id = verified["task"]["id"]
+    session_id = verified["completion"]["session"]["id"]
+    repository = verified["candidate"]["repository"]["name_with_owner"]
+    commits = verified["commits"]
+    detail = (
+        "generated zero commits"
+        if not commits
+        else f"generated {len(commits)} code commit(s) without an output commit"
+    )
+    raise CloudError(
+        f"completed Agent Task {detail}; {purpose} requires one final output "
+        f"artifact commit. Task: https://github.com/{repository}/tasks/"
+        f"{urllib.parse.quote(task_id, safe='')}; "
+        f"session: {session_id} (gh agent-task view {session_id} --log)",
+        "missing_output_commit",
+    )
+
+
 def guarded_fast_forward_default_candidate(
     result: Mapping[str, object], *, options: Options,
     source: BaseSnapshot, repository: str, executor_head_sha: str,

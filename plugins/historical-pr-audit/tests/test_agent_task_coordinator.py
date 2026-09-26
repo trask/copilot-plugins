@@ -61,6 +61,30 @@ class RuntimeLoaderTest(unittest.TestCase):
 
 
 class CandidateOutcomeTest(unittest.TestCase):
+    def test_missing_outcome_reports_task_and_session(self):
+        runtime = MODULE.load_cloud_task_runtime(RUNTIME_ROOT / "cloud_task.py")
+        for commits in ([], ["4" * 40]):
+            with self.subTest(commits=commits):
+                verified = {
+                    "artifact_commit": None,
+                    "commits": commits,
+                    "task": {"id": "task-1"},
+                    "completion": {"session": {"id": "session-1"}},
+                    "candidate": {"repository": {"name_with_owner": "owner/repo"}},
+                }
+                with (
+                    mock.patch.object(MODULE, "load_cloud_task_runtime", return_value=runtime),
+                    mock.patch.object(runtime, "verify_current_candidate", return_value=verified),
+                    self.assertRaisesRegex(MODULE.WorkflowError, r"\[missing_output_commit\]") as raised,
+                ):
+                    MODULE.validate_audit_candidate(
+                        {"generated": {"branch": "copilot/fresh", "head_sha": "3" * 40}},
+                        helper=Path("helper.py"), repo_root=Path("repo"), metadata=METADATA,
+                        requested_model="gpt-5.6-sol", prompt="audit", max_iterations=5,
+                    )
+                self.assertIn("https://github.com/owner/repo/tasks/task-1", str(raised.exception))
+                self.assertIn("gh agent-task view session-1 --log", str(raised.exception))
+
     def validate(self, outcome, *, commits=None):
         verified = {
             "artifact_commit": {"sha": "3" * 40, "changed_paths": [MODULE.AUDIT_OUTCOME_PATH]},
@@ -73,6 +97,7 @@ class CandidateOutcomeTest(unittest.TestCase):
             GitRepository=mock.Mock,
             verify_current_candidate=mock.Mock(return_value=verified),
             CloudError=RuntimeError,
+            require_output_commit=lambda candidate, **_: candidate["artifact_commit"],
         )
         with (
             mock.patch.object(MODULE, "load_cloud_task_runtime", return_value=runtime),
@@ -279,7 +304,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_current_policy(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "9bb0e0b54808bf0c9543789dde5aa5731f81b2f348f4da54e93b1b4ec4affdd5",
+            "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY,

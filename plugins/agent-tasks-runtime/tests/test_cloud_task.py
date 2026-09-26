@@ -683,6 +683,32 @@ class DetachedCandidateCheckoutTest(unittest.TestCase):
 
 
 class CandidateDispatcherTest(unittest.TestCase):
+    def test_required_candidate_output_reports_verified_task_and_session(self):
+        for commits in ([], ["2" * 40]):
+            with self.subTest(commits=commits):
+                verified = {
+                    "artifact_commit": None,
+                    "commits": commits,
+                    "task": {"id": "task-1"},
+                    "completion": {"session": {"id": "session-1"}},
+                    "candidate": {"repository": {"name_with_owner": "owner/repo"}},
+                }
+                with self.assertRaises(MODULE.CloudError) as raised:
+                    MODULE.require_output_commit(verified, purpose="audit outcome")
+                self.assertEqual("missing_output_commit", raised.exception.code)
+                message = str(raised.exception)
+                self.assertIn("generated zero commits" if not commits else "generated 1 code commit(s)", message)
+                self.assertIn("audit outcome", message)
+                self.assertIn("https://github.com/owner/repo/tasks/task-1", message)
+                self.assertIn("session-1 (gh agent-task view session-1 --log)", message)
+        artifact = {"sha": "3" * 40}
+        self.assertIs(
+            MODULE.require_output_commit(
+                {**verified, "artifact_commit": artifact}, purpose="audit outcome"
+            ),
+            artifact,
+        )
+
     def test_report_worker_completed_without_commits_identifies_task_and_session(self):
         root = Path("C:/repo")
         base_sha = "1" * 40

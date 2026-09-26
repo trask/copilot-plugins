@@ -35,7 +35,7 @@ SHORT_TARGET_PATTERN = re.compile(
 )
 BARE_TARGET_PATTERN = re.compile(r"^#?(?P<number>\d+)$")
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "9bb0e0b54808bf0c9543789dde5aa5731f81b2f348f4da54e93b1b4ec4affdd5"
+    "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -1362,8 +1362,11 @@ def validate_audit_candidate(
         )
     except runtime.CloudError as error:
         raise WorkflowError(f"historical candidate rejected: {error}") from error
-    artifact = verified["artifact_commit"]
-    if artifact is None or AUDIT_OUTCOME_PATH not in artifact["changed_paths"]:
+    try:
+        artifact = runtime.require_output_commit(verified, purpose="historical audit outcome")
+    except runtime.CloudError as error:
+        raise WorkflowError(f"historical candidate rejected [{error.code}]: {error}") from error
+    if AUDIT_OUTCOME_PATH not in artifact["changed_paths"]:
         raise WorkflowError("historical candidate has no terminal outcome artifact")
     content = git(repo_root, "show", f"{artifact['sha']}:{AUDIT_OUTCOME_PATH}")
     if len(content.encode("utf-8")) > 4096:
