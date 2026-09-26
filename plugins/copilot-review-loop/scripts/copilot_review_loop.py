@@ -1611,10 +1611,10 @@ def current_overview_review_error(
         return "overview no-change clearance is for an older head"
     reviews = fetch_reviews(target["owner"], target["repo"], target["number"])
     latest = latest_copilot_review(reviews, state.get("copilot_bot_id"))
+    if latest is None or latest.get("commit_id") != proof["head_sha"]:
+        return "overview no-change clearance has no Copilot review for the current head"
     if (
-        latest is None
-        or latest.get("id") != proof["review_id"]
-        or latest.get("commit_id") != proof["head_sha"]
+        latest.get("id") != proof["review_id"]
         or sha256_text(latest.get("body") or "") != proof["body_sha256"]
     ):
         return "overview no-change clearance is for an older review"
@@ -2288,6 +2288,20 @@ def latest_copilot_review_for_head(
         ],
         bot_id,
     )
+
+
+def latest_copilot_feedback_review(
+    reviews: list[dict[str, Any]], bot_id: str | None, head_sha: str
+) -> dict[str, Any] | None:
+    latest = latest_copilot_review(reviews, bot_id)
+    if (
+        latest is None
+        or latest.get("commit_id") != head_sha
+        or not latest.get("submitted_at")
+        or str(latest.get("state", "")).upper() == "DISMISSED"
+    ):
+        return None
+    return latest
 
 
 def review_has_inline_findings(
@@ -3217,7 +3231,7 @@ def command_preflight(args: argparse.Namespace) -> None:
         (prior_state or {}).get("copilot_bot_id"),
     )
     reviews = fetch_reviews(target["owner"], target["repo"], target["number"])
-    suppressed_review = latest_copilot_review(reviews, known_bot_id)
+    suppressed_review = latest_copilot_feedback_review(reviews, known_bot_id, head)
     if suppressed_review:
         comments.extend(review_body_feedback(suppressed_review))
     head_review = latest_copilot_review_for_head(reviews, known_bot_id, head)
@@ -6953,7 +6967,9 @@ def require_live_comments(
             comment["resolved"] = bool(thread.get("isResolved"))
         all_thread_comments.extend(selected_comments)
     reviews = fetch_reviews(pr["upstream_owner"], pr["upstream_repo"], pr["number"])
-    latest = latest_copilot_review(reviews, preflight.get("copilot_bot_id"))
+    latest = latest_copilot_feedback_review(
+        reviews, preflight.get("copilot_bot_id"), pr["head_sha"]
+    )
     body_feedback = review_body_feedback(latest) if latest else []
     all_comments = [*all_thread_comments, *body_feedback]
     by_id = {comment["id"]: comment for comment in all_comments}
@@ -7901,7 +7917,9 @@ def agent_task_preflight(
         ),
         None,
     )
-    suppressed_review = latest_copilot_review(reviews, known_bot_id)
+    suppressed_review = latest_copilot_feedback_review(
+        reviews, known_bot_id, pr["head_sha"]
+    )
     if suppressed_review:
         comments.extend(review_body_feedback(suppressed_review))
     head_review = latest_copilot_review_for_head(reviews, known_bot_id, pr["head_sha"])
@@ -8113,7 +8131,9 @@ def wait_for_fresh_copilot_state(
         )
         visible_ids = {comment["id"] for comment in select_queue(threads)}
         reviews = fetch_reviews(pr["upstream_owner"], pr["upstream_repo"], pr["number"])
-        latest = latest_copilot_review(reviews, state.get("copilot_bot_id"))
+        latest = latest_copilot_feedback_review(
+            reviews, state.get("copilot_bot_id"), watcher["head_sha"]
+        )
         body_feedback = review_body_feedback(latest) if latest else []
         visible_suppressed = sum(
             item["source"] == "suppressed" for item in body_feedback

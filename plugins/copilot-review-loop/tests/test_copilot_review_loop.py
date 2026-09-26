@@ -1904,7 +1904,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.105")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.106")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -5320,7 +5320,17 @@ class DetachedPipelineCheckoutTest(unittest.TestCase):
                 None, preflight, preflight, self.target, allow_detached=True
             )
 
+    def test_agent_task_preflight_requests_current_review_for_old_overview(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        review["commit_id"] = "3" * 40
+        with mock.patch.object(MODULE, "fetch_reviews", return_value=[review]):
+            preflight = MODULE.agent_task_preflight(
+                self.repo, self.target, allow_detached=True
+            )
 
+        self.assertEqual(preflight["comments"], [])
+        self.assertIsNone(preflight["head_review_id"])
+        self.assertFalse(preflight["head_review_clean"])
 
     def test_detached_standalone_wrong_head_and_dirty_checkouts_fail(self):
         with self.assertRaisesRegex(MODULE.WorkflowError, "requires a Pipeline"):
@@ -8578,6 +8588,18 @@ class OverviewNoChangeClearanceTest(unittest.TestCase):
                 "older head",
                 MODULE.current_overview_review_error(self.state, self.target),
             )
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value={
+                "head_sha": self.head
+            }),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[
+                {**self.review, "commit_id": "3" * 40}
+            ]),
+        ):
+            self.assertIn(
+                "no Copilot review for the current head",
+                MODULE.current_overview_review_error(self.state, self.target),
+            )
 
     def test_status_does_not_report_stale_overview_proof_as_clear(self):
         later = {**self.review, "id": self.review["id"] + 1}
@@ -9309,6 +9331,27 @@ class CopilotReviewTest(unittest.TestCase):
         self.assertIsNone(payload.get("clean_at_head_sha"))
         self.assertIsNone(recorded)
 
+    def test_old_overview_cannot_satisfy_fresh_review_visibility(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        review["commit_id"] = "old-head"
+        state = {
+            "pr": {
+                "upstream_owner": "owner", "upstream_repo": "repo",
+                "number": 7,
+            },
+        }
+        watcher = {
+            "head_sha": "current-head",
+            "overview_comment_count": 1,
+        }
+        with (
+            mock.patch.object(MODULE, "PR_HEAD_LAG_RETRY_DELAYS", ()),
+            mock.patch.object(MODULE, "fetch_copilot_threads", return_value=([], [])),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[review]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "not propagated"),
+        ):
+            MODULE.wait_for_fresh_copilot_state(state, watcher)
+
     def test_watch_treats_suppressed_only_review_as_comments(self):
         state = {
             "version": MODULE.STATE_VERSION,
@@ -9754,6 +9797,46 @@ class PreflightTargetTest(unittest.TestCase):
         self.assertEqual(payload["result"], "review_required")
         self.assertIsNone(payload["head_review_id"])
         self.assertFalse(payload["head_review_clean"])
+
+    def test_preflight_does_not_queue_older_head_body_feedback(self):
+        for fixture in (CCR_V2_OVERVIEW_REVIEW, CCR_V2_REVIEW):
+            with self.subTest(fixture=fixture.name):
+                review = json.loads(fixture.read_text(encoding="utf-8"))
+                review["commit_id"] = "old-head"
+
+                payload = self.run_preflight(reviews=[review])
+
+                self.assertEqual(payload["result"], "review_required")
+                self.assertEqual(payload["queue"]["comments"], [])
+                self.assertIsNone(payload["suppressed_review_id"])
+                self.assertIsNone(payload["head_review_id"])
+
+    def test_preflight_keeps_unresolved_inline_thread_from_older_review(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        review["commit_id"] = "old-head"
+        thread = {
+            "id": "thread-1",
+            "isResolved": False,
+            "comments": {"nodes": [{
+                "databaseId": 11,
+                "url": "https://example.test/11",
+                "body": "Fix this inline finding.",
+                "author": {"login": "copilot-pull-request-reviewer[bot]"},
+                "pullRequestReview": {"databaseId": review["id"]},
+            }]},
+        }
+
+        payload = self.run_preflight(threads=[thread], reviews=[review])
+
+        self.assertEqual(payload["result"], "ready")
+        self.assertEqual(
+            [
+                (comment["source"], comment["review_id"])
+                for comment in payload["queue"]["comments"]
+            ],
+            [("thread", review["id"])],
+        )
+        self.assertIsNone(payload["suppressed_review_id"])
 
     def test_preflight_requests_review_when_exact_head_review_was_dismissed(self):
         review = {
