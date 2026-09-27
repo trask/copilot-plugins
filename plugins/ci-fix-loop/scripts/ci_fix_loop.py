@@ -7069,131 +7069,13 @@ def agent_task_preflight(
         raise WorkflowError("GitHub API did not return complete authenticated context")
 
     observation = CIObservation.read(pr)
-    checks = observation.checks
     refreshed = metadata_for(target)
     if refreshed["head_sha"].lower() != pr["head_sha"]:
         raise WorkflowError("pull request head changed during check preflight")
-    decision = decide(
-        checks,
-        now=dt.datetime.now(dt.timezone.utc),
-        tracking={},
-        deadline_expired=True,
-        approval_runs=(
-            approval_blocked_runs(fetch_workflow_runs(pr, pr["head_sha"]))
-            if not checks
-            else []
-        ),
+    snapshot, log_downloads = observation.preflight_snapshot(
+        repo_root=repo_root, state_path=state_path,
+        collect_failure_logs=collect_failure_logs,
     )
-    failing_keys = (
-        [check["key"] for check in checks if check["class"] == "failed"]
-        if decision["decision"] == "failures"
-        and not decision.get("pending_checks")
-        else []
-    )
-    workflow_runs = observation.workflow_runs
-    if failing_keys:
-        observation.require_diagnosable(set(failing_keys))
-    baseline = (
-        baseline_conclusions(pr, pr["base_sha"])
-        if failing_keys and collect_failure_logs else {}
-    )
-    by_key = {check["key"]: check for check in checks}
-    rollup = check_rollup_identity(checks)
-    rollup_sha256 = sha256_text(
-        json.dumps(rollup, separators=(",", ":"), sort_keys=True)
-    )
-    log_directory = None
-    if failing_keys and collect_failure_logs:
-        if state_path is None:
-            raise WorkflowError(
-                "a state path is required to store failing logs outside the repository"
-            )
-        log_directory = state_path.with_name(
-            f"{state_path.stem}--ci-fix-logs--{pr['head_sha']}--"
-            f"{rollup_sha256[:16]}--{secrets.token_hex(8)}"
-        )
-        require_outside_repository(log_directory, repo_root)
-        if log_directory.exists():
-            raise WorkflowError(
-                f"refusing to reuse failing-log directory: {log_directory}"
-            )
-        log_directory.mkdir()
-    failures = []
-    log_downloads = []
-    created_logs: list[Path] = []
-    try:
-        for index, key in enumerate(
-            failing_keys if collect_failure_logs else [], start=1
-        ):
-            check = by_key[key]
-            log_download: dict[str, Any] = {}
-            log_path = (
-                log_directory
-                / f"{index:03d}-{sha256_text(key)[:16]}.log"
-                if log_directory is not None
-                else None
-            )
-            try:
-                log = fetch_failed_check_log(
-                    pr,
-                    check,
-                    log_path,
-                    repo_root=repo_root,
-                    evidence=log_download,
-                )
-            except WorkflowError as error:
-                run_id = check.get("workflow_run_id")
-                if str(run_id) in workflow_runs and (
-                    ci_run_identity(pr, run_id) != workflow_runs[str(run_id)]
-                ):
-                    raise WorkflowError(
-                        "CI attempt changed while its failure log was being read",
-                        details={"reason": "ci_observation_changed"},
-                    ) from error
-                raise
-            if log_path is not None:
-                created_logs.append(log_path)
-            if log_download:
-                log_downloads.append(log_download)
-            failures.append(
-                {
-                    "key": key,
-                    "kind": check["kind"],
-                    "name": check["name"],
-                    "workflow": check.get("workflow"),
-                    "url": check.get("url"),
-                    "description": check.get("description"),
-                    "conclusion": check.get("conclusion") or check.get("state"),
-                    "baseline_conclusion": baseline.get(check["name"]),
-                    "baseline_verdict": baseline_verdict(
-                        baseline.get(check["name"])
-                    ),
-                    "log_sha256": sha256_text(log),
-                    "log_path": str(log_path) if log_path is not None else None,
-                }
-            )
-        if ci_snapshot_runs(pr, checks) != workflow_runs:
-            raise WorkflowError(
-                "CI attempt changed during failed-check preflight",
-                details={"reason": "ci_observation_changed"},
-            )
-    except BaseException:
-        for path in created_logs:
-            path.unlink(missing_ok=True)
-        if log_directory is not None and log_directory.is_dir():
-            log_directory.rmdir()
-        raise
-    snapshot = {
-        "head_sha": pr["head_sha"],
-        "base_sha": pr["base_sha"],
-        "observed_at": utc_now(),
-        "rollup": rollup,
-        "rollup_sha256": rollup_sha256,
-        "decision": decision,
-        "failures": failures,
-        "workflow_runs": workflow_runs,
-    }
-    snapshot["sha256"] = check_snapshot_sha256(snapshot)
     return {
         "repository_root": str(repo_root),
         "identity": identity,
@@ -9049,6 +8931,124 @@ class CIObservation:
                 "CI workflow evidence is pending or contains an unobserved failure",
                 details={"reason": "ci_observation_changed"},
             )
+
+    def preflight_snapshot(
+        self, *, repo_root: Path, state_path: Path | None,
+        collect_failure_logs: bool,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        pr = self.pr
+        checks = self.checks
+        decision = decide(
+            checks,
+            now=dt.datetime.now(dt.timezone.utc),
+            tracking={},
+            deadline_expired=True,
+            approval_runs=(
+                approval_blocked_runs(fetch_workflow_runs(pr, pr["head_sha"]))
+                if not checks else []
+            ),
+        )
+        failing_keys = (
+            [check["key"] for check in checks if check["class"] == "failed"]
+            if decision["decision"] == "failures"
+            and not decision.get("pending_checks")
+            else []
+        )
+        if failing_keys:
+            self.require_diagnosable(set(failing_keys))
+        baseline = (
+            baseline_conclusions(pr, pr["base_sha"])
+            if failing_keys and collect_failure_logs else {}
+        )
+        rollup = check_rollup_identity(checks)
+        rollup_sha256 = sha256_text(
+            json.dumps(rollup, separators=(",", ":"), sort_keys=True)
+        )
+        log_directory = None
+        if failing_keys and collect_failure_logs:
+            if state_path is None:
+                raise WorkflowError(
+                    "a state path is required to store failing logs outside the repository"
+                )
+            log_directory = state_path.with_name(
+                f"{state_path.stem}--ci-fix-logs--{pr['head_sha']}--"
+                f"{rollup_sha256[:16]}--{secrets.token_hex(8)}"
+            )
+            require_outside_repository(log_directory, repo_root)
+            if log_directory.exists():
+                raise WorkflowError(
+                    f"refusing to reuse failing-log directory: {log_directory}"
+                )
+            log_directory.mkdir()
+        failures = []
+        log_downloads = []
+        log_paths: list[Path] = []
+        try:
+            by_key = {check["key"]: check for check in checks}
+            for index, key in enumerate(
+                failing_keys if collect_failure_logs else [], start=1
+            ):
+                check = by_key[key]
+                log_download: dict[str, Any] = {}
+                log_path = (
+                    log_directory / f"{index:03d}-{sha256_text(key)[:16]}.log"
+                    if log_directory is not None else None
+                )
+                if log_path is not None:
+                    log_paths.append(log_path)
+                try:
+                    log = fetch_failed_check_log(
+                        pr, check, log_path, repo_root=repo_root,
+                        evidence=log_download,
+                    )
+                except WorkflowError as error:
+                    run_id = check.get("workflow_run_id")
+                    if str(run_id) in self.workflow_runs and (
+                        ci_run_identity(pr, run_id) != self.workflow_runs[str(run_id)]
+                    ):
+                        raise WorkflowError(
+                            "CI attempt changed while its failure log was being read",
+                            details={"reason": "ci_observation_changed"},
+                        ) from error
+                    raise
+                if log_download:
+                    log_downloads.append(log_download)
+                failures.append({
+                    "key": key,
+                    "kind": check["kind"],
+                    "name": check["name"],
+                    "workflow": check.get("workflow"),
+                    "url": check.get("url"),
+                    "description": check.get("description"),
+                    "conclusion": check.get("conclusion") or check.get("state"),
+                    "baseline_conclusion": baseline.get(check["name"]),
+                    "baseline_verdict": baseline_verdict(baseline.get(check["name"])),
+                    "log_sha256": sha256_text(log),
+                    "log_path": str(log_path) if log_path is not None else None,
+                })
+            if ci_snapshot_runs(pr, checks) != self.workflow_runs:
+                raise WorkflowError(
+                    "CI attempt changed during failed-check preflight",
+                    details={"reason": "ci_observation_changed"},
+                )
+        except BaseException:
+            for path in log_paths:
+                path.unlink(missing_ok=True)
+            if log_directory is not None and log_directory.is_dir():
+                log_directory.rmdir()
+            raise
+        snapshot = {
+            "head_sha": pr["head_sha"],
+            "base_sha": pr["base_sha"],
+            "observed_at": utc_now(),
+            "rollup": rollup,
+            "rollup_sha256": rollup_sha256,
+            "decision": decision,
+            "failures": failures,
+            "workflow_runs": self.workflow_runs,
+        }
+        snapshot["sha256"] = check_snapshot_sha256(snapshot)
+        return snapshot, log_downloads
 
     def clearance_fingerprint(self, base_sha: str) -> str:
         rollup = [

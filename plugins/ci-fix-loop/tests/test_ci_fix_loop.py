@@ -4034,7 +4034,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.100", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.102", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -8259,6 +8259,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             if download_attempts == 1:
                 MODULE.atomic_write_text(destination, "first failure\n")
                 return "first failure\n"
+            MODULE.atomic_write_text(destination, "partial failure\n")
             raise MODULE.WorkflowError("check detail lookup failed")
 
         with (

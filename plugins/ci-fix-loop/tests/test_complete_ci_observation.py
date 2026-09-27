@@ -125,6 +125,36 @@ class CompleteCiObservationTest(unittest.TestCase):
                     MODULE.CIObservation.read(self.preflight["pr"])
                 runs.assert_not_called()
 
+    def test_preflight_snapshot_collects_failed_log_and_frozen_attempts(self):
+        def fetch_log(_pr, _check, destination, **_kwargs):
+            MODULE.atomic_write_text(destination, "failed\n")
+            return "failed\n"
+
+        with (
+            self.observe(),
+            mock.patch.object(
+                MODULE, "baseline_conclusions",
+                return_value={self.checks[0]["name"]: "failure"},
+            ),
+            mock.patch.object(MODULE, "fetch_failed_check_log", side_effect=fetch_log),
+        ):
+            observation = MODULE.CIObservation.read(self.preflight["pr"])
+            snapshot, downloads = observation.preflight_snapshot(
+                repo_root=self.repo, state_path=self.state_path,
+                collect_failure_logs=True,
+            )
+        self.assertEqual([], downloads)
+        self.assertEqual(self.runs, snapshot["workflow_runs"])
+        self.assertEqual(MODULE.check_snapshot_sha256(snapshot), snapshot["sha256"])
+        self.assertEqual("failures", snapshot["decision"]["decision"])
+        failure = snapshot["failures"][0]
+        self.assertEqual("failure", failure["baseline_conclusion"])
+        self.assertEqual(MODULE.sha256_text("failed\n"), failure["log_sha256"])
+        log_path = Path(failure["log_path"])
+        self.assertEqual("failed\n", log_path.read_text(encoding="utf-8"))
+        self.addCleanup(log_path.parent.rmdir)
+        self.addCleanup(log_path.unlink)
+
     def flow(self, *, after_task=None, after_import=None, candidate=False):
         result = self.fixture.candidate_result(["5" * 40] if candidate else [])
         if not candidate:
