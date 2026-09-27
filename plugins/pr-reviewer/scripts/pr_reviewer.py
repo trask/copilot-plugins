@@ -944,16 +944,89 @@ def decode_diff_path(value: str) -> str | None:
     return value
 
 
-def parse_unified_diff(
-    diff_text: str,
-) -> dict[str, dict[str, dict[int, int | str]]]:
-    """Map changed lines to positions and all hunk lines to their hunk IDs.
+class _SideAnchors:
+    def __init__(self) -> None:
+        self.changed: set[int] = set()
+        self.hunks: dict[int, int] = {}
+        self.text: dict[int, str] = {}
+
+
+class DiffAnchors:
+    def __init__(self) -> None:
+        self._files: dict[str, dict[str, _SideAnchors]] = {}
+        self._positions: dict[str, dict[int, tuple[str, int]]] = {}
+
+    def paths(self) -> list[str]:
+        return sorted(self._files)
+
+    def has_path(self, path: str) -> bool:
+        return path in self._files
+
+    def require_anchor(
+        self, index: int, path: str, side: str, line: int, start_line: int | None
+    ) -> None:
+        anchor = self._files[path][side]
+        if start_line is None:
+            if line not in anchor.changed:
+                raise WorkflowError(
+                    f"comment {index} anchor is not a changed {side} line: "
+                    f"{path}:{line}"
+                )
+            return
+        start_hunk = anchor.hunks.get(start_line)
+        end_hunk = anchor.hunks.get(line)
+        if start_hunk is None or end_hunk is None or start_hunk != end_hunk:
+            raise WorkflowError(
+                f"comment {index} range must be within one {side} diff hunk"
+            )
+        if not any(
+            changed_line in anchor.changed
+            for changed_line in range(start_line, line + 1)
+        ):
+            raise WorkflowError(
+                f"comment {index} range contains no changed {side} line"
+            )
+
+    def line_text(self, path: str, side: str, line: int) -> str | None:
+        file = self._files.get(path)
+        return file[side].text.get(line) if file is not None else None
+
+    def resolve_position(self, path: str, position: int) -> tuple[str, int] | None:
+        return self._positions.get(path, {}).get(position)
+
+    def _side(self, path: str, side: str) -> _SideAnchors:
+        file = self._files.get(path)
+        if file is None:
+            file = {"LEFT": _SideAnchors(), "RIGHT": _SideAnchors()}
+            self._files[path] = file
+        return file[side]
+
+    def _changed(
+        self, path: str, side: str, line: int, position: int, hunk: int, text: str
+    ) -> None:
+        anchors = self._side(path, side)
+        anchors.changed.add(line)
+        anchors.hunks.setdefault(line, hunk)
+        anchors.text.setdefault(line, text)
+        self._positions.setdefault(path, {})[position] = (side, line)
+
+    def _context(
+        self, path: str, line_left: int, line_right: int, hunk: int, text: str
+    ) -> None:
+        for side, line in (("LEFT", line_left), ("RIGHT", line_right)):
+            anchors = self._side(path, side)
+            anchors.hunks.setdefault(line, hunk)
+            anchors.text.setdefault(line, text)
+
+
+def parse_unified_diff(diff_text: str) -> DiffAnchors:
+    """Index changed lines, hunk lines, text, and legacy diff positions.
 
     GitHub counts positions down from a file's first ``@@`` header, which itself
     is position 0, and every later line in that file counts, including
     subsequent ``@@`` headers and ``\\ No newline`` markers.
     """
-    anchors: dict[str, dict[str, dict[int, int | str]]] = {}
+    anchors = DiffAnchors()
     old_path: str | None = None
     new_path: str | None = None
     path: str | None = None
@@ -987,17 +1060,7 @@ def parse_unified_diff(
             path = new_path or old_path
             if path is None:
                 raise WorkflowError("PR diff file has no usable path")
-            anchors.setdefault(
-                path,
-                {
-                    "LEFT": {},
-                    "RIGHT": {},
-                    "LEFT_LINES": {},
-                    "RIGHT_LINES": {},
-                    "LEFT_TEXT": {},
-                    "RIGHT_TEXT": {},
-                },
-            )
+            anchors._side(path, "LEFT")
             continue
 
         hunk = HUNK_PATTERN.match(raw_line)
@@ -1021,22 +1084,15 @@ def parse_unified_diff(
         if raw_line.startswith("\\"):
             continue
         if raw_line.startswith("+"):
-            anchors[path]["RIGHT"].setdefault(new_line, position)
-            anchors[path]["RIGHT_LINES"].setdefault(new_line, hunk_id)
-            anchors[path]["RIGHT_TEXT"].setdefault(new_line, raw_line[1:])
+            anchors._changed(path, "RIGHT", new_line, position, hunk_id, raw_line[1:])
             new_line += 1
             new_remaining -= 1
         elif raw_line.startswith("-"):
-            anchors[path]["LEFT"].setdefault(old_line, position)
-            anchors[path]["LEFT_LINES"].setdefault(old_line, hunk_id)
-            anchors[path]["LEFT_TEXT"].setdefault(old_line, raw_line[1:])
+            anchors._changed(path, "LEFT", old_line, position, hunk_id, raw_line[1:])
             old_line += 1
             old_remaining -= 1
         elif raw_line.startswith(" "):
-            anchors[path]["LEFT_LINES"].setdefault(old_line, hunk_id)
-            anchors[path]["RIGHT_LINES"].setdefault(new_line, hunk_id)
-            anchors[path]["LEFT_TEXT"].setdefault(old_line, raw_line[1:])
-            anchors[path]["RIGHT_TEXT"].setdefault(new_line, raw_line[1:])
+            anchors._context(path, old_line, new_line, hunk_id, raw_line[1:])
             old_line += 1
             new_line += 1
             old_remaining -= 1
@@ -1052,22 +1108,9 @@ def parse_unified_diff(
     return anchors
 
 
-def positions_by_path(
-    anchors: dict[str, dict[str, dict[int, int | str]]],
-) -> dict[str, dict[int, tuple[str, int]]]:
-    resolved: dict[str, dict[int, tuple[str, int]]] = {}
-    for path, sides in anchors.items():
-        for side in ("LEFT", "RIGHT"):
-            lines = sides[side]
-            for line, position in lines.items():
-                if isinstance(position, int):
-                    resolved.setdefault(path, {})[position] = (side, line)
-    return resolved
-
-
 def enrich_review_thread_anchor_text(
     threads: list[dict[str, Any]],
-    anchors: dict[str, dict[str, dict[int, int | str]]],
+    anchors: DiffAnchors,
 ) -> list[dict[str, Any]]:
     enriched = []
     for thread in threads:
@@ -1076,15 +1119,14 @@ def enrich_review_thread_anchor_text(
         side = item.get("side")
         line = item.get("line")
         start_line = item.get("start_line")
-        path_anchors = anchors.get(path, {}) if isinstance(path, str) else {}
-        text_by_line = (
-            path_anchors.get(f"{side}_TEXT", {})
-            if side in {"LEFT", "RIGHT"}
-            else {}
+        valid_anchor = isinstance(path, str) and side in {"LEFT", "RIGHT"}
+        line_text = (
+            anchors.line_text(path, side, line)
+            if valid_anchor and isinstance(line, int) else None
         )
-        line_text = text_by_line.get(line) if isinstance(line, int) else None
         start_line_text = (
-            text_by_line.get(start_line) if isinstance(start_line, int) else None
+            anchors.line_text(path, side, start_line)
+            if valid_anchor and isinstance(start_line, int) else None
         )
         comments = item.get("comments") or []
         if line_text is None:
@@ -1142,7 +1184,7 @@ def fetch_authoritative_diff(pr: dict[str, Any]) -> str:
 
 
 def fetch_changed_paths(pr: dict[str, Any]) -> list[str]:
-    return sorted(parse_unified_diff(fetch_authoritative_diff(pr)))
+    return parse_unified_diff(fetch_authoritative_diff(pr)).paths()
 
 
 def write_output_file(path_value: str, text: str, description: str) -> str:
@@ -1184,7 +1226,7 @@ def load_comments(path_value: str) -> list[dict[str, Any]]:
 
 def validate_comments(
     comments: list[dict[str, Any]],
-    anchors: dict[str, dict[str, dict[int, int | str]]],
+    anchors: DiffAnchors,
 ) -> list[dict[str, Any]]:
     if not comments:
         raise WorkflowError("at least one inline comment is required")
@@ -1219,16 +1261,12 @@ def validate_comments(
             raise WorkflowError(
                 f"comment {index} must provide start_line and start_side together"
             )
-        if path not in anchors:
+        if not anchors.has_path(path):
             raise WorkflowError(
                 f"comment {index} anchor is not a changed {side} line: {path}:{line}"
             )
         if not has_start_line:
-            if line not in anchors[path][side]:
-                raise WorkflowError(
-                    f"comment {index} anchor is not a changed {side} line: "
-                    f"{path}:{line}"
-                )
+            anchors.require_anchor(index, path, side, line, None)
             normalized.append(
                 {"path": path, "line": line, "side": side, "body": body}
             )
@@ -1254,21 +1292,7 @@ def validate_comments(
             raise WorkflowError(
                 f"comment {index} start_line must be less than line"
             )
-        hunk_lines = anchors[path][f"{side}_LINES"]
-        start_hunk = hunk_lines.get(start_line)
-        end_hunk = hunk_lines.get(line)
-        if start_hunk is None or end_hunk is None or start_hunk != end_hunk:
-            raise WorkflowError(
-                f"comment {index} range must be within one {side} diff hunk"
-            )
-        changed_lines = anchors[path][side]
-        if not any(
-            changed_line in changed_lines
-            for changed_line in range(start_line, line + 1)
-        ):
-            raise WorkflowError(
-                f"comment {index} range contains no changed {side} line"
-            )
+        anchors.require_anchor(index, path, side, line, start_line)
         normalized.append(
             {
                 "path": path,
@@ -1313,7 +1337,7 @@ def comment_signature(
 
 def resolve_actual_comment(
     comment: dict[str, Any],
-    positions: dict[str, dict[int, tuple[str, int]]],
+    anchors: DiffAnchors,
 ) -> dict[str, Any]:
     """Fill in ``line`` and ``side`` for a comment GitHub locates only by position.
 
@@ -1338,7 +1362,7 @@ def resolve_actual_comment(
             raise WorkflowError(
                 f"comment on {path} reports neither a line and side nor a diff position"
             )
-        resolved = positions.get(path, {}).get(position)
+        resolved = anchors.resolve_position(path, position)
         if resolved is None:
             raise WorkflowError(
                 f"comment on {path} has diff position {position}, "
@@ -1427,7 +1451,7 @@ def verify_created_review(
     viewer: str,
     review_id: int,
     expected_comments: list[dict[str, Any]],
-    anchors: dict[str, dict[str, dict[int, int | str]]],
+    anchors: DiffAnchors,
 ) -> dict[str, Any]:
     endpoint = f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews/{review_id}"
     review = gh_json(["api", endpoint])
@@ -1446,9 +1470,8 @@ def verify_created_review(
         raise WorkflowError(
             f"created review {review_id} is not a viewer-owned PENDING review"
         )
-    positions = positions_by_path(anchors)
     actual_comments = [
-        resolve_actual_comment(enrich_legacy_comment_location(comment), positions)
+        resolve_actual_comment(enrich_legacy_comment_location(comment), anchors)
         for comment in gh_paginated(f"{endpoint}/comments?per_page=100")
     ]
     expected = Counter(comment_signature(comment) for comment in expected_comments)
@@ -1468,7 +1491,7 @@ def preflight(
 ) -> tuple[
     dict[str, Any],
     str,
-    dict[str, dict[str, dict[int, int | str]]],
+    DiffAnchors,
     str | None,
     dict[str, Any] | None,
     list[dict[str, Any]],
@@ -1483,7 +1506,7 @@ def preflight(
     reviews = fetch_reviews(pr)
     pending = find_pending_review(reviews, viewer)
     if pending is not None:
-        return pr, viewer, {}, review_url(pr, pending), None, [], [], None
+        return pr, viewer, DiffAnchors(), review_url(pr, pending), None, [], [], None
     authoritative_diff = fetch_authoritative_diff(pr)
     anchors = parse_unified_diff(authoritative_diff)
     ensure_head_unchanged(
@@ -1784,7 +1807,7 @@ def hosted_review_prompt(pr: dict[str, Any], candidates: list[dict[str, Any]] | 
 
 def run_hosted_review_phase(
     *, runtime: ModuleType, helper: Path, repo_root: Path, state_path: Path,
-    state: dict[str, Any], anchors: dict[str, Any], candidates: list[dict[str, Any]] | None,
+    state: dict[str, Any], candidates: list[dict[str, Any]] | None,
 ) -> dict[str, Any]:
     phase, model_alias, output_path = (
         ("discovery", "sol", DISCOVERY_PATH) if candidates is None
@@ -1906,7 +1929,7 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
         runtime = load_cloud_task_runtime(helper)
         discovery = run_hosted_review_phase(
             runtime=runtime, helper=helper, repo_root=repo_root, state_path=state_path,
-            state=state, anchors=anchors, candidates=None,
+            state=state, candidates=None,
         )
         observed_pr = state["phases"][-1]["observed_pr"]
         if observed_pr["base"] != pr["base"]:
@@ -1994,7 +2017,7 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
         if candidates:
             critique = run_hosted_review_phase(
                 runtime=runtime, helper=helper, repo_root=repo_root, state_path=state_path,
-                state=state, anchors=anchors, candidates=candidates,
+                state=state, candidates=candidates,
             )
             by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
             seen = []

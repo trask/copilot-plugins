@@ -309,19 +309,37 @@ class UnifiedDiffTest(unittest.TestCase):
     def test_parses_multiple_files_and_hunks(self):
         anchors = MODULE.parse_unified_diff(DIFF)
 
-        self.assertEqual(set(anchors), {"src/one.py", "docs/two.md"})
-        self.assertEqual(anchors["src/one.py"]["RIGHT"], {2: 3, 4: 5, 21: 9})
-        self.assertEqual(anchors["src/one.py"]["LEFT"], {2: 2, 20: 8})
-        self.assertEqual(anchors["docs/two.md"]["LEFT"], {11: 2})
-        self.assertEqual(anchors["docs/two.md"]["RIGHT"], {})
+        self.assertEqual(anchors.paths(), ["docs/two.md", "src/one.py"])
+        for side, path, lines in (
+            ("RIGHT", "src/one.py", (2, 4, 21)),
+            ("LEFT", "src/one.py", (2, 20)),
+            ("LEFT", "docs/two.md", (11,)),
+        ):
+            for line in lines:
+                with self.subTest(path=path, side=side, line=line):
+                    self.assertEqual(
+                        MODULE.validate_comments(
+                            [{"path": path, "line": line, "side": side, "body": "Check."}],
+                            anchors,
+                        )[0]["line"],
+                        line,
+                    )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not a changed RIGHT line"):
+            MODULE.validate_comments(
+                [{"path": "docs/two.md", "line": 11, "side": "RIGHT", "body": "Check."}],
+                anchors,
+            )
 
     def test_positions_skip_the_first_hunk_header_and_count_later_ones(self):
         anchors = MODULE.parse_unified_diff(DIFF)
 
         # The line right below the first "@@" is position 1, and each later
         # "@@" header consumes a position of its own.
-        self.assertEqual(anchors["src/one.py"]["LEFT"][2], 2)
-        self.assertEqual(anchors["src/one.py"]["LEFT"][20], 8)
+        for position, side, line in ((2, "LEFT", 2), (8, "LEFT", 20)):
+            resolved = MODULE.resolve_actual_comment(
+                {"path": "src/one.py", "position": position}, anchors
+            )
+            self.assertEqual((resolved["side"], resolved["line"]), (side, line))
 
     def test_positions_count_a_no_newline_marker_inside_a_hunk(self):
         # A trailing marker after a hunk's counts are exhausted marks end of
@@ -344,26 +362,42 @@ diff --git a/data.txt b/data.txt
 
         anchors = MODULE.parse_unified_diff(diff)
 
-        self.assertEqual(anchors["data.txt"]["LEFT"], {2: 2, 11: 6})
-        self.assertEqual(anchors["data.txt"]["RIGHT"], {2: 3, 11: 8})
+        for position, side, line in (
+            (2, "LEFT", 2), (6, "LEFT", 11), (3, "RIGHT", 2), (8, "RIGHT", 11)
+        ):
+            resolved = MODULE.resolve_actual_comment(
+                {"path": "data.txt", "position": position}, anchors
+            )
+            self.assertEqual((resolved["side"], resolved["line"]), (side, line))
 
     def test_positions_reverse_map_to_a_single_changed_line(self):
         anchors = MODULE.parse_unified_diff(DIFF)
 
-        positions = MODULE.positions_by_path(anchors)
-
-        self.assertEqual(positions["src/one.py"][3], ("RIGHT", 2))
-        self.assertEqual(positions["src/one.py"][8], ("LEFT", 20))
-        self.assertEqual(positions["docs/two.md"][2], ("LEFT", 11))
-        self.assertNotIn(1, positions["src/one.py"])
+        for path, position, side, line in (
+            ("src/one.py", 3, "RIGHT", 2),
+            ("src/one.py", 8, "LEFT", 20),
+            ("docs/two.md", 2, "LEFT", 11),
+        ):
+            resolved = MODULE.resolve_actual_comment(
+                {"path": path, "position": position}, anchors
+            )
+            self.assertEqual((resolved["side"], resolved["line"]), (side, line))
+        self.assertIsNone(anchors.resolve_position("src/one.py", 1))
 
     def test_captures_line_text_for_changed_and_context_lines(self):
         anchors = MODULE.parse_unified_diff(DIFF)
 
-        self.assertEqual(anchors["src/one.py"]["LEFT_TEXT"][2], "old two")
-        self.assertEqual(anchors["src/one.py"]["RIGHT_TEXT"][2], "new two")
-        self.assertEqual(anchors["src/one.py"]["LEFT_TEXT"][3], "context three")
-        self.assertEqual(anchors["src/one.py"]["RIGHT_TEXT"][3], "context three")
+        threads = [
+            {"path": "src/one.py", "side": side, "line": line, "comments": []}
+            for side, line in (
+                ("LEFT", 2), ("RIGHT", 2), ("LEFT", 3), ("RIGHT", 3)
+            )
+        ]
+        enriched = MODULE.enrich_review_thread_anchor_text(threads, anchors)
+        self.assertEqual(
+            [thread["line_text"] for thread in enriched],
+            ["old two", "new two", "context three", "context three"],
+        )
 
     def test_extracts_original_line_text_from_a_comment_diff_hunk(self):
         hunk = """\
@@ -402,8 +436,16 @@ diff --git a/old.txt b/old.txt
 
         anchors = MODULE.parse_unified_diff(diff)
 
-        self.assertEqual(anchors["new.txt"]["RIGHT"], {1: 1, 2: 2})
-        self.assertEqual(anchors["old.txt"]["LEFT"], {1: 1, 2: 2})
+        self.assertEqual(anchors.paths(), ["new.txt", "old.txt"])
+        for path, side in (("new.txt", "RIGHT"), ("old.txt", "LEFT")):
+            for line in (1, 2):
+                self.assertEqual(
+                    MODULE.validate_comments(
+                        [{"path": path, "line": line, "side": side, "body": "Check."}],
+                        anchors,
+                    )[0]["line"],
+                    line,
+                )
 
     def test_fetches_the_actual_branch_diff(self):
         pr = {
@@ -464,7 +506,8 @@ diff --git "a/docs/\\303\\251.md" "b/docs/\\303\\251.md"
 
         anchors = MODULE.parse_unified_diff(diff)
 
-        self.assertEqual(anchors["docs/é.md"]["RIGHT"], {1: 1})
+        self.assertEqual(anchors.paths(), ["docs/é.md"])
+        self.assertEqual(anchors.resolve_position("docs/é.md", 1), ("RIGHT", 1))
 
     def test_unicode_line_separator_stays_within_changed_line(self):
         diff = (
@@ -479,8 +522,9 @@ diff --git "a/docs/\\303\\251.md" "b/docs/\\303\\251.md"
 
         anchors = MODULE.parse_unified_diff(diff)
 
-        self.assertEqual(anchors["data.txt"]["LEFT"], {1: 1})
-        self.assertEqual(anchors["data.txt"]["RIGHT"], {1: 2, 2: 3})
+        self.assertEqual(anchors.resolve_position("data.txt", 1), ("LEFT", 1))
+        self.assertEqual(anchors.resolve_position("data.txt", 2), ("RIGHT", 1))
+        self.assertEqual(anchors.resolve_position("data.txt", 3), ("RIGHT", 2))
 
 
 class CommentValidationTest(unittest.TestCase):
@@ -1961,8 +2005,10 @@ class GuardedPostingTest(unittest.TestCase):
         advanced = {
             **self.pr, "base": {**self.pr["base"], "sha": "3" * 40},
         }
-        anchors = MODULE.parse_unified_diff(DIFF)
-        anchors["src/one.py"]["RIGHT"].pop(2)
+        anchors = MODULE.parse_unified_diff(
+            DIFF.replace("@@ -1,4 +1,5 @@", "@@ -1,4 +1,4 @@")
+            .replace("+new two\n", "")
+        )
         with (
             mock.patch.object(MODULE, "preflight", return_value=(
                 advanced, "viewer", anchors, None, None, [], [], DIFF,
