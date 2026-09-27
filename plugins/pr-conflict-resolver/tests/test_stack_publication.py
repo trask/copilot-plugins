@@ -184,7 +184,6 @@ class StackPublicationTest(unittest.TestCase):
             "external_stack_dependents": {"return_value": []},
             "create_stack_workspace": {"return_value": self.workspace},
             "command_agent_task": {"side_effect": self.hosted},
-            "run_stack_cascade": {"side_effect": AssertionError("local cascade must stay disabled")},
             "emit": {},
         }.items():
             patcher = mock.patch.object(MODULE, name, **options)
@@ -215,7 +214,6 @@ class StackPublicationTest(unittest.TestCase):
     def test_real_cli_admits_only_bound_hosted_propagation(self):
         self.assertEqual(0, self.run_cli())
         self.calls["command_agent_task"].assert_called_once()
-        self.calls["run_stack_cascade"].assert_not_called()
         result = self.calls["emit"].call_args.args[0]
         self.assertEqual([{"number": 12, "head_sha": "published-tip"}], result["members_published"])
         self.assertFalse(self.workspace.exists())
@@ -470,14 +468,6 @@ class StackPublicationTest(unittest.TestCase):
         projected["source_stack"]["members"][0]["head_branch"] = "changed-prefix"
         with self.assertRaises(MODULE.WorkflowError):
             MODULE.require_authorized_stack(self.request, existing.pr_metadata(number=11), projected)
-
-    def test_existing_legacy_default_is_never_an_execution_input(self):
-        legacy = self.root / "legacy.json"
-        legacy.write_text('{"status":"resolved","workspace":"preserved"}', encoding="utf-8")
-        with mock.patch.object(MODULE, "default_propagation_state_path", return_value=legacy) as default:
-            self.assertEqual(0, self.run_cli())
-        default.assert_not_called()
-        self.assertEqual('{"status":"resolved","workspace":"preserved"}', legacy.read_text(encoding="utf-8"))
 
     def test_retry_cannot_reuse_a_changed_cached_push_command(self):
         state = {

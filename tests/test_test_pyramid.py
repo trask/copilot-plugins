@@ -41,10 +41,10 @@ FAIL_CLOSED_COVERAGE = {
         "ReplayTaskBaseTest",
         "test_creation_and_collection_share_the_policy_11_task_base",
     ),
-    "native replay completeness": (
-        "plugins/pr-conflict-resolver/tests/test_pr_conflict_resolver.py",
-        "PushRangeVerificationTest",
-        "test_a_rebase_that_dropped_a_commit_is_refused",
+    "hosted native replay sequence and verified history": (
+        "plugins/pr-conflict-resolver/tests/test_bounded_conflict_pipeline.py",
+        "BoundedNativeStackTest",
+        "test_two_member_stack_dispatches_once_per_member_and_verifies_final_history",
     ),
     "native replay attribution identity": (
         "plugins/pr-conflict-resolver/tests/test_decision_seams.py",
@@ -56,30 +56,30 @@ FAIL_CLOSED_COVERAGE = {
         "ReplayAttributionDecisionTest",
         "test_message_bytes_allow_only_the_verified_attribution_appendix",
     ),
-    "native publication command atomicity": (
-        "plugins/pr-conflict-resolver/tests/test_pr_conflict_resolver.py",
-        "ManagedConflictCoordinatorTest",
-        "test_native_stack_publication_is_atomic_with_one_lease_per_branch",
+    "hosted descendant atomic publication": (
+        "plugins/pr-conflict-resolver/tests/test_stack_publication.py",
+        "StackPublicationTest",
+        "test_hosted_request_and_atomic_push_include_only_authorized_descendants",
     ),
-    "formatter workspace rollback": (
-        "plugins/pr-conflict-resolver/tests/test_pr_conflict_resolver.py",
-        "StackFormatCommandTest",
-        "test_a_failed_formatter_restores_the_workspace_and_can_be_retried",
+    "hosted publication rejects source changes": (
+        "plugins/pr-conflict-resolver/tests/test_stack_publication.py",
+        "StackPublicationTest",
+        "test_publication_guard_rejects_changes_during_hosted_work",
     ),
-    "formatter ref rollback": (
-        "plugins/pr-conflict-resolver/tests/test_pr_conflict_resolver.py",
-        "StackFormatCommandTest",
-        "test_formatter_commit_hook_cannot_move_another_stack_ref",
+    "hosted child capture rejects topology and head drift": (
+        "plugins/pr-conflict-resolver/tests/test_stack_publication.py",
+        "StackPublicationTest",
+        "test_topology_and_heads_cannot_change_before_child_capture",
     ),
-    "validation fix workspace rollback": (
-        "plugins/pr-conflict-resolver/tests/test_pr_conflict_resolver.py",
-        "StackValidationFixCommandTest",
-        "test_undeclared_changes_restore_the_workspace_and_stack_ref",
+    "hosted candidate identity before publication": (
+        "plugins/pr-conflict-resolver/tests/test_bounded_conflict_pipeline.py",
+        "BoundedPipelineTest",
+        "test_terminal_result_identity_fails_before_publication",
     ),
-    "validation fix ref rollback": (
-        "plugins/pr-conflict-resolver/tests/test_pr_conflict_resolver.py",
-        "StackValidationFixCommandTest",
-        "test_moving_a_lower_stack_ref_rolls_back_every_member",
+    "ambiguous hosted dispatch cannot repost": (
+        "plugins/pr-conflict-resolver/tests/test_bounded_conflict_pipeline.py",
+        "BoundedPipelineTest",
+        "test_ambiguous_dispatch_never_reposts",
     ),
     "atomic stack publication lease": (
         "plugins/pr-conflict-resolver/tests/test_sequential_stack.py",
