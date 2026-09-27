@@ -2239,14 +2239,11 @@ def begin_bounded_ci_sweep(
             )
         ):
             raise WorkflowError("bounded CI pipeline still has active workflow ownership")
-        receipts = (coordinator or {}).get("processed_snapshots", [])
-        if not isinstance(receipts, list):
-            raise WorkflowError("bounded CI processed snapshot receipts are malformed")
         if isinstance(coordinator, dict):
             coordinator.pop("stability_sha256", None)
             coordinator.pop("stable_polls", None)
             coordinator.pop("check_snapshot", None)
-        state["bounded_processed_snapshot_baseline"] = len(receipts)
+        ProcessedCISnapshots(state).start_sweep()
         bounded = None
     elif bounded is not None and not isinstance(bounded, dict):
         raise WorkflowError("bounded CI pipeline owner is malformed")
@@ -12158,29 +12155,67 @@ def update_coordinator_state(
     return state
 
 
-def processed_ci_snapshot_ids(state: dict[str, Any]) -> set[str]:
-    coordinator = state.get("coordinator")
-    if not isinstance(coordinator, dict):
-        return set()
-    entries = coordinator.get("processed_snapshots")
-    if not isinstance(entries, list):
-        return set()
-    baseline = state.get("bounded_processed_snapshot_baseline", 0)
-    if (
-        state.get("budget_scope") == "pipeline"
-        and isinstance(state.get("bounded_step"), dict)
-        and type(baseline) is int
-        and 0 <= baseline <= len(entries)
-    ):
-        entries = entries[baseline:]
-    return {
-        digest
-        for entry in entries
-        if isinstance(entry, dict)
-        and isinstance(entry.get("snapshot_sha256"), str)
-        for digest in (entry["snapshot_sha256"], entry.get("stability_sha256"))
-        if isinstance(digest, str)
-    }
+class ProcessedCISnapshots:
+    def __init__(self, state: dict[str, Any]) -> None:
+        self.state = state
+
+    def _entries(self, *, create: bool = False) -> list[Any]:
+        coordinator = self.state.get("coordinator")
+        if coordinator is None and create:
+            coordinator = self.state["coordinator"] = {}
+        if coordinator is None:
+            return []
+        if not isinstance(coordinator, dict):
+            raise WorkflowError("CI processed snapshot coordinator is malformed")
+        if "processed_snapshots" not in coordinator:
+            if not create:
+                return []
+            coordinator["processed_snapshots"] = []
+        entries = coordinator["processed_snapshots"]
+        if not isinstance(entries, list):
+            raise WorkflowError("bounded CI processed snapshot receipts are malformed")
+        return entries
+
+    def _current(self, entries: list[Any]) -> list[Any]:
+        if self.state.get("budget_scope") != "pipeline" or not isinstance(
+            self.state.get("bounded_step"), dict
+        ):
+            return entries
+        baseline = self.state.get("bounded_processed_snapshot_baseline", 0)
+        if type(baseline) is not int or not 0 <= baseline <= len(entries):
+            raise WorkflowError("bounded CI processed snapshot baseline is malformed")
+        return entries[baseline:]
+
+    def start_sweep(self) -> None:
+        self.state["bounded_processed_snapshot_baseline"] = len(self._entries())
+
+    def identities(self) -> set[str]:
+        return {
+            digest
+            for entry in self._current(self._entries())
+            if isinstance(entry, dict)
+            and isinstance(entry.get("snapshot_sha256"), str)
+            for digest in (entry["snapshot_sha256"], entry.get("stability_sha256"))
+            if isinstance(digest, str)
+        }
+
+    def record(self, preflight: dict[str, Any], result: dict[str, Any]) -> None:
+        entries = self._entries(create=True)
+        identity = preflight["check_snapshot"]["sha256"]
+        if any(
+            isinstance(entry, dict) and entry.get("snapshot_sha256") == identity
+            for entry in self._current(entries)
+        ):
+            return
+        task = result.get("task") if isinstance(result.get("task"), dict) else {}
+        entries.append({
+            "head_sha": preflight["pr"]["head_sha"],
+            "snapshot_sha256": identity,
+            "stability_sha256": ci_stability_sha256(preflight["check_snapshot"]),
+            "task_id": task.get("id"),
+            "result": result["result"],
+            "recorded_at": utc_now(),
+        })
 
 
 def ci_preflight_is_stable_candidate(preflight: dict[str, Any]) -> bool:
@@ -12318,7 +12353,7 @@ class CIStabilityGate:
     ) -> dict[str, Any] | None:
         gate = cls._resume_bounded(state_path, state)
         _, ready = gate.observe_once(
-            preflight, processed=processed_ci_snapshot_ids(state), now=now,
+            preflight, processed=ProcessedCISnapshots(state).identities(), now=now,
             polls=polls, debounce_seconds=debounce_seconds,
         )
         if not ready:
@@ -12495,7 +12530,7 @@ def wait_for_stable_ci_preflight(
 
         state = coordinator_file_state(state_path)
         status, ready = gate.observe_once(
-            preflight, processed=processed_ci_snapshot_ids(state),
+            preflight, processed=ProcessedCISnapshots(state).identities(),
             now=dt.datetime.now(dt.timezone.utc),
             polls=required_stability, debounce_seconds=0,
             allow_processed_terminal=True,
@@ -12536,32 +12571,8 @@ def record_processed_ci_snapshot(
     terminal_result: dict[str, Any] | None = None,
 ) -> None:
     state = load_state(state_path)
-    coordinator = state.setdefault("coordinator", {})
-    entries = coordinator.setdefault("processed_snapshots", [])
-    identity = preflight["check_snapshot"]["sha256"]
-    baseline = state.get("bounded_processed_snapshot_baseline", 0)
-    if not (
-        state.get("budget_scope") == "pipeline"
-        and isinstance(state.get("bounded_step"), dict)
-        and type(baseline) is int
-        and 0 <= baseline <= len(entries)
-    ):
-        baseline = 0
-    if not any(
-        isinstance(entry, dict) and entry.get("snapshot_sha256") == identity
-        for entry in entries[baseline:]
-    ):
-        task = result.get("task") if isinstance(result.get("task"), dict) else {}
-        entries.append(
-            {
-                "head_sha": preflight["pr"]["head_sha"],
-                "snapshot_sha256": identity,
-                "stability_sha256": ci_stability_sha256(preflight["check_snapshot"]),
-                "task_id": task.get("id"),
-                "result": result["result"],
-                "recorded_at": utc_now(),
-            }
-        )
+    ProcessedCISnapshots(state).record(preflight, result)
+    coordinator = state["coordinator"]
     coordinator.pop("pending_rerun", None)
     bounded = state.get("bounded_step")
     if isinstance(bounded, dict):

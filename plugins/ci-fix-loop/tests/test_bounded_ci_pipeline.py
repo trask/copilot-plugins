@@ -89,6 +89,75 @@ class CIIterationOutcomeTest(unittest.TestCase):
         )
 
 
+class ProcessedCISnapshotsTest(unittest.TestCase):
+    def setUp(self):
+        self.snapshot = {
+            "sha256": "same", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
+            "decision": {"decision": "green"},
+        }
+        self.preflight = {"pr": {"head_sha": "head"}, "check_snapshot": self.snapshot}
+        self.state = {
+            "budget_scope": "pipeline", "bounded_step": {"owner": {"pipeline_iteration": 1}},
+            "coordinator": {
+                "processed_snapshots": [{
+                    "snapshot_sha256": "same", "stability_sha256": "old-stability",
+                    "task_id": "first",
+                }],
+            },
+        }
+
+    def test_later_sweep_reuses_snapshot_once_without_losing_earlier_receipts(self):
+        ledger = MODULE.ProcessedCISnapshots(self.state)
+        self.assertEqual({"same", "old-stability"}, ledger.identities())
+        ledger.start_sweep()
+        self.state["bounded_step"]["owner"]["pipeline_iteration"] = 2
+        self.assertEqual(1, self.state["bounded_processed_snapshot_baseline"])
+        self.assertEqual(set(), ledger.identities())
+        result = {"result": "published", "task": {"id": "second"}}
+        ledger.record(self.preflight, result)
+        ledger.record(self.preflight, result)
+        self.assertEqual(
+            ["first", "second"],
+            [entry["task_id"] for entry in self.state["coordinator"]["processed_snapshots"]],
+        )
+        self.assertEqual(
+            {"same", MODULE.ci_stability_sha256(self.snapshot)},
+            ledger.identities(),
+        )
+
+    def test_standalone_receipts_ignore_bounded_sweep_baseline(self):
+        ledger = MODULE.ProcessedCISnapshots(self.state)
+        ledger.start_sweep()
+        self.state.pop("bounded_step")
+        ledger.record(self.preflight, {"result": "published", "task": {"id": "later"}})
+        self.assertEqual(1, len(self.state["coordinator"]["processed_snapshots"]))
+        self.assertIn("same", ledger.identities())
+
+    def test_malformed_receipts_fail_at_each_caller_boundary(self):
+        for malformed in (None, {}, "bad"):
+            with self.subTest(malformed=malformed):
+                self.state["coordinator"]["processed_snapshots"] = malformed
+                ledger = MODULE.ProcessedCISnapshots(self.state)
+                with self.assertRaisesRegex(MODULE.WorkflowError, "receipts are malformed"):
+                    ledger.start_sweep()
+                with self.assertRaisesRegex(MODULE.WorkflowError, "receipts are malformed"):
+                    ledger.identities()
+                with self.assertRaisesRegex(MODULE.WorkflowError, "receipts are malformed"):
+                    ledger.record(self.preflight, {"result": "published"})
+
+    def test_invalid_bounded_baseline_cannot_replay_earlier_receipts(self):
+        ledger = MODULE.ProcessedCISnapshots(self.state)
+        for baseline in (-1, 2, True, "0"):
+            with self.subTest(baseline=baseline):
+                self.state["bounded_processed_snapshot_baseline"] = baseline
+                with self.assertRaisesRegex(MODULE.WorkflowError, "baseline is malformed"):
+                    ledger.identities()
+                with self.assertRaisesRegex(MODULE.WorkflowError, "baseline is malformed"):
+                    ledger.record(self.preflight, {"result": "published"})
+                self.assertEqual(1, len(self.state["coordinator"]["processed_snapshots"]))
+
+
 class CIStabilityGateTest(unittest.TestCase):
     def setUp(self):
         self.now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
@@ -525,7 +594,7 @@ class BoundedSweepAdmissionTest(unittest.TestCase):
         self.assertNotIn("stability_sha256", reopened["coordinator"])
         self.assertNotIn("stable_polls", reopened["coordinator"])
         self.assertNotIn("check_snapshot", reopened["coordinator"])
-        self.assertEqual(set(), MODULE.processed_ci_snapshot_ids(reopened))
+        self.assertEqual(set(), MODULE.ProcessedCISnapshots(reopened).identities())
 
     def test_admission_rejects_owner_drift_and_active_work_without_writing(self):
         state = MODULE.begin_bounded_ci_sweep(self.path, self.owner)
@@ -625,7 +694,7 @@ class BoundedCiPipelineTest(unittest.TestCase):
             self.assertEqual("checks_running", self.output[-1]["reason"])
             task.assert_not_called()
             snapshot["decision"]["decision"] = "green"
-            with mock.patch.object(MODULE, "processed_ci_snapshot_ids", return_value=set()):
+            with mock.patch.object(MODULE.ProcessedCISnapshots, "identities", return_value=set()):
                 task.side_effect = lambda _: MODULE.emit({
                     "result": "green", "state": str(self.path),
                 })
@@ -917,7 +986,7 @@ class BoundedCiPipelineTest(unittest.TestCase):
         task.assert_called_once()
         self.assertEqual(1, self.state["bounded_processed_snapshot_baseline"])
         self.assertEqual(1, self.state["coordinator"]["stable_polls"])
-        self.assertEqual(set(), MODULE.processed_ci_snapshot_ids(self.state))
+        self.assertEqual(set(), MODULE.ProcessedCISnapshots(self.state).identities())
         MODULE.record_processed_ci_snapshot(
             self.path, preflight, {"result": "published", "task": {"id": "second-task"}},
         )
@@ -925,7 +994,7 @@ class BoundedCiPipelineTest(unittest.TestCase):
             ["first-task", "second-task"],
             [entry["task_id"] for entry in self.state["coordinator"]["processed_snapshots"]],
         )
-        self.assertIn("ready", MODULE.processed_ci_snapshot_ids(self.state))
+        self.assertIn("ready", MODULE.ProcessedCISnapshots(self.state).identities())
 
     def test_later_sweep_keeps_owner_fields_and_requires_completed_work(self):
         snapshot = {
