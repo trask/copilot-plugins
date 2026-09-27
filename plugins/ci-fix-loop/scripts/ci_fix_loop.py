@@ -2113,6 +2113,37 @@ def advance_ci_rerun(
     return None
 
 
+def advance_ci_iteration(
+    state_path: Path, preflight: dict[str, Any], result: dict[str, Any],
+    *, bounded: bool, stack_state: bool = False,
+) -> dict[str, Any] | None:
+    outcome = result["result"]
+    if outcome == "waiting":
+        return result if bounded else None
+    task = result.get("task")
+    has_task = isinstance(task, dict) and isinstance(task.get("id"), str)
+    if outcome in {"source_changed", "ci_changed", "published"}:
+        if has_task:
+            record_processed_ci_snapshot(state_path, preflight, result)
+        if bounded:
+            return {"result": "waiting", "state": str(state_path), "reason": "checks_running"}
+        return result if outcome == "published" and stack_state else None
+    if outcome == "rerun":
+        return advance_ci_rerun(state_path, preflight, result, bounded=bounded)
+    if has_task:
+        record_processed_ci_snapshot(state_path, preflight, result)
+    if outcome == "snapshot_already_processed":
+        return (
+            {"result": "waiting", "state": str(state_path), "reason": "checks_running"}
+            if bounded else None
+        )
+    if bounded:
+        state = load_state(state_path)
+        state["bounded_step"]["terminal"] = result
+        save_state(state_path, state)
+    return result
+
+
 def run_bounded_cloud_helper(
     command: list[str], repo_root: Path, result_path: Path
 ) -> dict[str, Any]:
@@ -2308,33 +2339,10 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         step_args = argparse.Namespace(**vars(args))
         step_args._preflight = preflight
         result = capture_command(command_agent_task, step_args)[-1]
-    if result["result"] == "waiting":
-        emit(result)
-        return
-    task = result.get("task")
-    has_task = isinstance(task, dict) and isinstance(task.get("id"), str)
-    if result["result"] in {"source_changed", "ci_changed", "published"}:
-        if has_task:
-            record_processed_ci_snapshot(state_path, preflight, result)
-        emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
-        return
-    if result["result"] == "rerun":
-        rerun_result = advance_ci_rerun(
-            state_path, preflight, result, bounded=True,
-        )
-        if rerun_result is None:
-            raise WorkflowError("bounded CI re-run did not return a step result")
-        emit(rerun_result)
-        return
-    if has_task:
-        record_processed_ci_snapshot(state_path, preflight, result)
-    if result["result"] == "snapshot_already_processed":
-        emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
-        return
-    state = load_state(state_path)
-    state["bounded_step"]["terminal"] = result
-    save_state(state_path, state)
-    emit(result)
+    step_result = advance_ci_iteration(state_path, preflight, result, bounded=True)
+    if step_result is None:
+        raise WorkflowError("bounded CI iteration did not return a step result")
+    emit(step_result)
 
 
 def command_pipeline(args: argparse.Namespace) -> None:
@@ -12752,32 +12760,13 @@ def command_loop(args: argparse.Namespace) -> None:
             iteration_args._preflight = preflight
             results = capture_command(command_agent_task, iteration_args)
             result = results[-1]
-            task = result.get("task")
-            has_task = isinstance(task, dict) and isinstance(task.get("id"), str)
-            if result["result"] in {"ci_changed", "source_changed"}:
-                if has_task:
-                    record_processed_ci_snapshot(state_path, preflight, result)
+            iteration_result = advance_ci_iteration(
+                state_path, preflight, result, bounded=False,
+                stack_state=bool(args.stack_state),
+            )
+            if iteration_result is None:
                 continue
-            if result["result"] == "published":
-                if has_task:
-                    record_processed_ci_snapshot(state_path, preflight, result)
-                if args.stack_state:
-                    emit(result)
-                    return
-                continue
-            if result["result"] == "rerun":
-                rerun_result = advance_ci_rerun(
-                    state_path, preflight, result, bounded=False,
-                )
-                if rerun_result is not None:
-                    emit(rerun_result)
-                    return
-                continue
-            if has_task:
-                record_processed_ci_snapshot(state_path, preflight, result)
-            if result["result"] in {"waiting", "snapshot_already_processed"}:
-                continue
-            emit(result)
+            emit(iteration_result)
             return
     except KeyboardInterrupt as error:
         update_coordinator_state(

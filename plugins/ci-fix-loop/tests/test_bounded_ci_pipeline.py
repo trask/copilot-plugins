@@ -18,6 +18,77 @@ SPEC.loader.exec_module(MODULE)
 SESSION = "01234567-89ab-cdef-0123-456789abcdef"
 
 
+class CIIterationOutcomeTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "state.json"
+        self.preflight = {
+            "pr": {"head_sha": "head"},
+            "check_snapshot": {
+                "sha256": "snapshot", "head_sha": "head", "base_sha": "base",
+                "rollup": [], "workflow_runs": {},
+                "decision": {"decision": "green"},
+            },
+        }
+
+    def reset_state(self):
+        MODULE.save_state(self.path, {
+            "version": MODULE.STATE_VERSION, "history": [], "iterations": 0,
+            "bounded_step": {"owner": {}},
+        })
+
+    def test_both_coordinators_share_receipt_and_terminal_decisions(self):
+        for bounded in (False, True):
+            for outcome in (
+                "waiting", "source_changed", "ci_changed", "published",
+                "snapshot_already_processed", "green", "warning",
+            ):
+                with self.subTest(bounded=bounded, outcome=outcome):
+                    self.reset_state()
+                    result = {"result": outcome, "task": {"id": "task"}}
+                    actual = MODULE.advance_ci_iteration(
+                        self.path, self.preflight, result,
+                        bounded=bounded, stack_state=True,
+                    )
+                    if bounded:
+                        expected = (
+                            result if outcome in {"waiting", "green", "warning"}
+                            else {"result": "waiting", "state": str(self.path),
+                                  "reason": "checks_running"}
+                        )
+                    else:
+                        expected = (
+                            result if outcome in {"published", "green", "warning"}
+                            else None
+                        )
+                    self.assertEqual(expected, actual)
+                    state = MODULE.load_state(self.path)
+                    receipts = state.get("coordinator", {}).get("processed_snapshots", [])
+                    self.assertEqual(
+                        [] if outcome == "waiting" else ["task"],
+                        [entry["task_id"] for entry in receipts],
+                    )
+                    self.assertEqual(
+                        result if bounded and outcome in {"green", "warning"} else None,
+                        state["bounded_step"].get("terminal"),
+                    )
+
+    def test_standalone_publication_without_a_stack_reobserves_ci(self):
+        self.reset_state()
+        result = {"result": "published", "task": {"id": "task"}}
+        self.assertIsNone(MODULE.advance_ci_iteration(
+            self.path, self.preflight, result, bounded=False,
+        ))
+        self.assertEqual(
+            ["task"],
+            [
+                entry["task_id"]
+                for entry in MODULE.load_state(self.path)["coordinator"]["processed_snapshots"]
+            ],
+        )
+
+
 class CIStabilityGateTest(unittest.TestCase):
     def setUp(self):
         self.now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
@@ -164,6 +235,49 @@ class CIRerunProgressTest(unittest.TestCase):
             "version": MODULE.STATE_VERSION, "history": [], "iterations": 0,
             "bounded_step": {"owner": {}},
         })
+
+    def test_iteration_routes_rerun_through_the_shared_progress(self):
+        requested = []
+
+        def rerun(args):
+            requested.append(args.check)
+            MODULE.emit({"result": "rerun_requested"})
+
+        self.result["action_checks"] = ["check:a"]
+        with mock.patch.object(MODULE, "command_rerun", side_effect=rerun):
+            bounded = MODULE.advance_ci_iteration(
+                self.path, self.preflight, self.result, bounded=True,
+            )
+        self.assertEqual(
+            {"result": "waiting", "state": str(self.path), "reason": "rerun"},
+            bounded,
+        )
+        self.assertEqual(["check:a"], requested)
+        self.assertEqual(
+            [], MODULE.load_state(self.path)["coordinator"].get("processed_snapshots", []),
+        )
+        with mock.patch.object(MODULE, "command_rerun") as duplicate:
+            finished = MODULE.advance_ci_iteration(
+                self.path, self.preflight, self.result, bounded=True,
+            )
+        duplicate.assert_not_called()
+        self.assertEqual("checks_running", finished["reason"])
+        self.assertEqual(
+            1, len(MODULE.load_state(self.path)["coordinator"]["processed_snapshots"]),
+        )
+
+        MODULE.save_state(self.path, {
+            "version": MODULE.STATE_VERSION, "history": [], "iterations": 0,
+            "bounded_step": {"owner": {}},
+        })
+        with mock.patch.object(MODULE, "command_rerun", side_effect=rerun):
+            self.assertIsNone(MODULE.advance_ci_iteration(
+                self.path, self.preflight, self.result, bounded=False,
+            ))
+        self.assertEqual(["check:a", "check:a"], requested)
+        self.assertEqual(
+            1, len(MODULE.load_state(self.path)["coordinator"]["processed_snapshots"]),
+        )
 
     def test_bounded_rerun_resumes_each_check_without_repeating_requests(self):
         requested = []

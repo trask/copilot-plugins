@@ -6,6 +6,8 @@ The hosted helper prints pending v5 JSON to stdout for direct CLI calls. Under m
 
 The standalone loop and bounded step use the same CI rerun transition. It validates the task's selected checks, records rerun progress before requesting the next check, and resumes without repeating completed requests. The bounded step yields after one check; the standalone loop completes the available checks before observing CI again. An unsupported rerun ends the step and preserves its processed-snapshot receipt.
 
+Both coordinators use the same iteration outcome transition to record processed snapshots and route reruns. Bounded calls persist terminal results or return `waiting` for another call; the standalone loop observes CI again unless the result is terminal or a stack member was published.
+
 Both bounded and standalone coordinators poll the pull request's checks and its applicable Actions workflows without downloading failed-job logs. They also track PR-relevant workflows whose jobs have not yet appeared in the check rollup, but ignore unrelated workflow events such as Copilot cloud agent runs at the same head commit. When no checks are reported, the coordinator separately looks for approval-blocked workflows. Once the checks stabilize, it collects the failing logs once and rechecks the live CI identities before dispatch. A changed check set restarts observation rather than sending stale logs to the worker.
 
 The CI stability gate owns the collected logs until the confirmed preflight is handed to the next stage. If the check set changes during collection or the live identity check fails, the gate removes those logs. The bounded coordinator persists log paths between calls; the standalone coordinator keeps them for the current wait only.
