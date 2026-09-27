@@ -172,15 +172,6 @@ def stale_ci_warning_payload() -> dict:
 
 
 class GithubMutationPolicyTest(unittest.TestCase):
-    def setUp(self):
-        self.previous = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
-        self.addCleanup(
-            setattr,
-            MODULE.common,
-            "ACTIVE_GITHUB_MUTATION_POLICY",
-            self.previous,
-        )
-
     def test_run_defaults_to_normal_policy(self):
         args = MODULE.build_parser().parse_args(["run", "owner/repo#7"])
         self.assertEqual("allow", args.github_mutation_policy)
@@ -197,7 +188,6 @@ class GithubMutationPolicyTest(unittest.TestCase):
         self.assertEqual("source-only", args.github_mutation_policy)
 
     def test_metadata_sensitive_stages_receive_source_only_helper_argument(self):
-        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
         target = {"repo_name": "owner/repo", "number": 7}
         for stage in (
             MODULE.common.STAGE_COPILOT_REVIEW,
@@ -226,6 +216,7 @@ class GithubMutationPolicyTest(unittest.TestCase):
                             "1",
                         ],
                         resolve_program=lambda _name: "copilot",
+                        github_mutation_policy="source-only",
                     )
 
                 self.assertEqual(
@@ -236,7 +227,6 @@ class GithubMutationPolicyTest(unittest.TestCase):
     def test_ci_stage_receives_frozen_policy_for_both_modes(self):
         for policy in ("allow", "source-only"):
             with self.subTest(policy=policy):
-                MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = policy
                 command = MODULE.stage_command(
                     MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
                     target(),
@@ -244,6 +234,7 @@ class GithubMutationPolicyTest(unittest.TestCase):
                     effort="high",
                     run_id=PIPELINE_RUN,
                     sweep=2,
+                    github_mutation_policy=policy,
                 )
                 self.assertEqual(1, command.count("--github-mutation-policy"))
                 self.assertEqual(policy, command[command.index("--github-mutation-policy") + 1])
@@ -943,6 +934,7 @@ class MarkerTest(unittest.TestCase):
         payload: dict,
         base_sha: str = BASE,
         run_id: str | None = None,
+        github_mutation_policy: str = "allow",
     ) -> dict:
         entry = MODULE.STAGE_BY_NAME[stage]
         with mock.patch.object(
@@ -959,7 +951,9 @@ class MarkerTest(unittest.TestCase):
                 },
             },
         ):
-            return MODULE.inspect_stage(entry, target(), HEAD, base_sha, run_id)
+            return MODULE.inspect_stage(
+                entry, target(), HEAD, base_sha, run_id, github_mutation_policy,
+            )
 
     def policy_skip_payload(self) -> dict:
         observed_at = "2026-09-18T09:01:54Z"
@@ -1332,10 +1326,7 @@ class MarkerTest(unittest.TestCase):
         )
 
     def test_source_only_description_proposal_never_counts_as_applied(self):
-        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
-        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
-        try:
-            result = self.status(
+        result = self.status(
                 MODULE.STAGE_DESCRIPTION,
                 {
                     "stage_outcome": None,
@@ -1350,9 +1341,8 @@ class MarkerTest(unittest.TestCase):
                         "github_mutation_policy": "source-only",
                     },
                 },
+                github_mutation_policy="source-only",
             )
-        finally:
-            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
 
         self.assertFalse(result["clear"])
         self.assertIsNone(result["clear_at_head_sha"])
@@ -1362,16 +1352,12 @@ class MarkerTest(unittest.TestCase):
         )
 
     def test_verified_source_only_review_skip_is_clear_without_review_marker(self):
-        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
-        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
-        try:
-            result = self.status(
+        result = self.status(
                 MODULE.STAGE_COPILOT_REVIEW,
                 self.policy_skip_payload(),
                 run_id=PIPELINE_RUN,
+                github_mutation_policy="source-only",
             )
-        finally:
-            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
 
         self.assertTrue(result["clear"])
         self.assertEqual("skipped", result["outcome"])
@@ -1390,25 +1376,19 @@ class MarkerTest(unittest.TestCase):
         self.assertEqual("policy_skip_not_verified", result["reason"])
 
     def test_review_skip_with_owned_work_is_not_clear(self):
-        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
-        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
-        try:
-            payload = self.policy_skip_payload()
-            payload["queue"] = {"status": "active", "comments": []}
-            result = self.status(
+        payload = self.policy_skip_payload()
+        payload["queue"] = {"status": "active", "comments": []}
+        result = self.status(
                 MODULE.STAGE_COPILOT_REVIEW,
                 payload,
                 run_id=PIPELINE_RUN,
+                github_mutation_policy="source-only",
             )
-        finally:
-            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
 
         self.assertFalse(result["clear"])
         self.assertEqual("policy_skip_not_verified", result["reason"])
 
     def test_review_skip_rejects_cross_identity_and_forged_variants(self):
-        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
-        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
         cases = {}
 
         run = self.policy_skip_payload()
@@ -1439,47 +1419,30 @@ class MarkerTest(unittest.TestCase):
         clean["clean_at_head_sha"] = HEAD
         cases["clean marker"] = clean
 
-        try:
-            for name, payload in cases.items():
-                with self.subTest(name=name):
-                    result = self.status(
-                        MODULE.STAGE_COPILOT_REVIEW,
-                        payload,
-                        run_id=PIPELINE_RUN,
-                    )
-                    self.assertFalse(result["clear"])
-                    self.assertEqual(
-                        "policy_skip_not_verified",
-                        result["reason"],
-                    )
-        finally:
-            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+        for name, payload in cases.items():
+            with self.subTest(name=name):
+                result = self.status(
+                    MODULE.STAGE_COPILOT_REVIEW, payload,
+                    run_id=PIPELINE_RUN, github_mutation_policy="source-only",
+                )
+                self.assertFalse(result["clear"])
+                self.assertEqual("policy_skip_not_verified", result["reason"])
 
     def test_review_skip_requires_a_ready_status_envelope(self):
-        previous_policy = MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY
-        MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_COPILOT_REVIEW]
-        try:
-            with mock.patch.object(
-                MODULE,
-                "read_stage_status",
-                return_value={
-                    "ok": False,
-                    "installed": True,
-                    "state": "state.json",
-                    "reason": "status_not_ready",
-                    "payload": self.policy_skip_payload(),
-                },
-            ):
-                result = MODULE.inspect_stage(
-                    entry,
-                    target(),
-                    HEAD,
-                    BASE,
-                    PIPELINE_RUN,
-                )
-        finally:
-            MODULE.common.ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
+        with mock.patch.object(
+            MODULE, "read_stage_status",
+            return_value={
+                "ok": False,
+                "installed": True,
+                "state": "state.json",
+                "reason": "status_not_ready",
+                "payload": self.policy_skip_payload(),
+            },
+        ):
+            result = MODULE.inspect_stage(
+                entry, target(), HEAD, BASE, PIPELINE_RUN, "source-only",
+            )
 
         self.assertFalse(result["clear"])
         self.assertEqual("status_not_ready", result["reason"])
@@ -1688,14 +1651,11 @@ class InvocationStateIsolationTest(unittest.TestCase):
         with mock.patch.object(
             MODULE.common, "read_stage_status", side_effect=read_status
         ):
+            access = MODULE.common.StageAccess(
+                self.RUN_ID, MODULE.stage_models(None), "high", MODULE.MAX_SWEEPS,
+            )
             results = {
-                entry["stage"]: MODULE.inspect_stage_for_run(
-                    entry,
-                    target(),
-                    self.HEAD,
-                    self.BASE,
-                    self.RUN_ID,
-                )
+                entry["stage"]: access.inspect(entry, target(), self.HEAD, self.BASE)
                 for entry in MODULE.STAGES[:3]
             }
 
@@ -2121,6 +2081,16 @@ class SweepTest(unittest.TestCase):
             mock.patch.object(MODULE, "inspect_stage", side_effect=self.inspect),
             mock.patch.object(MODULE, "inspect_stages", side_effect=self.inspect_all),
             mock.patch.object(
+                MODULE.common.StageAccess, "inspect", autospec=True,
+                side_effect=lambda access, entry, selected, head, base=None:
+                    MODULE.inspect_stage(entry, selected, head, base, access.run_id),
+            ),
+            mock.patch.object(
+                MODULE.common.StageAccess, "inspect_all", autospec=True,
+                side_effect=lambda access, selected, head, base:
+                    MODULE.inspect_stages(selected, head, base, access.run_id),
+            ),
+            mock.patch.object(
                 MODULE, "snapshot_pr_commits", side_effect=self.snapshot_commits
             ),
         ]
@@ -2150,7 +2120,9 @@ class SweepTest(unittest.TestCase):
         sweep,
         conflict_strategy,
         report=None,
+        access=None,
     ):
+        self.assertEqual(run_id, access.run_id)
         self.launched.append((entry["stage"], sweep))
         self.launch_calls.append({
             "stage": entry["stage"],
@@ -2807,14 +2779,14 @@ class SweepTest(unittest.TestCase):
 
     def test_every_scheduler_stage_read_uses_the_current_pipeline_run(self):
         calls = []
-        original = MODULE.inspect_stage_for_run
+        original = MODULE.common.StageAccess.inspect.side_effect
 
-        def inspect(entry, selected, head, base, run_id):
-            calls.append((entry["stage"], run_id))
-            return original(entry, selected, head, base, run_id)
+        def inspect(access, entry, selected, head, base=None):
+            calls.append((entry["stage"], access.run_id))
+            return original(access, entry, selected, head, base)
 
         with mock.patch.object(
-            MODULE, "inspect_stage_for_run", side_effect=inspect
+            MODULE.common.StageAccess.inspect, "side_effect", inspect
         ):
             result = self.execute()
 
@@ -4105,11 +4077,13 @@ class CommandOutputTest(unittest.TestCase):
 
     def test_run_emits_json_lines_ending_with_pipeline_result(self):
         def fake_pipeline(
-            _target, _repo, *, models, effort, conflict_strategy, report, run_id
+            _target, _repo, *, models, effort, conflict_strategy, report, run_id,
+            github_mutation_policy,
         ):
             self.assertIsNotNone(models)
             self.assertEqual("high", effort)
             self.assertEqual("auto", conflict_strategy)
+            self.assertEqual("allow", github_mutation_policy)
             report({"event": "pipeline_started", "run_id": run_id})
             report(
                 {

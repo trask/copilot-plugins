@@ -46,6 +46,7 @@ class NativeStackClearanceTest(StackFixture):
         self.calls = {}
         patches = {
             (MODULE, "stage_state_path"): {"side_effect": self.state_path},
+            (COMMON, "stage_state_path"): {"side_effect": self.state_path},
             (COMMON, "stage_accepts_pipeline_position"): {"return_value": True},
             (COMMON, "run"): {"side_effect": self.status_command},
             (CONFLICT, "run"): {"side_effect": AssertionError("unexpected external command")},
@@ -187,6 +188,29 @@ class NativeStackClearanceTest(StackFixture):
         self.assertEqual("ready", status["result"])
         self.assertEqual("cleared", status["stage_outcome"])
         self.assertEqual(self.stack["members"][0]["head_sha"], status["mergeable_at_head_sha"])
+
+    def test_run_bound_access_reads_producer_status_and_rejects_foreign_run(self):
+        self.phase()
+        member = self.stack["members"][0]
+        entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_CONFLICT]
+        target = COMMON.target_for("owner/repo", member["number"])
+        script = (
+            self.root / "installed-plugins" / "trask-plugins"
+            / entry["plugin"] / "scripts" / f"{entry['module']}.py"
+        )
+        script.parent.mkdir(parents=True)
+        script.touch()
+        with mock.patch.object(COMMON, "copilot_home", return_value=self.root):
+            access = COMMON.StageAccess(self.controller.run_id, {}, "high", MODULE.MAX_PASSES)
+            self.assertEqual(self.receipt_path(MODULE.STAGE_CONFLICT), access.state_path(entry, target))
+            self.assertTrue(
+                access.inspect(entry, target, member["head_sha"], member["base_sha"])["clear"]
+            )
+            foreign = COMMON.StageAccess("another-run", {}, "high", MODULE.MAX_PASSES)
+            self.assertEqual("no_state", foreign.status(entry, target)["reason"])
+            self.assertFalse(
+                foreign.inspect(entry, target, member["head_sha"], member["base_sha"])["clear"]
+            )
 
     def fill_other_stages(self):
         for member in self.stack["members"]:

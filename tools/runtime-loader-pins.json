@@ -3,12 +3,30 @@
     "cloud-task": {
       "constant": "REQUIRED_CLOUD_TASK_SHA256",
       "consumers": [
-        {"path": "plugins/ci-fix-loop/scripts/ci_fix_loop.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
-        {"path": "plugins/copilot-review-loop/scripts/copilot_review_loop.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
-        {"path": "plugins/historical-pr-audit/scripts/historical_pr_audit.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
-        {"path": "plugins/pr-description/scripts/pr_description.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
-        {"path": "plugins/pr-reviewer/scripts/pr_reviewer.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
-        {"path": "plugins/self-review-loop/scripts/self_review_loop.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"}
+        {
+          "constant": "REQUIRED_CLOUD_TASK_SHA256",
+          "path": "plugins/ci-fix-loop/scripts/ci_fix_loop.py"
+        },
+        {
+          "constant": "REQUIRED_CLOUD_TASK_SHA256",
+          "path": "plugins/copilot-review-loop/scripts/copilot_review_loop.py"
+        },
+        {
+          "constant": "REQUIRED_CLOUD_TASK_SHA256",
+          "path": "plugins/historical-pr-audit/scripts/historical_pr_audit.py"
+        },
+        {
+          "constant": "REQUIRED_CLOUD_TASK_SHA256",
+          "path": "plugins/pr-description/scripts/pr_description.py"
+        },
+        {
+          "constant": "REQUIRED_CLOUD_TASK_SHA256",
+          "path": "plugins/pr-reviewer/scripts/pr_reviewer.py"
+        },
+        {
+          "constant": "REQUIRED_CLOUD_TASK_SHA256",
+          "path": "plugins/self-review-loop/scripts/self_review_loop.py"
+        }
       ],
       "installed_path": "scripts/cloud_task.py",
       "loader": "load_cloud_task_runtime",
@@ -19,17 +37,50 @@
     "execution": {
       "constant": "EXECUTION_SHA256",
       "consumers": [
-        {"path": "plugins/agent-tasks-runtime/skills/agent-tasks-runtime/scripts/cloud_task.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/ci-fix-loop/scripts/ci_fix_loop.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/copilot-review-loop/scripts/copilot_review_loop.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/historical-pr-audit/scripts/historical_pr_audit.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/pr-conflict-resolver/scripts/cloud_conflict_task.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/pr-conflict-resolver/scripts/pr_conflict_resolver.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/pr-description/scripts/pr_description.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/pr-pipeline/scripts/pr_pipeline.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/pr-pipeline/scripts/pr_stack_pipeline.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/pr-reviewer/scripts/pr_reviewer.py", "constant": "EXECUTION_SHA256"},
-        {"path": "plugins/self-review-loop/scripts/self_review_loop.py", "constant": "EXECUTION_SHA256"}
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/agent-tasks-runtime/skills/agent-tasks-runtime/scripts/cloud_task.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/ci-fix-loop/scripts/ci_fix_loop.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/copilot-review-loop/scripts/copilot_review_loop.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/historical-pr-audit/scripts/historical_pr_audit.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/pr-conflict-resolver/scripts/cloud_conflict_task.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/pr-conflict-resolver/scripts/pr_conflict_resolver.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/pr-description/scripts/pr_description.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/pr-pipeline/scripts/pr_pipeline.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/pr-pipeline/scripts/pr_stack_pipeline.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/pr-reviewer/scripts/pr_reviewer.py"
+        },
+        {
+          "constant": "EXECUTION_SHA256",
+          "path": "plugins/self-review-loop/scripts/self_review_loop.py"
+        }
       ],
       "installed_path": "scripts/execution.py",
       "loader": "load_execution_runtime",
@@ -40,13 +91,19 @@
     "pipeline-common": {
       "constant": "COMMON_SHA256",
       "consumers": [
-        {"path": "plugins/pr-pipeline/scripts/pr_pipeline.py", "constant": "COMMON_SHA256"},
-        {"path": "plugins/pr-pipeline/scripts/pr_stack_pipeline.py", "constant": "COMMON_SHA256"}
+        {
+          "constant": "COMMON_SHA256",
+          "path": "plugins/pr-pipeline/scripts/pr_pipeline.py"
+        },
+        {
+          "constant": "COMMON_SHA256",
+          "path": "plugins/pr-pipeline/scripts/pr_stack_pipeline.py"
+        }
       ],
       "installed_path": "scripts/pipeline_common.py",
       "loader": "load_common",
       "module": "pr_pipeline_common",
-      "sha256": "f51856368d892f8aadac1ac4ae68cd7aeced1fe1948b87c176683c09ca4ce9cd",
+      "sha256": "3858938044c58baa9fa720c3c3c304118787825220b8b6dfcab104473ea1f945",
       "source": "plugins/pr-pipeline/scripts/pipeline_common.py"
     }
   },

@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "f51856368d892f8aadac1ac4ae68cd7aeced1fe1948b87c176683c09ca4ce9cd"
+COMMON_SHA256 = "3858938044c58baa9fa720c3c3c304118787825220b8b6dfcab104473ea1f945"
 
 
 def load_common() -> Any:
@@ -698,6 +698,7 @@ def inspect_stage(
     head_sha: str,
     base_sha: str | None = None,
     run_id: str | None = None,
+    github_mutation_policy: str = "allow",
 ) -> dict[str, Any]:
     return common.inspect_stage(
         entry,
@@ -705,6 +706,7 @@ def inspect_stage(
         head_sha,
         base_sha,
         pipeline_run=run_id,
+        github_mutation_policy=github_mutation_policy,
         read_status=lambda current, selected: read_stage_status(
             current, selected, run_id
         ),
@@ -724,24 +726,8 @@ def inspect_stages(
     )
 
 
-def inspect_stage_for_run(
-    entry: dict[str, Any],
-    target: dict[str, Any],
-    head_sha: str,
-    base_sha: str,
-    run_id: str,
-) -> dict[str, Any]:
-    return inspect_stage(entry, target, head_sha, base_sha, run_id)
-
-
 def stage_accepts_pipeline_position(entry: dict[str, Any]) -> bool:
     return common.stage_accepts_pipeline_position(entry)
-
-
-def inspect_stages_for_run(
-    target: dict[str, Any], head_sha: str, base_sha: str, run_id: str
-) -> list[dict[str, Any]]:
-    return inspect_stages(target, head_sha, base_sha, run_id)
 
 
 def pipeline_arguments(entry: dict[str, Any], run_id: str, sweep: int) -> list[str]:
@@ -765,31 +751,14 @@ def stage_command(
     conflict_strategy: str = "auto",
     repo_root: Path | None = None,
     bounded: bool = False,
+    github_mutation_policy: str = "allow",
 ) -> list[str]:
-    arguments = pipeline_arguments(entry, run_id, sweep)
-    if bounded:
-        arguments.append("--bounded-step")
-    arguments.extend(
-        [
-            "--state",
-            str(stage_state_path(entry, target, run_id)),
-        ]
+    access = common.StageAccess(
+        run_id, {entry["stage"]: model}, effort, MAX_SWEEPS,
+        github_mutation_policy,
     )
-    if entry["stage"] == STAGE_CONFLICT:
-        arguments.extend(
-            [
-                "--strategy",
-                conflict_strategy,
-            ]
-        )
-    return common.stage_command(
-        entry,
-        target,
-        model=model,
-        effort=effort,
-        arguments=arguments,
-        repo_root=repo_root,
-    )
+    extra = ["--strategy", conflict_strategy] if entry["stage"] == STAGE_CONFLICT else []
+    return access.command(entry, target, sweep, repo_root=repo_root, extra=extra, bounded=bounded)
 
 
 def stage_log_path(
@@ -817,18 +786,20 @@ def run_stage(
     conflict_strategy: str = "auto",
     report: Callable[[dict[str, Any]], None] | None = None,
     bounded: bool = False,
+    access: Any | None = None,
 ) -> dict[str, Any]:
-    command = stage_command(
-        entry,
-        target,
-        model=model,
-        effort=effort,
-        run_id=run_id,
-        sweep=sweep,
-        conflict_strategy=conflict_strategy,
-        repo_root=repo_root,
-        bounded=bounded,
-    )
+    extra = ["--strategy", conflict_strategy] if entry["stage"] == STAGE_CONFLICT else []
+    if access is None:
+        command = stage_command(
+            entry, target, model=model, effort=effort, run_id=run_id,
+            sweep=sweep, conflict_strategy=conflict_strategy,
+            repo_root=repo_root, bounded=bounded,
+        )
+        access = common.StageAccess(run_id, {entry["stage"]: model}, effort, MAX_SWEEPS)
+    else:
+        command = access.command(
+            entry, target, sweep, repo_root=repo_root, extra=extra, bounded=bounded,
+        )
     log_path = stage_log_path(target, run_id, sweep, entry)
     last_signature: str | None = None
     last_reported_at = time.monotonic()
@@ -838,13 +809,7 @@ def run_stage(
     def progress() -> None:
         nonlocal last_reported_at, last_signature
         now = time.monotonic()
-        current = common.stage_live_progress(
-            entry,
-            target,
-            state_for=lambda selected, current_target: stage_state_path(
-                selected, current_target, run_id
-            ),
-        )
+        current = access.progress(entry, target)
         hosted = common.hosted_task_progress(observed_after=started_wall)
         if hosted is not None:
             current = hosted
@@ -908,6 +873,7 @@ def blocked_result(
     local_head_sha: str | None = None,
     retained_commits: list[dict[str, str]] | None = None,
     stages: list[dict[str, Any]] | None = None,
+    access: Any | None = None,
 ) -> dict[str, Any]:
     payload = {
         "result": "blocked",
@@ -942,12 +908,12 @@ def blocked_result(
         )
     if common.ci_warning_fields(current_stages):
         try:
-            current_ci = inspect_stage_for_run(
+            current_ci = (
+                access or common.StageAccess(run_id, stage_models(None), DEFAULT_EFFORT, MAX_SWEEPS)
+            ).inspect(
                 STAGE_BY_NAME[STAGE_CI],
                 common.target_for(pr["repo_name"], pr["number"]),
-                pr["head_sha"],
-                pr["base_sha"],
-                run_id,
+                pr["head_sha"], pr["base_sha"],
             )
             payload.update(common.ci_warning_fields([current_ci]))
             if current_ci.get("reason") in UNAVAILABLE_STATUS_REASONS | {
@@ -1008,8 +974,12 @@ def run_pipeline(
     report: Callable[[dict[str, Any]], None] | None = None,
     cursor: dict[str, Any] | None = None,
     checkpoint: Callable[[dict[str, Any]], None] | None = None,
+    github_mutation_policy: str = "allow",
 ) -> dict[str, Any]:
     run_id = run_id or uuid.uuid4().hex
+    access = common.StageAccess(
+        run_id, models, effort, MAX_SWEEPS, github_mutation_policy,
+    )
     bounded = checkpoint is not None
     runs: list[dict[str, Any]] = list(cursor.get("runs", [])) if cursor else []
     known_safe_head: str | None = cursor.get("known_safe_head") if cursor else None
@@ -1087,6 +1057,7 @@ def run_pipeline(
         pr = read_pull_request(target)
         if pr["state"] != "OPEN":
             return blocked_result(
+                access=access,
                 pr=pr,
                 run_id=run_id,
                 sweeps=completed_sweeps,
@@ -1100,6 +1071,7 @@ def run_pipeline(
         )
         if synced["result"] != "ready":
             return blocked_result(
+                access=access,
                 pr=pr,
                 run_id=run_id,
                 sweeps=completed_sweeps,
@@ -1138,6 +1110,7 @@ def run_pipeline(
             pr = read_pull_request(target)
             if pr["state"] != "OPEN":
                 return blocked_result(
+                    access=access,
                     pr=pr,
                     run_id=run_id,
                     sweeps=completed_sweeps,
@@ -1151,6 +1124,7 @@ def run_pipeline(
             )
             if synced["result"] != "ready":
                 return blocked_result(
+                    access=access,
                     pr=pr,
                     run_id=run_id,
                     sweeps=completed_sweeps,
@@ -1165,9 +1139,7 @@ def run_pipeline(
             base_changed = base_changed or pr["base_sha"] != sweep_started_base
             known_safe_head = current_head
 
-            before = inspect_stage_for_run(
-                entry, target, current_head, pr["base_sha"], run_id
-            )
+            before = access.inspect(entry, target, current_head, pr["base_sha"])
             before_attempt_id = (
                 ((before.get("status") or {}).get("attempt") or {}).get("id")
                 if entry["stage"] == STAGE_CONFLICT
@@ -1217,6 +1189,7 @@ def run_pipeline(
             if blocker is not None:
                 reason, detail = blocker
                 return blocked_result(
+                    access=access,
                     pr=pr,
                     run_id=run_id,
                     sweeps=completed_sweeps,
@@ -1321,6 +1294,7 @@ def run_pipeline(
                 sweep=sweep,
                 conflict_strategy=conflict_strategy,
                 report=report,
+                access=access,
                 **stage_options,
             )
             if bounded and launched.get("waiting") is True:
@@ -1370,9 +1344,7 @@ def run_pipeline(
                 )
                 pr_head = settled.get("pr_head_sha") or started_head
                 current_pr = read_pull_request(target)
-                stages = inspect_stages_for_run(
-                    target, pr_head, current_pr["base_sha"], run_id
-                )
+                stages = access.inspect_all(target, pr_head, current_pr["base_sha"])
                 stage_result = next(
                     result for result in stages if result["stage"] == entry["stage"]
                 )
@@ -1406,6 +1378,7 @@ def run_pipeline(
                 runs.append(record)
                 report_event(report, "stage_finished", run_id=run_id, **record)
                 return blocked_result(
+                    access=access,
                     pr=read_pull_request(target),
                     run_id=run_id,
                     sweeps=completed_sweeps,
@@ -1423,13 +1396,7 @@ def run_pipeline(
             known_safe_head = ended_head
             head_changed = head_changed or ended_head != started_head
             current_pr = read_pull_request(target)
-            after = inspect_stage_for_run(
-                entry,
-                target,
-                ended_head,
-                current_pr["base_sha"],
-                run_id,
-            )
+            after = access.inspect(entry, target, ended_head, current_pr["base_sha"])
             child_terminal = launched.get("child_terminal_result")
             if launched.get("returncode") != 0 and isinstance(child_terminal, dict):
                 after["sealed_terminal"] = child_terminal
@@ -1471,6 +1438,7 @@ def run_pipeline(
                     or launched.get("error")
                 )
                 return blocked_result(
+                    access=access,
                     pr=current_pr,
                     run_id=run_id,
                     sweeps=completed_sweeps,
@@ -1496,6 +1464,7 @@ def run_pipeline(
             if blocker is not None:
                 reason, detail = blocker
                 return blocked_result(
+                    access=access,
                     pr=current_pr,
                     run_id=run_id,
                     sweeps=completed_sweeps,
@@ -1527,6 +1496,7 @@ def run_pipeline(
         )
         if synced["result"] != "ready":
             return blocked_result(
+                access=access,
                 pr=pr,
                 run_id=run_id,
                 sweeps=completed_sweeps,
@@ -1539,7 +1509,7 @@ def run_pipeline(
         known_safe_head = final_head
         head_changed = head_changed or final_head != sweep_started_head
         base_changed = base_changed or pr["base_sha"] != sweep_started_base
-        stages = inspect_stages_for_run(target, final_head, pr["base_sha"], run_id)
+        stages = access.inspect_all(target, final_head, pr["base_sha"])
         report_event(
             report,
             "sweep_finished",
@@ -1605,7 +1575,6 @@ def run_pipeline(
 
 
 def command_run(args: argparse.Namespace) -> None:
-    common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
     args.run_id = (
         common._EXECUTION.run_id if common._EXECUTION is not None else uuid.uuid4().hex
     )
@@ -1620,6 +1589,7 @@ def command_run(args: argparse.Namespace) -> None:
         "conflict_strategy": args.conflict_strategy,
         "report": reporter,
         "run_id": args.run_id,
+        "github_mutation_policy": args.github_mutation_policy,
     }
     result = run_pipeline(target, repo_root, **options)
     pr = result.get("pr")
@@ -1702,7 +1672,6 @@ def command_advance(args: argparse.Namespace) -> None:
         reporter = ProgressReporter(
             target=target, result_path=run_result_path(target, args.run_id)
         )
-        common.ACTIVE_GITHUB_MUTATION_POLICY = state["github_mutation_policy"]
 
         def checkpoint(cursor: dict[str, Any]) -> None:
             state["cursor"] = cursor
@@ -1721,6 +1690,7 @@ def command_advance(args: argparse.Namespace) -> None:
                 effort=state["effort"], run_id=args.run_id,
                 conflict_strategy=state["conflict_strategy"], report=reporter,
                 cursor=previous if previous else None, checkpoint=checkpoint,
+                github_mutation_policy=state["github_mutation_policy"],
             )
         except BaseException as error:
             state["status"] = "blocked"

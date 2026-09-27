@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """Reusable pieces shared by the single pull request and stack pipelines.
 
-This module owns no stage policy. It carries the stage registry, model
-selection, subprocess launching, marker inspection, worktree safety, and
-logging that both pipeline helpers build on. Every function that calls
-another overridable function accepts it as a keyword argument, so a caller
-can substitute its own binding and a test can replace a single seam without
-reaching inside an implementation.
+This module carries the stage registry, run-bound access, model selection,
+subprocess launching, marker inspection, worktree safety, and logging shared
+by both pipeline helpers.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -1632,7 +1630,9 @@ def current_ci_clearance_verification(verification: Any) -> bool:
     )
 
 
-def current_description_verification(payload: Any, pipeline_run: str | None) -> bool:
+def current_description_verification(
+    payload: Any, pipeline_run: str | None, github_mutation_policy: str = "allow"
+) -> bool:
     if not isinstance(payload, dict):
         return False
     verification = payload.get("clearance_verification")
@@ -1652,7 +1652,7 @@ def current_description_verification(payload: Any, pipeline_run: str | None) -> 
             pipeline_run is None
             or (
                 payload.get("pipeline_run") == pipeline_run
-                and task.get("github_mutation_policy") == ACTIVE_GITHUB_MUTATION_POLICY
+                and task.get("github_mutation_policy") == github_mutation_policy
             )
         )
     )
@@ -1755,6 +1755,7 @@ def inspect_stage(
     base_sha: str | None = None,
     *,
     pipeline_run: str | None = None,
+    github_mutation_policy: str = "allow",
     read_status: Callable[..., dict[str, Any]] = read_stage_status,
 ) -> dict[str, Any]:
     """Decide whether one stage is clear for exactly these revisions.
@@ -1842,7 +1843,7 @@ def inspect_stage(
             "observed_at",
         }
         policy_skip_is_valid = (
-            ACTIVE_GITHUB_MUTATION_POLICY == "source-only"
+            github_mutation_policy == "source-only"
             and isinstance(pipeline_run, str)
             and bool(pipeline_run)
             and isinstance(policy_skip, dict)
@@ -1919,7 +1920,9 @@ def inspect_stage(
         )
         and (
             entry["stage"] != STAGE_DESCRIPTION
-            or current_description_verification(payload, pipeline_run)
+            or current_description_verification(
+                payload, pipeline_run, github_mutation_policy
+            )
         )
     )
     if clear and outcome == "warning":
@@ -2073,9 +2076,6 @@ def pipeline_arguments(
     ]
 
 
-ACTIVE_GITHUB_MUTATION_POLICY = "allow"
-
-
 def stage_prompt(target: dict[str, Any], arguments: list[str]) -> str:
     name = f"{target['repo_name']}#{target['number']}"
     if not arguments:
@@ -2101,12 +2101,13 @@ def stage_command(
     prompt: str | None = None,
     resolve_program: Callable[[str], str] = resolve_launch_program,
     repo_root: Path | None = None,
+    github_mutation_policy: str = "allow",
 ) -> list[str]:
     validate_stage_route(entry, model, effort)
     stage_arguments = list(arguments)
     if entry.get("github_mutation_policy") is True:
         stage_arguments.extend(
-            ["--github-mutation-policy", ACTIVE_GITHUB_MUTATION_POLICY]
+            ["--github-mutation-policy", github_mutation_policy]
         )
     if repo_root is not None:
         stage_arguments.extend(["--repo-root", str(repo_root)])
@@ -2119,6 +2120,75 @@ def stage_command(
         COORDINATOR_MODEL_ARGUMENTS[model],
         *stage_arguments,
     ]
+
+
+@dataclass(frozen=True)
+class StageAccess:
+    run_id: str
+    models: dict[str, str]
+    effort: str
+    max_iterations: int
+    github_mutation_policy: str = "allow"
+
+    def __post_init__(self) -> None:
+        if not self.run_id or self.github_mutation_policy not in {"allow", "source-only"}:
+            raise WorkflowError("invalid stage run or GitHub mutation policy")
+
+    def state_path(self, entry: dict[str, Any], target: dict[str, Any]) -> Path:
+        return stage_state_path(entry, target, self.run_id)
+
+    def status(self, entry: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+        return read_stage_status(entry, target, state_for=self.state_path)
+
+    def inspect(
+        self, entry: dict[str, Any], target: dict[str, Any],
+        head_sha: str, base_sha: str | None = None,
+    ) -> dict[str, Any]:
+        return inspect_stage(
+            entry, target, head_sha, base_sha,
+            pipeline_run=self.run_id,
+            github_mutation_policy=self.github_mutation_policy,
+            read_status=self.status,
+        )
+
+    def inspect_all(
+        self, target: dict[str, Any], head_sha: str, base_sha: str,
+    ) -> list[dict[str, Any]]:
+        return [self.inspect(entry, target, head_sha, base_sha) for entry in STAGES]
+
+    def progress(
+        self, entry: dict[str, Any], target: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        return stage_live_progress(entry, target, state_for=self.state_path)
+
+    def arguments(
+        self, entry: dict[str, Any], target: dict[str, Any],
+        iteration: int, *, extra: list[str] | None = None, bounded: bool = False,
+    ) -> list[str]:
+        arguments = pipeline_arguments(
+            entry, self.run_id, iteration, self.max_iterations
+        )
+        if bounded:
+            arguments.append("--bounded-step")
+        arguments.extend(["--state", str(self.state_path(entry, target))])
+        arguments.extend(extra or [])
+        return arguments
+
+    def command(
+        self, entry: dict[str, Any], target: dict[str, Any], iteration: int,
+        *, repo_root: Path | None = None, extra: list[str] | None = None,
+        bounded: bool = False,
+    ) -> list[str]:
+        return stage_command(
+            entry, target,
+            model=self.models[entry["stage"]],
+            effort=self.effort,
+            arguments=self.arguments(
+                entry, target, iteration, extra=extra, bounded=bounded,
+            ),
+            repo_root=repo_root,
+            github_mutation_policy=self.github_mutation_policy,
+        )
 
 
 def launch_options(log: Any, cwd: Path) -> dict[str, Any]:

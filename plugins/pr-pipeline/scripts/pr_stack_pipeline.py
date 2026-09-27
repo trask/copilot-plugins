@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "f51856368d892f8aadac1ac4ae68cd7aeced1fe1948b87c176683c09ca4ce9cd"
+COMMON_SHA256 = "3858938044c58baa9fa720c3c3c304118787825220b8b6dfcab104473ea1f945"
 
 
 def load_common() -> Any:
@@ -1137,6 +1137,7 @@ class WorkerLauncher:
         worktree_root: Path | None = None,
         models: dict[str, str],
         effort: str,
+        stage_access: Any | None = None,
         readiness_timeout: float = READINESS_TIMEOUT,
         poll_interval: float = READINESS_POLL_INTERVAL,
         sleep: Callable[[float], None] = time.sleep,
@@ -1151,6 +1152,9 @@ class WorkerLauncher:
         )
         self.models = models
         self.effort = effort
+        self.stage_access = stage_access or common.StageAccess(
+            run_id, models, effort, MAX_PASSES,
+        )
         self.readiness_timeout = readiness_timeout
         self.poll_interval = poll_interval
         self.sleep = sleep
@@ -1288,12 +1292,12 @@ class WorkerLauncher:
         entry = STAGE_BY_NAME[request["stage"]]
         target = common.target_for(self.repository, request["number"])
         command = common.stage_command(
-            entry,
-            target,
+            entry, target,
             model=self.models[request["stage"]],
             effort=self.effort,
             arguments=request["arguments"],
             repo_root=worktree,
+            github_mutation_policy=self.stage_access.github_mutation_policy,
         )
         log_path = self.log_path(request)
         record_path = self.record_path(request)
@@ -1795,8 +1799,10 @@ class StackPipeline:
                 "github_mutation_policy must be 'allow' or 'source-only'"
             )
         self.github_mutation_policy = github_mutation_policy
-        common.ACTIVE_GITHUB_MUTATION_POLICY = github_mutation_policy
         self.run_id = run_id or uuid.uuid4().hex
+        self.stage_access = common.StageAccess(
+            self.run_id, models, effort, MAX_PASSES, github_mutation_policy,
+        )
         self.report = report
         self.state_path = state_path or state_path_for(kickoff, self.run_id)
         self.run_directory = run_directory or run_directory_for(kickoff, self.run_id)
@@ -1809,14 +1815,11 @@ class StackPipeline:
             run_directory=self.run_directory,
             models=models,
             effort=effort,
+            stage_access=self.stage_access,
         )
         self.read_stack = read_stack
         self.inspect = (
-            (
-                lambda entry, target, head, base: inspect_stage(
-                    entry, target, head, base, self.run_id
-                )
-            )
+            self.stage_access.inspect
             if inspect is inspect_stage
             else inspect
         )
@@ -1829,7 +1832,9 @@ class StackPipeline:
         self.checkpoints = (
             (
                 lambda repository, number: checkpoints(
-                    repository, number, run_id=self.run_id
+                    repository, number, run_id=self.run_id,
+                    state_for=lambda entry, target, _run:
+                        self.stage_access.state_path(entry, target),
                 )
             )
             if checkpoints is accepted_push_checkpoints
@@ -1837,8 +1842,8 @@ class StackPipeline:
         )
         self.worker_progress = (
             (
-                lambda repository, number, stage: worker_progress(
-                    repository, number, stage, run_id=self.run_id
+                lambda repository, number, stage: self.stage_access.progress(
+                    STAGE_BY_NAME[stage], common.target_for(repository, number),
                 )
             )
             if worker_progress is worker_live_progress
@@ -2079,33 +2084,19 @@ class StackPipeline:
     ) -> dict[str, Any]:
         entry = STAGE_BY_NAME[stage]
         target = common.target_for(self.repository, member["number"])
-        arguments = common.pipeline_arguments(
-            entry,
-            self.run_id,
-            pass_number,
-            MAX_PASSES,
-            accepts=common.stage_accepts_pipeline_position,
-        )
-        arguments.extend(
-            [
-                "--state",
-                str(stage_state_path(entry, target, self.run_id)),
-            ]
-        )
+        extra = []
         if stage == STAGE_CONFLICT:
-            arguments.extend(
-                [
-                    "--strategy",
-                    self.conflict_strategy,
-                ]
-            )
+            extra.extend(["--strategy", self.conflict_strategy])
             if scope is not None:
-                arguments.append("--whole-stack")
+                extra.append("--whole-stack")
                 request_path, _ = self.authorize_stack_publication(
                     member["number"], member["head_sha"],
                     operation="whole-stack", pass_number=pass_number,
                 )
-                arguments.extend(["--stack-request", str(request_path)])
+                extra.extend(["--stack-request", str(request_path)])
+        arguments = self.stage_access.arguments(
+            entry, target, pass_number, extra=extra,
+        )
         return {
             "number": member["number"],
             "stage": stage,
@@ -4347,7 +4338,6 @@ def compact_terminal_result(
 
 
 def command_run(args: argparse.Namespace) -> None:
-    common.ACTIVE_GITHUB_MUTATION_POLICY = args.github_mutation_policy
     common.require_tools()
     repo_root = common.resolve_repo_root()
     target = common.resolve_target(args.target, repo_root)

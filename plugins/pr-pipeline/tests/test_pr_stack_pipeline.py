@@ -385,11 +385,6 @@ class ModelTest(unittest.TestCase):
         )
 
     def test_stack_workers_forward_source_only_to_pr_description(self):
-        previous = COMMON.ACTIVE_GITHUB_MUTATION_POLICY
-        COMMON.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
-        self.addCleanup(
-            setattr, COMMON, "ACTIVE_GITHUB_MUTATION_POLICY", previous
-        )
         entry = MODULE.STAGE_BY_NAME[MODULE.STAGE_DESCRIPTION]
         command = COMMON.stage_command(
             entry,
@@ -399,6 +394,7 @@ class ModelTest(unittest.TestCase):
             arguments=["--pipeline-run", "a" * 32],
             prompt="frozen worker prompt",
             resolve_program=lambda name: name,
+            github_mutation_policy="source-only",
         )
 
         self.assertEqual(
@@ -407,10 +403,6 @@ class ModelTest(unittest.TestCase):
         self.assertNotIn("-p", command)
 
     def test_stack_pipeline_freezes_source_only_in_run_state(self):
-        previous = COMMON.ACTIVE_GITHUB_MUTATION_POLICY
-        self.addCleanup(
-            setattr, COMMON, "ACTIVE_GITHUB_MUTATION_POLICY", previous
-        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pipeline = MODULE.StackPipeline(
@@ -436,7 +428,7 @@ class ModelTest(unittest.TestCase):
                 "source-only", saved["github_mutation_policy"]
             )
             self.assertEqual(
-                "source-only", COMMON.ACTIVE_GITHUB_MUTATION_POLICY
+                "source-only", pipeline.stage_access.github_mutation_policy
             )
 
 
@@ -2557,10 +2549,6 @@ class CiWarningTest(StackFixture):
     def setUp(self):
         super().setUp()
         self.warnings = {}
-        self.addCleanup(
-            setattr, COMMON, "ACTIVE_GITHUB_MUTATION_POLICY",
-            COMMON.ACTIVE_GITHUB_MUTATION_POLICY,
-        )
 
     def record_warning(self, number, head=None, base=BASE):
         self.warnings[number] = {
@@ -2938,6 +2926,7 @@ class CiWarningTest(StackFixture):
                     MODULE.STAGE_BY_NAME[MODULE.STAGE_CI],
                     COMMON.target_for("owner/repo", 11),
                     model="gpt-6-sol", effort="high", arguments=request["arguments"],
+                    github_mutation_policy=pipeline.stage_access.github_mutation_policy,
                 )
                 self.assertEqual(policy, command[command.index("--github-mutation-policy") + 1])
                 self.assertEqual("run-1", command[command.index("--pipeline-run") + 1])
