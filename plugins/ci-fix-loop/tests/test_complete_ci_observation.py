@@ -87,6 +87,44 @@ class CompleteCiObservationTest(unittest.TestCase):
         stack.enter_context(mock.patch.object(MODULE, "gh_json", side_effect=self.api))
         return stack
 
+    def test_observation_binds_preflight_and_clearance_to_the_same_attempt(self):
+        with self.observe():
+            observed = MODULE.CIObservation.read(self.preflight["pr"])
+            observed.require_preflight_match(self.preflight["check_snapshot"])
+            expected = observed.clearance_fingerprint(self.preflight["pr"]["base_sha"])
+            self.assertEqual(
+                (True, expected),
+                observed.clearance_matches(
+                    expected, self.preflight["pr"]["base_sha"], require_passing=False,
+                ),
+            )
+            self.runs["1"] = {**self.old, "run_attempt": 2}
+            changed = MODULE.CIObservation.read(self.preflight["pr"])
+            with self.assertRaisesRegex(MODULE.WorkflowError, "snapshot changed"):
+                changed.require_preflight_match(self.preflight["check_snapshot"])
+            self.assertFalse(changed.clearance_matches(
+                expected, self.preflight["pr"]["base_sha"], require_passing=False,
+            )[0])
+
+    def test_observation_rejects_new_pending_workflow_and_wrong_head(self):
+        with self.observe():
+            observed = MODULE.CIObservation.read(self.preflight["pr"])
+            expected = observed.clearance_fingerprint(self.preflight["pr"]["base_sha"])
+            self.runs["3"] = {
+                **self.old, "id": 3, "workflow_id": 20,
+                "status": "in_progress", "conclusion": None,
+            }
+            changed = MODULE.CIObservation.read(self.preflight["pr"])
+            self.assertFalse(changed.clearance_matches(
+                expected, self.preflight["pr"]["base_sha"], require_passing=False,
+            )[0])
+            with mock.patch.object(
+                MODULE, "fetch_rollup", return_value=("9" * 40, self.checks),
+            ), mock.patch.object(MODULE, "ci_snapshot_runs") as runs:
+                with self.assertRaisesRegex(MODULE.WorkflowError, "snapshot changed"):
+                    MODULE.CIObservation.read(self.preflight["pr"])
+                runs.assert_not_called()
+
     def flow(self, *, after_task=None, after_import=None, candidate=False):
         result = self.fixture.candidate_result(["5" * 40] if candidate else [])
         if not candidate:
@@ -260,6 +298,8 @@ class CompleteCiObservationTest(unittest.TestCase):
         self.assertEqual(0, imports)
         self.assertEqual(0, state["iterations"])
         self.assertEqual(
-            MODULE.ci_warning_snapshot_sha256(self.preflight["pr"], self.live_checks, self.runs),
+            MODULE.CIObservation(
+                self.preflight["pr"], self.live_checks, self.runs,
+            ).clearance_fingerprint(self.preflight["pr"]["base_sha"]),
             state["green_snapshot_sha256"],
         )

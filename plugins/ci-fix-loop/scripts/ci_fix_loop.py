@@ -7072,11 +7072,8 @@ def agent_task_preflight(
     ):
         raise WorkflowError("GitHub API did not return complete authenticated context")
 
-    live_head, checks = fetch_rollup(pr)
-    if live_head.lower() != pr["head_sha"]:
-        raise WorkflowError(
-            f"status checks belong to {live_head}, not pinned head {pr['head_sha']}"
-        )
+    observation = CIObservation.read(pr)
+    checks = observation.checks
     refreshed = metadata_for(target)
     if refreshed["head_sha"].lower() != pr["head_sha"]:
         raise WorkflowError("pull request head changed during check preflight")
@@ -7097,9 +7094,9 @@ def agent_task_preflight(
         and not decision.get("pending_checks")
         else []
     )
-    workflow_runs = ci_snapshot_runs(pr, checks)
+    workflow_runs = observation.workflow_runs
     if failing_keys:
-        require_diagnosable_ci_runs(checks, workflow_runs, set(failing_keys))
+        observation.require_diagnosable(set(failing_keys))
     baseline = (
         baseline_conclusions(pr, pr["base_sha"])
         if failing_keys and collect_failure_logs else {}
@@ -8997,47 +8994,106 @@ def ci_snapshot_runs(
     return runs
 
 
-def ci_warning_snapshot_sha256(
-    pr: dict[str, Any], checks: list[dict[str, Any]], runs: dict[str, Any],
-) -> str:
-    rollup = [
-        {key: value for key, value in check.items() if key != "key"}
-        for check in check_rollup_identity(checks)
-    ]
-    rollup.sort(key=lambda item: json.dumps(item, separators=(",", ":"), sort_keys=True))
-    return canonical_json_sha256({
-        "head_sha": pr["head_sha"], "base_sha": pr["base_sha"],
-        "checks": rollup, "workflow_runs": runs,
-    })
+class CIObservation:
+    def __init__(
+        self,
+        pr: dict[str, Any],
+        checks: list[dict[str, Any]],
+        workflow_runs: dict[str, dict[str, Any]],
+    ) -> None:
+        self.pr = pr
+        self.checks = checks
+        self.workflow_runs = workflow_runs
 
+    @classmethod
+    def read(cls, pr: dict[str, Any]) -> "CIObservation":
+        head, checks = fetch_rollup(pr)
+        if head.lower() != pr["head_sha"].lower():
+            raise WorkflowError(
+                f"live CI snapshot changed: status checks belong to {head}, "
+                f"not pinned head {pr['head_sha']}",
+                details={"reason": "ci_observation_changed"},
+            )
+        return cls(pr, checks, ci_snapshot_runs(pr, checks))
 
-def require_diagnosable_ci_runs(
-    checks: list[dict[str, Any]], runs: dict[str, Any], failure_keys: set[str],
-) -> None:
-    observed_failures = {
-        str(check["workflow_run_id"])
-        for check in checks
-        if check.get("class") == "failed" and check.get("key") in failure_keys
-        and type(check.get("workflow_run_id")) is int
-    }
-    changed_failure = any(
-        str(check["workflow_run_id"]) not in runs
-        or runs[str(check["workflow_run_id"])]["name"] != check.get("workflow")
-        for check in checks
-        if check.get("class") == "failed" and type(check.get("workflow_run_id")) is int
-    )
-    if changed_failure or any(
-        run["status"] != "completed"
-        or (
-            run["conclusion"] not in {"success", "neutral", "skipped"}
-            and run_id not in observed_failures
+    def require_preflight_match(self, snapshot: dict[str, Any]) -> None:
+        rollup = check_rollup_identity(self.checks)
+        digest = sha256_text(json.dumps(rollup, separators=(",", ":"), sort_keys=True))
+        if (
+            digest != snapshot.get("rollup_sha256")
+            or self.workflow_runs != snapshot.get("workflow_runs")
+        ):
+            raise WorkflowError(
+                "live failing-check snapshot changed before publication",
+                details={"reason": "ci_observation_changed"},
+            )
+
+    def require_diagnosable(self, failure_keys: set[str]) -> None:
+        observed_failures = {
+            str(check["workflow_run_id"])
+            for check in self.checks
+            if check.get("class") == "failed" and check.get("key") in failure_keys
+            and type(check.get("workflow_run_id")) is int
+        }
+        changed_failure = any(
+            str(check["workflow_run_id"]) not in self.workflow_runs
+            or self.workflow_runs[str(check["workflow_run_id"])]["name"] != check.get("workflow")
+            for check in self.checks
+            if check.get("class") == "failed" and type(check.get("workflow_run_id")) is int
         )
-        for run_id, run in runs.items()
-    ):
-        raise WorkflowError(
-            "CI workflow evidence is pending or contains an unobserved failure",
-            details={"reason": "ci_observation_changed"},
+        if changed_failure or any(
+            run["status"] != "completed"
+            or (
+                run["conclusion"] not in {"success", "neutral", "skipped"}
+                and run_id not in observed_failures
+            )
+            for run_id, run in self.workflow_runs.items()
+        ):
+            raise WorkflowError(
+                "CI workflow evidence is pending or contains an unobserved failure",
+                details={"reason": "ci_observation_changed"},
+            )
+
+    def clearance_fingerprint(self, base_sha: str) -> str:
+        rollup = [
+            {key: value for key, value in check.items() if key != "key"}
+            for check in check_rollup_identity(self.checks)
+        ]
+        rollup.sort(key=lambda item: json.dumps(item, separators=(",", ":"), sort_keys=True))
+        return canonical_json_sha256({
+            "head_sha": self.pr["head_sha"], "base_sha": base_sha,
+            "checks": rollup, "workflow_runs": self.workflow_runs,
+        })
+
+    def clearance_matches(
+        self, expected: str, base_sha: str, *, require_passing: bool
+    ) -> tuple[bool, str]:
+        observed = self.clearance_fingerprint(base_sha)
+        current = observed == expected and all(
+            run["status"] == "completed"
+            and (
+                not require_passing
+                or run["conclusion"] in {"success", "neutral", "skipped"}
+            )
+            for run in self.workflow_runs.values()
         )
+        return current, observed
+
+    def require_green_decision(self) -> dict[str, Any]:
+        decision = decide(
+            self.checks, now=dt.datetime.now(dt.timezone.utc),
+            tracking={}, deadline_expired=True,
+        )
+        if decision["decision"] not in {"green", "no_checks"} or not all(
+            run["status"] == "completed"
+            and run["conclusion"] in {"success", "neutral", "skipped"}
+            for run in self.workflow_runs.values()
+        ):
+            raise WorkflowError(
+                "CI workflow attempt changed before clearance",
+                details={"reason": "ci_observation_changed"},
+            )
+        return decision
 
 
 def stale_ci_head_fields(
@@ -9086,14 +9142,10 @@ def verify_ci_warning_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         {**pr, "title": live.get("title"), "body": live.get("body")},
         live, expected_head=pr["head_sha"], allow_linear_base_advance=True,
     )
-    head, checks = fetch_rollup(live)
-    if head.lower() != pr["head_sha"]:
-        raise WorkflowError("pull request head changed while verifying CI warnings")
-    runs = ci_snapshot_runs(live, checks)
-    observed = ci_warning_snapshot_sha256(
-        {**live, "base_sha": state["warning_at_base_sha"]}, checks, runs,
+    observation = CIObservation.read(live)
+    current, observed = observation.clearance_matches(
+        expected, state["warning_at_base_sha"], require_passing=False,
     )
-    current = observed == expected and all(run["status"] == "completed" for run in runs.values())
     fields: dict[str, Any] = {"warning_verification": {
         "result": "current" if current else "stale",
         "expected_snapshot_sha256": expected, "observed_snapshot_sha256": observed,
@@ -9134,20 +9186,13 @@ def verify_ci_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         {**pr, "title": live.get("title"), "body": live.get("body")},
         live, expected_head=pr["head_sha"], allow_linear_base_advance=True,
     )
-    head, checks = fetch_rollup(live)
-    if head.lower() != pr["head_sha"]:
-        raise WorkflowError("pull request head changed while verifying CI clearance")
-    runs = ci_snapshot_runs(live, checks)
-    observed = ci_warning_snapshot_sha256(
-        {**live, "base_sha": state["clean_at_base_sha"]}, checks, runs,
+    observation = CIObservation.read(live)
+    current, observed = observation.clearance_matches(
+        expected, state["clean_at_base_sha"], require_passing=True,
     )
     current = (
-        observed == expected
-        and state.get("clean_at_head_sha") == head.lower()
-        and all(
-            run["status"] == "completed" and run["conclusion"] in {"success", "neutral", "skipped"}
-            for run in runs.values()
-        )
+        current
+        and state.get("clean_at_head_sha") == observation.pr["head_sha"].lower()
     )
     result = {"clearance_verification": {
         "result": "current" if current else "stale",
@@ -9552,20 +9597,9 @@ def wait_for_live_pr_snapshot(
 
 
 def require_live_check_snapshot(preflight: dict[str, Any]) -> None:
-    head, checks = fetch_rollup(preflight["pr"])
-    snapshot = preflight["check_snapshot"]
-    rollup = check_rollup_identity(checks)
-    digest = sha256_text(json.dumps(rollup, separators=(",", ":"), sort_keys=True))
-    if head.lower() != preflight["pr"]["head_sha"]:
-        raise WorkflowError("live failing-check snapshot changed before publication")
-    if (
-        digest != snapshot["rollup_sha256"]
-        or ci_snapshot_runs(preflight["pr"], checks) != snapshot.get("workflow_runs")
-    ):
-        raise WorkflowError(
-            "live failing-check snapshot changed before publication",
-            details={"reason": "ci_observation_changed"},
-        )
+    CIObservation.read(preflight["pr"]).require_preflight_match(
+        preflight["check_snapshot"]
+    )
 
 
 def agent_task_retry_command(
@@ -11218,32 +11252,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
     }
     if not bounded_resume and decision["decision"] in {"green", "no_checks"}:
         require_live_pr_snapshot(pr, metadata_for(target), expected_head=pr["head_sha"])
-        live_head, live_checks = fetch_rollup(pr)
-        live_decision = decide(
-            live_checks, now=dt.datetime.now(dt.timezone.utc),
-            tracking={}, deadline_expired=True,
-        )
-        runs = ci_snapshot_runs(pr, live_checks)
-        if (
-            live_head.lower() != pr["head_sha"]
-            or live_decision["decision"] not in {"green", "no_checks"}
-            or any(
-                run["status"] != "completed"
-                or run["conclusion"] not in {"success", "neutral", "skipped"}
-                for run in runs.values()
-            )
-        ):
-            raise WorkflowError(
-                "CI workflow attempt changed before clearance",
-                details={"reason": "ci_observation_changed"},
-            )
-        decision = live_decision
-        state["run"]["checks"] = check_rollup_identity(live_checks)
+        live = CIObservation.read(pr)
+        decision = live.require_green_decision()
+        state["run"]["checks"] = check_rollup_identity(live.checks)
         state["run"]["decision"] = decision
         record_terminal_outcome(state, state["run"], decision["decision"])
-        state["green_snapshot_sha256"] = ci_warning_snapshot_sha256(
-            pr, live_checks, runs
-        )
+        state["green_snapshot_sha256"] = live.clearance_fingerprint(pr["base_sha"])
         save_state(state_path, state)
         emit(
             {
@@ -11911,9 +11925,9 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 if not base_advanced:
                     require_live_check_snapshot(preflight)
                 warning_runs = snapshot["workflow_runs"]
-                require_diagnosable_ci_runs(
-                    snapshot["rollup"], warning_runs,
-                    {item["check_key"] for item in diagnoses},
+                warning = CIObservation(pr, snapshot["rollup"], warning_runs)
+                warning.require_diagnosable(
+                    {item["check_key"] for item in diagnoses}
                 )
                 state["outcome"] = "warning"
                 state["clean_at_head_sha"] = None
@@ -11921,8 +11935,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 state["warning_at_head_sha"] = pr["head_sha"]
                 state["warning_at_base_sha"] = pr["base_sha"]
                 state["ci_warnings"] = diagnoses
-                state["warning_snapshot_sha256"] = ci_warning_snapshot_sha256(
-                    pr, snapshot["rollup"], warning_runs,
+                state["warning_snapshot_sha256"] = warning.clearance_fingerprint(
+                    pr["base_sha"]
                 )
             elif report["outcome"] == "unfixable":
                 state["escalation"] = {

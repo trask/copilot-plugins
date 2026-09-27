@@ -331,9 +331,9 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             "outcome": "warning", "clean_at_head_sha": None,
             "warning_at_head_sha": self.pr["head_sha"],
             "warning_at_base_sha": self.pr["base_sha"],
-            "warning_snapshot_sha256": MODULE.ci_warning_snapshot_sha256(
+            "warning_snapshot_sha256": MODULE.CIObservation(
                 self.pr, self.checks, {"11": self.run},
-            ),
+            ).clearance_fingerprint(self.pr["base_sha"]),
             "ci_warnings": [{**self.entries[0], "diagnosis": "unrelated", "name": "test"}],
         })
         return state
@@ -378,9 +378,9 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             "outcome": "green",
             "clean_at_head_sha": self.pr["head_sha"],
             "clean_at_base_sha": self.pr["base_sha"],
-            "green_snapshot_sha256": MODULE.ci_warning_snapshot_sha256(
+            "green_snapshot_sha256": MODULE.CIObservation(
                 self.pr, checks, {"11": passed_run},
-            ),
+            ).clearance_fingerprint(self.pr["base_sha"]),
         }
         with (
             mock.patch.object(MODULE, "gh_json", return_value=[{"workflow_runs": []}]),

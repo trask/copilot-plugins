@@ -150,7 +150,9 @@ class CiWarningProducerContractTest(unittest.TestCase):
             "version": CI.STATE_VERSION, "pr": pr, "history": [], "iterations": 2,
             "reruns": {}, "outcome": "green", "clean_at_head_sha": pr["head_sha"],
             "clean_at_base_sha": pr["base_sha"],
-            "green_snapshot_sha256": CI.ci_warning_snapshot_sha256(pr, checks, {"11": run}),
+            "green_snapshot_sha256": CI.CIObservation(
+                pr, checks, {"11": run},
+            ).clearance_fingerprint(pr["base_sha"]),
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -240,7 +242,9 @@ class CiWarningProducerContractTest(unittest.TestCase):
             "clean_at_head_sha": None,
             "warning_at_head_sha": pr["head_sha"],
             "warning_at_base_sha": pr["base_sha"],
-            "warning_snapshot_sha256": CI.ci_warning_snapshot_sha256(pr, checks, runs),
+            "warning_snapshot_sha256": CI.CIObservation(
+                pr, checks, runs,
+            ).clearance_fingerprint(pr["base_sha"]),
             "pipeline_budget": {"run": pipeline_run, "max_iterations": 2},
             "ci_warnings": [{
                 "check_key": "check:Build/test",
