@@ -18,7 +18,7 @@ The clearance verifier reads the live pull request and CI observation for either
 
 Both the standalone coordinator and the bounded step use the same CI stability gate to count matching observations and confirm the identity after collecting logs. The bounded step also requires its debounce interval to elapse across calls; the standalone coordinator sleeps within its wait budget. A processed failure needs a new snapshot in either mode. The standalone coordinator may revisit a processed green or no-checks snapshot; the bounded step waits for a new snapshot within its sweep.
 
-The gate restores and records the bounded step's stability checkpoint, including its first-observed time and retained log paths. Restarting a bounded call resumes that observation without making the coordinator manage the gate's fields.
+The gate records the observed decision and handles confirmation or an identity change for both coordinators. It restores and records the bounded step's stability checkpoint, including its first-observed time and retained log paths. Restarting a bounded call resumes that observation without making the coordinator manage the gate's fields.
 
 Both coordinators ask the gate to record the observed head, snapshot identity, decision, and poll count. Failure diagnostics read that recorded observation. The standalone wait loop still owns its sleep and timeout policy; the bounded gate also stores its resume checkpoint.
 

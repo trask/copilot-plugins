@@ -12176,6 +12176,7 @@ class CIStabilityGate:
         self, *, identity: str | None = None, polls: int = 0,
         since: str | None = None, state_path: Path | None = None,
         active_log_paths: Iterable[Path] = (),
+        bounded_checkpoint: bool = False,
     ) -> None:
         self.identity = identity
         self.polls = polls
@@ -12183,6 +12184,7 @@ class CIStabilityGate:
         self.status = "waiting_for_checks"
         self.state_path = state_path
         self.active_log_paths = set(active_log_paths)
+        self.bounded_checkpoint = bounded_checkpoint
 
     @classmethod
     def _resume_bounded(
@@ -12205,6 +12207,7 @@ class CIStabilityGate:
             since=bounded.get("stable_since"),
             state_path=state_path,
             active_log_paths=(Path(value) for value in recorded_logs),
+            bounded_checkpoint=True,
         )
 
     def record_observation(
@@ -12233,6 +12236,61 @@ class CIStabilityGate:
         bounded["active_log_paths"] = sorted(str(path) for path in self.active_log_paths)
         save_state(self.state_path, state)
 
+    def _record(self, preflight: dict[str, Any], *, status: str) -> None:
+        if self.bounded_checkpoint:
+            self._checkpoint_bounded(preflight, status=status)
+        else:
+            self.record_observation(preflight, status=status)
+
+    def observe_once(
+        self, preflight: dict[str, Any], *, processed: set[str],
+        now: dt.datetime, polls: int, debounce_seconds: float,
+        allow_processed_terminal: bool = False,
+    ) -> tuple[str, bool]:
+        status = self.observe(
+            preflight, processed=processed, now=now,
+            allow_processed_terminal=allow_processed_terminal,
+        )
+        if status != "stabilizing" and allow_processed_terminal:
+            self.reset()
+        self._record(preflight, status=status)
+        return status, self.ready(
+            polls=polls, debounce_seconds=debounce_seconds,
+            now=dt.datetime.now(dt.timezone.utc),
+        )
+
+    def confirm_once(
+        self, collect: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        try:
+            preflight, confirmed = self.collect_confirmed(collect)
+        except WorkflowError as error:
+            if error.details.get("reason") != "ci_observation_changed":
+                raise
+            self.reset()
+            if self.state_path is None:
+                raise WorkflowError("CI stability gate requires a state path") from error
+            if self.bounded_checkpoint:
+                state = load_state(self.state_path)
+                coordinator = state.setdefault("coordinator", {})
+                coordinator.update(
+                    status="waiting_for_checks", detail=str(error),
+                    stability_sha256=None, stable_polls=0,
+                )
+                state["bounded_step"]["stable_since"] = None
+                save_state(self.state_path, state)
+            else:
+                update_coordinator_state(
+                    self.state_path, status="waiting_for_checks", detail=str(error),
+                )
+            return None
+        if not confirmed:
+            self.reset()
+            self._record(preflight, status="waiting_for_checks")
+            return None
+        self._record(preflight, status="ready")
+        return preflight
+
     @classmethod
     def advance_bounded(
         cls, state_path: Path, state: dict[str, Any], preflight: dict[str, Any],
@@ -12240,18 +12298,13 @@ class CIStabilityGate:
         debounce_seconds: float, collect: Callable[[], dict[str, Any]],
     ) -> dict[str, Any] | None:
         gate = cls._resume_bounded(state_path, state)
-        gate.observe(preflight, processed=processed_ci_snapshot_ids(state), now=now)
-        gate._checkpoint_bounded(preflight, status="stabilizing")
-        if not gate.ready(
+        _, ready = gate.observe_once(
+            preflight, processed=processed_ci_snapshot_ids(state), now=now,
             polls=polls, debounce_seconds=debounce_seconds,
-            now=dt.datetime.now(dt.timezone.utc),
-        ):
+        )
+        if not ready:
             return None
-        preflight, confirmed = gate.collect_confirmed(collect)
-        if confirmed:
-            gate._checkpoint_bounded(preflight, status="ready")
-            return preflight
-        return None
+        return gate.confirm_once(collect)
 
     def _retain_logs(self, preflight: dict[str, Any]) -> None:
         paths = set(managed_task_log_paths({"preflight": preflight}))
@@ -12422,20 +12475,15 @@ def wait_for_stable_ci_preflight(
             continue
 
         state = coordinator_file_state(state_path)
-        status = gate.observe(
+        status, ready = gate.observe_once(
             preflight, processed=processed_ci_snapshot_ids(state),
             now=dt.datetime.now(dt.timezone.utc),
+            polls=required_stability, debounce_seconds=0,
             allow_processed_terminal=True,
         )
         if status == "stabilizing" and gate.polls == 1:
             attempt = 0
-        if status != "stabilizing":
-            gate.reset()
-        gate.record_observation(preflight, status=status)
-        if gate.ready(
-            polls=required_stability, debounce_seconds=0,
-            now=dt.datetime.now(dt.timezone.utc),
-        ):
+        if ready:
             if float(args.debounce_seconds) > 0:
                 time.sleep(min(
                     float(args.debounce_seconds),
@@ -12443,34 +12491,20 @@ def wait_for_stable_ci_preflight(
                 ))
                 if time.monotonic() >= deadline:
                     continue
-            try:
-                confirmation, confirmed = gate.collect_confirmed(
-                    lambda: agent_task_preflight(
-                        repo_root,
-                        target,
-                        stack_state=(
-                            cli_path(args.stack_state) if args.stack_state else None
-                        ),
-                        state_path=state_path,
-                    )
+            confirmation = gate.confirm_once(
+                lambda: agent_task_preflight(
+                    repo_root,
+                    target,
+                    stack_state=(
+                        cli_path(args.stack_state) if args.stack_state else None
+                    ),
+                    state_path=state_path,
                 )
-            except WorkflowError as error:
-                if error.details.get("reason") != "ci_observation_changed":
-                    raise
-                gate.reset()
+            )
+            if confirmation is None:
                 attempt = 0
-                update_coordinator_state(
-                    state_path, status="waiting_for_checks", detail=str(error),
-                )
                 continue
-            if not confirmed:
-                gate.reset()
-                attempt = 0
-                gate.record_observation(confirmation, status="waiting_for_checks")
-                continue
-            preflight = confirmation
-            gate.record_observation(preflight, status="ready")
-            return preflight
+            return confirmation
         time.sleep(coordinator_delay(args, attempt))
         attempt += 1
 

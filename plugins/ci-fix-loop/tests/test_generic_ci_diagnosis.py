@@ -562,6 +562,12 @@ class GenericCiDiagnosisTest(unittest.TestCase):
     def test_controller_observes_after_recommendation_with_a_wait_budget_per_iteration(self):
         repository = self.root / "repo"
         repository.mkdir()
+        snapshot = self.preflight["check_snapshot"]
+        snapshot.update(
+            head_sha=self.pr["head_sha"], base_sha=self.pr["base_sha"],
+            decision={"decision": "failures"},
+        )
+        snapshot["sha256"] = MODULE.check_snapshot_sha256(snapshot)
         args = MODULE.build_parser().parse_args([
             "loop", self.pr["pr_url"], "--repo-root", str(repository),
             "--state", str(self.path), "--wait-timeout", "60",

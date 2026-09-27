@@ -213,6 +213,66 @@ class CIStabilityGateTest(unittest.TestCase):
                     self.assertFalse(log_directory.exists())
                     self.assertEqual(set(), gate.active_log_paths)
 
+    def test_observation_transition_records_actual_status_in_both_modes(self):
+        pending = copy.deepcopy(self.preflight)
+        pending["check_snapshot"]["decision"] = {
+            "decision": "waiting", "detail": "checks running",
+        }
+        for bounded in (False, True):
+            with self.subTest(bounded=bounded), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                MODULE.save_state(path, {
+                    "version": MODULE.STATE_VERSION, "history": [], "iterations": 0,
+                    "bounded_step": {"owner": {}},
+                })
+                gate = MODULE.CIStabilityGate(
+                    state_path=path, bounded_checkpoint=bounded,
+                )
+                self.assertEqual(
+                    ("waiting_for_checks", False),
+                    gate.observe_once(
+                        pending, processed=set(), now=self.now,
+                        polls=1, debounce_seconds=0,
+                    ),
+                )
+                state = MODULE.load_state(path)
+                self.assertEqual("waiting_for_checks", state["coordinator"]["status"])
+                if bounded:
+                    self.assertEqual(
+                        self.now.isoformat(), state["bounded_step"]["stable_since"],
+                    )
+
+    def test_confirmation_transition_restarts_changed_observation_in_both_modes(self):
+        for bounded in (False, True):
+            with self.subTest(bounded=bounded), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                MODULE.save_state(path, {
+                    "version": MODULE.STATE_VERSION, "history": [], "iterations": 0,
+                    "bounded_step": {"owner": {}},
+                })
+                gate = MODULE.CIStabilityGate(
+                    state_path=path, bounded_checkpoint=bounded,
+                )
+                self.assertTrue(gate.observe_once(
+                    self.preflight, processed=set(), now=self.now,
+                    polls=1, debounce_seconds=0,
+                )[1])
+                error = MODULE.WorkflowError(
+                    "CI attempt changed",
+                    details={"reason": "ci_observation_changed"},
+                )
+                with mock.patch.object(
+                    MODULE, "require_live_check_snapshot", side_effect=error,
+                ):
+                    self.assertIsNone(gate.confirm_once(lambda: self.preflight))
+                state = MODULE.load_state(path)
+                self.assertEqual("waiting_for_checks", state["coordinator"]["status"])
+                self.assertEqual(0, gate.polls)
+                self.assertEqual("CI attempt changed", state["coordinator"]["detail"])
+                if bounded:
+                    self.assertEqual(0, state["coordinator"]["stable_polls"])
+                    self.assertIsNone(state["bounded_step"]["stable_since"])
+
 
 class CIRerunProgressTest(unittest.TestCase):
     def setUp(self):
