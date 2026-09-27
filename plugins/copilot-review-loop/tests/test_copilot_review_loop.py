@@ -1766,19 +1766,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
     def test_source_fingerprint_matches_recovery_probe_shape(self):
         shared_refs = {
             "refs/heads/feature": self.head,
@@ -1893,11 +1880,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 before=before,
                 after=after,
             )
-
-
-
-
-
 
 
     def test_agent_definition_is_thin_and_version_is_bumped(self):
@@ -3648,7 +3630,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertFalse(canonical.exists())
 
 
-
     def test_windows_run_bytes_hides_console_processes(self):
         completed = MODULE.subprocess.CompletedProcess(["git"], 0, b"", b"")
         with (
@@ -3888,9 +3869,6 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
             ),
             mock.patch.object(MODULE, "process_is_running", return_value=False),
         )
-
-
-
 
 
     def terminal_local_recovery_case(self, state_path):
@@ -5306,8 +5284,6 @@ class DetachedPipelineCheckoutTest(unittest.TestCase):
         self.addCleanup(setattr, MODULE, "ACTIVE_GITHUB_MUTATION_POLICY", policy)
 
 
-
-
     def test_detached_clearance_keeps_exact_head_and_pipeline_guards(self):
         preflight = MODULE.agent_task_preflight(
             self.repo, self.target, allow_detached=True
@@ -5368,7 +5344,6 @@ class DetachedPipelineCheckoutTest(unittest.TestCase):
             MODULE.local_source_owner_fingerprint(
                 {key: value for key, value in before.items() if key != "worktree"}
             )
-
 
 
 class ParseTargetTest(unittest.TestCase):
@@ -6148,8 +6123,6 @@ class QueueSelectionTest(unittest.TestCase):
         )
 
 
-
-
 class SuppressedCommentTest(unittest.TestCase):
     def test_queues_actionable_overview_without_inventing_a_location(self):
         review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
@@ -6644,8 +6617,6 @@ return value;
         )
 
 
-
-
 class RemoteParsingTest(unittest.TestCase):
     def test_parses_https_and_ssh_remotes(self):
         self.assertEqual(
@@ -6744,8 +6715,6 @@ class RemoteParsingTest(unittest.TestCase):
             remote_head.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS) + 1
         )
         self.assertEqual(sleep.call_count, len(MODULE.REMOTE_REF_LAG_RETRY_DELAYS))
-
-
 
 
 class ReplyPublishingTest(unittest.TestCase):
@@ -7099,12 +7068,6 @@ class ReplyPublishingTest(unittest.TestCase):
 
         fetch_comments.assert_not_called()
         graphql.assert_not_called()
-
-
-
-
-
-
 
 
 class VerifyPublishTest(unittest.TestCase):
@@ -7499,12 +7462,6 @@ class FirstCopilotReviewTest(unittest.TestCase):
 
 class CleanAtHeadShaTest(unittest.TestCase):
     """The marker an external orchestrator reads to see whether this stage is green."""
-
-
-
-
-
-
 
 
     def test_watch_records_a_clean_head_when_the_review_asks_for_nothing(self):
@@ -8728,9 +8685,6 @@ class CopilotReviewTest(unittest.TestCase):
                 MODULE.command_watch(SimpleNamespace(state=str(path)))
 
 
-
-
-
 class PipelineBudgetTest(unittest.TestCase):
     """A later sweep gets a new allowance without resetting the run total."""
 
@@ -9029,7 +8983,6 @@ class DerivedCeilingTest(unittest.TestCase):
                 )
 
 
-
     def test_a_genuine_advance_refreshes_only_the_sweep_baseline(self):
         state = {"iterations": 11, "pipeline_budget": dict(self.SCOPE)}
 
@@ -9055,14 +9008,11 @@ class DerivedCeilingTest(unittest.TestCase):
         self.assertEqual(self.SCOPE, scope)
 
 
-
-
     def test_the_agent_file_states_the_outer_cap_as_a_bound_on_the_run(self):
         """Left as a replacement in prose, the next reader reinstates it in code."""
         instructions = AGENT.read_text(encoding="utf-8")
 
         self.assertIn("iteration budgets", instructions)
-
 
 
 class DetachedHeadTargetTest(unittest.TestCase):
