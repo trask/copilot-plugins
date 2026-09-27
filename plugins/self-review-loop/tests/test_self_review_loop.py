@@ -2820,6 +2820,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     MODULE.command_pipeline(args)
                     self.assertEqual("waiting", emitted[-1]["result"])
                     self.assertNotIn("stage_outcome", emitted[-1])
+                    self.assertEqual(0, MODULE.load_state(Path(args.state))["iterations"])
                     clock[0] += 40
                 with mock.patch.dict(
                     MODULE.os.environ, {"COPILOT_AGENT_SESSION_ID": "other-session"}
@@ -2835,17 +2836,25 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                 self.assertEqual([], commands)
                 pending = MODULE.load_state(Path(args.state))["agent_task"]
                 self.assertFalse(Path(pending["result_file"]).exists())
+                spent = 0
                 for _ in range(10):
                     MODULE.command_pipeline(args)
                     clock[0] += 40
                     if emitted[-1]["result"] != "waiting":
                         break
+                    waiting_state = MODULE.load_state(Path(args.state))
+                    self.assertLessEqual(spent, waiting_state["iterations"])
+                    self.assertLessEqual(waiting_state["iterations"], 1)
+                    spent = waiting_state["iterations"]
                 else:
                     self.fail("bounded publication did not finish")
                 self.assertEqual("cleared", emitted[-1]["stage_outcome"])
                 self.assertGreater(clock[0], 120)
                 self.assertEqual(2, len(commands))
-                self.assertEqual("completed", MODULE.load_state(Path(args.state))["agent_task"]["status"])
+                completed = MODULE.load_state(Path(args.state))
+                self.assertEqual("completed", completed["agent_task"]["status"])
+                self.assertEqual(2, completed["iterations"])
+                self.assertEqual(1, completed["agent_task"]["consumed_iterations"])
                 result_path = Path(dispatches[0][dispatches[0].index("--result-file") + 1])
                 self.assertFalse(
                     result_path.with_name(result_path.name + ".pipeline.json").exists()
@@ -3031,8 +3040,29 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
                     )
                 )
                 imported.assert_not_called()
+                before = Path(args.state).read_bytes()
+                with self.assertRaisesRegex(MODULE.WorkflowError, "later sweep"):
+                    MODULE.command_pipeline(args)
+                self.assertEqual(before, Path(args.state).read_bytes())
             self.assertEqual(2, len(calls))
             self.assertEqual(1, len(commands))
+
+    def test_zero_commit_incomplete_task_does_not_clear_or_charge(self):
+        with self.pipeline_run(fixes=0) as (args, commands, emitted):
+            with (
+                mock.patch.object(
+                    MODULE, "git",
+                    return_value='{"outcome":"incomplete","iterations_used":1}',
+                ),
+                self.assertRaisesRegex(MODULE.WorkflowError, "candidate not imported"),
+            ):
+                MODULE.command_pipeline(args)
+            state = MODULE.load_state(Path(args.state))
+            self.assertEqual(1, len(commands))
+            self.assertEqual("failed", state["agent_task"]["status"])
+            self.assertEqual(0, state["iterations"])
+            self.assertIsNone(MODULE.recorded_clean_at_head_sha(state))
+            self.assertEqual([], emitted)
 
     def test_pipeline_refreshes_its_budget_in_the_next_sweep(self):
         with self.pipeline_run(fixes=5) as (args, commands, emitted):

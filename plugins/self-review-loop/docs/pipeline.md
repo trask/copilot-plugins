@@ -4,7 +4,7 @@ PR Pipeline may call `scripts/self_review_loop.py pipeline` with `--bounded-step
 
 `{"result":"waiting"}` means the stage is not finished. It does not clear review. Each hosted task performs one pass. The first call dispatches a task; later calls observe it and reuse its pinned input and artifacts. After the task completes, the stage verifies the candidate and publishes its source changes. Verified code commits count as one pass even without a structured outcome file; the next call starts a new task on the published head. A pass without code requires an explicit clean outcome to clear review. Publication visibility may require more waiting calls. Changing the session, run, state, target, iteration, model, policy, or budget cannot adopt an unfinished task.
 
-The completed observation also returns waiting. The next call verifies the result and begins publication. Completed code passes return waiting until a later clean pass or the iteration budget is exhausted.
+The completed observation also returns waiting. The next call verifies the result and begins publication. The accepted-result transition records superseded candidate evidence and its spent allowance without importing it, or charges a published result after remote visibility is confirmed before recording clearance. Completed code passes return waiting until a later clean pass or the iteration budget is exhausted.
 
 A later sweep in the same run starts from a fresh PR preflight. The target PR and completed task history remain bound, but the current branch, head, base, draft state, title, and body need not match the prior sweep. The stage keeps its spent iteration count; it only accepts a new hosted result against that task's pinned inputs.
 

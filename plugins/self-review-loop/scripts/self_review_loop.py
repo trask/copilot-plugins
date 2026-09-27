@@ -2874,6 +2874,188 @@ def bounded_review_failure(
     return f"managed helper reported {error['code']}: {error['message']}"
 
 
+class AcceptedReviewResult:
+    def __init__(
+        self, state_path: Path, pr: dict[str, Any], remote: dict[str, Any],
+        report: dict[str, Any], coordinator_report: dict[str, Any],
+        result_sha256: str, args: argparse.Namespace, artifacts: frozenset[Path],
+    ) -> None:
+        self.state_path = state_path
+        self.pr = pr
+        self.remote = remote
+        self.report = report
+        self.coordinator_report = coordinator_report
+        self.result_sha256 = result_sha256
+        self.args = args
+        self.artifacts = artifacts
+
+    def supersede(self, live: dict[str, Any]) -> dict[str, Any]:
+        current = load_state(self.state_path)
+        task = current["agent_task"]
+        task.update(
+            {
+                "status": "superseded",
+                "task_id": self.remote["task_id"],
+                "task_url": self.remote["task_url"],
+                "generated_branch": self.remote["generated_branch"],
+                "generated_head": self.remote["generated_head"],
+                "ordered_commits": self.remote["commits"],
+                "result_sha256": self.result_sha256,
+                "candidate_manifest": self.remote["candidate_manifest"],
+                "completion": self.remote["completion"],
+                "report_evidence": self.remote["report_evidence"],
+                "coordinator_report": self.coordinator_report,
+                "review_outcome": self.report,
+                "imported": False,
+                "reserved_iterations": 0,
+                "consumed_iterations": self.report["iterations_used"],
+                "superseded_at": utc_now(),
+                "superseded_by_head_sha": live["head_sha"],
+                "discarded_reason": "pull request head advanced on the pinned source ref",
+            }
+        )
+        for _ in range(self.report["iterations_used"]):
+            charge_iteration(current)
+        current["review"].update(
+            {
+                "status": "incomplete",
+                "outcome": "source_changed",
+                "iterations_used": self.report["iterations_used"],
+            }
+        )
+        save_state(self.state_path, current)
+        payload = {
+            "result": "source_changed",
+            "state": str(self.state_path),
+            "pr": self.pr["pr_url"],
+            "pr_number": self.pr["number"],
+            "pr_title": self.pr["title"],
+            "session_title": f"Self Review Loop: {self.pr['number']} - {self.pr['title']}",
+            "head_sha": self.pr["head_sha"],
+            "next_head_sha": live["head_sha"],
+            "iterations": current["iterations"],
+            "outcome": "incomplete",
+            "stage_outcome": "source_changed",
+            "task": {"id": self.remote["task_id"], "url": self.remote["task_url"]},
+        }
+        if not getattr(self.args, "_pipeline", False):
+            emit(payload)
+        return payload
+
+    def complete(
+        self, current: dict[str, Any], final_live: dict[str, Any], published_head: str,
+    ) -> dict[str, Any]:
+        current["pr"] = {**self.pr, **final_live}
+        for _ in range(self.report["iterations_used"]):
+            charge_iteration(current)
+        outcome = self.report
+        pipeline_mode = bool(getattr(self.args, "_pipeline", False))
+        if outcome["outcome"] == "continue":
+            budget = (
+                current.get("pipeline_budget")
+                if pipeline_mode else current.get("invocation_budget")
+            )
+            if exhausted_budget(
+                current, budget, self.args.max_iterations,
+                absolute_iteration_cap(
+                    budget, self.args.max_iterations, self.args.pipeline_max_iterations,
+                ) if pipeline_mode else None,
+            ) is not None:
+                outcome = {**outcome, "outcome": "max_iterations_reached"}
+        review = current["review"]
+        review["status"] = (
+            "resolved"
+            if outcome["outcome"] == "cleared"
+            else "completed"
+            if outcome["outcome"] == "continue"
+            else "max_iterations_reached"
+        )
+        review["published_head_sha"] = published_head
+        review["task_completion"] = {
+            "task_id": self.remote["task_id"],
+            "session_id": self.remote["session_id"],
+            "state": "completed",
+        }
+        review["candidate_commit_count"] = len(self.remote["commits"])
+        review["coordinator_report"] = self.coordinator_report
+        if outcome["outcome"] == "cleared":
+            review["outcome"] = "clean"
+            review["clean_at_head_sha"] = published_head
+            review["clean_at_base_sha"] = final_live["base_sha"]
+        else:
+            review["outcome"] = "exhausted"
+        if outcome["outcome"] == "continue":
+            review["outcome"] = "continue"
+        review["iterations_used"] = outcome["iterations_used"]
+        task = current["agent_task"]
+        task["reserved_iterations"] = 0
+        task["consumed_iterations"] = outcome["iterations_used"]
+        task["outcome"] = outcome["outcome"]
+        task["status"] = "completed"
+        task["completed_at"] = utc_now()
+        task["artifacts_removed"] = False
+        for field in ("error", "failed_at"):
+            task.pop(field, None)
+        save_state(self.state_path, current)
+        if (
+            outcome["outcome"] == "cleared"
+            and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
+        ):
+            publish_shared_state(
+                current["pr"],
+                section="self_review",
+                field="clean_at_head_sha",
+                value=published_head,
+                updated_at=current["updated_at"],
+            )
+        finalize_agent_task_artifacts(
+            task, self.artifacts,
+            preserve=bool(getattr(self.args, "preserve_artifacts", False)),
+            report_content=None,
+        )
+        save_state(self.state_path, current)
+        prior_passes = [
+            item for item in current.get("managed_task_history", [])
+            if item.get("pass_scope") == task["pass_scope"]
+            and item.get("status") == "completed"
+        ]
+        all_commits = [
+            commit for item in prior_passes for commit in item.get("ordered_commits", [])
+        ] + self.remote["commits"]
+        all_tasks = [
+            {"id": item["task_id"], "url": item["task_url"]}
+            for item in prior_passes
+        ] + [{"id": self.remote["task_id"], "url": self.remote["task_url"]}]
+        payload = {
+            "result": "published" if all_commits else "nothing_to_publish",
+            "state": str(self.state_path),
+            "pr": current["pr"]["pr_url"],
+            "pr_number": current["pr"]["number"],
+            "pr_title": current["pr"]["title"],
+            "session_title": (
+                f"Self Review Loop: {current['pr']['number']} - "
+                f"{current['pr']['title']}"
+            ),
+            "head_sha": published_head,
+            "commits": all_commits,
+            "tasks": all_tasks,
+            "iterations": current["iterations"],
+            "outcome": outcome["outcome"],
+            **stage_outcome_fields(current),
+            **(
+                {"stage_outcome": "max_iterations_reached"}
+                if pipeline_mode and outcome["outcome"] == "max_iterations_reached"
+                else {}
+            ),
+            "task": {"id": self.remote["task_id"], "url": self.remote["task_url"]},
+            "attestation": "dispatcher_candidate",
+            "coordinator_report": self.coordinator_report,
+        }
+        if not pipeline_mode:
+            emit(payload)
+        return payload
+
+
 def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
     global ACTIVE_GITHUB_MUTATION_POLICY
 
@@ -3368,73 +3550,19 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
             preflight=preflight,
             remote=remote,
         )
-        report_content = None
         report = candidate_review_outcome(
             repo_root, remote, allowed_iterations=allowed_iterations,
             helper=helper,
         )
         state["agent_task"]["review_outcome"] = report
         save_state(state_path, state)
+        accepted = AcceptedReviewResult(
+            state_path, pr, remote, report, coordinator_report, result_sha256, args,
+            frozenset({prompt_path, result_path, *([checkpoint_path] if bounded else [])}),
+        )
         live_before_import = metadata_for(target)
         if not publication_resume and same_ref_forward_head_drift(pr, live_before_import):
-            current = load_state(state_path)
-            task_state = current["agent_task"]
-            task_state.update(
-                {
-                    "status": "superseded",
-                    "task_id": remote["task_id"],
-                    "task_url": remote["task_url"],
-                    "generated_branch": remote["generated_branch"],
-                    "generated_head": remote["generated_head"],
-                    "ordered_commits": remote["commits"],
-                    "result_sha256": result_sha256,
-                    "candidate_manifest": remote["candidate_manifest"],
-                    "completion": remote["completion"],
-                    "report_evidence": remote["report_evidence"],
-                    "coordinator_report": coordinator_report,
-                    "review_outcome": report,
-                    "imported": False,
-                    "reserved_iterations": 0,
-                    "consumed_iterations": report["iterations_used"],
-                    "superseded_at": utc_now(),
-                    "superseded_by_head_sha": live_before_import["head_sha"],
-                    "discarded_reason": (
-                        "pull request head advanced on the pinned source ref"
-                    ),
-                }
-            )
-            for _ in range(report["iterations_used"]):
-                charge_iteration(current)
-            current["review"].update(
-                {
-                    "status": "incomplete",
-                    "outcome": "source_changed",
-                    "iterations_used": report["iterations_used"],
-                }
-            )
-            save_state(state_path, current)
-            payload = {
-                "result": "source_changed",
-                "state": str(state_path),
-                "pr": pr["pr_url"],
-                "pr_number": pr["number"],
-                "pr_title": pr["title"],
-                "session_title": (
-                    f"Self Review Loop: {pr['number']} - {pr['title']}"
-                ),
-                "head_sha": pr["head_sha"],
-                "next_head_sha": live_before_import["head_sha"],
-                "iterations": current["iterations"],
-                "outcome": "incomplete",
-                "stage_outcome": "source_changed",
-                "task": {
-                    "id": remote["task_id"],
-                    "url": remote["task_url"],
-                },
-            }
-            if not pipeline_mode:
-                emit(payload)
-            return payload
+            return accepted.supersede(live_before_import)
         if report["outcome"] == "incomplete":
             raise WorkflowError("hosted Self Review is incomplete; candidate not imported")
         if not publication_resume:
@@ -3633,119 +3761,7 @@ def _command_agent_task_pass(args: argparse.Namespace) -> dict[str, Any]:
                 target, pr, expected_head=published_head,
                 allow_linear_base_advance=True,
             )
-        current["pr"] = {**pr, **final_live}
-        for _ in range(report["iterations_used"]):
-            charge_iteration(current)
-        if report["outcome"] == "continue":
-            budget = (
-                current.get("pipeline_budget")
-                if pipeline_mode else current.get("invocation_budget")
-            )
-            if exhausted_budget(
-                current, budget, max_iterations,
-                absolute_iteration_cap(
-                    budget, max_iterations, args.pipeline_max_iterations,
-                ) if pipeline_mode else None,
-            ) is not None:
-                report = {**report, "outcome": "max_iterations_reached"}
-        review = current["review"]
-        review["status"] = (
-            "resolved"
-            if report["outcome"] == "cleared"
-            else "completed"
-            if report["outcome"] == "continue"
-            else "max_iterations_reached"
-        )
-        review["published_head_sha"] = published_head
-        review["task_completion"] = {
-            "task_id": remote["task_id"],
-            "session_id": remote["session_id"],
-            "state": "completed",
-        }
-        review["candidate_commit_count"] = len(remote["commits"])
-        review["coordinator_report"] = coordinator_report
-        if report["outcome"] == "cleared":
-            review["outcome"] = "clean"
-            review["clean_at_head_sha"] = published_head
-            review["clean_at_base_sha"] = final_live["base_sha"]
-        else:
-            review["outcome"] = "exhausted"
-        if report["outcome"] == "continue":
-            review["outcome"] = "continue"
-        review["iterations_used"] = report["iterations_used"]
-        current["agent_task"]["reserved_iterations"] = 0
-        current["agent_task"]["consumed_iterations"] = report["iterations_used"]
-        current["agent_task"]["outcome"] = report["outcome"]
-        current["agent_task"]["status"] = "completed"
-        current["agent_task"]["completed_at"] = utc_now()
-        current["agent_task"]["artifacts_removed"] = False
-        for field in ("error", "failed_at"):
-            current["agent_task"].pop(field, None)
-        save_state(state_path, current)
-        if (
-            report["outcome"] == "cleared"
-            and ACTIVE_GITHUB_MUTATION_POLICY != "source-only"
-        ):
-            publish_shared_state(
-                current["pr"],
-                section="self_review",
-                field="clean_at_head_sha",
-                value=published_head,
-                updated_at=current["updated_at"],
-            )
-        finalize_agent_task_artifacts(
-            current["agent_task"],
-            {prompt_path, result_path, *([checkpoint_path] if bounded else [])},
-            preserve=bool(getattr(args, "preserve_artifacts", False)),
-            report_content=report_content,
-        )
-        save_state(state_path, current)
-        prior_passes = [
-            item for item in current.get("managed_task_history", [])
-            if item.get("pass_scope") == current["agent_task"]["pass_scope"]
-            and item.get("status") == "completed"
-        ]
-        all_commits = [
-            commit
-            for item in prior_passes
-            for commit in item.get("ordered_commits", [])
-        ] + remote["commits"]
-        all_tasks = [
-            {"id": item["task_id"], "url": item["task_url"]}
-            for item in prior_passes
-        ] + [{"id": remote["task_id"], "url": remote["task_url"]}]
-        result_name = "published" if all_commits else "nothing_to_publish"
-        payload = {
-            "result": result_name,
-            "state": str(state_path),
-            "pr": current["pr"]["pr_url"],
-            "pr_number": current["pr"]["number"],
-            "pr_title": current["pr"]["title"],
-            "session_title": (
-                f"Self Review Loop: {current['pr']['number']} - "
-                f"{current['pr']['title']}"
-            ),
-            "head_sha": published_head,
-            "commits": all_commits,
-            "tasks": all_tasks,
-            "iterations": current["iterations"],
-            "outcome": report["outcome"],
-            **stage_outcome_fields(current),
-            **(
-                {"stage_outcome": "max_iterations_reached"}
-                if pipeline_mode and report["outcome"] == "max_iterations_reached"
-                else {}
-            ),
-            "task": {
-                "id": remote["task_id"],
-                "url": remote["task_url"],
-            },
-            "attestation": "dispatcher_candidate",
-            "coordinator_report": coordinator_report,
-        }
-        if not pipeline_mode:
-            emit(payload)
-        return payload
+        return accepted.complete(current, final_live, published_head)
     except BaseException as error:
         current = load_state(state_path)
         task_state = current.get("agent_task")
