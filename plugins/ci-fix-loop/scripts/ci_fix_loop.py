@@ -9065,6 +9065,18 @@ class CIObservation:
         return decision
 
 
+def stale_ci_clearance_fields(*, warning: bool) -> dict[str, Any]:
+    return {
+        "stage_outcome": "pending", "outcome": None,
+        "clean_at_head_sha": None, "clean_at_base_sha": None,
+        "all_ci_passed": False,
+        **({
+            "warning_at_head_sha": None, "warning_at_base_sha": None,
+            "ci_warnings": [],
+        } if warning else {}),
+    }
+
+
 def stale_ci_head_fields(
     state: dict[str, Any], live: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -9080,13 +9092,7 @@ def stale_ci_head_fields(
         )
     warning = state.get("outcome") == "warning"
     return {
-        "stage_outcome": "pending", "outcome": None,
-        "clean_at_head_sha": None, "clean_at_base_sha": None,
-        "all_ci_passed": False,
-        **({
-            "warning_at_head_sha": None, "warning_at_base_sha": None,
-            "ci_warnings": [],
-        } if warning else {}),
+        **stale_ci_clearance_fields(warning=warning),
         ("warning_verification" if warning else "clearance_verification"): {
             "result": "stale",
             "reason": "ci_warning_snapshot_changed" if warning else "ci_snapshot_changed",
@@ -9098,46 +9104,19 @@ def stale_ci_head_fields(
     }
 
 
-def verify_ci_warning_snapshot(state: dict[str, Any]) -> dict[str, Any]:
-    expected = state.get("warning_snapshot_sha256")
-    if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
-        raise WorkflowError("CI warning has no frozen check snapshot identity")
-    pr = state["pr"]
-    live = metadata_for(parse_target(pr["pr_url"]))
-    stale = stale_ci_head_fields(state, live)
-    if stale is not None:
-        return stale
-    require_live_pr_snapshot(
-        {**pr, "title": live.get("title"), "body": live.get("body")},
-        live, expected_head=pr["head_sha"], allow_linear_base_advance=True,
-    )
-    observation = CIObservation.read(live)
-    current, observed = observation.clearance_matches(
-        expected, state["warning_at_base_sha"], require_passing=False,
-    )
-    fields: dict[str, Any] = {"warning_verification": {
-        "result": "current" if current else "stale",
-        "expected_snapshot_sha256": expected, "observed_snapshot_sha256": observed,
-        "reason": "ci_warning_snapshot_current" if current else "ci_warning_snapshot_changed",
-    }}
-    if not current:
-        fields.update({
-            "stage_outcome": "pending", "outcome": None,
-            "clean_at_head_sha": None, "clean_at_base_sha": None, "warning_at_head_sha": None,
-            "warning_at_base_sha": None, "ci_warnings": [],
-            "all_ci_passed": False,
-        })
-    return fields
-
-
 def verify_ci_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
-    if state.get("outcome") == "warning":
-        return verify_ci_warning_snapshot(state)
-    expected = state.get("green_snapshot_sha256")
-    if (
-        state.get("outcome") not in {"green", "no_checks"}
-        or not isinstance(expected, str)
-        or re.fullmatch(r"[0-9a-f]{64}", expected) is None
+    warning = state.get("outcome") == "warning"
+    expected = state.get(
+        "warning_snapshot_sha256" if warning else "green_snapshot_sha256"
+    )
+    valid_snapshot = (
+        isinstance(expected, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
+    )
+    if warning and not valid_snapshot:
+        raise WorkflowError("CI warning has no frozen check snapshot identity")
+    if not warning and (
+        state.get("outcome") not in {"green", "no_checks"} or not valid_snapshot
     ):
         return {
             "stage_outcome": "pending", "clean_at_head_sha": None,
@@ -9157,23 +9136,24 @@ def verify_ci_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     )
     observation = CIObservation.read(live)
     current, observed = observation.clearance_matches(
-        expected, state["clean_at_base_sha"], require_passing=True,
+        expected,
+        state["warning_at_base_sha"] if warning else state["clean_at_base_sha"],
+        require_passing=not warning,
     )
-    current = (
-        current
-        and state.get("clean_at_head_sha") == observation.pr["head_sha"].lower()
-    )
-    result = {"clearance_verification": {
+    if not warning:
+        current = (
+            current
+            and state.get("clean_at_head_sha") == observation.pr["head_sha"].lower()
+        )
+    verification = "warning_verification" if warning else "clearance_verification"
+    reason = "ci_warning_snapshot" if warning else "ci_snapshot"
+    result = {verification: {
         "result": "current" if current else "stale",
-        "reason": "ci_snapshot_current" if current else "ci_snapshot_changed",
+        "reason": f"{reason}_current" if current else f"{reason}_changed",
         "expected_snapshot_sha256": expected, "observed_snapshot_sha256": observed,
     }}
     if not current:
-        result.update({
-            "stage_outcome": "pending", "outcome": None,
-            "clean_at_head_sha": None, "clean_at_base_sha": None,
-            "all_ci_passed": False,
-        })
+        result.update(stale_ci_clearance_fields(warning=warning))
     return result
 
 

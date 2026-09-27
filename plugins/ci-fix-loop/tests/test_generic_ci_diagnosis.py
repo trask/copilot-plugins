@@ -349,7 +349,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             mock.patch.object(MODULE, "fetch_rollup", return_value=(self.pr["head_sha"], self.checks[::-1])),
             mock.patch.object(MODULE, "ci_run_identity", return_value=self.run),
         ):
-            fields = MODULE.verify_ci_warning_snapshot(state)
+            fields = MODULE.verify_ci_clearance_snapshot(state)
         self.assertEqual("current", fields["warning_verification"]["result"])
         self.assertNotIn("stage_outcome", fields)
 
@@ -363,7 +363,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             mock.patch.object(MODULE, "ci_run_identity", return_value=self.run),
             mock.patch.object(MODULE, "commit_contains", return_value=True),
         ):
-            fields = MODULE.verify_ci_warning_snapshot(state)
+            fields = MODULE.verify_ci_clearance_snapshot(state)
         self.assertEqual("current", fields["warning_verification"]["result"])
         self.assertEqual("warning", MODULE.stage_outcome(state))
 
@@ -409,7 +409,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
                 mock.patch.object(MODULE, "fetch_rollup", return_value=(self.pr["head_sha"], checks)),
                 mock.patch.object(MODULE, "ci_run_identity", return_value=self.run),
             ):
-                fields = MODULE.verify_ci_warning_snapshot(state)
+                fields = MODULE.verify_ci_clearance_snapshot(state)
             self.assertEqual("stale", fields["warning_verification"]["result"])
             self.assertEqual("pending", fields["stage_outcome"])
             self.assertIsNone(fields["clean_at_head_sha"])
@@ -431,7 +431,7 @@ class GenericCiDiagnosisTest(unittest.TestCase):
                 mock.patch.object(MODULE, "ci_run_identity", return_value=live),
             ):
                 self.assertEqual(
-                    "stale", MODULE.verify_ci_warning_snapshot(state)["warning_verification"]["result"],
+                    "stale", MODULE.verify_ci_clearance_snapshot(state)["warning_verification"]["result"],
                 )
 
     def test_warning_verification_read_errors_never_become_current(self):
@@ -440,10 +440,87 @@ class GenericCiDiagnosisTest(unittest.TestCase):
             mock.patch.object(MODULE, "metadata_for", side_effect=MODULE.WorkflowError("API unavailable")),
             self.assertRaisesRegex(MODULE.WorkflowError, "API unavailable"),
         ):
-            MODULE.verify_ci_warning_snapshot(state)
+            MODULE.verify_ci_clearance_snapshot(state)
         state.pop("warning_snapshot_sha256")
         with self.assertRaisesRegex(MODULE.WorkflowError, "no frozen check snapshot"):
-            MODULE.verify_ci_warning_snapshot(state)
+            MODULE.verify_ci_clearance_snapshot(state)
+
+    def test_clearance_verifier_keeps_warning_and_green_workflow_rules(self):
+        warning = self.warning_state()
+        passing_checks = [
+            {**check, "class": "passed", "conclusion": "SUCCESS"}
+            for check in self.checks
+        ]
+        passing_run = {**self.run, "conclusion": "success"}
+        green = {
+            "pr": self.pr, "outcome": "green",
+            "clean_at_head_sha": self.pr["head_sha"],
+            "clean_at_base_sha": self.pr["base_sha"],
+            "green_snapshot_sha256": MODULE.CIObservation(
+                self.pr, passing_checks, {"11": passing_run},
+            ).clearance_fingerprint(self.pr["base_sha"]),
+        }
+        for state, checks, run, key in (
+            (warning, self.checks, self.run, "warning_verification"),
+            (green, passing_checks, passing_run, "clearance_verification"),
+        ):
+            with self.subTest(outcome=state["outcome"]), (
+                mock.patch.object(MODULE, "metadata_for", return_value=self.pr)
+            ), mock.patch.object(
+                MODULE.CIObservation, "read",
+                return_value=MODULE.CIObservation(self.pr, checks, {"11": run}),
+            ):
+                fields = MODULE.verify_ci_clearance_snapshot(state)
+                self.assertEqual("current", fields[key]["result"])
+                self.assertNotIn("stage_outcome", fields)
+
+                changed = {**run, "run_attempt": 2}
+                with mock.patch.object(
+                    MODULE.CIObservation, "read",
+                    return_value=MODULE.CIObservation(self.pr, checks, {"11": changed}),
+                ):
+                    stale = MODULE.verify_ci_clearance_snapshot(state)
+                self.assertEqual("stale", stale[key]["result"])
+                self.assertEqual("pending", stale["stage_outcome"])
+                self.assertIsNone(stale["outcome"])
+                self.assertFalse(stale["all_ci_passed"])
+                if state["outcome"] == "warning":
+                    self.assertEqual([], stale["ci_warnings"])
+                else:
+                    self.assertNotIn("ci_warnings", stale)
+
+        green["green_snapshot_sha256"] = warning["warning_snapshot_sha256"]
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=self.pr),
+            mock.patch.object(
+                MODULE.CIObservation, "read",
+                return_value=MODULE.CIObservation(
+                    self.pr, self.checks, {"11": self.run},
+                ),
+            ),
+        ):
+            self.assertEqual(
+                "stale",
+                MODULE.verify_ci_clearance_snapshot(green)["clearance_verification"]["result"],
+            )
+
+    def test_missing_clearance_identity_preserves_outcome_specific_error(self):
+        warning = self.warning_state()
+        warning.pop("warning_snapshot_sha256")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "no frozen check snapshot"):
+            MODULE.verify_ci_clearance_snapshot(warning)
+        self.assertEqual(
+            {
+                "stage_outcome": "pending", "clean_at_head_sha": None,
+                "clean_at_base_sha": None, "all_ci_passed": False,
+                "clearance_verification": {
+                    "result": "unverified", "reason": "ci_snapshot_missing",
+                },
+            },
+            MODULE.verify_ci_clearance_snapshot({
+                "pr": self.pr, "outcome": "green",
+            }),
+        )
 
     def test_verified_status_reports_same_stale_result_without_mutating_saved_state(self):
         MODULE.save_state(self.path, self.warning_state())

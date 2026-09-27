@@ -14,6 +14,8 @@ The CI stability gate owns the collected logs until the confirmed preflight is h
 
 CI observation binds a pinned head's check rollup to the applicable workflow attempts. Preflight, publication and green/warning verification compare evidence from that same boundary. Stability identity ignores log collection, while clearance identity includes all applicable workflow attempts; a new attempt at the same head invalidates earlier clearance. Pipeline's verified status result stays the same.
 
+The clearance verifier reads the live pull request and CI observation for either a clean result or a warning. Both outcomes become pending if the pinned head advances or their check snapshot changes. Clean results require passing workflows; warnings retain their recorded failures only while the same workflow attempts remain current.
+
 Both the standalone coordinator and the bounded step use the same CI stability gate to count matching observations and confirm the identity after collecting logs. The bounded step also requires its debounce interval to elapse across calls; the standalone coordinator sleeps within its wait budget. A processed failure needs a new snapshot in either mode. The standalone coordinator may revisit a processed green or no-checks snapshot; the bounded step waits for a new snapshot within its sweep.
 
 The gate restores and records the bounded step's stability checkpoint, including its first-observed time and retained log paths. Restarting a bounded call resumes that observation without making the coordinator manage the gate's fields.
