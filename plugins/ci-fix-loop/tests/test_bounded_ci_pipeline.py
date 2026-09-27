@@ -1,4 +1,5 @@
 import copy
+import datetime as dt
 import importlib.util
 import json
 import os
@@ -14,6 +15,69 @@ SPEC = importlib.util.spec_from_file_location("ci_fix_bounded_test", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 SESSION = "01234567-89ab-cdef-0123-456789abcdef"
+
+
+class CIStabilityGateTest(unittest.TestCase):
+    def setUp(self):
+        self.now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        self.snapshot = {
+            "sha256": "snapshot", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
+            "decision": {"decision": "green", "detail": "passed"},
+        }
+        self.preflight = {"check_snapshot": self.snapshot}
+
+    def test_requires_matching_polls_and_debounce_before_confirmation(self):
+        gate = MODULE.CIStabilityGate()
+        self.assertEqual(
+            "stabilizing",
+            gate.observe(self.preflight, processed=set(), now=self.now),
+        )
+        self.assertFalse(gate.ready(polls=2, debounce_seconds=10, now=self.now))
+        gate.observe(self.preflight, processed=set(), now=self.now + dt.timedelta(seconds=2))
+        self.assertFalse(gate.ready(
+            polls=2, debounce_seconds=10, now=self.now + dt.timedelta(seconds=9),
+        ))
+        self.assertTrue(gate.ready(
+            polls=2, debounce_seconds=10, now=self.now + dt.timedelta(seconds=10),
+        ))
+        changed = copy.deepcopy(self.preflight)
+        changed["check_snapshot"]["workflow_runs"] = {"42": {"run_attempt": 2}}
+        with mock.patch.object(MODULE, "require_live_check_snapshot") as verify:
+            self.assertFalse(gate.confirm(changed))
+            verify.assert_not_called()
+            self.assertTrue(gate.confirm(self.preflight))
+            verify.assert_called_once_with(self.preflight)
+        gate.observe(changed, processed=set(), now=self.now + dt.timedelta(seconds=11))
+        self.assertEqual(1, gate.polls)
+        self.assertFalse(gate.ready(
+            polls=2, debounce_seconds=0, now=self.now + dt.timedelta(seconds=11),
+        ))
+
+    def test_processed_failure_blocks_both_modes_but_terminal_can_be_reobserved(self):
+        gate = MODULE.CIStabilityGate()
+        identity = MODULE.ci_stability_sha256(self.snapshot)
+        self.assertEqual(
+            "waiting_for_change",
+            gate.observe(self.preflight, processed={identity}, now=self.now),
+        )
+        self.assertFalse(gate.ready(polls=1, debounce_seconds=0, now=self.now))
+        self.assertEqual(
+            "stabilizing",
+            gate.observe(
+                self.preflight, processed={identity}, now=self.now,
+                allow_processed_terminal=True,
+            ),
+        )
+        self.snapshot["decision"]["decision"] = "failures"
+        self.assertEqual(
+            "waiting_for_change",
+            gate.observe(
+                self.preflight,
+                processed={MODULE.ci_stability_sha256(self.snapshot)},
+                now=self.now, allow_processed_terminal=True,
+            ),
+        )
 
 
 class BoundedCiPipelineTest(unittest.TestCase):

@@ -2274,7 +2274,6 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
                 return
             raise
         snapshot = preflight["check_snapshot"]
-        stability_identity = ci_stability_sha256(snapshot)
         current_logs = set(managed_task_log_paths({"preflight": preflight}))
         recorded_logs = bounded.get("active_log_paths", [])
         if not isinstance(recorded_logs, list) or any(
@@ -2286,50 +2285,47 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         }
         cleanup_superseded_preflight_logs(state_path, previous_logs - current_logs)
         coordinator = state.get("coordinator") or {}
-        stable = coordinator.get("stability_sha256") == stability_identity
-        polls = coordinator.get("stable_polls", 0) + 1 if stable else 1
-        stable_since = (
-            bounded.get("stable_since") if stable else utc_now()
+        gate = CIStabilityGate(
+            identity=coordinator.get("stability_sha256"),
+            polls=coordinator.get("stable_polls", 0),
+            since=bounded.get("stable_since"),
         )
-        if not isinstance(stable_since, str):
-            stable_since = utc_now()
+        gate.observe(
+            preflight, processed=processed_ci_snapshot_ids(state),
+            now=dt.datetime.now(dt.timezone.utc),
+        )
         update_coordinator_state(
             state_path, status="stabilizing",
             head_sha=snapshot["head_sha"], snapshot_sha256=snapshot["sha256"],
-            stability_sha256=stability_identity,
-            stable_polls=polls, detail=snapshot["decision"]["detail"],
+            stability_sha256=gate.identity,
+            stable_polls=gate.polls, detail=snapshot["decision"]["detail"],
             check_snapshot=snapshot,
         )
         state = load_state(state_path)
-        state["bounded_step"]["stable_since"] = stable_since
+        state["bounded_step"]["stable_since"] = gate.since
         state["bounded_step"]["active_log_paths"] = sorted(
             str(path) for path in current_logs
         )
         save_state(state_path, state)
-        processed = processed_ci_snapshot_ids(state)
-        if (
-            not ci_preflight_is_stable_candidate(preflight)
-            or polls < max(1, args.stability_polls)
-            or (
-                dt.datetime.now(dt.timezone.utc) - parse_timestamp(stable_since)
-            ).total_seconds() < max(0.0, float(getattr(args, "debounce_seconds", 0.0)))
-            or stability_identity in processed
-            or snapshot["sha256"] in processed
+        if not gate.ready(
+            polls=args.stability_polls,
+            debounce_seconds=getattr(args, "debounce_seconds", 0.0),
+            now=dt.datetime.now(dt.timezone.utc),
         ):
             emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
             return
         try:
             complete = agent_task_preflight(repo_root, target, state_path=state_path)
             complete_logs = set(managed_task_log_paths({"preflight": complete}))
-            if ci_stability_sha256(complete["check_snapshot"]) != stability_identity:
-                cleanup_superseded_preflight_logs(state_path, complete_logs)
-                emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
-                return
             try:
-                require_live_check_snapshot(complete)
+                confirmed = gate.confirm(complete)
             except WorkflowError:
                 cleanup_superseded_preflight_logs(state_path, complete_logs)
                 raise
+            if not confirmed:
+                cleanup_superseded_preflight_logs(state_path, complete_logs)
+                emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+                return
         except WorkflowError as error:
             if error.details.get("reason") != "ci_observation_changed":
                 raise
@@ -2340,8 +2336,8 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         update_coordinator_state(
             state_path, status="ready",
             head_sha=snapshot["head_sha"], snapshot_sha256=snapshot["sha256"],
-            stability_sha256=stability_identity,
-            stable_polls=polls, detail=snapshot["decision"]["detail"],
+            stability_sha256=gate.identity,
+            stable_polls=gate.polls, detail=snapshot["decision"]["detail"],
             check_snapshot=snapshot,
         )
         state = load_state(state_path)
@@ -12231,6 +12227,63 @@ def ci_preflight_is_stable_candidate(preflight: dict[str, Any]) -> bool:
     return decision["decision"] in {"green", "no_checks", "escalate"}
 
 
+class CIStabilityGate:
+    def __init__(
+        self, *, identity: str | None = None, polls: int = 0,
+        since: str | None = None,
+    ) -> None:
+        self.identity = identity
+        self.polls = polls
+        self.since = since
+        self.status = "waiting_for_checks"
+
+    def reset(self) -> None:
+        self.identity = None
+        self.polls = 0
+        self.since = None
+        self.status = "waiting_for_checks"
+
+    def observe(
+        self, preflight: dict[str, Any], *, processed: set[str],
+        now: dt.datetime, allow_processed_terminal: bool = False,
+    ) -> str:
+        snapshot = preflight["check_snapshot"]
+        identity = ci_stability_sha256(snapshot)
+        if identity == self.identity:
+            self.polls += 1
+        else:
+            self.identity = identity
+            self.polls = 1
+            self.since = now.isoformat()
+        if not isinstance(self.since, str):
+            self.since = now.isoformat()
+        already_processed = identity in processed or snapshot["sha256"] in processed
+        eligible = ci_preflight_is_stable_candidate(preflight) and not (
+            already_processed
+            and (not allow_processed_terminal or snapshot["decision"]["decision"] == "failures")
+        )
+        self.status = (
+            "stabilizing" if eligible else
+            "waiting_for_change" if already_processed else "waiting_for_checks"
+        )
+        return self.status
+
+    def ready(self, *, polls: int, debounce_seconds: float, now: dt.datetime) -> bool:
+        return (
+            self.status == "stabilizing"
+            and self.polls >= max(1, polls)
+            and self.since is not None
+            and (now - parse_timestamp(self.since)).total_seconds()
+            >= max(0.0, float(debounce_seconds))
+        )
+
+    def confirm(self, preflight: dict[str, Any]) -> bool:
+        if ci_stability_sha256(preflight["check_snapshot"]) != self.identity:
+            return False
+        require_live_check_snapshot(preflight)
+        return True
+
+
 def cleanup_superseded_preflight_logs(
     state_path: Path,
     paths: Iterable[Path],
@@ -12262,8 +12315,7 @@ def wait_for_stable_ci_preflight(
     state_path: Path,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + max(0.0, float(args.wait_timeout))
-    stable_identity: str | None = None
-    stable_polls = 0
+    gate = CIStabilityGate()
     attempt = 0
     active_log_paths: set[Path] = set()
     required_stability = max(1, int(args.stability_polls))
@@ -12291,8 +12343,7 @@ def wait_for_stable_ci_preflight(
             )
         except WorkflowError as error:
             if error.details.get("reason") == "ci_observation_changed":
-                stable_identity = None
-                stable_polls = 0
+                gate.reset()
                 update_coordinator_state(
                     state_path, status="waiting_for_checks", detail=str(error),
                 )
@@ -12315,40 +12366,30 @@ def wait_for_stable_ci_preflight(
             continue
 
         snapshot = preflight["check_snapshot"]
-        identity = ci_stability_sha256(snapshot)
         decision = snapshot["decision"]
         state = coordinator_file_state(state_path)
-        processed = processed_ci_snapshot_ids(state)
-        already_processed = identity in processed or snapshot["sha256"] in processed
-        candidate = ci_preflight_is_stable_candidate(preflight) and not (
-            decision["decision"] == "failures" and already_processed
+        status = gate.observe(
+            preflight, processed=processed_ci_snapshot_ids(state),
+            now=dt.datetime.now(dt.timezone.utc),
+            allow_processed_terminal=True,
         )
-        if candidate and identity == stable_identity:
-            stable_polls += 1
-        elif candidate:
-            stable_identity = identity
-            stable_polls = 1
+        if status == "stabilizing" and gate.polls == 1:
             attempt = 0
-        else:
-            stable_identity = None
-            stable_polls = 0
-        status = (
-            "stabilizing"
-            if candidate
-            else "waiting_for_change"
-            if already_processed
-            else "waiting_for_checks"
-        )
+        if status != "stabilizing":
+            gate.reset()
         update_coordinator_state(
             state_path,
             status=status,
             head_sha=snapshot["head_sha"],
             snapshot_sha256=snapshot["sha256"],
-            stable_polls=stable_polls,
+            stable_polls=gate.polls,
             detail=decision["detail"],
             check_snapshot=snapshot,
         )
-        if candidate and stable_polls >= required_stability:
+        if gate.ready(
+            polls=required_stability, debounce_seconds=0,
+            now=dt.datetime.now(dt.timezone.utc),
+        ):
             if float(args.debounce_seconds) > 0:
                 time.sleep(min(
                     float(args.debounce_seconds),
@@ -12368,8 +12409,7 @@ def wait_for_stable_ci_preflight(
             except WorkflowError as error:
                 if error.details.get("reason") != "ci_observation_changed":
                     raise
-                stable_identity = None
-                stable_polls = 0
+                gate.reset()
                 attempt = 0
                 update_coordinator_state(
                     state_path, status="waiting_for_checks", detail=str(error),
@@ -12382,11 +12422,23 @@ def wait_for_stable_ci_preflight(
                 state_path, active_log_paths - confirmation_log_paths
             )
             active_log_paths = confirmation_log_paths
-            if ci_stability_sha256(confirmation["check_snapshot"]) != identity:
+            try:
+                confirmed = gate.confirm(confirmation)
+            except WorkflowError as error:
                 cleanup_superseded_preflight_logs(state_path, active_log_paths)
                 active_log_paths = set()
-                stable_identity = None
-                stable_polls = 0
+                if error.details.get("reason") != "ci_observation_changed":
+                    raise
+                gate.reset()
+                attempt = 0
+                update_coordinator_state(
+                    state_path, status="waiting_for_checks", detail=str(error),
+                )
+                continue
+            if not confirmed:
+                cleanup_superseded_preflight_logs(state_path, active_log_paths)
+                active_log_paths = set()
+                gate.reset()
                 attempt = 0
                 changed_snapshot = confirmation["check_snapshot"]
                 update_coordinator_state(
@@ -12399,27 +12451,13 @@ def wait_for_stable_ci_preflight(
                     check_snapshot=changed_snapshot,
                 )
                 continue
-            try:
-                require_live_check_snapshot(confirmation)
-            except WorkflowError as error:
-                cleanup_superseded_preflight_logs(state_path, active_log_paths)
-                active_log_paths = set()
-                if error.details.get("reason") != "ci_observation_changed":
-                    raise
-                stable_identity = None
-                stable_polls = 0
-                attempt = 0
-                update_coordinator_state(
-                    state_path, status="waiting_for_checks", detail=str(error),
-                )
-                continue
             preflight = confirmation
             update_coordinator_state(
                 state_path,
                 status="ready",
                 head_sha=preflight["check_snapshot"]["head_sha"],
                 snapshot_sha256=preflight["check_snapshot"]["sha256"],
-                stable_polls=stable_polls,
+                stable_polls=gate.polls,
                 detail=preflight["check_snapshot"]["decision"]["detail"],
                 check_snapshot=preflight["check_snapshot"],
             )
