@@ -2274,21 +2274,18 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
                 return
             raise
         snapshot = preflight["check_snapshot"]
-        current_logs = set(managed_task_log_paths({"preflight": preflight}))
         recorded_logs = bounded.get("active_log_paths", [])
         if not isinstance(recorded_logs, list) or any(
             not isinstance(value, str) for value in recorded_logs
         ):
             raise WorkflowError("bounded CI log ownership is malformed")
-        previous_logs = {
-            Path(value) for value in recorded_logs
-        }
-        cleanup_superseded_preflight_logs(state_path, previous_logs - current_logs)
         coordinator = state.get("coordinator") or {}
         gate = CIStabilityGate(
             identity=coordinator.get("stability_sha256"),
             polls=coordinator.get("stable_polls", 0),
             since=bounded.get("stable_since"),
+            state_path=state_path,
+            active_log_paths=(Path(value) for value in recorded_logs),
         )
         gate.observe(
             preflight, processed=processed_ci_snapshot_ids(state),
@@ -2304,7 +2301,7 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         state = load_state(state_path)
         state["bounded_step"]["stable_since"] = gate.since
         state["bounded_step"]["active_log_paths"] = sorted(
-            str(path) for path in current_logs
+            str(path) for path in gate.active_log_paths
         )
         save_state(state_path, state)
         if not gate.ready(
@@ -2315,15 +2312,10 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
             emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
             return
         try:
-            complete = agent_task_preflight(repo_root, target, state_path=state_path)
-            complete_logs = set(managed_task_log_paths({"preflight": complete}))
-            try:
-                confirmed = gate.confirm(complete)
-            except WorkflowError:
-                cleanup_superseded_preflight_logs(state_path, complete_logs)
-                raise
+            complete, confirmed = gate.collect_confirmed(
+                lambda: agent_task_preflight(repo_root, target, state_path=state_path)
+            )
             if not confirmed:
-                cleanup_superseded_preflight_logs(state_path, complete_logs)
                 emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
                 return
         except WorkflowError as error:
@@ -2342,7 +2334,7 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         )
         state = load_state(state_path)
         state["bounded_step"]["active_log_paths"] = sorted(
-            str(path) for path in complete_logs
+            str(path) for path in gate.active_log_paths
         )
         save_state(state_path, state)
         step_args = argparse.Namespace(**vars(args))
@@ -12230,12 +12222,37 @@ def ci_preflight_is_stable_candidate(preflight: dict[str, Any]) -> bool:
 class CIStabilityGate:
     def __init__(
         self, *, identity: str | None = None, polls: int = 0,
-        since: str | None = None,
+        since: str | None = None, state_path: Path | None = None,
+        active_log_paths: Iterable[Path] = (),
     ) -> None:
         self.identity = identity
         self.polls = polls
         self.since = since
         self.status = "waiting_for_checks"
+        self.state_path = state_path
+        self.active_log_paths = set(active_log_paths)
+
+    def _retain_logs(self, preflight: dict[str, Any]) -> None:
+        paths = set(managed_task_log_paths({"preflight": preflight}))
+        if self.state_path is None:
+            if paths or self.active_log_paths:
+                raise WorkflowError("CI stability gate requires a state path for failing logs")
+        else:
+            cleanup_superseded_preflight_logs(
+                self.state_path, self.active_log_paths - paths
+            )
+        self.active_log_paths = paths
+
+    def discard_logs(self) -> None:
+        self._discard_paths(self.active_log_paths)
+
+    def _discard_paths(self, paths: set[Path]) -> None:
+        if not paths:
+            return
+        if self.state_path is None:
+            raise WorkflowError("CI stability gate requires a state path for failing logs")
+        cleanup_superseded_preflight_logs(self.state_path, paths)
+        self.active_log_paths.difference_update(paths)
 
     def reset(self) -> None:
         self.identity = None
@@ -12247,6 +12264,7 @@ class CIStabilityGate:
         self, preflight: dict[str, Any], *, processed: set[str],
         now: dt.datetime, allow_processed_terminal: bool = False,
     ) -> str:
+        self._retain_logs(preflight)
         snapshot = preflight["check_snapshot"]
         identity = ci_stability_sha256(snapshot)
         if identity == self.identity:
@@ -12283,6 +12301,24 @@ class CIStabilityGate:
         require_live_check_snapshot(preflight)
         return True
 
+    def collect_confirmed(
+        self, collect: Callable[[], dict[str, Any]]
+    ) -> tuple[dict[str, Any], bool]:
+        preflight = collect()
+        paths = set(managed_task_log_paths({"preflight": preflight}))
+        if paths and self.state_path is None:
+            raise WorkflowError("CI stability gate requires a state path for failing logs")
+        try:
+            confirmed = self.confirm(preflight)
+            if confirmed:
+                self._retain_logs(preflight)
+        except BaseException:
+            self._discard_paths(paths)
+            raise
+        if not confirmed:
+            self._discard_paths(paths)
+        return preflight, confirmed
+
 
 def cleanup_superseded_preflight_logs(
     state_path: Path,
@@ -12315,13 +12351,12 @@ def wait_for_stable_ci_preflight(
     state_path: Path,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + max(0.0, float(args.wait_timeout))
-    gate = CIStabilityGate()
+    gate = CIStabilityGate(state_path=state_path)
     attempt = 0
-    active_log_paths: set[Path] = set()
     required_stability = max(1, int(args.stability_polls))
     while True:
         if time.monotonic() >= deadline:
-            cleanup_superseded_preflight_logs(state_path, active_log_paths)
+            gate.discard_logs()
             update_coordinator_state(
                 state_path,
                 status="blocked",
@@ -12354,7 +12389,7 @@ def wait_for_stable_ci_preflight(
                 attempt += 1
                 continue
             if not is_rate_limit_error(error):
-                cleanup_superseded_preflight_logs(state_path, active_log_paths)
+                gate.discard_logs()
                 raise
             update_coordinator_state(
                 state_path,
@@ -12398,35 +12433,17 @@ def wait_for_stable_ci_preflight(
                 if time.monotonic() >= deadline:
                     continue
             try:
-                confirmation = agent_task_preflight(
-                    repo_root,
-                    target,
-                    stack_state=(
-                        cli_path(args.stack_state) if args.stack_state else None
-                    ),
-                    state_path=state_path,
+                confirmation, confirmed = gate.collect_confirmed(
+                    lambda: agent_task_preflight(
+                        repo_root,
+                        target,
+                        stack_state=(
+                            cli_path(args.stack_state) if args.stack_state else None
+                        ),
+                        state_path=state_path,
+                    )
                 )
             except WorkflowError as error:
-                if error.details.get("reason") != "ci_observation_changed":
-                    raise
-                gate.reset()
-                attempt = 0
-                update_coordinator_state(
-                    state_path, status="waiting_for_checks", detail=str(error),
-                )
-                continue
-            confirmation_log_paths = set(
-                managed_task_log_paths({"preflight": confirmation})
-            )
-            cleanup_superseded_preflight_logs(
-                state_path, active_log_paths - confirmation_log_paths
-            )
-            active_log_paths = confirmation_log_paths
-            try:
-                confirmed = gate.confirm(confirmation)
-            except WorkflowError as error:
-                cleanup_superseded_preflight_logs(state_path, active_log_paths)
-                active_log_paths = set()
                 if error.details.get("reason") != "ci_observation_changed":
                     raise
                 gate.reset()
@@ -12436,8 +12453,6 @@ def wait_for_stable_ci_preflight(
                 )
                 continue
             if not confirmed:
-                cleanup_superseded_preflight_logs(state_path, active_log_paths)
-                active_log_paths = set()
                 gate.reset()
                 attempt = 0
                 changed_snapshot = confirmation["check_snapshot"]

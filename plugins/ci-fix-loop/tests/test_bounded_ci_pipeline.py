@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -78,6 +79,68 @@ class CIStabilityGateTest(unittest.TestCase):
                 now=self.now, allow_processed_terminal=True,
             ),
         )
+
+    def test_gate_owns_logs_across_observations_and_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            old_directory = Path(directory) / "state--ci-fix-logs--old"
+            old_directory.mkdir()
+            old_log = old_directory / "001.log"
+            old_log.write_text("old", encoding="utf-8")
+            gate = MODULE.CIStabilityGate(
+                state_path=state_path, active_log_paths=[old_log],
+            )
+            gate.observe(self.preflight, processed=set(), now=self.now)
+            self.assertFalse(old_directory.exists())
+
+            new_directory = Path(directory) / "state--ci-fix-logs--new"
+            new_directory.mkdir()
+            new_log = new_directory / "001.log"
+            new_log.write_text("new", encoding="utf-8")
+            complete = copy.deepcopy(self.preflight)
+            complete["check_snapshot"]["failures"] = [{"log_path": str(new_log)}]
+            with mock.patch.object(MODULE, "require_live_check_snapshot") as verify:
+                self.assertEqual(
+                    (complete, True),
+                    gate.collect_confirmed(lambda: complete),
+                )
+                verify.assert_called_once_with(complete)
+            self.assertEqual({new_log}, gate.active_log_paths)
+            self.assertTrue(new_log.is_file())
+            gate.discard_logs()
+            self.assertFalse(new_directory.exists())
+            self.assertEqual(set(), gate.active_log_paths)
+
+    def test_gate_discards_downloaded_logs_when_confirmation_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = MODULE.CIStabilityGate(state_path=Path(directory) / "state.json")
+            gate.observe(self.preflight, processed=set(), now=self.now)
+            for change in ("different_attempt", "live_race"):
+                with self.subTest(change=change):
+                    log_directory = Path(directory) / f"state--ci-fix-logs--{change}"
+                    log_directory.mkdir()
+                    log = log_directory / "001.log"
+                    log.write_text("failure", encoding="utf-8")
+                    complete = copy.deepcopy(self.preflight)
+                    complete["check_snapshot"]["failures"] = [{"log_path": str(log)}]
+                    if change == "different_attempt":
+                        complete["check_snapshot"]["workflow_runs"] = {"42": {"run_attempt": 2}}
+                        self.assertEqual(
+                            (complete, False), gate.collect_confirmed(lambda: complete),
+                        )
+                    else:
+                        error = MODULE.WorkflowError(
+                            "snapshot changed", details={"reason": "ci_observation_changed"},
+                        )
+                        with (
+                            mock.patch.object(
+                                MODULE, "require_live_check_snapshot", side_effect=error,
+                            ),
+                            self.assertRaises(MODULE.WorkflowError),
+                        ):
+                            gate.collect_confirmed(lambda: complete)
+                    self.assertFalse(log_directory.exists())
+                    self.assertEqual(set(), gate.active_log_paths)
 
 
 class BoundedCiPipelineTest(unittest.TestCase):
