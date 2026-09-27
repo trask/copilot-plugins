@@ -13317,6 +13317,157 @@ def command_stack_start(args: argparse.Namespace) -> None:
     )
 
 
+def handle_active_stack_member(
+    path: Path, state: dict[str, Any], member: dict[str, Any], member_state_path: Path,
+) -> bool:
+    if member_state_path.is_file():
+        member_state = load_state(member_state_path)
+        pending = member_state.get("pending_stack_push")
+        member_guard = ((member_state.get("run") or {}).get("stack_guard") or {})
+        member_owned_by_run = (
+            member_guard.get("run_id") == state["run_id"]
+            and member_guard.get("member") == member["number"]
+        )
+        member_guard_matches_head = (
+            member_owned_by_run
+            and member_guard.get("member_head_sha") == member["head_sha"]
+        )
+        pending_matches_run = (
+            isinstance(pending, dict)
+            and pending.get("pipeline_run") == state["run_id"]
+            and pending.get("member") == member["number"]
+            and member_owned_by_run
+        )
+        if pending_matches_run and pending.get("head_sha") == member["head_sha"]:
+            finalize_pending_stack_push(member_state_path, member_state, pending)
+        elif (
+            pending_matches_run
+            and pending.get("previous_head_sha") == member["head_sha"]
+        ):
+            resume = pending.get("resume") or {}
+            command = resume.get("command")
+            if command not in {"agent-task", "publish", "rerun"}:
+                stack_stop(
+                    path,
+                    state,
+                    "pending_push_unrecoverable",
+                    f"pull request #{member['number']} has a pending push with "
+                    "no supported resume command",
+                    member=member["number"],
+                )
+                return True
+            emit(
+                {
+                    "result": f"resume_{command}",
+                    "state": str(path),
+                    "member": member["number"],
+                    "member_state": str(member_state_path),
+                    "check": resume.get("check"),
+                    "validation": pending.get("validation"),
+                    "reason": "prepared_push_not_published",
+                }
+            )
+            return True
+        if member_guard_matches_head and not isinstance(pending, dict):
+            managed_task = member_state.get("agent_task")
+            if (
+                isinstance(managed_task, dict)
+                and managed_task.get("status") not in {"completed", "consumed"}
+            ):
+                emit(
+                    {
+                        "result": "incomplete_agent-task",
+                        "state": str(path),
+                        "member": member["number"],
+                        "member_state": str(member_state_path),
+                        "reason": f"agent_task_{managed_task.get('status')}",
+                    }
+                )
+                return True
+            unfinished_reruns = [
+                (check_key, rerun)
+                for check_key, rerun in (member_state.get("reruns") or {}).items()
+                if isinstance(rerun, dict)
+                and rerun.get("method") == "empty_commit"
+                and rerun.get("head_sha") == member["head_sha"]
+                and rerun.get("status") in {"creating", "prepared", "pushed"}
+            ]
+            if len(unfinished_reruns) > 1:
+                stack_stop(
+                    path,
+                    state,
+                    "pending_push_unrecoverable",
+                    f"pull request #{member['number']} has multiple unfinished "
+                    "empty-commit retries",
+                    member=member["number"],
+                )
+                return True
+            if unfinished_reruns:
+                check_key, rerun = unfinished_reruns[0]
+                emit(
+                    {
+                        "result": "resume_rerun",
+                        "state": str(path),
+                        "member": member["number"],
+                        "member_state": str(member_state_path),
+                        "check": check_key,
+                        "validation": None,
+                        "reason": f"empty_commit_{rerun['status']}",
+                    }
+                )
+                return True
+        propagated = set(state.get("propagated_pushes") or [])
+        pending_pushes = [
+            checkpoint
+            for checkpoint in member_state.get("accepted_pushes") or []
+            if checkpoint.get("pipeline_run") == state["run_id"]
+            and checkpoint.get("id")
+            and checkpoint["id"] not in propagated
+        ]
+        current_pushes = [
+            checkpoint
+            for checkpoint in pending_pushes
+            if checkpoint.get("head_sha") == member["head_sha"]
+        ]
+        superseded = [
+            checkpoint["id"]
+            for checkpoint in pending_pushes
+            if checkpoint.get("head_sha") != member["head_sha"]
+        ]
+        if superseded:
+            state.setdefault("superseded_pushes", []).extend(superseded)
+            state["superseded_pushes"] = sorted(set(state["superseded_pushes"]))
+            state.setdefault("propagated_pushes", []).extend(superseded)
+            state["propagated_pushes"] = sorted(set(state["propagated_pushes"]))
+        if current_pushes:
+            checkpoint = current_pushes[-1]
+            save_state(path, state)
+            emit(
+                {
+                    "result": "propagate",
+                    "state": str(path),
+                    "stack_number": state["stack_number"],
+                    "fixed_pr": member["number"],
+                    "expected_head": member["head_sha"],
+                    "checkpoint_id": checkpoint["id"],
+                    "reason": "accepted_push_not_propagated",
+                }
+            )
+            return True
+    dispatched_head = member.get("dispatched_head_sha")
+    if dispatched_head and dispatched_head != member["head_sha"]:
+        stack_stop(
+            path,
+            state,
+            "active_member_head_changed",
+            f"pull request #{member['number']} moved from {dispatched_head} to "
+            f"{member['head_sha']} while its CI repair was active",
+            member=member["number"],
+        )
+        return True
+    return False
+
+
 def command_stack_next(args: argparse.Namespace) -> None:
     require_tools()
     path = cli_path(args.state)
@@ -13452,158 +13603,10 @@ def command_stack_next(args: argparse.Namespace) -> None:
     member = members[cursor]
     member_target = parse_target(f"{state['repository']}#{member['number']}")
     member_state_path = stack_member_state_path(path, member["number"])
-    if member.get("ci_status") == "active":
-        if member_state_path.is_file():
-            member_state = load_state(member_state_path)
-            pending = member_state.get("pending_stack_push")
-            member_guard = ((member_state.get("run") or {}).get("stack_guard") or {})
-            member_owned_by_run = (
-                member_guard.get("run_id") == state["run_id"]
-                and member_guard.get("member") == member["number"]
-            )
-            member_guard_matches_head = (
-                member_owned_by_run
-                and member_guard.get("member_head_sha") == member["head_sha"]
-            )
-            pending_matches_run = (
-                isinstance(pending, dict)
-                and pending.get("pipeline_run") == state["run_id"]
-                and pending.get("member") == member["number"]
-                and member_owned_by_run
-            )
-            if pending_matches_run and pending.get("head_sha") == member["head_sha"]:
-                finalize_pending_stack_push(
-                    member_state_path, member_state, pending
-                )
-            elif (
-                pending_matches_run
-                and pending.get("previous_head_sha") == member["head_sha"]
-            ):
-                resume = pending.get("resume") or {}
-                command = resume.get("command")
-                if command not in {"agent-task", "publish", "rerun"}:
-                    stack_stop(
-                        path,
-                        state,
-                        "pending_push_unrecoverable",
-                        f"pull request #{member['number']} has a pending push with "
-                        "no supported resume command",
-                        member=member["number"],
-                    )
-                    return
-                emit(
-                    {
-                        "result": f"resume_{command}",
-                        "state": str(path),
-                        "member": member["number"],
-                        "member_state": str(member_state_path),
-                        "check": resume.get("check"),
-                        "validation": pending.get("validation"),
-                        "reason": "prepared_push_not_published",
-                    }
-                )
-                return
-            if member_guard_matches_head and not isinstance(pending, dict):
-                managed_task = member_state.get("agent_task")
-                if (
-                    isinstance(managed_task, dict)
-                    and managed_task.get("status") not in {"completed", "consumed"}
-                ):
-                    emit(
-                        {
-                            "result": "incomplete_agent-task",
-                            "state": str(path),
-                            "member": member["number"],
-                            "member_state": str(member_state_path),
-                            "reason": f"agent_task_{managed_task.get('status')}",
-                        }
-                    )
-                    return
-                unfinished_reruns = [
-                    (check_key, rerun)
-                    for check_key, rerun in (member_state.get("reruns") or {}).items()
-                    if isinstance(rerun, dict)
-                    and rerun.get("method") == "empty_commit"
-                    and rerun.get("head_sha") == member["head_sha"]
-                    and rerun.get("status") in {"creating", "prepared", "pushed"}
-                ]
-                if len(unfinished_reruns) > 1:
-                    stack_stop(
-                        path,
-                        state,
-                        "pending_push_unrecoverable",
-                        f"pull request #{member['number']} has multiple unfinished "
-                        "empty-commit retries",
-                        member=member["number"],
-                    )
-                    return
-                if unfinished_reruns:
-                    check_key, rerun = unfinished_reruns[0]
-                    emit(
-                        {
-                            "result": "resume_rerun",
-                            "state": str(path),
-                            "member": member["number"],
-                            "member_state": str(member_state_path),
-                            "check": check_key,
-                            "validation": None,
-                            "reason": f"empty_commit_{rerun['status']}",
-                        }
-                    )
-                    return
-            propagated = set(state.get("propagated_pushes") or [])
-            pending_pushes = [
-                checkpoint
-                for checkpoint in member_state.get("accepted_pushes") or []
-                if checkpoint.get("pipeline_run") == state["run_id"]
-                and checkpoint.get("id")
-                and checkpoint["id"] not in propagated
-            ]
-            current_pushes = [
-                checkpoint
-                for checkpoint in pending_pushes
-                if checkpoint.get("head_sha") == member["head_sha"]
-            ]
-            superseded = [
-                checkpoint["id"]
-                for checkpoint in pending_pushes
-                if checkpoint.get("head_sha") != member["head_sha"]
-            ]
-            if superseded:
-                state.setdefault("superseded_pushes", []).extend(superseded)
-                state["superseded_pushes"] = sorted(
-                    set(state["superseded_pushes"])
-                )
-                state.setdefault("propagated_pushes", []).extend(superseded)
-                state["propagated_pushes"] = sorted(
-                    set(state["propagated_pushes"])
-                )
-            if current_pushes:
-                checkpoint = current_pushes[-1]
-                save_state(path, state)
-                emit(
-                    {
-                        "result": "propagate",
-                        "state": str(path),
-                        "stack_number": state["stack_number"],
-                        "fixed_pr": member["number"],
-                        "expected_head": member["head_sha"],
-                        "checkpoint_id": checkpoint["id"],
-                        "reason": "accepted_push_not_propagated",
-                    }
-                )
-                return
-        dispatched_head = member.get("dispatched_head_sha")
-        if dispatched_head and dispatched_head != member["head_sha"]:
-            stack_stop(
-                path,
-                state,
-                "active_member_head_changed",
-                f"pull request #{member['number']} moved from {dispatched_head} to "
-                f"{member['head_sha']} while its CI repair was active",
-                member=member["number"],
-            )
-            return
+    if member.get("ci_status") == "active" and handle_active_stack_member(
+        path, state, member, member_state_path,
+    ):
+        return
     if cursor:
         predecessor = members[cursor - 1]
         if predecessor.get("ci_status") != "clear":

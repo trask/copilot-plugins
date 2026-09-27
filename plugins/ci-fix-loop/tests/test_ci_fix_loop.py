@@ -14779,6 +14779,51 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         self.assertEqual("lower2", pending["head_sha"])
         self.assertEqual({"command": "publish"}, pending["resume"])
 
+    def test_prepared_push_takes_priority_over_unfinished_task_and_receipts(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        member_state = self.pending_member_state(started["run_id"])
+        saved = MODULE.load_state(member_state)
+        saved["agent_task"] = {"status": "bounded_pending"}
+        saved["accepted_pushes"] = [{
+            "id": "older-push", "head_sha": "lower1",
+            "pipeline_run": started["run_id"],
+        }]
+        MODULE.save_state(member_state, saved)
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "stack_member_state_path", return_value=member_state
+        ):
+            action = call("stack-next", "--state", str(self.stack_state))
+
+        self.assertEqual("resume_publish", action["result"])
+        self.assertEqual("prepared_push_not_published", action["reason"])
+        self.assertNotIn("older-push", MODULE.load_stack_state(self.stack_state)["propagated_pushes"])
+
+    def test_superseded_receipt_is_recorded_before_dispatch_resumes(self):
+        stack = native_stack()
+        started = self.start(stack)
+        self.next(stack)
+        member_state = self.member_state(5, "lower1", started["run_id"])
+        saved = MODULE.load_state(member_state)
+        saved["accepted_pushes"][0]["head_sha"] = "older-head"
+        MODULE.save_state(member_state, saved)
+
+        with mock.patch.object(MODULE, "require_tools"), mock.patch.object(
+            MODULE, "read_native_stack", return_value=stack
+        ), mock.patch.object(
+            MODULE, "stack_member_state_path", return_value=member_state
+        ):
+            action = call("stack-next", "--state", str(self.stack_state))
+
+        self.assertEqual("run_member", action["result"])
+        coordinator = MODULE.load_stack_state(self.stack_state)
+        self.assertEqual(["push-5"], coordinator["superseded_pushes"])
+        self.assertEqual(["push-5"], coordinator["propagated_pushes"])
+
     def test_unlanded_empty_rerun_resumes_the_prepared_check(self):
         stack = native_stack()
         started = self.start(stack)
