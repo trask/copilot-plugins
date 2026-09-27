@@ -372,6 +372,89 @@ class CIRerunProgressTest(unittest.TestCase):
         self.assertEqual(1, len(state["coordinator"]["processed_snapshots"]))
 
 
+class BoundedSweepAdmissionTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "state.json"
+        self.owner = {
+            "session_id": SESSION, "pipeline_run": "a" * 32,
+            "pipeline_iteration": 1, "pipeline_max_iterations": 3,
+            "model": "sol", "github_mutation_policy": "allow",
+            "max_iterations": 5, "target": {"number": 7},
+            "repo_root": directory.name, "state": str(self.path),
+        }
+
+    def test_admission_resumes_and_reopens_only_completed_sweeps(self):
+        first = MODULE.begin_bounded_ci_sweep(self.path, self.owner)
+        self.assertEqual(self.owner, first["bounded_step"]["owner"])
+        self.assertEqual({}, first["reruns"])
+        self.assertIsNone(first["escalation"])
+        self.assertEqual(first, MODULE.begin_bounded_ci_sweep(self.path, self.owner))
+
+        first["budget_scope"] = "pipeline"
+        first["bounded_step"]["terminal"] = {"result": "green"}
+        first["coordinator"] = {
+            "status": "waiting_for_checks",
+            "stability_sha256": "old", "stable_polls": 8,
+            "check_snapshot": {"sha256": "old"},
+            "processed_snapshots": [{"snapshot_sha256": "old"}],
+        }
+        MODULE.save_state(self.path, first)
+        next_owner = {**self.owner, "pipeline_iteration": 2}
+        reopened = MODULE.begin_bounded_ci_sweep(self.path, next_owner)
+        self.assertEqual({"owner": next_owner}, reopened["bounded_step"])
+        self.assertEqual(1, reopened["bounded_processed_snapshot_baseline"])
+        self.assertEqual(
+            [{"snapshot_sha256": "old"}], reopened["coordinator"]["processed_snapshots"],
+        )
+        self.assertNotIn("stability_sha256", reopened["coordinator"])
+        self.assertNotIn("stable_polls", reopened["coordinator"])
+        self.assertNotIn("check_snapshot", reopened["coordinator"])
+        self.assertEqual(set(), MODULE.processed_ci_snapshot_ids(reopened))
+
+    def test_admission_rejects_owner_drift_and_active_work_without_writing(self):
+        state = MODULE.begin_bounded_ci_sweep(self.path, self.owner)
+        state["bounded_step"]["terminal"] = {"result": "green"}
+        MODULE.save_state(self.path, state)
+        next_owner = {**self.owner, "pipeline_iteration": 2}
+
+        for change in (
+            {"pipeline_run": "b" * 32},
+            {"model": "terra"},
+        ):
+            with self.subTest(change=change):
+                before = self.path.read_bytes()
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.begin_bounded_ci_sweep(
+                        self.path, {**next_owner, **change},
+                    )
+                self.assertEqual(before, self.path.read_bytes())
+
+        for active in (
+            {"agent_task": {"status": "bounded_pending"}},
+            {"agent_task": {"status": "completed", "retry_command": "pending"}},
+            {"agent_task": {"status": "completed", "dispatch_monitor": {"status": "running"}}},
+            {"coordinator": {"pending_rerun": {"check": "build"}}},
+            {"pending_stack_push": {"head": "head"}},
+        ):
+            with self.subTest(active=active):
+                saved = copy.deepcopy(state)
+                saved.update(active)
+                MODULE.save_state(self.path, saved)
+                before = self.path.read_bytes()
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.begin_bounded_ci_sweep(self.path, next_owner)
+                self.assertEqual(before, self.path.read_bytes())
+
+        MODULE.save_state(self.path, state)
+        MODULE.begin_bounded_ci_sweep(self.path, next_owner)
+        before = self.path.read_bytes()
+        with self.assertRaises(MODULE.WorkflowError):
+            MODULE.begin_bounded_ci_sweep(self.path, self.owner)
+        self.assertEqual(before, self.path.read_bytes())
+
+
 class BoundedCiPipelineTest(unittest.TestCase):
     def setUp(self):
         self.state = {}

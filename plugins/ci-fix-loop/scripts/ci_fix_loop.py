@@ -2213,31 +2213,9 @@ def run_bounded_cloud_helper(
     return payload
 
 
-def command_bounded_pipeline(args: argparse.Namespace) -> None:
-    require_tools()
-    if (
-        type(args.pipeline_iteration) is not int
-        or type(args.pipeline_max_iterations) is not int
-        or not 1 <= args.pipeline_iteration <= args.pipeline_max_iterations
-    ):
-        raise WorkflowError("bounded CI pipeline requires a valid sweep position")
-    repo_root = resolve_repo_root(args.repo_root)
-    target = resolve_target(args.target, repo_root)
-    state_path = cli_path(args.state)
-    require_outside_repository(state_path, repo_root)
-    session_id = current_agent_session_id()
-    owner = {
-        "session_id": session_id,
-        "pipeline_run": args.pipeline_run,
-        "pipeline_iteration": args.pipeline_iteration,
-        "pipeline_max_iterations": args.pipeline_max_iterations,
-        "model": args.model,
-        "github_mutation_policy": args.github_mutation_policy,
-        "max_iterations": args.max_iterations,
-        "target": target,
-        "repo_root": str(repo_root),
-        "state": str(state_path.resolve()),
-    }
+def begin_bounded_ci_sweep(
+    state_path: Path, owner: dict[str, Any],
+) -> dict[str, Any]:
     state = coordinator_file_state(state_path)
     bounded = state.get("bounded_step")
     if isinstance(bounded, dict) and bounded.get("owner") != owner:
@@ -2250,7 +2228,7 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
                 if key != "pipeline_iteration"
             )
             or type(previous.get("pipeline_iteration")) is not int
-            or previous["pipeline_iteration"] >= args.pipeline_iteration
+            or previous["pipeline_iteration"] >= owner["pipeline_iteration"]
             or bounded.get("terminal") is None
             or isinstance(bounded.get("pending_rerun"), dict)
             or not fresh_invocation_may_supersede_task(state.get("agent_task"))
@@ -2294,6 +2272,36 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         state.setdefault("reruns", {})
         state.setdefault("escalation", None)
         save_state(state_path, state)
+    return state
+
+
+def command_bounded_pipeline(args: argparse.Namespace) -> None:
+    require_tools()
+    if (
+        type(args.pipeline_iteration) is not int
+        or type(args.pipeline_max_iterations) is not int
+        or not 1 <= args.pipeline_iteration <= args.pipeline_max_iterations
+    ):
+        raise WorkflowError("bounded CI pipeline requires a valid sweep position")
+    repo_root = resolve_repo_root(args.repo_root)
+    target = resolve_target(args.target, repo_root)
+    state_path = cli_path(args.state)
+    require_outside_repository(state_path, repo_root)
+    session_id = current_agent_session_id()
+    owner = {
+        "session_id": session_id,
+        "pipeline_run": args.pipeline_run,
+        "pipeline_iteration": args.pipeline_iteration,
+        "pipeline_max_iterations": args.pipeline_max_iterations,
+        "model": args.model,
+        "github_mutation_policy": args.github_mutation_policy,
+        "max_iterations": args.max_iterations,
+        "target": target,
+        "repo_root": str(repo_root),
+        "state": str(state_path.resolve()),
+    }
+    state = begin_bounded_ci_sweep(state_path, owner)
+    bounded = state["bounded_step"]
     if bounded.get("terminal") is not None:
         emit(bounded["terminal"])
         return
