@@ -2060,12 +2060,7 @@ def advance_ci_rerun(
     state_path: Path, preflight: dict[str, Any], result: dict[str, Any],
     *, bounded: bool,
 ) -> dict[str, Any] | None:
-    task = result.get("task")
-    if not isinstance(task, dict) or not isinstance(task.get("id"), str):
-        raise WorkflowError("CI re-run result has no Agent Task identity")
-    checks = result.get("action_checks") or []
-    if not all(isinstance(check, str) for check in checks):
-        raise WorkflowError("CI re-run result has invalid check identities")
+    checks = ci_rerun_identity(preflight, result)["checks"]
     if result.get("attestation") == "dispatcher_candidate" and not bounded:
         record_processed_ci_snapshot(state_path, preflight, result)
         retry_result = retry_diagnosed_ci(state_path, preflight, checks)
@@ -2074,12 +2069,6 @@ def advance_ci_rerun(
         )
         return None
     completed = prepare_pending_ci_rerun(state_path, preflight, result, checks)
-    if bounded:
-        state = load_state(state_path)
-        state["bounded_step"]["pending_rerun"] = {
-            "preflight": preflight, "result": result,
-        }
-        save_state(state_path, state)
     for check in checks:
         if check in completed:
             continue
@@ -2090,12 +2079,10 @@ def advance_ci_rerun(
                 command_rerun, argparse.Namespace(state=str(state_path), check=check)
             )[-1]
             if rerun_result["result"] == "no_rerun_support":
-                record_processed_ci_snapshot(state_path, preflight, result)
-                if bounded:
-                    state = load_state(state_path)
-                    state["bounded_step"].pop("pending_rerun", None)
-                    state["bounded_step"]["terminal"] = rerun_result
-                    save_state(state_path, state)
+                record_processed_ci_snapshot(
+                    state_path, preflight, result,
+                    terminal_result=rerun_result if bounded else None,
+                )
                 return rerun_result
             if rerun_result["result"] not in {"rerun_requested", "empty_commit_published"}:
                 raise WorkflowError(
@@ -2106,9 +2093,6 @@ def advance_ci_rerun(
             return {"result": "waiting", "state": str(state_path), "reason": "rerun"}
     record_processed_ci_snapshot(state_path, preflight, result)
     if bounded:
-        state = load_state(state_path)
-        state["bounded_step"].pop("pending_rerun", None)
-        save_state(state_path, state)
         return {"result": "waiting", "state": str(state_path), "reason": "checks_running"}
     return None
 
@@ -2311,9 +2295,8 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         step_args = argparse.Namespace(**vars(args))
         step_args._bounded_resume = True
         result = capture_command(command_agent_task, step_args)[-1]
-    elif isinstance(bounded.get("pending_rerun"), dict):
-        preflight = bounded["pending_rerun"]["preflight"]
-        result = bounded["pending_rerun"]["result"]
+    elif (pending_rerun := resumable_ci_rerun(state)) is not None:
+        preflight, result = pending_rerun
     else:
         try:
             preflight = agent_task_preflight(
@@ -12496,6 +12479,8 @@ def record_processed_ci_snapshot(
     state_path: Path,
     preflight: dict[str, Any],
     result: dict[str, Any],
+    *,
+    terminal_result: dict[str, Any] | None = None,
 ) -> None:
     state = load_state(state_path)
     coordinator = state.setdefault("coordinator", {})
@@ -12525,10 +12510,80 @@ def record_processed_ci_snapshot(
             }
         )
     coordinator.pop("pending_rerun", None)
+    bounded = state.get("bounded_step")
+    if isinstance(bounded, dict):
+        bounded.pop("pending_rerun", None)
+    if terminal_result is not None:
+        if not isinstance(bounded, dict):
+            raise WorkflowError("bounded CI re-run has no terminal state")
+        bounded["terminal"] = terminal_result
     coordinator["check_snapshot"] = None
     coordinator["status"] = "waiting_for_checks"
     coordinator["observed_at"] = utc_now()
     save_state(state_path, state)
+
+
+def ci_rerun_identity(
+    preflight: dict[str, Any], result: dict[str, Any],
+    checks: list[str] | None = None,
+) -> dict[str, Any]:
+    task = result.get("task")
+    if not isinstance(task, dict) or not isinstance(task.get("id"), str):
+        raise WorkflowError("CI re-run result has no Agent Task identity")
+    action_checks = result.get("action_checks")
+    if checks is None:
+        checks = action_checks or []
+    if not isinstance(checks, list) or not all(isinstance(check, str) for check in checks):
+        raise WorkflowError("CI re-run result has invalid check identities")
+    if action_checks is not None and action_checks != checks:
+        raise WorkflowError("CI re-run checks do not match the task result")
+    pr = preflight.get("pr")
+    snapshot = preflight.get("check_snapshot")
+    if not isinstance(pr, dict) or not isinstance(snapshot, dict):
+        raise WorkflowError("CI re-run preflight is malformed")
+    if not isinstance(pr.get("head_sha"), str) or not isinstance(snapshot.get("sha256"), str):
+        raise WorkflowError("CI re-run preflight has no check identity")
+    return {
+        "head_sha": pr["head_sha"], "snapshot_sha256": snapshot["sha256"],
+        "task_id": task["id"], "checks": checks,
+    }
+
+
+def resumable_ci_rerun(
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    coordinator = state.get("coordinator")
+    if coordinator is not None and not isinstance(coordinator, dict):
+        raise WorkflowError("CI re-run coordinator state is malformed")
+    pending = (coordinator or {}).get("pending_rerun")
+    bounded = state.get("bounded_step")
+    legacy = bounded.get("pending_rerun") if isinstance(bounded, dict) else None
+    if pending is None and legacy is None:
+        return None
+    if not isinstance(pending, dict):
+        raise WorkflowError("CI re-run has no pending coordinator transition")
+    if legacy is not None and not isinstance(legacy, dict):
+        raise WorkflowError("bounded CI re-run checkpoint is malformed")
+    source = pending if "preflight" in pending or "result" in pending else legacy
+    if not isinstance(source, dict):
+        raise WorkflowError("CI re-run has no resumable preflight and result")
+    preflight, result = source.get("preflight"), source.get("result")
+    if not isinstance(preflight, dict) or not isinstance(result, dict):
+        raise WorkflowError("CI re-run has no resumable preflight and result")
+    identity = ci_rerun_identity(preflight, result, pending.get("checks"))
+    if any(pending.get(key) != value for key, value in identity.items()):
+        raise WorkflowError("stored pending CI re-run does not match its preflight and task result")
+    if legacy is not None and (
+        legacy.get("preflight") != preflight or legacy.get("result") != result
+    ):
+        raise WorkflowError("bounded CI re-run checkpoint disagrees with coordinator")
+    completed = pending.get("completed_checks")
+    if (
+        not isinstance(completed, list)
+        or any(not isinstance(check, str) or check not in identity["checks"] for check in completed)
+    ):
+        raise WorkflowError("stored CI re-run progress is malformed")
+    return preflight, result
 
 
 def prepare_pending_ci_rerun(
@@ -12539,35 +12594,45 @@ def prepare_pending_ci_rerun(
 ) -> set[str]:
     state = load_state(state_path)
     coordinator = state.setdefault("coordinator", {})
-    task = result.get("task") if isinstance(result.get("task"), dict) else {}
-    expected = {
-        "head_sha": preflight["pr"]["head_sha"],
-        "snapshot_sha256": preflight["check_snapshot"]["sha256"],
-        "task_id": task.get("id"),
-        "checks": checks,
-    }
+    expected = ci_rerun_identity(preflight, result, checks)
     pending = coordinator.get("pending_rerun")
     if isinstance(pending, dict):
-        actual = {key: pending.get(key) for key in expected}
-        if actual != expected:
+        if any(pending.get(key) != value for key, value in expected.items()):
             raise WorkflowError(
                 "stored pending CI re-run does not match the current task result",
-                details={"expected": expected, "actual": actual},
             )
+        if "preflight" in pending or "result" in pending or (
+            isinstance(state.get("bounded_step"), dict)
+            and "pending_rerun" in state["bounded_step"]
+        ):
+            resumable = resumable_ci_rerun(state)
+            if resumable != (preflight, result):
+                raise WorkflowError(
+                    "stored pending CI re-run does not match the current task result",
+                )
+        elif (
+            not isinstance(pending.get("completed_checks"), list)
+            or any(
+                not isinstance(check, str) or check not in checks
+                for check in pending["completed_checks"]
+            )
+        ):
+            raise WorkflowError("stored CI re-run progress is malformed")
+        if "preflight" not in pending:
+            pending["preflight"] = preflight
+            pending["result"] = result
+            save_state(state_path, state)
+    elif pending is not None:
+        raise WorkflowError("stored pending CI re-run is malformed")
     else:
         pending = {
-            **expected,
+            **expected, "preflight": preflight, "result": result,
             "completed_checks": [],
             "recorded_at": utc_now(),
         }
         coordinator["pending_rerun"] = pending
         save_state(state_path, state)
-    completed = pending.get("completed_checks")
-    return {
-        check
-        for check in completed
-        if isinstance(check, str)
-    } if isinstance(completed, list) else set()
+    return set(pending["completed_checks"])
 
 
 def record_completed_ci_rerun(state_path: Path, check: str) -> None:
@@ -12576,7 +12641,9 @@ def record_completed_ci_rerun(state_path: Path, check: str) -> None:
     pending = coordinator.get("pending_rerun") if isinstance(coordinator, dict) else None
     if not isinstance(pending, dict):
         raise WorkflowError("CI re-run completion has no pending coordinator transition")
-    completed = pending.setdefault("completed_checks", [])
+    if check not in pending["checks"]:
+        raise WorkflowError("CI re-run completion names an unknown check")
+    completed = pending["completed_checks"]
     if check not in completed:
         completed.append(check)
     pending["updated_at"] = utc_now()

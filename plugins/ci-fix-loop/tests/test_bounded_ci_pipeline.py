@@ -293,7 +293,9 @@ class CIRerunProgressTest(unittest.TestCase):
             state = MODULE.load_state(self.path)
             self.assertEqual(["check:a"], requested)
             self.assertEqual(["check:a"], state["coordinator"]["pending_rerun"]["completed_checks"])
-            self.assertEqual(self.result, state["bounded_step"]["pending_rerun"]["result"])
+            self.assertEqual(self.result, state["coordinator"]["pending_rerun"]["result"])
+            self.assertEqual(self.preflight, state["coordinator"]["pending_rerun"]["preflight"])
+            self.assertNotIn("pending_rerun", state["bounded_step"])
             self.assertNotIn("processed_snapshots", state["coordinator"])
 
             second = MODULE.advance_ci_rerun(
@@ -307,7 +309,6 @@ class CIRerunProgressTest(unittest.TestCase):
             first["reason"], second["reason"], final["reason"],
         ])
         state = MODULE.load_state(self.path)
-        self.assertNotIn("pending_rerun", state["bounded_step"])
         self.assertNotIn("pending_rerun", state["coordinator"])
         self.assertEqual("task", state["coordinator"]["processed_snapshots"][0]["task_id"])
 
@@ -335,7 +336,7 @@ class CIRerunProgressTest(unittest.TestCase):
             state = MODULE.load_state(self.path)
             observed.append((
                 keys, state["coordinator"]["pending_rerun"]["completed_checks"],
-                state["bounded_step"]["pending_rerun"]["result"],
+                state["coordinator"]["pending_rerun"]["result"],
             ))
             return "rerun_requested"
 
@@ -361,15 +362,68 @@ class CIRerunProgressTest(unittest.TestCase):
         def reject(_args):
             MODULE.emit({"result": "no_rerun_support"})
 
-        with mock.patch.object(MODULE, "command_rerun", side_effect=reject):
+        with (
+            mock.patch.object(MODULE, "command_rerun", side_effect=reject),
+            mock.patch.object(MODULE, "save_state", wraps=MODULE.save_state) as save,
+        ):
             terminal = MODULE.advance_ci_rerun(
                 self.path, self.preflight, self.result, bounded=True,
             )
+        self.assertEqual(2, save.call_count)
+        self.assertNotIn("pending_rerun", save.call_args.args[1]["coordinator"])
+        self.assertEqual(terminal, save.call_args.args[1]["bounded_step"]["terminal"])
         state = MODULE.load_state(self.path)
         self.assertEqual("no_rerun_support", terminal["result"])
         self.assertEqual(terminal, state["bounded_step"]["terminal"])
-        self.assertNotIn("pending_rerun", state["bounded_step"])
+        self.assertNotIn("pending_rerun", state["coordinator"])
         self.assertEqual(1, len(state["coordinator"]["processed_snapshots"]))
+
+    def test_legacy_bounded_checkpoint_migrates_without_repeating_a_check(self):
+        requested = []
+
+        def rerun(args):
+            requested.append(args.check)
+            MODULE.emit({"result": "rerun_requested"})
+
+        with mock.patch.object(MODULE, "command_rerun", side_effect=rerun):
+            MODULE.advance_ci_rerun(self.path, self.preflight, self.result, bounded=True)
+            state = MODULE.load_state(self.path)
+            pending = state["coordinator"]["pending_rerun"]
+            state["bounded_step"]["pending_rerun"] = {
+                "preflight": pending.pop("preflight"),
+                "result": pending.pop("result"),
+            }
+            MODULE.save_state(self.path, state)
+            preflight, result = MODULE.resumable_ci_rerun(MODULE.load_state(self.path))
+            MODULE.advance_ci_rerun(self.path, preflight, result, bounded=True)
+
+        self.assertEqual(["check:a", "check:b"], requested)
+        migrated = MODULE.load_state(self.path)
+        self.assertEqual(self.result, migrated["coordinator"]["pending_rerun"]["result"])
+        self.assertEqual(self.preflight, migrated["coordinator"]["pending_rerun"]["preflight"])
+
+    def test_disagreeing_legacy_checkpoint_fails_before_requesting_rerun(self):
+        with mock.patch.object(MODULE, "command_rerun",
+                               side_effect=lambda _: MODULE.emit({"result": "rerun_requested"})):
+            MODULE.advance_ci_rerun(self.path, self.preflight, self.result, bounded=True)
+        state = MODULE.load_state(self.path)
+        state["bounded_step"]["pending_rerun"] = {
+            "preflight": self.preflight,
+            "result": {**self.result, "action_checks": ["check:b"]},
+        }
+        MODULE.save_state(self.path, state)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "disagrees"):
+            MODULE.resumable_ci_rerun(MODULE.load_state(self.path))
+
+    def test_malformed_completed_checks_cannot_restart_a_rerun(self):
+        with mock.patch.object(MODULE, "command_rerun",
+                               side_effect=lambda _: MODULE.emit({"result": "rerun_requested"})):
+            MODULE.advance_ci_rerun(self.path, self.preflight, self.result, bounded=True)
+        state = MODULE.load_state(self.path)
+        state["coordinator"]["pending_rerun"]["completed_checks"] = ["unknown"]
+        MODULE.save_state(self.path, state)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "progress is malformed"):
+            MODULE.resumable_ci_rerun(MODULE.load_state(self.path))
 
 
 class BoundedSweepAdmissionTest(unittest.TestCase):
@@ -674,6 +728,62 @@ class BoundedCiPipelineTest(unittest.TestCase):
         ])
         self.assertEqual(1, len(self.state["coordinator"]["processed_snapshots"]))
         self.assertNotIn("pending_rerun", self.state["bounded_step"])
+        self.assertNotIn("pending_rerun", self.state["coordinator"])
+
+    def test_resume_uses_coordinator_or_legacy_checkpoint_after_restart(self):
+        snapshot = {
+            "sha256": "snapshot", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
+            "decision": {"decision": "failures", "detail": "failed"},
+        }
+        preflight = {"pr": {"head_sha": "head"}, "check_snapshot": snapshot}
+        requests = []
+
+        def rerun(args):
+            requests.append(args.check)
+            MODULE.emit({"result": "rerun_requested"})
+
+        with (
+            mock.patch.object(MODULE, "agent_task_preflight", return_value=preflight) as observe,
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(
+                MODULE, "command_agent_task",
+                side_effect=lambda _: MODULE.emit({
+                    "result": "rerun", "task": {"id": "task"},
+                    "action_checks": ["check:a", "check:b"],
+                }),
+            ) as task,
+            mock.patch.object(MODULE, "command_rerun", side_effect=rerun),
+        ):
+            for legacy in (False, True):
+                with self.subTest(legacy=legacy):
+                    self.state = {}
+                    self.output = []
+                    requests.clear()
+                    task.reset_mock()
+                    observe.reset_mock()
+                    MODULE.command_bounded_pipeline(self.args)
+                    self.assertIn("preflight", self.state["coordinator"]["pending_rerun"])
+                    self.assertNotIn("pending_rerun", self.state["bounded_step"])
+                    saved = copy.deepcopy(self.state)
+                    if legacy:
+                        pending = saved["coordinator"]["pending_rerun"]
+                        saved["bounded_step"]["pending_rerun"] = {
+                            "preflight": pending.pop("preflight"),
+                            "result": pending.pop("result"),
+                        }
+                    self.state = saved
+                    MODULE.command_bounded_pipeline(self.args)
+                    MODULE.command_bounded_pipeline(self.args)
+
+                    self.assertEqual(["check:a", "check:b"], requests)
+                    task.assert_called_once()
+                    self.assertEqual(2, observe.call_count)
+                    self.assertEqual(["rerun", "rerun", "checks_running"], [
+                        item["reason"] for item in self.output
+                    ])
+                    self.assertNotIn("pending_rerun", self.state["coordinator"])
+                    self.assertNotIn("pending_rerun", self.state["bounded_step"])
 
     def test_pipeline_validates_final_result_but_not_waiting(self):
         self.args.github_mutation_policy = "allow"
