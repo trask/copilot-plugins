@@ -2056,21 +2056,30 @@ def validate_terminal_ci_fix_state(
     return payload
 
 
-def bounded_ci_rerun(
-    state_path: Path, preflight: dict[str, Any], result: dict[str, Any]
-) -> None:
+def advance_ci_rerun(
+    state_path: Path, preflight: dict[str, Any], result: dict[str, Any],
+    *, bounded: bool,
+) -> dict[str, Any] | None:
     task = result.get("task")
     if not isinstance(task, dict) or not isinstance(task.get("id"), str):
         raise WorkflowError("CI re-run result has no Agent Task identity")
     checks = result.get("action_checks") or []
     if not all(isinstance(check, str) for check in checks):
         raise WorkflowError("CI re-run result has invalid check identities")
+    if result.get("attestation") == "dispatcher_candidate" and not bounded:
+        record_processed_ci_snapshot(state_path, preflight, result)
+        retry_result = retry_diagnosed_ci(state_path, preflight, checks)
+        update_coordinator_state(
+            state_path, status="waiting_for_checks", detail=retry_result,
+        )
+        return None
     completed = prepare_pending_ci_rerun(state_path, preflight, result, checks)
-    state = load_state(state_path)
-    state["bounded_step"]["pending_rerun"] = {
-        "preflight": preflight, "result": result,
-    }
-    save_state(state_path, state)
+    if bounded:
+        state = load_state(state_path)
+        state["bounded_step"]["pending_rerun"] = {
+            "preflight": preflight, "result": result,
+        }
+        save_state(state_path, state)
     for check in checks:
         if check in completed:
             continue
@@ -2082,22 +2091,26 @@ def bounded_ci_rerun(
             )[-1]
             if rerun_result["result"] == "no_rerun_support":
                 record_processed_ci_snapshot(state_path, preflight, result)
-                state = load_state(state_path)
-                state["bounded_step"].pop("pending_rerun", None)
-                state["bounded_step"]["terminal"] = rerun_result
-                save_state(state_path, state)
-                emit(rerun_result)
-                return
+                if bounded:
+                    state = load_state(state_path)
+                    state["bounded_step"].pop("pending_rerun", None)
+                    state["bounded_step"]["terminal"] = rerun_result
+                    save_state(state_path, state)
+                return rerun_result
             if rerun_result["result"] not in {"rerun_requested", "empty_commit_published"}:
-                raise WorkflowError("CI re-run returned an unexpected result")
+                raise WorkflowError(
+                    f"CI re-run returned unexpected result {rerun_result['result']!r}"
+                )
         record_completed_ci_rerun(state_path, check)
-        emit({"result": "waiting", "state": str(state_path), "reason": "rerun"})
-        return
+        if bounded:
+            return {"result": "waiting", "state": str(state_path), "reason": "rerun"}
     record_processed_ci_snapshot(state_path, preflight, result)
-    state = load_state(state_path)
-    state["bounded_step"].pop("pending_rerun", None)
-    save_state(state_path, state)
-    emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+    if bounded:
+        state = load_state(state_path)
+        state["bounded_step"].pop("pending_rerun", None)
+        save_state(state_path, state)
+        return {"result": "waiting", "state": str(state_path), "reason": "checks_running"}
+    return None
 
 
 def run_bounded_cloud_helper(
@@ -2351,7 +2364,12 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
         emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
         return
     if result["result"] == "rerun":
-        bounded_ci_rerun(state_path, preflight, result)
+        rerun_result = advance_ci_rerun(
+            state_path, preflight, result, bounded=True,
+        )
+        if rerun_result is None:
+            raise WorkflowError("bounded CI re-run did not return a step result")
+        emit(rerun_result)
         return
     if has_task:
         record_processed_ci_snapshot(state_path, preflight, result)
@@ -12731,48 +12749,12 @@ def command_loop(args: argparse.Namespace) -> None:
                     return
                 continue
             if result["result"] == "rerun":
-                if not has_task:
-                    raise WorkflowError("CI re-run result has no Agent Task identity")
-                check_keys = result.get("action_checks") or []
-                if not all(isinstance(check, str) for check in check_keys):
-                    raise WorkflowError("CI re-run result has invalid check identities")
-                if result.get("attestation") == "dispatcher_candidate":
-                    record_processed_ci_snapshot(state_path, preflight, result)
-                    retry_result = retry_diagnosed_ci(state_path, preflight, check_keys)
-                    update_coordinator_state(
-                        state_path, status="waiting_for_checks",
-                        detail=retry_result,
-                    )
-                    continue
-                completed = prepare_pending_ci_rerun(
-                    state_path,
-                    preflight,
-                    result,
-                    check_keys,
+                rerun_result = advance_ci_rerun(
+                    state_path, preflight, result, bounded=False,
                 )
-                for check_key in check_keys:
-                    if check_key in completed:
-                        continue
-                    rerun_results = capture_command(
-                        command_rerun,
-                        argparse.Namespace(state=str(state_path), check=check_key),
-                    )
-                    rerun_result = rerun_results[-1]
-                    if rerun_result["result"] in {
-                        "rerun_requested",
-                        "empty_commit_published",
-                    }:
-                        record_completed_ci_rerun(state_path, check_key)
-                        continue
-                    if rerun_result["result"] == "no_rerun_support":
-                        record_processed_ci_snapshot(state_path, preflight, result)
-                        emit(rerun_result)
-                        return
-                    raise WorkflowError(
-                        f"CI re-run returned unexpected result "
-                        f"{rerun_result['result']!r}"
-                    )
-                record_processed_ci_snapshot(state_path, preflight, result)
+                if rerun_result is not None:
+                    emit(rerun_result)
+                    return
                 continue
             if has_task:
                 record_processed_ci_snapshot(state_path, preflight, result)
