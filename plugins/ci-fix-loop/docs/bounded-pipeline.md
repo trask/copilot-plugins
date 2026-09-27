@@ -16,6 +16,8 @@ CI observation binds a pinned head's check rollup to the applicable workflow att
 
 The clearance verifier reads the live pull request and CI observation for either a clean result or a warning. Both outcomes become pending if the pinned head advances or their check snapshot changes. Clean results require passing workflows; warnings retain their recorded failures only while the same workflow attempts remain current.
 
+Before importing a hosted candidate, CI Fix checks the local checkout and the live pull request. A forward move on the same head ref supersedes the candidate; a changed CI attempt discards it. An admitted candidate has a persisted receipt bound to the frozen source head, check snapshot, task, and generated commits before local import begins. A linear base advance retains the frozen candidate but does not grant CI clearance.
+
 Both the standalone coordinator and the bounded step use the same CI stability gate to count matching observations and confirm the identity after collecting logs. The bounded step also requires its debounce interval to elapse across calls; the standalone coordinator sleeps within its wait budget. A processed failure needs a new snapshot in either mode. The standalone coordinator may revisit a processed green or no-checks snapshot; the bounded step waits for a new snapshot within its sweep.
 
 The gate records the observed decision and handles confirmation or an identity change for both coordinators. It restores and records the bounded step's stability checkpoint, including its first-observed time and retained log paths. Restarting a bounded call resumes that observation without making the coordinator manage the gate's fields.

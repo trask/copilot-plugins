@@ -7119,6 +7119,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual("ci_changed", payload["result"])
         self.assertEqual("completed", state["agent_task"]["status"])
         self.assertFalse(state["agent_task"]["imported"])
+        self.assertNotIn("consumer_receipt", state["agent_task"])
+        self.assertNotIn("candidate_attestation", state["agent_task"])
         apply.assert_not_called()
         self.assertIsNone(MODULE.stage_outcome(state))
 
@@ -7140,6 +7142,8 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual("superseded", state["agent_task"]["status"])
         self.assertFalse(state["agent_task"]["imported"])
         self.assertEqual("6" * 40, state["agent_task"]["superseded_by_head_sha"])
+        self.assertNotIn("consumer_receipt", state["agent_task"])
+        self.assertNotIn("candidate_attestation", state["agent_task"])
         self.assertEqual(1, state["iterations"])
         apply.assert_not_called()
 
@@ -7152,6 +7156,10 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertEqual("rerun", payload["result"])
         self.assertEqual("rerun", payload["outcome"])
         self.assertFalse(state["agent_task"].get("clearance_stale", False))
+        self.assertEqual(
+            self.preflight["pr"]["base_sha"],
+            state["agent_task"]["consumer_receipt"]["base_sha"],
+        )
         self.assertEqual(1, state["iterations"])
         apply.assert_called_once()
 
@@ -7183,6 +7191,21 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             if command[:4] == ["git", "-C", str(repo), "merge"]:
                 identity["head"] = command[-1]
             return MODULE.subprocess.CompletedProcess(command, 0, "", "")
+
+        def import_candidate(*_args, **kwargs):
+            admitted = MODULE.load_state(state_path)["agent_task"]
+            self.assertEqual("validated_pending_import", admitted["status"])
+            self.assertTrue(admitted["candidate_attestation"])
+            self.assertEqual(
+                preflight["check_snapshot"]["sha256"],
+                admitted["consumer_receipt"]["check_snapshot_sha256"],
+            )
+            self.assertEqual(
+                MODULE.canonical_json_sha256(admitted["consumer_receipt"]),
+                admitted["consumer_receipt_sha256"],
+            )
+            identity["head"] = kwargs["remote"]["final_local_head"]
+            return True
 
         arguments = MODULE.build_parser().parse_args(
             [
@@ -7218,10 +7241,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             mock.patch.object(
                 MODULE,
                 "apply_verified_candidate_import",
-                side_effect=lambda *a, **kw: identity.update(
-                    head=kw["remote"]["final_local_head"]
-                )
-                or True,
+                side_effect=import_candidate,
             ),
             mock.patch.object(
                 MODULE, "refuse_test_suppression",

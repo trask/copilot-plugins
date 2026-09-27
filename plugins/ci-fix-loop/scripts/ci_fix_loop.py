@@ -26,7 +26,7 @@ import sys
 import tempfile
 import time
 from types import ModuleType
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping, NamedTuple
 import urllib.parse
 import uuid
 
@@ -11057,6 +11057,168 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
         ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
 
 
+class CandidateAdmission(NamedTuple):
+    report: dict[str, Any]
+    diagnoses: list[dict[str, Any]] | None
+    base_advanced: bool
+    terminal: dict[str, Any] | None = None
+
+
+def admit_ci_fix_candidate(
+    state_path: Path,
+    state: dict[str, Any],
+    target: dict[str, Any],
+    preflight: dict[str, Any],
+    remote: dict[str, Any],
+    *,
+    result_sha256: str,
+) -> CandidateAdmission:
+    pr = preflight["pr"]
+    task_state = state["agent_task"]
+    identity = local_identity(Path(state["repo_root"]))
+    allowed_local_heads = (
+        {pr["head_sha"], remote["final_local_head"]}
+        if remote["requires_apply"]
+        else {remote["final_local_head"]}
+    )
+    if (
+        identity["branch"] != preflight["identity"]["branch"]
+        or identity["status"]
+        or identity["head"] not in allowed_local_heads
+    ):
+        raise WorkflowError(
+            "local repository identity drifted before report validation"
+        )
+    paths_by_commit = {
+        item["sha"]: item["changed_paths"]
+        for item in remote["candidate_manifest"]["code_commits"]
+    }
+    coordinator_report = candidate_ci_fix_report(preflight=preflight, remote=remote)
+    report = {
+        "outcome": "candidate" if remote["commits"] else "no_change",
+        "changed_paths": sorted({
+            path for paths in paths_by_commit.values() for path in paths
+        }),
+    }
+    diagnoses = read_ci_diagnosis(preflight, remote)
+    if diagnoses is not None:
+        coordinator_report["diagnoses"] = diagnoses
+        report["outcome"] = ci_diagnosis_outcome(diagnoses)
+
+    live = metadata_for(target)
+    if same_ref_forward_head_drift(pr, live):
+        task_state.update({
+            "status": "superseded",
+            "task_id": remote["task_id"],
+            "task_url": remote["task_url"],
+            "generated_branch": remote["generated_branch"],
+            "generated_head": remote["generated_head"],
+            "ordered_commits": remote["commits"],
+            "result_sha256": result_sha256,
+            "candidate_manifest": remote["candidate_manifest"],
+            "completion": remote["completion"],
+            "consumer_report": coordinator_report,
+            "imported": False,
+            "superseded_at": utc_now(),
+            "superseded_by_head_sha": live["head_sha"].lower(),
+            "discarded_reason": "pull request head advanced on the pinned source ref",
+        })
+        state["clean_at_head_sha"] = None
+        state["outcome"] = None
+        save_state(state_path, state)
+        return CandidateAdmission(
+            report=report, diagnoses=diagnoses, base_advanced=False,
+            terminal={
+                "result": "source_changed",
+                "state": str(state_path),
+                "head_sha": pr["head_sha"],
+                "next_head_sha": live["head_sha"].lower(),
+                "detail": task_state["discarded_reason"],
+                "task": {"id": remote["task_id"], "url": remote["task_url"]},
+            },
+        )
+    if live["head_sha"].lower() != pr["head_sha"]:
+        raise WorkflowError("pull request head moved before authenticated publication")
+    base_advanced = require_live_pr_snapshot(
+        pr, live, expected_head=live["head_sha"], allow_linear_base_advance=True,
+    )
+    if not base_advanced:
+        try:
+            require_live_check_snapshot(preflight)
+        except WorkflowError as error:
+            if error.details.get("reason") != "ci_observation_changed":
+                raise
+            task_state.update({
+                "status": "completed", "task_id": remote["task_id"],
+                "completed_at": utc_now(), "discarded_reason": str(error),
+                "candidate_manifest": remote["candidate_manifest"],
+                "completion": remote["completion"],
+                "consumer_report": coordinator_report,
+                "imported": False,
+            })
+            state["clean_at_head_sha"] = None
+            state["outcome"] = None
+            save_state(state_path, state)
+            return CandidateAdmission(
+                report=report, diagnoses=diagnoses, base_advanced=False,
+                terminal={
+                    "result": "ci_changed", "state": str(state_path),
+                    "head_sha": pr["head_sha"], "detail": str(error),
+                    "task": {"id": remote["task_id"], "url": remote["task_url"]},
+                },
+            )
+
+    task_state.update({
+        "status": "validated_pending_import",
+        "task_id": remote["task_id"],
+        "task_url": remote["task_url"],
+        "generated_branch": remote["generated_branch"],
+        "generated_head": remote["generated_head"],
+        "ordered_commits": remote["commits"],
+        "result_sha256": result_sha256,
+        "validated_at": utc_now(),
+        "candidate_manifest": remote["candidate_manifest"],
+        "completion": remote["completion"],
+        "report_evidence": remote["report_evidence"],
+        "consumer_report": coordinator_report,
+        "consumer_receipt": {
+            "schema": CI_FIX_CANDIDATE_RECEIPT_SCHEMA,
+            "result_sha256": result_sha256,
+            "repository": pr["repo_name"],
+            "pull_request": pr["number"],
+            "source_head_sha": pr["head_sha"],
+            "base_sha": pr["base_sha"],
+            "check_snapshot_sha256": preflight["check_snapshot"]["sha256"],
+            "task": {
+                "id": remote["task_id"],
+                "session_id": remote["session_id"],
+                "state": "completed",
+            },
+            "generated_branch": remote["generated_branch"],
+            "generated_head_sha": remote["generated_head"],
+            "code_tip_sha": remote["code_tip"],
+            "ordered_commits": remote["commits"],
+            "candidate_manifest_sha256": canonical_json_sha256(
+                remote["candidate_manifest"]
+            ),
+            "report_evidence": remote["report_evidence"],
+        },
+        "candidate_attestation": True,
+    })
+    task_state["consumer_receipt_sha256"] = sha256_text(
+        json.dumps(
+            task_state["consumer_receipt"],
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    save_state(state_path, state)
+    return CandidateAdmission(
+        report=report, diagnoses=diagnoses, base_advanced=base_advanced,
+    )
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -11525,161 +11687,18 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         save_state(state_path, state)
-        identity = local_identity(repo_root)
-        allowed_local_heads = (
-            {pr["head_sha"], remote["final_local_head"]}
-            if remote["requires_apply"]
-            else {remote["final_local_head"]}
+        admission = admit_ci_fix_candidate(
+            state_path, state, target, preflight, remote,
+            result_sha256=result_sha256,
         )
-        if (
-            identity["branch"] != preflight["identity"]["branch"]
-            or identity["status"]
-            or identity["head"] not in allowed_local_heads
-        ):
-            raise WorkflowError(
-                "local repository identity drifted before report validation"
-            )
-        paths_by_commit = {
-            item["sha"]: item["changed_paths"]
-            for item in remote["candidate_manifest"]["code_commits"]
-        }
-        coordinator_report = candidate_ci_fix_report(
-            preflight=preflight,
-            remote=remote,
-        )
-        report = {
-            "outcome": "candidate" if remote["commits"] else "no_change",
-            "changed_paths": sorted(
-                {
-                    path
-                    for paths in paths_by_commit.values()
-                    for path in paths
-                }
-            ),
-        }
-        diagnoses = read_ci_diagnosis(preflight, remote)
-        if diagnoses is not None:
-            coordinator_report["diagnoses"] = diagnoses
-            report["outcome"] = ci_diagnosis_outcome(diagnoses)
-        live = metadata_for(target)
-        if same_ref_forward_head_drift(pr, live):
-            task_state.update(
-                {
-                    "status": "superseded",
-                    "task_id": remote["task_id"],
-                    "task_url": remote["task_url"],
-                    "generated_branch": remote["generated_branch"],
-                    "generated_head": remote["generated_head"],
-                    "ordered_commits": remote["commits"],
-                    "result_sha256": result_sha256,
-                    "candidate_manifest": remote["candidate_manifest"],
-                    "completion": remote["completion"],
-                    "consumer_report": coordinator_report,
-                    "imported": False,
-                    "superseded_at": utc_now(),
-                    "superseded_by_head_sha": live["head_sha"].lower(),
-                    "discarded_reason": (
-                        "pull request head advanced on the pinned source ref"
-                    ),
-                }
-            )
-            state["clean_at_head_sha"] = None
-            state["outcome"] = None
-            save_state(state_path, state)
-            emit(
-                {
-                    "result": "source_changed",
-                    "state": str(state_path),
-                    "head_sha": pr["head_sha"],
-                    "next_head_sha": live["head_sha"].lower(),
-                    "detail": task_state["discarded_reason"],
-                    "task": {
-                        "id": remote["task_id"],
-                        "url": remote["task_url"],
-                    },
-                }
-            )
+        if admission.terminal is not None:
+            emit(admission.terminal)
             return
-        if live["head_sha"].lower() != pr["head_sha"]:
-            raise WorkflowError("pull request head moved before authenticated publication")
-        base_advanced = require_live_pr_snapshot(
-            pr,
-            live,
-            expected_head=live["head_sha"],
-            allow_linear_base_advance=True,
-        )
-        if not base_advanced:
-            try:
-                require_live_check_snapshot(preflight)
-            except WorkflowError as error:
-                if error.details.get("reason") != "ci_observation_changed":
-                    raise
-                task_state.update({
-                    "status": "completed", "task_id": remote["task_id"],
-                    "completed_at": utc_now(), "discarded_reason": str(error),
-                    "candidate_manifest": remote["candidate_manifest"],
-                    "completion": remote["completion"],
-                    "consumer_report": coordinator_report,
-                    "imported": False,
-                })
-                state["clean_at_head_sha"] = None
-                state["outcome"] = None
-                save_state(state_path, state)
-                emit({
-                    "result": "ci_changed", "state": str(state_path),
-                    "head_sha": pr["head_sha"], "detail": str(error),
-                    "task": {"id": remote["task_id"], "url": remote["task_url"]},
-                })
-                return
         validated_hosted_result = True
-        task_state.update(
-            {
-                "status": "validated_pending_import",
-                "task_id": remote["task_id"],
-                "task_url": remote["task_url"],
-                "generated_branch": remote["generated_branch"],
-                "generated_head": remote["generated_head"],
-                "ordered_commits": remote["commits"],
-                "result_sha256": result_sha256,
-                "validated_at": utc_now(),
-                "candidate_manifest": remote["candidate_manifest"],
-                "completion": remote["completion"],
-                "report_evidence": remote["report_evidence"],
-                "consumer_report": coordinator_report,
-                "consumer_receipt": {
-                    "schema": CI_FIX_CANDIDATE_RECEIPT_SCHEMA,
-                    "result_sha256": result_sha256,
-                    "repository": pr["repo_name"],
-                    "pull_request": pr["number"],
-                    "source_head_sha": pr["head_sha"],
-                    "base_sha": pr["base_sha"],
-                    "check_snapshot_sha256": preflight["check_snapshot"]["sha256"],
-                    "task": {
-                        "id": remote["task_id"],
-                        "session_id": remote["session_id"],
-                        "state": "completed",
-                    },
-                    "generated_branch": remote["generated_branch"],
-                    "generated_head_sha": remote["generated_head"],
-                    "code_tip_sha": remote["code_tip"],
-                    "ordered_commits": remote["commits"],
-                    "candidate_manifest_sha256": canonical_json_sha256(
-                        remote["candidate_manifest"]
-                    ),
-                    "report_evidence": remote["report_evidence"],
-                },
-                "candidate_attestation": True,
-            }
-        )
-        task_state["consumer_receipt_sha256"] = sha256_text(
-            json.dumps(
-                task_state["consumer_receipt"],
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-        )
-        save_state(state_path, state)
+        base_advanced = admission.base_advanced
+        report = admission.report
+        diagnoses = admission.diagnoses
+        coordinator_report = task_state["consumer_report"]
         published_head = task_state.get("published_head_sha")
         accepted_push = None
         if published_head is not None:
