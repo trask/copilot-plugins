@@ -1097,6 +1097,9 @@ class SealedCiFixCommandTest(unittest.TestCase):
                     MODULE, "fetch_workflow_runs", return_value={},
                 ))
                 stack.enter_context(mock.patch.object(
+                    MODULE, "ci_snapshot_runs", return_value={},
+                ))
+                stack.enter_context(mock.patch.object(
                     MODULE, "decide",
                     return_value={"decision": "failures", "reason": "checks_failed"},
                 ))
@@ -1113,6 +1116,89 @@ class SealedCiFixCommandTest(unittest.TestCase):
             )
             self.assertEqual("predecessor_clearance", result["stage"])
             self.assertEqual("failed", result["status"])
+
+    def test_lower_stack_clearance_includes_workflows_absent_from_check_rollup(self):
+        target = MODULE.parse_target("owner/repo#7")
+        stack = native_stack(heads={
+            5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+        })
+        identity = MODULE.sealed_ci_fix_stack_identity(target, stack=stack)
+        lower = {
+            "state": "OPEN", "number": 5, "repo_name": "owner/repo",
+            "head_sha": "b" * 40, "head_branch": "lower",
+            "base_branch": "main",
+        }
+        run = {
+            "id": 42, "workflow_id": 10, "name": "CI",
+            "head_sha": lower["head_sha"], "event": "pull_request",
+        }
+        checks = [{"key": "check:lint", "class": "passed", "name": "lint"}]
+        with (
+            mock.patch.object(MODULE, "read_native_stack", return_value=stack),
+            mock.patch.object(MODULE, "metadata_for", return_value=lower),
+            mock.patch.object(
+                MODULE, "fetch_rollup", return_value=(lower["head_sha"], checks),
+            ),
+            mock.patch.object(
+                MODULE, "gh_json", return_value=[{"workflow_runs": [run]}],
+            ),
+            mock.patch.object(MODULE, "ci_run_identity") as read_run,
+        ):
+            for status, conclusion in (
+                ("in_progress", None),
+                ("completed", "failure"),
+                ("completed", "success"),
+            ):
+                with self.subTest(status=status, conclusion=conclusion):
+                    read_run.return_value = {
+                        **run, "status": status, "conclusion": conclusion,
+                    }
+                    if conclusion == "success":
+                        self.assertEqual(
+                            [{"number": 5, "head_sha": lower["head_sha"],
+                              "decision": "green"}],
+                            MODULE.sealed_ci_fix_predecessor_clearance(target, identity),
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            MODULE.WorkflowError, "lower PR #5 is not CI-clear",
+                        ):
+                            MODULE.sealed_ci_fix_predecessor_clearance(target, identity)
+            self.assertEqual(3, read_run.call_count)
+
+    def test_lower_stack_without_checks_still_requires_workflow_approval(self):
+        target = MODULE.parse_target("owner/repo#7")
+        stack = native_stack(heads={
+            5: "b" * 40, 7: "d" * 40, 9: "c" * 40,
+        })
+        identity = MODULE.sealed_ci_fix_stack_identity(target, stack=stack)
+        lower = {
+            "state": "OPEN", "number": 5, "repo_name": "owner/repo",
+            "head_sha": "b" * 40, "head_branch": "lower",
+            "base_branch": "main", "upstream_owner": "owner",
+            "upstream_repo": "repo",
+        }
+        with (
+            mock.patch.object(MODULE, "read_native_stack", return_value=stack),
+            mock.patch.object(MODULE, "metadata_for", return_value=lower),
+            mock.patch.object(
+                MODULE, "fetch_rollup", return_value=(lower["head_sha"], []),
+            ),
+            mock.patch.object(
+                MODULE, "gh_json", return_value=[{"workflow_runs": []}],
+            ),
+            mock.patch.object(
+                MODULE, "fetch_workflow_runs",
+                return_value={"workflow_runs": [{
+                    "event": "pull_request", "status": "waiting",
+                    "name": "CI", "id": 42,
+                }]},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "lower PR #5 is not CI-clear.*approval_required",
+            ):
+                MODULE.sealed_ci_fix_predecessor_clearance(target, identity)
 
     def test_missing_descendant_rebase_helper_stops_before_repair(self):
         with tempfile.TemporaryDirectory(prefix="sealed resolver ") as directory:
@@ -1221,6 +1307,9 @@ class SealedCiFixCommandTest(unittest.TestCase):
                     return_value=("b" * 40, [{
                         "class": "passed", "key": "build", "name": "build",
                     }]),
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "ci_snapshot_runs", return_value={},
                 ))
                 stack.enter_context(mock.patch.object(
                     MODULE, "read_native_stack",
@@ -1362,6 +1451,9 @@ class SealedCiFixCommandTest(unittest.TestCase):
                     return_value=("b" * 40, [{
                         "class": "passed", "key": "build", "name": "build",
                     }]),
+                ))
+                stack.enter_context(mock.patch.object(
+                    MODULE, "ci_snapshot_runs", return_value={},
                 ))
                 stack.enter_context(mock.patch.object(
                     MODULE, "read_native_stack", return_value=original,
@@ -4034,7 +4126,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.114", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.115", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

@@ -9036,16 +9036,42 @@ class CIObservation:
         )
         return current, observed
 
-    def require_green_decision(self) -> dict[str, Any]:
+    def clearance_decision(self) -> dict[str, Any]:
         decision = decide(
             self.checks, now=dt.datetime.now(dt.timezone.utc),
             tracking={}, deadline_expired=True,
+            approval_runs=(
+                approval_blocked_runs(
+                    fetch_workflow_runs(self.pr, self.pr["head_sha"])
+                ) if not self.checks else []
+            ),
         )
-        if decision["decision"] not in {"green", "no_checks"} or not all(
-            run["status"] == "completed"
-            and run["conclusion"] in {"success", "neutral", "skipped"}
-            for run in self.workflow_runs.values()
-        ):
+        if decision["decision"] not in {"green", "no_checks"}:
+            return decision
+        failed = [
+            run for run in self.workflow_runs.values()
+            if run["status"] == "completed"
+            and run["conclusion"] not in {"success", "neutral", "skipped"}
+        ]
+        pending = [
+            run for run in self.workflow_runs.values()
+            if run["status"] != "completed"
+        ]
+        if failed or pending:
+            return {
+                "decision": "escalate" if failed else "waiting",
+                "reason": "workflow_failed" if failed else "workflow_running",
+                "checks": [],
+                "detail": (
+                    f"{len(failed)} applicable workflow(s) failed and "
+                    f"{len(pending)} are still pending"
+                ),
+            }
+        return decision
+
+    def require_green_decision(self) -> dict[str, Any]:
+        decision = self.clearance_decision()
+        if decision["decision"] not in {"green", "no_checks"}:
             raise WorkflowError(
                 "CI workflow attempt changed before clearance",
                 details={"reason": "ci_observation_changed"},
@@ -10166,21 +10192,7 @@ def sealed_ci_fix_predecessor_clearance(
             raise WorkflowError(
                 f"lower PR #{member['number']} changed during CI preflight"
             )
-        head, checks = fetch_rollup(live)
-        if head.lower() != member["head_sha"].lower():
-            raise WorkflowError(
-                f"lower PR #{member['number']} checks belong to another head"
-            )
-        decision = decide(
-            checks,
-            now=dt.datetime.now(dt.timezone.utc),
-            tracking={},
-            deadline_expired=True,
-            approval_runs=(
-                approval_blocked_runs(fetch_workflow_runs(live, head))
-                if not checks else []
-            ),
-        )
+        decision = CIObservation.read(live).clearance_decision()
         if decision["decision"] not in {"green", "no_checks"}:
             raise WorkflowError(
                 f"lower PR #{member['number']} is not CI-clear "
