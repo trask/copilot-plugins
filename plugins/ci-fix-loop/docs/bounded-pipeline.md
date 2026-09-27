@@ -16,6 +16,8 @@ CI observation binds a pinned head's check rollup to the applicable workflow att
 
 The clearance verifier reads the live pull request and CI observation for either a clean result or a warning. Both outcomes become pending if the pinned head advances or their check snapshot changes. Clean results require passing workflows; warnings retain their recorded failures only while the same workflow attempts remain current.
 
+The CI Fix status command writes a full status file and prints a compact summary derived from that file's payload. Both views report the same outcome, pinned head, progress and optional clearance verification; the compact view also counts checks, batches and history entries.
+
 For a selected native-stack member with actionable failures, lower open members must have passing checks and completed, passing applicable workflows before repair starts. The coordinator reads their CI observations through the same clearance decision used for a selected member, including approval-blocked workflows when no checks are reported.
 
 Before importing a hosted candidate, CI Fix checks the local checkout and the live pull request. A forward move on the same head ref supersedes the candidate; a changed CI attempt discards it. An admitted candidate has a persisted receipt bound to the frozen source head, check snapshot, task, and generated commits before local import begins. A linear base advance retains the frozen candidate but does not grant CI clearance.

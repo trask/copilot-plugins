@@ -4126,7 +4126,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.115", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.116", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -11987,6 +11987,41 @@ class StatusCommandTest(unittest.TestCase):
         self.assertEqual({"check:a": "pr_caused"}, payload["verdicts"])
         self.assertEqual(1, payload["counts"]["passed"])
         self.assertTrue(Path(payload["status_path"]).is_file())
+
+    def test_compact_status_projects_the_saved_snapshot(self):
+        path = write_state(
+            self.root,
+            outcome="green",
+            clean_at_head_sha="head1",
+            history=[{"id": "previous"}],
+            run={
+                "checks": [check("check:a", klass="passed")],
+                "decision": {
+                    "decision": "green", "action": "waiting",
+                    "reason": "all_checks_passed",
+                },
+            },
+        )
+
+        compact = call("status", "--state", str(path))
+        full = json.loads(Path(compact["status_path"]).read_text(encoding="utf-8"))
+
+        for key in (
+            "result", "state", "outcome", "stage_outcome",
+            "clean_at_head_sha", "clean_at_base_sha", "skip_note",
+            "escalation", "coordinator", "auto_retries", "local_validation",
+            "iterations", "budget_scope", "invocation_budget",
+            "accepted_pushes", "progress", "last_helper_activity",
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(full.get(key), compact.get(key))
+        self.assertEqual(
+            {key: full["pr"][key] for key in compact["pr"]}, compact["pr"]
+        )
+        self.assertEqual(full["run"]["decision"]["action"], compact["run"]["action"])
+        self.assertEqual(len(full["history"]), compact["counts"]["history"])
+        self.assertEqual(len(full["reruns"]), compact["counts"]["reruns"])
+        self.assertEqual(len(full["run"]["checks"]), compact["counts"]["checks"])
 
     def test_reports_a_pre_identity_blocked_envelope(self):
         path = self.root / "blocked.json"

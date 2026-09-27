@@ -14649,6 +14649,72 @@ def status_payload(state: dict[str, Any], path: Path) -> dict[str, Any]:
     }
 
 
+def status_summary(
+    payload: dict[str, Any], status_path: Path, verification: dict[str, Any],
+) -> dict[str, Any]:
+    pr = payload["pr"]
+    run_state = payload["run"]
+    checks = run_state.get("checks") or []
+    decision = run_state.get("decision") or {}
+    return {
+        "result": payload["result"],
+        "state": payload["state"],
+        "status_path": str(status_path),
+        "pr": (
+            {key: pr[key] for key in (
+                "number", "title", "pr_url", "repo_name", "head_branch", "base_branch",
+            )}
+            if pr is not None else None
+        ),
+        "run": {
+            "id": run_state.get("id"),
+            "status": run_state.get("status"),
+            "iteration": run_state.get("iteration"),
+            "head_sha": run_state.get("head_sha"),
+            "decision": decision.get("decision"),
+            "action": decision.get("action"),
+            "reason": decision.get("reason"),
+            "outcome": run_state.get("outcome"),
+            "batch_statuses": count_by_status(run_state.get("batches")),
+        },
+        "outcome": payload["outcome"],
+        **{
+            key: payload[key]
+            for key in (
+                "stage_outcome", "ci_warnings", "warning_at_head_sha",
+                "warning_at_base_sha", "all_ci_passed",
+            )
+            if key in payload
+        },
+        "clean_at_head_sha": payload["clean_at_head_sha"],
+        "clean_at_base_sha": payload["clean_at_base_sha"],
+        "skip_note": payload["skip_note"],
+        "escalation": payload["escalation"],
+        "coordinator": payload["coordinator"],
+        "auto_retries": payload["auto_retries"],
+        "local_validation": payload["local_validation"],
+        "verdicts": {
+            key: entry.get("verdict")
+            for key, entry in (run_state.get("attributions") or {}).items()
+        },
+        "counts": {
+            "batches": len(run_state.get("batches") or []),
+            "changed_files": len(run_state.get("changed_files") or []),
+            "checks": len(checks),
+            "history": len(payload["history"]),
+            "reruns": len(payload["reruns"]),
+            **class_counts(checks),
+        },
+        "iterations": payload["iterations"],
+        "budget_scope": payload["budget_scope"],
+        "invocation_budget": payload["invocation_budget"],
+        "accepted_pushes": payload["accepted_pushes"],
+        "progress": payload["progress"],
+        "last_helper_activity": payload["last_helper_activity"],
+        **{key: payload[key] for key in verification},
+    }
+
+
 def command_status(args: argparse.Namespace) -> None:
     if args.current:
         require_tools()
@@ -14685,68 +14751,7 @@ def command_status(args: argparse.Namespace) -> None:
     payload.update(warning_verification)
     status_path = status_path_for(path)
     write_result_file(status_path, payload, "status")
-    pr = status_pr(state)
-    run_state = state.get("run") or {}
-    checks = run_state.get("checks") or []
-    decision = run_state.get("decision") or {}
-    emit(
-        {
-            "result": "ready",
-            "state": str(path),
-            "status_path": str(status_path),
-            "pr": (
-                {
-                    "number": pr["number"],
-                    "title": pr["title"],
-                    "pr_url": pr["pr_url"],
-                    "repo_name": pr["repo_name"],
-                    "head_branch": pr["head_branch"],
-                    "base_branch": pr["base_branch"],
-                }
-                if pr is not None
-                else None
-            ),
-            "run": {
-                "id": run_state.get("id"),
-                "status": run_state.get("status"),
-                "iteration": run_state.get("iteration"),
-                "head_sha": run_state.get("head_sha"),
-                "decision": decision.get("decision"),
-                "action": decision.get("action"),
-                "reason": decision.get("reason"),
-                "outcome": run_state.get("outcome"),
-                "batch_statuses": count_by_status(run_state.get("batches")),
-            },
-            "outcome": state.get("outcome"),
-            **stage_outcome_fields(state),
-            "clean_at_head_sha": state.get("clean_at_head_sha"),
-            "clean_at_base_sha": state.get("clean_at_base_sha"),
-            "skip_note": state.get("skip_note"),
-            "escalation": state.get("escalation"),
-            "coordinator": state.get("coordinator"),
-            "auto_retries": state.get("auto_retries") or {},
-            "local_validation": state.get("local_validation") or [],
-            "verdicts": {
-                key: entry.get("verdict")
-                for key, entry in (run_state.get("attributions") or {}).items()
-            },
-            "counts": {
-                "batches": len(run_state.get("batches") or []),
-                "changed_files": len(run_state.get("changed_files") or []),
-                "checks": len(checks),
-                "history": len(state.get("history") or []),
-                "reruns": len(state.get("reruns") or {}),
-                **class_counts(checks),
-            },
-            "iterations": int(state.get("iterations", 0)),
-            "budget_scope": state.get("budget_scope", "lifetime"),
-            "invocation_budget": state.get("invocation_budget"),
-            "accepted_pushes": state.get("accepted_pushes") or [],
-            "progress": work_progress(state),
-            "last_helper_activity": last_helper_activity(state),
-            **warning_verification,
-        }
-    )
+    emit(status_summary(payload, status_path, warning_verification))
 
 
 def command_cleanup(args: argparse.Namespace) -> None:
