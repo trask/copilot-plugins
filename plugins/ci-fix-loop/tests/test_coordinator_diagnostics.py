@@ -256,6 +256,33 @@ class CoordinatorDiagnosticTest(unittest.TestCase):
         self.assertEqual(before, state)
         self.assertEqual(["check:CI/test"], context["checks"])
 
+    def test_gate_records_standalone_observations_for_failure_diagnostics(self):
+        self.save()
+        gate = MODULE.CIStabilityGate(state_path=self.path)
+        observed = snapshot(NEW_HEAD, attempt=1, pending=False)
+        preflight = {"check_snapshot": observed}
+        now = MODULE.dt.datetime(2026, 9, 20, tzinfo=MODULE.dt.timezone.utc)
+        gate.observe(preflight, processed=set(), now=now)
+        gate.record_observation(preflight, status="stabilizing")
+        observed["decision"]["checks"].append("check:not-observed")
+        saved = MODULE.load_state(self.path)
+        self.assertEqual(1, saved["coordinator"]["stable_polls"])
+        self.assertEqual(
+            "last_observed", MODULE.coordinator_failure_context(saved)["check_context"],
+        )
+        self.assertEqual(
+            ["check:CI/test"], saved["coordinator"]["check_snapshot"]["decision"]["checks"],
+        )
+
+        gate.reset()
+        changed = snapshot(NEW_HEAD, attempt=2, pending=False)
+        gate.record_observation({"check_snapshot": changed}, status="waiting_for_checks")
+        saved = MODULE.load_state(self.path)
+        self.assertEqual(0, saved["coordinator"]["stable_polls"])
+        self.assertEqual(changed["sha256"], saved["coordinator"]["snapshot_sha256"])
+        context = MODULE.coordinator_failure_context(saved)
+        self.assertEqual(2, context["check_snapshot"]["workflow_runs"]["42"]["run_attempt"])
+
     def test_status_outputs_preserve_observation_and_frozen_labels(self):
         self.save()
         self.observe(snapshot(NEW_HEAD, attempt=2, pending=False))

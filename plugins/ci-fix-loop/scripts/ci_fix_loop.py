@@ -12216,11 +12216,11 @@ class CIStabilityGate:
             active_log_paths=(Path(value) for value in recorded_logs),
         )
 
-    def _checkpoint_bounded(
+    def record_observation(
         self, preflight: dict[str, Any], *, status: str,
     ) -> None:
         if self.state_path is None:
-            raise WorkflowError("bounded CI stability gate requires a state path")
+            raise WorkflowError("CI stability gate requires a state path to record observations")
         snapshot = preflight["check_snapshot"]
         update_coordinator_state(
             self.state_path, status=status,
@@ -12229,6 +12229,13 @@ class CIStabilityGate:
             stable_polls=self.polls, detail=snapshot["decision"]["detail"],
             check_snapshot=snapshot,
         )
+
+    def _checkpoint_bounded(
+        self, preflight: dict[str, Any], *, status: str,
+    ) -> None:
+        if self.state_path is None:
+            raise WorkflowError("bounded CI stability gate requires a state path")
+        self.record_observation(preflight, status=status)
         state = load_state(self.state_path)
         bounded = state["bounded_step"]
         bounded["stable_since"] = self.since
@@ -12423,8 +12430,6 @@ def wait_for_stable_ci_preflight(
             attempt += 1
             continue
 
-        snapshot = preflight["check_snapshot"]
-        decision = snapshot["decision"]
         state = coordinator_file_state(state_path)
         status = gate.observe(
             preflight, processed=processed_ci_snapshot_ids(state),
@@ -12435,15 +12440,7 @@ def wait_for_stable_ci_preflight(
             attempt = 0
         if status != "stabilizing":
             gate.reset()
-        update_coordinator_state(
-            state_path,
-            status=status,
-            head_sha=snapshot["head_sha"],
-            snapshot_sha256=snapshot["sha256"],
-            stable_polls=gate.polls,
-            detail=decision["detail"],
-            check_snapshot=snapshot,
-        )
+        gate.record_observation(preflight, status=status)
         if gate.ready(
             polls=required_stability, debounce_seconds=0,
             now=dt.datetime.now(dt.timezone.utc),
@@ -12478,27 +12475,10 @@ def wait_for_stable_ci_preflight(
             if not confirmed:
                 gate.reset()
                 attempt = 0
-                changed_snapshot = confirmation["check_snapshot"]
-                update_coordinator_state(
-                    state_path,
-                    status="waiting_for_checks",
-                    head_sha=changed_snapshot["head_sha"],
-                    snapshot_sha256=changed_snapshot["sha256"],
-                    stable_polls=0,
-                    detail=changed_snapshot["decision"]["detail"],
-                    check_snapshot=changed_snapshot,
-                )
+                gate.record_observation(confirmation, status="waiting_for_checks")
                 continue
             preflight = confirmation
-            update_coordinator_state(
-                state_path,
-                status="ready",
-                head_sha=preflight["check_snapshot"]["head_sha"],
-                snapshot_sha256=preflight["check_snapshot"]["sha256"],
-                stable_polls=gate.polls,
-                detail=preflight["check_snapshot"]["decision"]["detail"],
-                check_snapshot=preflight["check_snapshot"],
-            )
+            gate.record_observation(preflight, status="ready")
             return preflight
         time.sleep(coordinator_delay(args, attempt))
         attempt += 1

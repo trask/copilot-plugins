@@ -20,6 +20,8 @@ Both the standalone coordinator and the bounded step use the same CI stability g
 
 The gate restores and records the bounded step's stability checkpoint, including its first-observed time and retained log paths. Restarting a bounded call resumes that observation without making the coordinator manage the gate's fields.
 
+Both coordinators ask the gate to record the observed head, snapshot identity, decision, and poll count. Failure diagnostics read that recorded observation. The standalone wait loop still owns its sleep and timeout policy; the bounded gate also stores its resume checkpoint.
+
 A strictly later sweep of the same pipeline run and PR starts a new observation after the preceding bounded step reaches a terminal result. Earlier processed snapshots and task receipts remain recorded, but they do not prevent the new sweep from inspecting the same head or check set. The stage still enforces its per-sweep and whole-run iteration limits. A repeated sweep reuses its own active observation and hosted task; it cannot claim a new allowance or change its owner, model, policy, or limits.
 
 The CI observation stores complete failed-job logs in a fresh directory outside the repository and verifies their hashes. If collection fails, it removes partial logs and the directory before returning the error. A local Copilot investigation uses the configured model (Sol by default) and read-only file/search tools scoped to that directory. It returns a free-form, size-limited briefing with selected failure evidence, possible groupings, and suggested reproduction or validation commands. The controller does not run those commands or treat the briefing as verified. CI logs retain their text except for terminal-control escaping.
