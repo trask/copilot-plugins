@@ -2286,70 +2286,25 @@ def command_bounded_pipeline(args: argparse.Namespace) -> None:
                 emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
                 return
             raise
-        snapshot = preflight["check_snapshot"]
-        recorded_logs = bounded.get("active_log_paths", [])
-        if not isinstance(recorded_logs, list) or any(
-            not isinstance(value, str) for value in recorded_logs
-        ):
-            raise WorkflowError("bounded CI log ownership is malformed")
-        coordinator = state.get("coordinator") or {}
-        gate = CIStabilityGate(
-            identity=coordinator.get("stability_sha256"),
-            polls=coordinator.get("stable_polls", 0),
-            since=bounded.get("stable_since"),
-            state_path=state_path,
-            active_log_paths=(Path(value) for value in recorded_logs),
-        )
-        gate.observe(
-            preflight, processed=processed_ci_snapshot_ids(state),
-            now=dt.datetime.now(dt.timezone.utc),
-        )
-        update_coordinator_state(
-            state_path, status="stabilizing",
-            head_sha=snapshot["head_sha"], snapshot_sha256=snapshot["sha256"],
-            stability_sha256=gate.identity,
-            stable_polls=gate.polls, detail=snapshot["decision"]["detail"],
-            check_snapshot=snapshot,
-        )
-        state = load_state(state_path)
-        state["bounded_step"]["stable_since"] = gate.since
-        state["bounded_step"]["active_log_paths"] = sorted(
-            str(path) for path in gate.active_log_paths
-        )
-        save_state(state_path, state)
-        if not gate.ready(
-            polls=args.stability_polls,
-            debounce_seconds=getattr(args, "debounce_seconds", 0.0),
-            now=dt.datetime.now(dt.timezone.utc),
-        ):
-            emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
-            return
         try:
-            complete, confirmed = gate.collect_confirmed(
-                lambda: agent_task_preflight(repo_root, target, state_path=state_path)
+            complete = CIStabilityGate.advance_bounded(
+                state_path, state, preflight,
+                now=dt.datetime.now(dt.timezone.utc),
+                polls=args.stability_polls,
+                debounce_seconds=getattr(args, "debounce_seconds", 0.0),
+                collect=lambda: agent_task_preflight(
+                    repo_root, target, state_path=state_path
+                ),
             )
-            if not confirmed:
-                emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
-                return
         except WorkflowError as error:
             if error.details.get("reason") != "ci_observation_changed":
                 raise
             emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
             return
+        if complete is None:
+            emit({"result": "waiting", "state": str(state_path), "reason": "checks_running"})
+            return
         preflight = complete
-        snapshot = complete["check_snapshot"]
-        update_coordinator_state(
-            state_path, status="ready",
-            head_sha=snapshot["head_sha"], snapshot_sha256=snapshot["sha256"],
-            stability_sha256=gate.identity,
-            stable_polls=gate.polls, detail=snapshot["decision"]["detail"],
-            check_snapshot=snapshot,
-        )
-        state = load_state(state_path)
-        state["bounded_step"]["active_log_paths"] = sorted(
-            str(path) for path in gate.active_log_paths
-        )
-        save_state(state_path, state)
         step_args = argparse.Namespace(**vars(args))
         step_args._preflight = preflight
         result = capture_command(command_agent_task, step_args)[-1]
@@ -12249,6 +12204,68 @@ class CIStabilityGate:
         self.status = "waiting_for_checks"
         self.state_path = state_path
         self.active_log_paths = set(active_log_paths)
+
+    @classmethod
+    def _resume_bounded(
+        cls, state_path: Path, state: dict[str, Any],
+    ) -> "CIStabilityGate":
+        bounded = state["bounded_step"]
+        coordinator = state.get("coordinator")
+        if coordinator is None:
+            coordinator = {}
+        if not isinstance(coordinator, dict):
+            raise WorkflowError("bounded CI coordinator state is malformed")
+        recorded_logs = bounded.get("active_log_paths", [])
+        if not isinstance(recorded_logs, list) or any(
+            not isinstance(value, str) for value in recorded_logs
+        ):
+            raise WorkflowError("bounded CI log ownership is malformed")
+        return cls(
+            identity=coordinator.get("stability_sha256"),
+            polls=coordinator.get("stable_polls", 0),
+            since=bounded.get("stable_since"),
+            state_path=state_path,
+            active_log_paths=(Path(value) for value in recorded_logs),
+        )
+
+    def _checkpoint_bounded(
+        self, preflight: dict[str, Any], *, status: str,
+    ) -> None:
+        if self.state_path is None:
+            raise WorkflowError("bounded CI stability gate requires a state path")
+        snapshot = preflight["check_snapshot"]
+        update_coordinator_state(
+            self.state_path, status=status,
+            head_sha=snapshot["head_sha"], snapshot_sha256=snapshot["sha256"],
+            stability_sha256=self.identity,
+            stable_polls=self.polls, detail=snapshot["decision"]["detail"],
+            check_snapshot=snapshot,
+        )
+        state = load_state(self.state_path)
+        bounded = state["bounded_step"]
+        bounded["stable_since"] = self.since
+        bounded["active_log_paths"] = sorted(str(path) for path in self.active_log_paths)
+        save_state(self.state_path, state)
+
+    @classmethod
+    def advance_bounded(
+        cls, state_path: Path, state: dict[str, Any], preflight: dict[str, Any],
+        *, now: dt.datetime, polls: int,
+        debounce_seconds: float, collect: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        gate = cls._resume_bounded(state_path, state)
+        gate.observe(preflight, processed=processed_ci_snapshot_ids(state), now=now)
+        gate._checkpoint_bounded(preflight, status="stabilizing")
+        if not gate.ready(
+            polls=polls, debounce_seconds=debounce_seconds,
+            now=dt.datetime.now(dt.timezone.utc),
+        ):
+            return None
+        preflight, confirmed = gate.collect_confirmed(collect)
+        if confirmed:
+            gate._checkpoint_bounded(preflight, status="ready")
+            return preflight
+        return None
 
     def _retain_logs(self, preflight: dict[str, Any]) -> None:
         paths = set(managed_task_log_paths({"preflight": preflight}))

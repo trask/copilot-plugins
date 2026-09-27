@@ -347,6 +347,56 @@ class BoundedCiPipelineTest(unittest.TestCase):
         task.assert_not_called()
         sleep.assert_not_called()
 
+    def test_bounded_step_restores_checkpoint_and_replaces_owned_logs(self):
+        self.args.stability_polls = 2
+        snapshot = {
+            "sha256": "ready", "head_sha": "head", "base_sha": "base",
+            "rollup": [], "workflow_runs": {},
+            "decision": {"decision": "failures", "detail": "failed"},
+        }
+        preflight = {"check_snapshot": snapshot}
+        with tempfile.TemporaryDirectory() as directory:
+            self.path = Path(directory) / "state.json"
+            self.args.state = str(self.path)
+            old_directory = self.path.with_name("state--ci-fix-logs--old")
+            old_directory.mkdir()
+            old_log = old_directory / "001.log"
+            old_log.write_text("old", encoding="utf-8")
+            new_directory = self.path.with_name("state--ci-fix-logs--new")
+            new_directory.mkdir()
+            new_log = new_directory / "001.log"
+            new_log.write_text("new", encoding="utf-8")
+            complete = copy.deepcopy(preflight)
+            complete["check_snapshot"]["failures"] = [{"log_path": str(new_log)}]
+            with (
+                mock.patch.object(
+                    MODULE, "agent_task_preflight",
+                    side_effect=[preflight, preflight, complete],
+                ) as observe,
+                mock.patch.object(MODULE, "require_live_check_snapshot") as confirm,
+                mock.patch.object(
+                    MODULE, "command_agent_task",
+                    side_effect=lambda _: MODULE.emit({
+                        "result": "warning", "state": str(self.path),
+                    }),
+                ) as task,
+            ):
+                MODULE.command_bounded_pipeline(self.args)
+                first_since = self.state["bounded_step"]["stable_since"]
+                self.assertEqual(1, self.state["coordinator"]["stable_polls"])
+                self.state["bounded_step"]["active_log_paths"] = [str(old_log)]
+                MODULE.command_bounded_pipeline(self.args)
+
+            self.assertEqual(3, observe.call_count)
+            confirm.assert_called_once_with(complete)
+            task.assert_called_once()
+            self.assertEqual("warning", self.output[-1]["result"])
+            self.assertEqual(2, self.state["coordinator"]["stable_polls"])
+            self.assertEqual(first_since, self.state["bounded_step"]["stable_since"])
+            self.assertEqual([str(new_log)], self.state["bounded_step"]["active_log_paths"])
+            self.assertFalse(old_directory.exists())
+            self.assertTrue(new_log.is_file())
+
     def test_changed_checks_after_log_collection_defer_dispatch(self):
         snapshot = {
             "sha256": "ready", "head_sha": "head", "base_sha": "base",
