@@ -158,7 +158,8 @@ tip. Report artifacts are never imported. Publication stays with the caller.
 The repository owns the Runtime source-pin specification in
 `tools/runtime-loader-pins.json`. Run
 `python tools/runtime_loader_pins.py check` after Runtime changes,
-`python tools/runtime_loader_pins.py update` to refresh the recorded source
-digests, and `python tools/runtime_loader_pins.py generate cloud-task` or
+`python tools/runtime_loader_pins.py update` to refresh the declared consumer
+constants and transitive source digests before publishing, and
+`python tools/runtime_loader_pins.py generate cloud-task` or
 `generate execution` to print a self-contained byte-verifying Python loader
 for a consumer migration.

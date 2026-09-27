@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
@@ -23,7 +24,9 @@ DEPENDENCY_FIELDS = {
     "module",
     "sha256",
     "source",
+    "consumers",
 }
+CONSUMER_FIELDS = {"path", "constant"}
 
 
 class PinError(RuntimeError):
@@ -38,7 +41,7 @@ def read_spec(path: Path) -> dict[str, Any]:
     if (
         not isinstance(data, dict)
         or set(data) != {"schema", "dependencies"}
-        or data["schema"] != 1
+        or data["schema"] != 2
         or not isinstance(data["dependencies"], dict)
         or not data["dependencies"]
     ):
@@ -49,40 +52,153 @@ def read_spec(path: Path) -> dict[str, Any]:
             or not name
             or not isinstance(dependency, dict)
             or set(dependency) != DEPENDENCY_FIELDS
-            or not all(isinstance(value, str) and value for value in dependency.values())
+            or not all(
+                isinstance(dependency[field], str) and dependency[field]
+                for field in DEPENDENCY_FIELDS - {"consumers"}
+            )
             or IDENTIFIER_PATTERN.fullmatch(dependency["constant"]) is None
             or IDENTIFIER_PATTERN.fullmatch(dependency["loader"]) is None
             or IDENTIFIER_PATTERN.fullmatch(dependency["module"]) is None
             or SHA256_PATTERN.fullmatch(dependency["sha256"]) is None
+            or not isinstance(dependency["consumers"], list)
+            or not dependency["consumers"]
         ):
             raise PinError(f"Runtime loader dependency {name!r} is malformed")
-        source = Path(dependency["source"])
-        installed = Path(dependency["installed_path"])
-        if (
-            source.is_absolute()
-            or installed.is_absolute()
-            or ".." in source.parts
-            or ".." in installed.parts
-        ):
-            raise PinError(f"Runtime loader dependency {name!r} has an unsafe path")
+        safe_path(dependency["source"])
+        safe_path(dependency["installed_path"], require_file=False)
+        for consumer in dependency["consumers"]:
+            if (
+                not isinstance(consumer, dict)
+                or set(consumer) != CONSUMER_FIELDS
+                or not isinstance(consumer["constant"], str)
+                or IDENTIFIER_PATTERN.fullmatch(consumer["constant"]) is None
+                or not isinstance(consumer["path"], str)
+            ):
+                raise PinError(f"Runtime loader consumer of {name!r} is malformed")
+            safe_path(consumer["path"])
+    source_paths = [dependency["source"] for dependency in data["dependencies"].values()]
+    if len(set(source_paths)) != len(source_paths):
+        raise PinError("Runtime loader sources must be unique")
+    pins = [
+        (consumer["path"], consumer["constant"])
+        for dependency in data["dependencies"].values()
+        for consumer in dependency["consumers"]
+    ]
+    if len(set(pins)) != len(pins):
+        raise PinError("Runtime loader consumer assignments must be unique")
+    dependency_order(data)
     return data
 
 
-def source_digest(dependency: dict[str, str]) -> str:
-    path = ROOT / dependency["source"]
+def safe_path(value: str, *, require_file: bool = True) -> Path:
+    if (
+        not value
+        or "\\" in value
+        or value.startswith("/")
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or ":" in value
+    ):
+        raise PinError(f"unsafe Runtime loader path: {value!r}")
+    path = ROOT.joinpath(*value.split("/"))
+    if (
+        (require_file and not path.is_file())
+        or path.is_symlink()
+        or not path.resolve().is_relative_to(ROOT.resolve())
+    ):
+        raise PinError(f"invalid Runtime loader file: {value!r}")
+    return path
+
+
+def dependency_order(data: dict[str, Any]) -> list[str]:
+    dependencies = data["dependencies"]
+    sources = {entry["source"]: name for name, entry in dependencies.items()}
+    incoming: dict[str, set[str]] = {name: set() for name in dependencies}
+    for name, entry in dependencies.items():
+        for consumer in entry["consumers"]:
+            downstream = sources.get(consumer["path"])
+            if downstream is not None:
+                incoming[downstream].add(name)
+    order: list[str] = []
+    while incoming:
+        ready = sorted(name for name, parents in incoming.items() if not parents)
+        if not ready:
+            raise PinError("Runtime loader pin dependencies contain a cycle")
+        order.extend(ready)
+        for name in ready:
+            del incoming[name]
+        for parents in incoming.values():
+            parents.difference_update(ready)
+    return order
+
+
+def source_digest(dependency: dict[str, Any]) -> str:
+    path = safe_path(dependency["source"])
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError as error:
         raise PinError(f"could not read Runtime source {path}: {error}") from None
 
 
+def pin_literal(source: bytes, constant: str) -> tuple[int, int, str]:
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, UnicodeError, ValueError) as error:
+        raise PinError(f"invalid Runtime loader consumer source: {error}") from None
+    matches = [
+        node.value
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and (
+            any(isinstance(target, ast.Name) and target.id == constant for target in node.targets)
+            if isinstance(node, ast.Assign)
+            else isinstance(node.target, ast.Name) and node.target.id == constant
+        )
+    ]
+    if len(matches) != 1 or not isinstance(matches[0], ast.Constant) or not isinstance(matches[0].value, str):
+        raise PinError(f"expected one literal assignment to {constant}")
+    value = matches[0]
+    offsets = [0]
+    for line in source.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    start = offsets[value.lineno - 1] + value.col_offset
+    end = offsets[value.end_lineno - 1] + value.end_col_offset
+    literal = source[start:end]
+    if re.fullmatch(rb"""["'][0-9a-f]{64}["']""", literal) is None:
+        raise PinError(f"expected one SHA256 string literal for {constant}")
+    return start, end, value.value
+
+
+def prepared_pins(data: dict[str, Any], *, update: bool) -> tuple[dict[Path, bytes], list[str]]:
+    files: dict[Path, bytes] = {}
+    stale: list[str] = []
+    for name in dependency_order(data):
+        dependency = data["dependencies"][name]
+        source = safe_path(dependency["source"])
+        contents = files.get(source)
+        if contents is None:
+            contents = source.read_bytes()
+        digest = hashlib.sha256(contents).hexdigest()
+        if dependency["sha256"] != digest:
+            stale.append(f"{name}: expected {dependency['sha256']}, found {digest}")
+        if update:
+            dependency["sha256"] = digest
+        for consumer in dependency["consumers"]:
+            path = safe_path(consumer["path"])
+            content = files.get(path)
+            if content is None:
+                content = path.read_bytes()
+            start, end, value = pin_literal(content, consumer["constant"])
+            if value != digest:
+                stale.append(f"{consumer['path']}:{consumer['constant']}: expected {digest}, found {value}")
+                if update:
+                    quote = content[start:start + 1]
+                    files[path] = content[:start] + quote + digest.encode("ascii") + quote + content[end:]
+    return files, stale
+
+
 def check_spec(path: Path) -> None:
     data = read_spec(path)
-    stale = []
-    for name, dependency in sorted(data["dependencies"].items()):
-        actual = source_digest(dependency)
-        if actual != dependency["sha256"]:
-            stale.append(f"{name}: expected {dependency['sha256']}, found {actual}")
+    _, stale = prepared_pins(data, update=False)
     if stale:
         raise PinError(
             "Runtime loader pins are stale; run "
@@ -92,13 +208,13 @@ def check_spec(path: Path) -> None:
 
 def update_spec(path: Path) -> None:
     data = read_spec(path)
-    for dependency in data["dependencies"].values():
-        dependency["sha256"] = source_digest(dependency)
-    path.write_text(
-        json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    files, _ = prepared_pins(data, update=True)
+    spec_bytes = (json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    for consumer_path, content in files.items():
+        if consumer_path.read_bytes() != content:
+            consumer_path.write_bytes(content)
+    if path.read_bytes() != spec_bytes:
+        path.write_bytes(spec_bytes)
 
 
 def render_loader(name: str, dependency: dict[str, str]) -> str:

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,99 @@ MODULE_SPEC.loader.exec_module(MODULE)
 
 
 class RuntimeLoaderPinsTest(unittest.TestCase):
+    def fixture(self, root):
+        (root / "base.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (root / "middle.py").write_text(
+            'BASE_SHA256 = "' + "0" * 64 + '"\nVALUE = 2\n', encoding="utf-8"
+        )
+        (root / "last.py").write_text(
+            'MIDDLE_SHA256 = "' + "0" * 64 + '"\nVALUE = 3\n', encoding="utf-8"
+        )
+        dependencies = {}
+        for name, source, consumer, constant in (
+            ("base", "base.py", "middle.py", "BASE_SHA256"),
+            ("middle", "middle.py", "last.py", "MIDDLE_SHA256"),
+        ):
+            dependencies[name] = {
+                "constant": constant,
+                "consumers": [{"path": consumer, "constant": constant}],
+                "installed_path": source,
+                "loader": f"load_{name}",
+                "module": name,
+                "sha256": "0" * 64,
+                "source": source,
+            }
+        spec = root / "pins.json"
+        spec.write_text(
+            json.dumps({"schema": 2, "dependencies": dependencies}),
+            encoding="utf-8",
+        )
+        return spec
+
+    def test_update_propagates_transitive_byte_pins_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self.fixture(root)
+            with mock.patch.object(MODULE, "ROOT", root):
+                MODULE.update_spec(spec)
+                MODULE.check_spec(spec)
+                data = MODULE.read_spec(spec)["dependencies"]
+                middle = (root / "middle.py").read_bytes()
+                self.assertEqual(
+                    hashlib.sha256((root / "base.py").read_bytes()).hexdigest(),
+                    data["base"]["sha256"],
+                )
+                self.assertIn(data["base"]["sha256"].encode(), middle)
+                self.assertEqual(
+                    hashlib.sha256(middle).hexdigest(), data["middle"]["sha256"]
+                )
+                self.assertIn(
+                    data["middle"]["sha256"].encode(), (root / "last.py").read_bytes()
+                )
+                before = {path: path.read_bytes() for path in root.iterdir()}
+                MODULE.update_spec(spec)
+                self.assertEqual(before, {path: path.read_bytes() for path in root.iterdir()})
+                (root / "last.py").write_bytes(
+                    (root / "last.py").read_bytes().replace(
+                        data["middle"]["sha256"].encode(), b"0" * 64
+                    )
+                )
+                with self.assertRaisesRegex(MODULE.PinError, "last.py:MIDDLE_SHA256"):
+                    MODULE.check_spec(spec)
+
+    def test_invalid_declarations_never_write_consumer_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self.fixture(root)
+            with mock.patch.object(MODULE, "ROOT", root):
+                for mutation in ("cycle", "duplicate", "missing", "path", "ambiguous"):
+                    with self.subTest(mutation=mutation):
+                        data = json.loads(spec.read_text(encoding="utf-8"))
+                        if mutation == "cycle":
+                            data["dependencies"]["middle"]["consumers"].append(
+                                {"path": "base.py", "constant": "BACK_SHA256"}
+                            )
+                        elif mutation == "duplicate":
+                            data["dependencies"]["base"]["consumers"] *= 2
+                        elif mutation == "missing":
+                            data["dependencies"]["base"]["consumers"][0]["constant"] = "MISSING"
+                        elif mutation == "path":
+                            data["dependencies"]["base"]["source"] = "../base.py"
+                        else:
+                            (root / "middle.py").write_text(
+                                'BASE_SHA256 = "' + "0" * 64 + '"\n'
+                                'BASE_SHA256 = "' + "0" * 64 + '"\n',
+                                encoding="utf-8",
+                            )
+                        invalid = root / f"{mutation}.json"
+                        invalid.write_text(json.dumps(data), encoding="utf-8")
+                        before = {path: path.read_bytes() for path in root.iterdir()}
+                        with self.assertRaises(MODULE.PinError):
+                            MODULE.update_spec(invalid)
+                        self.assertEqual(before, {path: path.read_bytes() for path in root.iterdir()})
+                        if mutation == "ambiguous":
+                            break
+
     def test_committed_pins_match_runtime_sources(self):
         MODULE.check_spec(SPEC_PATH)
 

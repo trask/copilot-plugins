@@ -29,5 +29,13 @@ Keep each plugin complete under `plugins/<name>/`, including its agent
 definitions, scripts, and tests. Bump the plugin version in both `plugin.json`
 and `.github/plugin/marketplace.json` when you publish a change to behavior.
 
+When a pinned Runtime source or Pipeline common module changes, run
+`python tools/runtime_loader_pins.py update` to refresh its declared consumer
+constants and dependent source hashes in order. Run
+`python tools/runtime_loader_pins.py check` before publishing. The source-pin
+spec in `tools/runtime-loader-pins.json` lists the exact consumer assignments;
+the update command rejects missing assignments and invalid dependencies before
+writing files. Installed loaders still verify the source bytes they compile.
+
 Shared code and documentation must not contain credentials, employer details,
 internal hostnames, or personal filesystem paths.

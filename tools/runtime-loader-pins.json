@@ -2,6 +2,14 @@
   "dependencies": {
     "cloud-task": {
       "constant": "REQUIRED_CLOUD_TASK_SHA256",
+      "consumers": [
+        {"path": "plugins/ci-fix-loop/scripts/ci_fix_loop.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
+        {"path": "plugins/copilot-review-loop/scripts/copilot_review_loop.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
+        {"path": "plugins/historical-pr-audit/scripts/historical_pr_audit.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
+        {"path": "plugins/pr-description/scripts/pr_description.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
+        {"path": "plugins/pr-reviewer/scripts/pr_reviewer.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"},
+        {"path": "plugins/self-review-loop/scripts/self_review_loop.py", "constant": "REQUIRED_CLOUD_TASK_SHA256"}
+      ],
       "installed_path": "scripts/cloud_task.py",
       "loader": "load_cloud_task_runtime",
       "module": "_trask_agent_tasks_runtime",
@@ -10,12 +18,37 @@
     },
     "execution": {
       "constant": "EXECUTION_SHA256",
+      "consumers": [
+        {"path": "plugins/agent-tasks-runtime/skills/agent-tasks-runtime/scripts/cloud_task.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/ci-fix-loop/scripts/ci_fix_loop.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/copilot-review-loop/scripts/copilot_review_loop.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/historical-pr-audit/scripts/historical_pr_audit.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/pr-conflict-resolver/scripts/cloud_conflict_task.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/pr-conflict-resolver/scripts/pr_conflict_resolver.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/pr-description/scripts/pr_description.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/pr-pipeline/scripts/pr_pipeline.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/pr-pipeline/scripts/pr_stack_pipeline.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/pr-reviewer/scripts/pr_reviewer.py", "constant": "EXECUTION_SHA256"},
+        {"path": "plugins/self-review-loop/scripts/self_review_loop.py", "constant": "EXECUTION_SHA256"}
+      ],
       "installed_path": "scripts/execution.py",
       "loader": "load_execution_runtime",
       "module": "_trask_foreground_execution",
       "sha256": "d149f16fa6c89e57155aa815e98261c01985a85742b5bb2c15bc85527fad4acb",
       "source": "plugins/agent-tasks-runtime/skills/agent-tasks-runtime/scripts/execution.py"
+    },
+    "pipeline-common": {
+      "constant": "COMMON_SHA256",
+      "consumers": [
+        {"path": "plugins/pr-pipeline/scripts/pr_pipeline.py", "constant": "COMMON_SHA256"},
+        {"path": "plugins/pr-pipeline/scripts/pr_stack_pipeline.py", "constant": "COMMON_SHA256"}
+      ],
+      "installed_path": "scripts/pipeline_common.py",
+      "loader": "load_common",
+      "module": "pr_pipeline_common",
+      "sha256": "f51856368d892f8aadac1ac4ae68cd7aeced1fe1948b87c176683c09ca4ce9cd",
+      "source": "plugins/pr-pipeline/scripts/pipeline_common.py"
     }
   },
-  "schema": 1
+  "schema": 2
 }
