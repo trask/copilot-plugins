@@ -1712,18 +1712,112 @@ def task_failure_from_result(result: dict[str, Any]) -> WorkflowError:
     return WorkflowError(f"Agent Task failed [{code}]: {message}")
 
 
-def candidate_anchor(candidate: dict[str, Any]) -> dict[str, Any]:
-    anchor = candidate["anchor"]
-    value = {
-        "path": candidate["path"],
-        "line": anchor["line"],
-        "side": anchor["side"],
-        "body": candidate.get("explanation") or candidate["title"],
-    }
-    if anchor["start_line"] is not None:
-        value["start_line"] = anchor["start_line"]
-        value["start_side"] = anchor["start_side"]
-    return value
+class ReviewBatch:
+    def __init__(
+        self, candidates: list[dict[str, Any]], anchors: DiffAnchors
+    ) -> None:
+        self.candidates = candidates
+        self.anchors = anchors
+
+    @classmethod
+    def discover(
+        cls,
+        raw_candidates: list[Any],
+        anchors: DiffAnchors,
+        *,
+        original_anchors: DiffAnchors | None = None,
+    ) -> ReviewBatch:
+        candidates = []
+        for index, raw in enumerate(raw_candidates):
+            if (
+                not isinstance(raw, dict)
+                or not isinstance(raw.get("evidence"), str) or not raw["evidence"].strip()
+                or len(json.dumps(raw).encode("utf-8")) > MAX_CANDIDATE_BYTES
+            ):
+                raise WorkflowError("hosted discovery candidate evidence is invalid")
+            comment = validate_comments(
+                [{key: value for key, value in raw.items() if key != "evidence"}],
+                original_anchors or anchors,
+            )[0]
+            if original_anchors is not None:
+                try:
+                    validate_comments([comment], anchors)
+                except WorkflowError:
+                    continue
+            candidates.append({
+                "candidate_id": f"candidate-{index + 1:03d}", "path": comment["path"],
+                "anchor": {key: comment.get(key) for key in ("line", "side", "start_line", "start_side")},
+                "explanation": comment["body"], "evidence": raw["evidence"],
+            })
+        return cls(candidates, anchors)
+
+    @staticmethod
+    def _anchor(candidate: dict[str, Any]) -> dict[str, Any]:
+        anchor = candidate["anchor"]
+        value = {
+            "path": candidate["path"],
+            "line": anchor["line"],
+            "side": anchor["side"],
+            "body": candidate.get("explanation") or candidate["title"],
+        }
+        if anchor["start_line"] is not None:
+            value["start_line"] = anchor["start_line"]
+            value["start_side"] = anchor["start_side"]
+        return value
+
+    def select(self, raw_comments: list[Any]) -> list[dict[str, Any]]:
+        by_id = {candidate["candidate_id"]: candidate for candidate in self.candidates}
+        seen = []
+        comments = []
+        for item in raw_comments:
+            if (
+                not isinstance(item, dict) or set(item) != {"candidate_id", "body"}
+                or not isinstance(item["candidate_id"], str)
+                or item["candidate_id"] not in by_id or item["candidate_id"] in seen
+            ):
+                raise WorkflowError("hosted critique has an unknown or repeated candidate")
+            seen.append(item["candidate_id"])
+            comment = {**self._anchor(by_id[item["candidate_id"]]), "body": item["body"]}
+            comments.append({
+                "candidate_id": item["candidate_id"],
+                **validate_comments([comment], self.anchors)[0],
+            })
+        if seen != [
+            candidate["candidate_id"]
+            for candidate in self.candidates
+            if candidate["candidate_id"] in seen
+        ]:
+            raise WorkflowError("hosted critique changed candidate order")
+        return comments
+
+    def posting_comments(
+        self, raw_comments: list[Any], hosted_comments: Any
+    ) -> list[dict[str, Any]]:
+        if not isinstance(hosted_comments, list) or raw_comments != hosted_comments:
+            raise WorkflowError("comments must exactly match completed hosted Astra critique")
+        candidates = {
+            candidate["candidate_id"]: candidate
+            for candidate in self.candidates
+            if isinstance(candidate, dict) and isinstance(candidate.get("candidate_id"), str)
+        }
+        selected_ids: list[str] = []
+        comment_values: list[dict[str, Any]] = []
+        for index, comment in enumerate(raw_comments):
+            if not isinstance(comment, dict):
+                raise WorkflowError(f"comment {index} must be an object")
+            candidate_id = comment.get("candidate_id")
+            if not isinstance(candidate_id, str) or candidate_id not in candidates:
+                raise WorkflowError(f"comment {index} does not name a validated candidate")
+            selected_ids.append(candidate_id)
+            value = {key: item for key, item in comment.items() if key != "candidate_id"}
+            expected = self._anchor(candidates[candidate_id])
+            for key in ("path", "line", "side", "start_line", "start_side"):
+                if value.get(key) != expected.get(key):
+                    raise WorkflowError(f"comment {index} changed its validated candidate anchor")
+            comment_values.append(value)
+        if len(selected_ids) != len(set(selected_ids)):
+            raise WorkflowError("a validated candidate may be posted only once")
+        return validate_comments(comment_values, self.anchors)
 
 
 def remove_transient_artifacts(paths: list[Path]) -> None:
@@ -1932,6 +2026,7 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
             state=state, candidates=None,
         )
         observed_pr = state["phases"][-1]["observed_pr"]
+        discovery_anchors = anchors
         if observed_pr["base"] != pr["base"]:
             (
                 refreshed_pr,
@@ -1962,36 +2057,12 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
             anchors = refreshed_anchors
             state["pr"] = pr
             save_run_state(state_path, state)
-        candidates = []
-        for index, raw in enumerate(discovery["candidates"]):
-            if (
-                not isinstance(raw, dict)
-                or not isinstance(raw.get("evidence"), str) or not raw["evidence"].strip()
-                or len(json.dumps(raw).encode("utf-8")) > MAX_CANDIDATE_BYTES
-            ):
-                raise WorkflowError("hosted discovery candidate evidence is invalid")
-            try:
-                comment = validate_comments(
-                    [
-                        {
-                            key: value
-                            for key, value in raw.items()
-                            if key != "evidence"
-                        }
-                    ],
-                    anchors,
-                )[0]
-            except WorkflowError:
-                if state.get("base_refresh") is None:
-                    raise
-                continue
-            candidates.append({
-                "candidate_id": f"candidate-{index + 1:03d}", "path": comment["path"],
-                "anchor": {key: comment.get(key) for key in ("line", "side", "start_line", "start_side")},
-                "explanation": comment["body"], "evidence": raw["evidence"],
-            })
-        state["candidates"] = candidates
-        if state.get("base_refresh") is not None and not candidates:
+        batch = ReviewBatch.discover(
+            discovery["candidates"], anchors,
+            original_anchors=discovery_anchors if state.get("base_refresh") else None,
+        )
+        state["candidates"] = batch.candidates
+        if state.get("base_refresh") is not None and not batch.candidates:
             state["agent_task"]["clearance_stale"] = True
             save_run_state(state_path, state)
             remove_transient_artifacts([
@@ -2014,25 +2085,12 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
             })
             return
         comments = []
-        if candidates:
+        if batch.candidates:
             critique = run_hosted_review_phase(
                 runtime=runtime, helper=helper, repo_root=repo_root, state_path=state_path,
-                state=state, candidates=candidates,
+                state=state, candidates=batch.candidates,
             )
-            by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
-            seen = []
-            for item in critique["comments"]:
-                if (
-                    not isinstance(item, dict) or set(item) != {"candidate_id", "body"}
-                    or not isinstance(item["candidate_id"], str)
-                    or item["candidate_id"] not in by_id or item["candidate_id"] in seen
-                ):
-                    raise WorkflowError("hosted critique has an unknown or repeated candidate")
-                seen.append(item["candidate_id"])
-                comment = {**candidate_anchor(by_id[item["candidate_id"]]), "body": item["body"]}
-                comments.append({"candidate_id": item["candidate_id"], **validate_comments([comment], anchors)[0]})
-            if seen != [candidate["candidate_id"] for candidate in candidates if candidate["candidate_id"] in seen]:
-                raise WorkflowError("hosted critique changed candidate order")
+            comments = batch.select(critique["comments"])
         if state.get("base_refresh") is not None and not comments:
             state["agent_task"]["clearance_stale"] = True
             save_run_state(state_path, state)
@@ -2068,7 +2126,7 @@ def command_check(args: argparse.Namespace, *, result_sink=None) -> None:
             "pr_title": pr["title"], "head_sha": pr["head_sha"],
             "session_title": f"PR Review: {pr['number']} - {pr['title']}",
             "comments_file": str(comments_path), "comments": comments,
-            "candidate_count": len(candidates), "hosted_task_count": len(state["phases"]),
+            "candidate_count": len(batch.candidates), "hosted_task_count": len(state["phases"]),
         })
     except BaseException as error:
         if isinstance(error, WorkflowError) and error.details.get("reason") == "head_changed":
@@ -2209,35 +2267,12 @@ def command_post(args: argparse.Namespace, *, result_sink=None) -> None:
         raise WorkflowError("authenticated viewer changed since check")
     raw_comments = load_comments(args.comments)
     if (
-        not isinstance(state.get("hosted_comments"), list)
-        or raw_comments != state["hosted_comments"]
-        or (state.get("agent_task") or {}).get("status") != "completed"
+        (state.get("agent_task") or {}).get("status") != "completed"
         or (state.get("agent_task") or {}).get("model") != MODEL_ALIASES["astra"]
     ):
         raise WorkflowError("comments must exactly match completed hosted Astra critique")
-    candidates = {
-        candidate["candidate_id"]: candidate
-        for candidate in state.get("candidates", [])
-        if isinstance(candidate, dict) and isinstance(candidate.get("candidate_id"), str)
-    }
-    selected_ids: list[str] = []
-    comment_values: list[dict[str, Any]] = []
-    for index, comment in enumerate(raw_comments):
-        if not isinstance(comment, dict):
-            raise WorkflowError(f"comment {index} must be an object")
-        candidate_id = comment.get("candidate_id")
-        if not isinstance(candidate_id, str) or candidate_id not in candidates:
-            raise WorkflowError(f"comment {index} does not name a validated candidate")
-        selected_ids.append(candidate_id)
-        value = {key: item for key, item in comment.items() if key != "candidate_id"}
-        expected = candidate_anchor(candidates[candidate_id])
-        for key in ("path", "line", "side", "start_line", "start_side"):
-            if value.get(key) != expected.get(key):
-                raise WorkflowError(f"comment {index} changed its validated candidate anchor")
-        comment_values.append(value)
-    if len(selected_ids) != len(set(selected_ids)):
-        raise WorkflowError("a validated candidate may be posted only once")
-    comments = validate_comments(comment_values, anchors)
+    batch = ReviewBatch(state.get("candidates", []), anchors)
+    comments = batch.posting_comments(raw_comments, state.get("hosted_comments"))
     payload = {"commit_id": pr["head_sha"], "comments": comments}
     endpoint = f"repos/{pr['repo_name']}/pulls/{pr['number']}/reviews"
     ensure_snapshot_unchanged(

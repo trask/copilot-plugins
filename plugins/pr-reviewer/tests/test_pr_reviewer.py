@@ -672,6 +672,119 @@ diff --git a/file.py b/file.py
             )
 
 
+class ReviewBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.anchors = MODULE.parse_unified_diff(DIFF)
+        self.discovery = [
+            {
+                "path": "src/one.py", "line": 2, "side": "RIGHT",
+                "body": "Incorrect result.", "evidence": "The caller expects the old result.",
+            },
+            {
+                "path": "src/one.py", "line": 4, "side": "RIGHT",
+                "start_line": 2, "start_side": "RIGHT",
+                "body": "Incorrect range.", "evidence": "The range changes the result.",
+            },
+        ]
+
+    def test_round_trip_keeps_anchors_ids_order_and_hosted_bodies(self):
+        batch = MODULE.ReviewBatch.discover(self.discovery, self.anchors)
+
+        self.assertEqual(
+            [candidate["candidate_id"] for candidate in batch.candidates],
+            ["candidate-001", "candidate-002"],
+        )
+        selected = batch.select([
+            {"candidate_id": "candidate-001", "body": "Final single-line comment."},
+            {"candidate_id": "candidate-002", "body": "Final range comment."},
+        ])
+        self.assertEqual(
+            MODULE.ReviewBatch(batch.candidates, self.anchors).posting_comments(
+                selected, selected
+            ),
+            [
+                {
+                    "path": "src/one.py", "line": 2, "side": "RIGHT",
+                    "body": "Final single-line comment.",
+                },
+                {
+                    "path": "src/one.py", "start_line": 2, "start_side": "RIGHT",
+                    "line": 4, "side": "RIGHT", "body": "Final range comment.",
+                },
+            ],
+        )
+
+    def test_advanced_base_drops_missing_anchors_but_keeps_original_ids(self):
+        missing_first = MODULE.parse_unified_diff(
+            DIFF.replace("@@ -1,4 +1,5 @@", "@@ -1,4 +1,4 @@")
+            .replace("+new two\n", "")
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not a changed"):
+            MODULE.ReviewBatch.discover(self.discovery, missing_first)
+        batch = MODULE.ReviewBatch.discover(
+            self.discovery, missing_first, original_anchors=self.anchors
+        )
+        self.assertEqual(
+            [candidate["candidate_id"] for candidate in batch.candidates],
+            ["candidate-002"],
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "invalid line"):
+            MODULE.ReviewBatch.discover(
+                [{**self.discovery[0], "line": "2"}, self.discovery[1]],
+                missing_first, original_anchors=self.anchors,
+            )
+
+    def test_rejects_invalid_discovery_and_critique(self):
+        with self.assertRaisesRegex(MODULE.WorkflowError, "evidence is invalid"):
+            MODULE.ReviewBatch.discover(
+                [{**self.discovery[0], "evidence": " "}], self.anchors
+            )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "evidence is invalid"):
+            MODULE.ReviewBatch.discover(
+                [{**self.discovery[0], "evidence": "x" * MODULE.MAX_CANDIDATE_BYTES}],
+                self.anchors,
+            )
+        batch = MODULE.ReviewBatch.discover(self.discovery, self.anchors)
+        for comments, error in (
+            ([{"candidate_id": "candidate-001", "body": " "}], "must not be empty"),
+            ([{"candidate_id": "candidate-003", "body": "Missing."}], "unknown or repeated"),
+            ([
+                {"candidate_id": "candidate-001", "body": "First."},
+                {"candidate_id": "candidate-001", "body": "Again."},
+            ], "unknown or repeated"),
+            ([
+                {"candidate_id": "candidate-002", "body": "Second."},
+                {"candidate_id": "candidate-001", "body": "First."},
+            ], "changed candidate order"),
+        ):
+            with self.subTest(comments=comments), self.assertRaisesRegex(
+                MODULE.WorkflowError, error
+            ):
+                batch.select(comments)
+
+    def test_posting_rejects_changed_body_anchor_and_lost_diff_line(self):
+        batch = MODULE.ReviewBatch.discover(self.discovery, self.anchors)
+        selected = batch.select([
+            {"candidate_id": "candidate-001", "body": "Final comment."}
+        ])
+        with self.assertRaisesRegex(MODULE.WorkflowError, "exactly match"):
+            batch.posting_comments(
+                [{**selected[0], "body": "Edited after critique."}], selected
+            )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "changed its validated"):
+            batch.posting_comments(
+                [{**selected[0], "line": 4}], [{**selected[0], "line": 4}]
+            )
+        missing_anchor = MODULE.parse_unified_diff(
+            DIFF.replace("@@ -1,4 +1,5 @@", "@@ -1,4 +1,4 @@")
+            .replace("+new two\n", "")
+        )
+        with self.assertRaisesRegex(MODULE.WorkflowError, "not a changed"):
+            MODULE.ReviewBatch(batch.candidates, missing_anchor).posting_comments(
+                selected, selected
+            )
+
+
 class SuppressedCommentTest(unittest.TestCase):
     def test_parses_current_and_low_confidence_headings(self):
         body = """
