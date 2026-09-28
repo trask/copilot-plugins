@@ -1360,6 +1360,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
         }
 
         def write_empty_result(command, **_kwargs):
+            self.assertTrue(_kwargs["require_execution"])
             result_path = Path(command[command.index("--result-file") + 1])
             result_path.write_text("{}", encoding="utf-8")
             return completed(2, stderr="HTTP 409")

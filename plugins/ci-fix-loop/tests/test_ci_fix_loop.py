@@ -1339,7 +1339,8 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 ))
                 requests = []
 
-                def publish(command, *, check):
+                def publish(command, *, check, require_execution):
+                    self.assertTrue(require_execution)
                     request_path = Path(
                         command[command.index("--stack-request") + 1]
                     )
@@ -4126,7 +4127,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.119", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.120", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -15143,6 +15144,7 @@ class NativeStackCoordinatorTest(unittest.TestCase):
         )
         command = run.call_args.args[0]
         self.assertIn("descendant-propagate", command)
+        self.assertTrue(run.call_args.kwargs["require_execution"])
         self.assertIn("--stack-number", command)
         self.assertIn("77", command)
         self.assertIn("--expected-head", command)

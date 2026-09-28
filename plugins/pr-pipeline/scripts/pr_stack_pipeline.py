@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "05f7745327e99ae11b0802c79fda5720ab2e242e6b5cb4506034a5545827270d"
+COMMON_SHA256 = "f5688b76fd94db17c86595b9fb745e4b08964903393cc924f95b6fc2904052fd"
 
 
 def load_common() -> Any:
@@ -1725,6 +1725,7 @@ def propagate_descendants(
             str(state_path),
         ],
         check=False,
+        require_execution=True,
     )
     if process.returncode != 0:
         detail = (process.stderr or "").strip() or (process.stdout or "").strip()

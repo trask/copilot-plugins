@@ -394,7 +394,9 @@ def run(
     cwd: Path | None = None,
     check: bool = True,
     timeout: float | None = None,
+    require_execution: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    children_before = len(_EXECUTION.children) if require_execution and _EXECUTION else None
     try:
         process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
             command,
@@ -405,12 +407,29 @@ def run(
             stderr=subprocess.PIPE,
             check=False,
             timeout=timeout,
+            **({"require_execution": True} if require_execution and _EXECUTION else {}),
             **windows_no_window_options(),
         )
     except subprocess.TimeoutExpired as error:
         raise WorkflowError(
             f"{' '.join(command)} did not return within {timeout} seconds"
         ) from error
+    if children_before is not None:
+        children = _EXECUTION.children[children_before:]
+        terminal = children[0].terminal_result if len(children) == 1 else None
+        if (
+            not isinstance(terminal, dict)
+            or terminal.get("exit_code") != process.returncode
+            or not isinstance(terminal.get("workflow_result"), dict)
+            or (process.returncode == 0 and terminal.get("local_status") != "finished")
+        ):
+            raise WorkflowError("controller returned no matching sealed execution result")
+        process = subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            json.dumps(terminal["workflow_result"]),
+            process.stderr,
+        )
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no output"
         raise WorkflowError(

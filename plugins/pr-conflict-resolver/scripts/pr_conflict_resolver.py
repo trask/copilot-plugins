@@ -243,6 +243,7 @@ def run(
     input_text: str | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
+    require_execution: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     try:
         process = (_EXECUTION.run if _EXECUTION else subprocess.run)(
@@ -256,6 +257,7 @@ def run(
             stderr=subprocess.PIPE,
             check=False,
             env=env,
+            **({"require_execution": True} if require_execution and _EXECUTION else {}),
             **windows_no_window_options(),
         )
     except subprocess.TimeoutExpired as error:
@@ -6040,7 +6042,7 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
         advance_bounded_conflict(state_path, state, args._bounded_session)
         return
     try:
-        process = run(command, cwd=repo_root, check=False)
+        process = run(command, cwd=repo_root, check=False, require_execution=True)
     except OSError as error:
         task["status"] = "failed"
         task["task_id"] = None
@@ -6470,7 +6472,9 @@ def advance_bounded_conflict(
         *task["helper_command"], "--bounded-phase", phase,
         "--bounded-session", session,
     ]
-    process = run(command, cwd=Path(state["repo_root"]), check=False)
+    process = run(
+        command, cwd=Path(state["repo_root"]), check=False, require_execution=True
+    )
     result_path = Path(task["result_file"])
     if not result_path.is_file():
         raise WorkflowError("bounded conflict helper did not write a result")

@@ -3187,6 +3187,7 @@ class DependencyTest(unittest.TestCase):
             stderr = ""
 
         def runner(command, **_options):
+            self.assertTrue(_options["require_execution"])
             seen.append(command)
             return Result()
 

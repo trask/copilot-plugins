@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -301,6 +302,66 @@ class WindowsSubprocessTest(unittest.TestCase):
             MODULE.common.run(["tasklist"], check=False)
 
         self.assertEqual(0x08000000, run.call_args.kwargs["creationflags"])
+
+    def test_controller_uses_sealed_result_and_preserves_exit_code(self):
+        for code in (0, 1):
+            with self.subTest(code=code):
+                execution = SimpleNamespace(children=[])
+                payload = {"result": "published" if code == 0 else "error"}
+
+                def launch(command, **kwargs):
+                    self.assertTrue(kwargs["require_execution"])
+                    self.assertEqual(0x08000000, kwargs["creationflags"])
+                    execution.children.append(SimpleNamespace(terminal_result={
+                        "exit_code": code,
+                        "local_status": "finished" if code == 0 else "failed",
+                        "workflow_result": payload,
+                    }))
+                    return subprocess.CompletedProcess(command, code, "not JSON", "")
+
+                execution.run = launch
+                with (
+                    mock.patch.object(MODULE.common, "_EXECUTION", execution),
+                    mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+                    mock.patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True),
+                ):
+                    result = MODULE.common.run(["helper"], check=False, require_execution=True)
+                self.assertEqual(code, result.returncode)
+                self.assertEqual(payload, json.loads(result.stdout))
+
+    def test_controller_refuses_successful_stdout_without_a_matching_seal(self):
+        for terminal in (
+            None,
+            {"exit_code": 0, "local_status": "finished"},
+            {"exit_code": 1, "local_status": "finished", "workflow_result": {}},
+            {"exit_code": 0, "local_status": "failed", "workflow_result": {}},
+        ):
+            with self.subTest(terminal=terminal):
+                execution = SimpleNamespace(children=[])
+
+                def launch(command, **kwargs):
+                    execution.children.append(SimpleNamespace(terminal_result=terminal))
+                    return subprocess.CompletedProcess(command, 0, '{"result":"published"}', "")
+
+                execution.run = launch
+                with (
+                    mock.patch.object(MODULE.common, "_EXECUTION", execution),
+                    self.assertRaisesRegex(MODULE.WorkflowError, "sealed execution result"),
+                ):
+                    MODULE.common.run(["helper"], require_execution=True)
+
+    def test_direct_controller_keeps_stdout_and_windows_no_window(self):
+        with (
+            mock.patch.object(MODULE.common, "_EXECUTION", None),
+            mock.patch.object(MODULE.common, "IS_WINDOWS", True),
+            mock.patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True),
+            mock.patch.object(subprocess, "run") as launch,
+        ):
+            launch.return_value = subprocess.CompletedProcess(["helper"], 0, "output", "")
+            result = MODULE.common.run(["helper"], require_execution=True)
+        self.assertEqual("output", result.stdout)
+        self.assertNotIn("require_execution", launch.call_args.kwargs)
+        self.assertEqual(0x08000000, launch.call_args.kwargs["creationflags"])
 
     def test_windows_liveness_check_uses_the_windows_api(self):
         with (

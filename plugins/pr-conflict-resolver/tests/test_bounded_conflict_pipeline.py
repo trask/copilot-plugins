@@ -69,6 +69,7 @@ class BoundedPipelineTest(unittest.TestCase):
         return {"result": "published", "state": str(path), "stage_outcome": "completed"}
 
     def helper(self, command, **kwargs):
+        self.assertTrue(kwargs["require_execution"])
         phase = command[command.index("--bounded-phase") + 1]
         self.assertNotIn("--bounded-deadline", command)
         result_path = Path(command[command.index("--result-file") + 1])

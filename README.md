@@ -251,6 +251,10 @@ that wants another integration starts another run. It never posts anything to
 GitHub. Its
 machine-facing descendant propagation operation uses the same topology checks and
 atomic publisher after a lower stack member receives a CI fix.
+CI Fix and Stack Pipeline give the propagation controller its own execution
+context and consume its verified terminal result. The controller binds each
+hosted helper launch to a fresh child request and requires its sealed result
+before publication.
 
 The source branch is authoritative before and after hosted work. If GitHub's
 PR record lags a native restack, the resolver derives commits and conflicts
