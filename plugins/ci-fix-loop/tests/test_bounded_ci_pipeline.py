@@ -18,6 +18,164 @@ SPEC.loader.exec_module(MODULE)
 SESSION = "01234567-89ab-cdef-0123-456789abcdef"
 
 
+class HostedRepairAttemptTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.path = self.root / "state.json"
+        self.helper = self.root / "helper.py"
+        self.helper.write_text("helper", encoding="utf-8")
+        self.preflight = {
+            "pr": {"pr_url": "https://github.com/owner/repo/pull/7"},
+            "check_snapshot": {"failures": []},
+        }
+        self.args = SimpleNamespace(model="sol", bounded_step=True)
+
+    def attempt(self, *, resume=False):
+        return MODULE.HostedRepairAttempt(
+            self.args, self.repo, self.path, self.preflight, "gpt-6-sol",
+            bounded_resume=resume,
+        )
+
+    def test_pending_attempt_resumes_and_attests_result_through_one_boundary(self):
+        state = {"version": MODULE.STATE_VERSION, "history": [], "outcome": "warning"}
+        first = self.attempt()
+        first.prepare(state)
+        result = {
+            "status": "success",
+            "task": {"id": "task"},
+            "candidate": {"task": {"session_id": "session"}},
+            "generated": {},
+            "report": {},
+        }
+
+        def observe(_command, _repo, result_path):
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            return {"status": "completed"}
+
+        responses = iter((lambda *_: {"status": "pending"}, observe))
+        with (
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=self.helper),
+            mock.patch.object(MODULE, "local_ci_briefing", return_value="briefing"),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(MODULE, "bounded_worker_prompt", return_value=("prompt", "evidence")),
+            mock.patch.object(
+                MODULE, "REQUIRED_CLOUD_TASK_SHA256", MODULE.sha256_file(self.helper)
+            ),
+            mock.patch.object(
+                MODULE, "run_bounded_cloud_helper",
+                side_effect=lambda *args: next(responses)(*args),
+            ) as dispatch,
+            mock.patch.object(MODULE, "load_agent_task_result", return_value=result),
+            mock.patch.object(
+                MODULE, "verify_runtime_candidate", return_value={"task_id": "task"}
+            ) as verify,
+        ):
+            self.assertFalse(first.dispatch())
+            pending = MODULE.load_state(self.path)
+            self.assertEqual("bounded_pending", pending["agent_task"]["status"])
+            self.assertIsNone(pending["outcome"])
+            pending["agent_task"]["dispatch_identity"] = {
+                "task_id": "task", "session_id": "session",
+            }
+            MODULE.save_state(self.path, pending)
+            resumed = self.attempt(resume=True)
+            resumed.prepare(MODULE.load_state(self.path))
+            self.assertTrue(resumed.dispatch())
+            self.assertEqual(
+                MODULE.HostedRepairResult(
+                    {"task_id": "task"}, MODULE.sha256_file(resumed.result_path),
+                ),
+                resumed.verify_result(),
+            )
+            self.assertEqual(2, dispatch.call_count)
+            self.assertIn("--pipeline-observe", dispatch.call_args.args[0])
+            verify.assert_called_once()
+
+    def test_resume_rejects_changed_dispatch_identity_before_candidate_validation(self):
+        state = {"version": MODULE.STATE_VERSION, "history": []}
+        first = self.attempt()
+        first.prepare(state)
+        saved = MODULE.load_state(self.path)
+        saved["agent_task"].update({
+            "status": "bounded_pending",
+            "helper": str(self.helper),
+            "prompt_sha256": MODULE.sha256_text("prompt"),
+            "dispatch_identity": {"task_id": "original", "session_id": "session"},
+        })
+        MODULE.save_state(self.path, saved)
+        first.prompt_path.write_text("prompt", encoding="utf-8")
+        result = {
+            "status": "success",
+            "task": {"id": "different"},
+            "candidate": {"task": {"session_id": "session"}},
+        }
+        first.result_path.write_text(json.dumps(result), encoding="utf-8")
+        resumed = self.attempt(resume=True)
+        resumed.prepare(MODULE.load_state(self.path))
+        with (
+            mock.patch.object(
+                MODULE, "REQUIRED_CLOUD_TASK_SHA256", MODULE.sha256_file(self.helper)
+            ),
+            mock.patch.object(MODULE, "load_agent_task_result", return_value=result),
+            mock.patch.object(MODULE, "verify_runtime_candidate") as verify,
+            self.assertRaisesRegex(MODULE.WorkflowError, "dispatch identity"),
+        ):
+            self.assertTrue(resumed.dispatch())
+            resumed.verify_result()
+        verify.assert_not_called()
+
+    def test_foreground_attempt_verifies_before_import_and_owns_cleanup(self):
+        self.args.bounded_step = False
+        self.args.hosted_timeout = 60
+        self.args.hosted_discovery_interval = 1
+        state = {"version": MODULE.STATE_VERSION, "history": []}
+        attempt = self.attempt()
+        attempt.prepare(state)
+        result = {
+            "status": "success",
+            "task": {"id": "task"},
+            "generated": {},
+            "report": {},
+        }
+
+        def complete(_command, **_kwargs):
+            attempt.result_path.write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=self.helper),
+            mock.patch.object(MODULE, "local_ci_briefing", return_value="briefing"),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(MODULE, "bounded_worker_prompt", return_value=("prompt", "evidence")),
+            mock.patch.object(MODULE, "run_hosted_helper", side_effect=complete) as dispatch,
+            mock.patch.object(MODULE, "load_agent_task_result", return_value=result),
+            mock.patch.object(
+                MODULE, "verify_runtime_candidate", return_value={"task_id": "task"}
+            ),
+            mock.patch.object(
+                MODULE, "apply_verified_candidate_import", return_value=True
+            ) as import_candidate,
+            mock.patch.object(MODULE, "finalize_agent_task_artifacts") as finalize,
+        ):
+            self.assertTrue(attempt.dispatch())
+            self.assertEqual(
+                {"task_id": "task"}, attempt.verify_result().remote
+            )
+            self.assertTrue(attempt.import_candidate({"task_id": "task"}))
+            attempt.finalize_artifacts(MODULE.load_state(self.path), preserve=False)
+
+        dispatch.assert_called_once()
+        import_candidate.assert_called_once()
+        self.assertEqual(self.helper, import_candidate.call_args.kwargs["helper"])
+        self.assertEqual("prompt", import_candidate.call_args.kwargs["prompt"])
+        self.assertIn(attempt.result_path, finalize.call_args.args[2])
+        self.assertIn(attempt.briefing_path, finalize.call_args.args[2])
+
+
 class CIIterationOutcomeTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()

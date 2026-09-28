@@ -11235,6 +11235,330 @@ def admit_ci_fix_candidate(
     )
 
 
+class HostedRepairResult(NamedTuple):
+    remote: dict[str, Any]
+    result_sha256: str
+
+
+class HostedRepairAttempt:
+    def __init__(
+        self, args: argparse.Namespace, repo_root: Path, state_path: Path,
+        preflight: dict[str, Any], requested_model: str, *,
+        bounded_resume: bool,
+    ) -> None:
+        self.args = args
+        self.repo_root = repo_root
+        self.state_path = state_path
+        self.preflight = preflight
+        self.requested_model = requested_model
+        self.bounded_resume = bounded_resume
+        self.run_id: str | None = None
+        self.prompt_path: Path | None = None
+        self.result_path: Path | None = None
+        self.briefing_path: Path | None = None
+        self.helper: Path | None = None
+        self.prompt: str | None = None
+        self.result_sha256: str | None = None
+
+    def prepare(self, state: dict[str, Any]) -> None:
+        existing_task = state.get("agent_task")
+        run_id = existing_task["run_id"] if self.bounded_resume else secrets.token_hex(16)
+        self.run_id = run_id
+        stem = f"{self.state_path.stem}--{run_id}--"
+        self.prompt_path = self.state_path.with_name(stem + "agent-task-prompt.txt")
+        self.result_path = self.state_path.with_name(stem + "agent-task-result.json")
+        self.briefing_path = self.state_path.with_name(stem + "ci-briefing.txt")
+        for artifact in (self.prompt_path, self.result_path, self.briefing_path):
+            require_outside_repository(artifact, self.repo_root)
+            if artifact.exists() and not self.bounded_resume:
+                raise WorkflowError(
+                    f"refusing to overwrite existing Agent Task artifact: {artifact}"
+                )
+        task_record = existing_task if self.bounded_resume else {
+            "status": "preparing",
+            "run_id": run_id,
+            "model": self.requested_model,
+            "policy": AGENT_TASK_POLICY,
+            "iteration_allowance": 1,
+            "preflight": self.preflight,
+            "prompt_file": str(self.prompt_path),
+            "result_file": str(self.result_path),
+            "briefing_file": str(self.briefing_path),
+            "started_at": utc_now(),
+        }
+        state["agent_task"] = task_record
+        if not self.bounded_resume:
+            state["outcome"] = None
+            state["clean_at_head_sha"] = None
+            state["escalation"] = None
+            for key in (
+                "ci_warnings", "warning_at_head_sha", "warning_at_base_sha",
+                "warning_snapshot_sha256",
+            ):
+                state.pop(key, None)
+        save_state(self.state_path, state)
+
+    def dispatch(self) -> bool:
+        if self.run_id is None or self.prompt_path is None or self.result_path is None or self.briefing_path is None:
+            raise WorkflowError("hosted CI repair attempt has not been prepared")
+        state = load_state(self.state_path)
+        task_state = state["agent_task"]
+        pr = self.preflight["pr"]
+        if not self.result_path.is_file():
+            try:
+                if self.bounded_resume:
+                    self.helper = Path(task_state["helper"])
+                    if sha256_file(self.helper) != REQUIRED_CLOUD_TASK_SHA256:
+                        raise WorkflowError("pinned Agent Tasks helper changed during CI repair")
+                    if sha256_file(self.prompt_path) != task_state.get("prompt_sha256"):
+                        raise WorkflowError("bounded CI repair prompt changed")
+                    self.prompt = self.prompt_path.read_text(encoding="utf-8")
+                    observation = run_bounded_cloud_helper(
+                        [
+                            sys.executable, str(self.helper), "--pipeline-observe",
+                            "--apply-with-report", "--pipeline-run", self.run_id,
+                            "--model", self.args.model, "--pr", pr["pr_url"],
+                            "--prompt-file", str(self.prompt_path),
+                            "--result-file", str(self.result_path),
+                            "--policy", AGENT_TASK_POLICY,
+                        ], self.repo_root, self.result_path,
+                    )
+                    if observation.get("status") == "pending":
+                        return False
+                    if not self.result_path.is_file():
+                        raise WorkflowError("bounded CI repair observation has no final result")
+                else:
+                    task_state["phase"] = "controller_evidence"
+                    save_state(self.state_path, state)
+                    self.helper = discover_cloud_task()
+                    briefing = local_ci_briefing(self.preflight, model=self.requested_model)
+                    require_live_check_snapshot(self.preflight)
+                    atomic_write_text(self.briefing_path, briefing + "\n")
+                    self.prompt, ci_evidence = bounded_worker_prompt(
+                        self.preflight, helper=self.helper,
+                        iteration_allowance=1,
+                        prior_history=state.get("history") or [],
+                        requested_model=self.requested_model,
+                        briefing=briefing,
+                    )
+                    task_state["evidence_sha256"] = sha256_text(ci_evidence)
+                    atomic_write_text(self.prompt_path, self.prompt)
+                    command = [
+                        sys.executable, str(self.helper), "--apply-with-report",
+                        "--model", self.args.model, "--pr", pr["pr_url"],
+                        "--prompt-file", str(self.prompt_path),
+                        "--result-file", str(self.result_path),
+                        "--policy", AGENT_TASK_POLICY,
+                    ]
+                    if getattr(self.args, "bounded_step", False):
+                        command.extend(["--pipeline-dispatch", "--pipeline-run", self.run_id])
+                    task_state["status"] = (
+                        "bounded_pending" if getattr(self.args, "bounded_step", False)
+                        else "running"
+                    )
+                    task_state["phase"] = "hosted_fix"
+                    task_state["helper"] = str(self.helper)
+                    if getattr(self.args, "bounded_step", False):
+                        task_state["prompt_sha256"] = sha256_file(self.prompt_path)
+                    save_state(self.state_path, state)
+                    if getattr(self.args, "bounded_step", False):
+                        observation = run_bounded_cloud_helper(
+                            command, self.repo_root, self.result_path
+                        )
+                        if observation.get("status") == "pending":
+                            return False
+                        if not self.result_path.is_file():
+                            raise WorkflowError("bounded CI dispatch has no final result")
+                    else:
+                        process = run_hosted_helper(
+                            command,
+                            repo_root=self.repo_root,
+                            state_path=self.state_path,
+                            run_id=self.run_id,
+                            preflight=self.preflight,
+                            consumer_prompt=self.prompt,
+                            requested_model=self.requested_model,
+                            timeout=self.args.hosted_timeout,
+                            discovery_interval=self.args.hosted_discovery_interval,
+                        )
+                        if not self.result_path.is_file():
+                            raise WorkflowError(
+                                f"managed helper exited {process.returncode} without an atomic "
+                                "result file"
+                            )
+            except BaseException as error:
+                state = load_state(self.state_path)
+                task_state = state["agent_task"]
+                task_state["status"] = "failed"
+                task_state["error"] = str(error)
+                task_state["failed_at"] = utc_now()
+                if task_state.get("phase") == "controller_evidence":
+                    task_state["task_id_status"] = "not_created"
+                else:
+                    task_state.pop("retry_command", None)
+                    if task_state.get("task_id_status") != "known":
+                        task_state["task_id_status"] = "unknown"
+                        task_state["task_id"] = None
+                save_state(self.state_path, state)
+                if isinstance(error, WorkflowError):
+                    error.details["state"] = str(self.state_path)
+                raise
+        if self.bounded_resume and self.result_path.is_file():
+            try:
+                retained = json.loads(self.result_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise WorkflowError("bounded CI repair result is invalid") from error
+            if isinstance(retained, dict) and retained.get("status") == "pending":
+                raise WorkflowError("pending CI Agent Task wrote a final result file")
+            self.helper = Path(task_state["helper"])
+            if sha256_file(self.helper) != REQUIRED_CLOUD_TASK_SHA256:
+                raise WorkflowError("pinned Agent Tasks helper changed during CI repair")
+            if sha256_file(self.prompt_path) != task_state.get("prompt_sha256"):
+                raise WorkflowError("bounded CI repair prompt changed")
+            self.prompt = self.prompt_path.read_text(encoding="utf-8")
+        return True
+
+    def verify_result(self) -> HostedRepairResult:
+        if self.prompt_path is None or self.result_path is None:
+            raise WorkflowError("hosted CI repair attempt has not been prepared")
+        if self.helper is None or self.prompt is None:
+            raise WorkflowError("hosted CI repair attempt has no verified helper or prompt")
+        result = load_agent_task_result(self.result_path)
+        self.result_sha256 = sha256_file(self.result_path)
+        dispatch_identity = load_state(self.state_path).get("agent_task", {}).get(
+            "dispatch_identity"
+        )
+        if dispatch_identity is not None:
+            result_task = result.get("task")
+            result_candidate = result.get("candidate")
+            candidate_task = (
+                result_candidate.get("task")
+                if isinstance(result_candidate, dict)
+                else None
+            )
+            if (
+                not isinstance(dispatch_identity, dict)
+                or not isinstance(result_task, dict)
+                or result_task.get("id") != dispatch_identity.get("task_id")
+                or (
+                    result.get("status") == "success"
+                    and (
+                        not isinstance(candidate_task, dict)
+                        or candidate_task.get("session_id")
+                        != dispatch_identity.get("session_id")
+                    )
+                )
+            ):
+                raise WorkflowError(
+                    "managed helper result does not match the retained hosted "
+                    "dispatch identity"
+                )
+        if result.get("status") != "success":
+            result_task = result.get("task")
+            result_task_id = (
+                result_task.get("id") if isinstance(result_task, dict) else None
+            )
+            if result_task_id is None:
+                failure = validate_candidate_task_creation_failure_result(
+                    result,
+                    preflight=self.preflight,
+                    requested_model=self.requested_model,
+                )
+                state = load_state(self.state_path)
+                task_state = state["agent_task"]
+                task_state.update(
+                    {
+                        "task": result["task"],
+                        "generated": result["generated"],
+                        "report": result["report"],
+                        "semantic_output": result.get("semantic_output"),
+                        "candidate": result.get("candidate"),
+                        "completion": result.get("completion"),
+                        "attestation": result.get("attestation"),
+                        "status": "failed",
+                        "task_id": None,
+                        "task_id_status": "not_created",
+                        "error": failure,
+                    }
+                )
+                save_state(self.state_path, state)
+            raise task_failure_from_result(result)
+        remote = verify_runtime_candidate(
+            result,
+            helper=self.helper,
+            repo_root=self.repo_root,
+            preflight=self.preflight,
+            requested_model=self.requested_model,
+            prompt=self.prompt,
+        )
+        state = load_state(self.state_path)
+        state["agent_task"].update(
+            {
+                "task": result["task"],
+                "generated": result["generated"],
+                "report": result["report"],
+                "semantic_output": result.get("semantic_output"),
+                "candidate": result.get("candidate"),
+                "completion": result.get("completion"),
+                "attestation": result.get("attestation"),
+            }
+        )
+        save_state(self.state_path, state)
+        return HostedRepairResult(remote, self.result_sha256)
+
+    def import_candidate(self, remote: dict[str, Any]) -> bool:
+        if self.helper is None or self.prompt is None or self.result_path is None or self.result_sha256 is None:
+            raise WorkflowError("hosted CI repair attempt has no verified result to import")
+        return apply_verified_candidate_import(
+            self.repo_root,
+            helper=self.helper,
+            requested_model=self.requested_model,
+            prompt=self.prompt,
+            result_path=self.result_path,
+            result_sha256=self.result_sha256,
+            preflight=self.preflight,
+            remote=remote,
+        )
+
+    def finalize_artifacts(
+        self, state: dict[str, Any], *, preserve: bool,
+    ) -> None:
+        if self.prompt_path is None or self.result_path is None or self.briefing_path is None:
+            raise WorkflowError("hosted CI repair attempt has no artifacts to finalize")
+        cleanup_paths = [
+            *(
+                Path(failure["log_path"])
+                for failure in self.preflight["check_snapshot"]["failures"]
+            ),
+            self.prompt_path,
+            self.result_path,
+            self.briefing_path,
+            *(
+                Path(path)
+                for path in state["agent_task"].get("prior_result_files") or []
+                if isinstance(path, str) and path
+            ),
+            *(
+                Path(path)
+                for path in state["agent_task"].get("recovery_results") or []
+                if isinstance(path, str) and path
+            ),
+            *(
+                path
+                for archived in state.get("managed_task_history") or []
+                if isinstance(archived, dict)
+                for path in (
+                    managed_task_artifact_paths(archived)
+                    + managed_task_log_paths(archived)
+                )
+                if not preserve or path.is_file()
+            ),
+        ]
+        finalize_agent_task_artifacts(
+            self.state_path, state, dict.fromkeys(cleanup_paths), preserve=preserve,
+        )
+
+
 def command_agent_task(args: argparse.Namespace) -> None:
     require_tools()
     repo_root = resolve_repo_root(args.repo_root)
@@ -11458,251 +11782,21 @@ def command_agent_task(args: argparse.Namespace) -> None:
             }
         )
         return
-    iteration_allowance = 1
-    run_id = existing_task["run_id"] if bounded_resume else secrets.token_hex(16)
-    prompt_path = state_path.with_name(
-        f"{state_path.stem}--{run_id}--agent-task-prompt.txt"
+    attempt = HostedRepairAttempt(
+        args, repo_root, state_path, preflight, requested_model,
+        bounded_resume=bounded_resume,
     )
-    result_path = state_path.with_name(
-        f"{state_path.stem}--{run_id}--agent-task-result.json"
-    )
-    briefing_path = state_path.with_name(
-        f"{state_path.stem}--{run_id}--ci-briefing.txt"
-    )
-    new_artifacts = [prompt_path, result_path, briefing_path]
-    for artifact in new_artifacts:
-        require_outside_repository(artifact, repo_root)
-        if artifact.exists() and not bounded_resume:
-            raise WorkflowError(
-                f"refusing to overwrite existing Agent Task artifact: {artifact}"
-            )
-    task_record = existing_task if bounded_resume else {
-        "status": "preparing",
-        "run_id": run_id,
-        "model": requested_model,
-        "policy": AGENT_TASK_POLICY,
-        "iteration_allowance": iteration_allowance,
-        "preflight": preflight,
-        "prompt_file": str(prompt_path),
-        "result_file": str(result_path),
-        "briefing_file": str(briefing_path),
-        "started_at": utc_now(),
-    }
-    state["agent_task"] = task_record
-    if not bounded_resume:
-        state["outcome"] = None
-        state["clean_at_head_sha"] = None
-        state["escalation"] = None
-        for key in ("ci_warnings", "warning_at_head_sha", "warning_at_base_sha", "warning_snapshot_sha256"):
-            state.pop(key, None)
-    save_state(state_path, state)
-
+    attempt.prepare(state)
     pr = preflight["pr"]
-    task_state = state["agent_task"]
-    if not result_path.is_file():
-        try:
-            if bounded_resume:
-                helper = Path(task_state["helper"])
-                if sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256:
-                    raise WorkflowError("pinned Agent Tasks helper changed during CI repair")
-                prompt_path = Path(task_state["prompt_file"])
-                if sha256_file(prompt_path) != task_state.get("prompt_sha256"):
-                    raise WorkflowError("bounded CI repair prompt changed")
-                prompt = prompt_path.read_text(encoding="utf-8")
-                observation = run_bounded_cloud_helper(
-                    [
-                        sys.executable, str(helper), "--pipeline-observe",
-                        "--apply-with-report",
-                        "--pipeline-run", task_state["run_id"],
-                        "--model", args.model, "--pr", pr["pr_url"],
-                        "--prompt-file", str(prompt_path), "--result-file", str(result_path),
-                        "--policy", AGENT_TASK_POLICY,
-                    ], repo_root, result_path,
-                )
-                if observation.get("status") == "pending":
-                    emit({"result": "waiting", "state": str(state_path), "reason": "hosted_fix"})
-                    return
-                if not result_path.is_file():
-                    raise WorkflowError("bounded CI repair observation has no final result")
-            else:
-                task_state["phase"] = "controller_evidence"
-                save_state(state_path, state)
-                helper = discover_cloud_task()
-                briefing = local_ci_briefing(preflight, model=requested_model)
-                require_live_check_snapshot(preflight)
-                atomic_write_text(briefing_path, briefing + "\n")
-                prompt, ci_evidence = bounded_worker_prompt(
-                    preflight, helper=helper,
-                    iteration_allowance=iteration_allowance,
-                    prior_history=state.get("history") or [],
-                    requested_model=requested_model,
-                    briefing=briefing,
-                )
-                task_state["evidence_sha256"] = sha256_text(ci_evidence)
-                atomic_write_text(prompt_path, prompt)
-                command = [
-                    sys.executable,
-                    str(helper),
-                    "--apply-with-report",
-                    "--model",
-                    args.model,
-                    "--pr",
-                    pr["pr_url"],
-                    "--prompt-file",
-                    str(prompt_path),
-                    "--result-file",
-                    str(result_path),
-                    "--policy",
-                    AGENT_TASK_POLICY,
-                ]
-                if getattr(args, "bounded_step", False):
-                    command.extend(["--pipeline-dispatch", "--pipeline-run", run_id])
-                task_state["status"] = "bounded_pending" if getattr(args, "bounded_step", False) else "running"
-                task_state["phase"] = "hosted_fix"
-                task_state["helper"] = str(helper)
-                if getattr(args, "bounded_step", False):
-                    task_state["prompt_sha256"] = sha256_file(prompt_path)
-                save_state(state_path, state)
-                if getattr(args, "bounded_step", False):
-                    observation = run_bounded_cloud_helper(command, repo_root, result_path)
-                    if observation.get("status") == "pending":
-                        emit({"result": "waiting", "state": str(state_path), "reason": "hosted_fix"})
-                        return
-                    if not result_path.is_file():
-                        raise WorkflowError("bounded CI dispatch has no final result")
-                else:
-                    process = run_hosted_helper(
-                        command,
-                        repo_root=repo_root,
-                        state_path=state_path,
-                        run_id=task_state["run_id"],
-                        preflight=preflight,
-                        consumer_prompt=prompt,
-                        requested_model=requested_model,
-                        timeout=args.hosted_timeout,
-                        discovery_interval=args.hosted_discovery_interval,
-                    )
-                    state = load_state(state_path)
-                    task_state = state["agent_task"]
-                    if not result_path.is_file():
-                        raise WorkflowError(
-                            f"managed helper exited {process.returncode} without an atomic "
-                            "result file"
-                        )
-        except BaseException as error:
-            state = load_state(state_path)
-            task_state = state["agent_task"]
-            task_state["status"] = "failed"
-            task_state["error"] = str(error)
-            task_state["failed_at"] = utc_now()
-            if task_state.get("phase") == "controller_evidence":
-                task_state["task_id_status"] = "not_created"
-            else:
-                task_state.pop("retry_command", None)
-                if task_state.get("task_id_status") != "known":
-                    task_state["task_id_status"] = "unknown"
-                    task_state["task_id"] = None
-            save_state(state_path, state)
-            if isinstance(error, WorkflowError):
-                error.details["state"] = str(state_path)
-            raise
-    if bounded_resume and result_path.is_file():
-        try:
-            retained = json.loads(result_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            raise WorkflowError("bounded CI repair result is invalid") from error
-        if isinstance(retained, dict) and retained.get("status") == "pending":
-            raise WorkflowError("pending CI Agent Task wrote a final result file")
-        helper = Path(task_state["helper"])
-        if sha256_file(helper) != REQUIRED_CLOUD_TASK_SHA256:
-            raise WorkflowError("pinned Agent Tasks helper changed during CI repair")
-        if sha256_file(prompt_path) != task_state.get("prompt_sha256"):
-            raise WorkflowError("bounded CI repair prompt changed")
-        prompt = prompt_path.read_text(encoding="utf-8")
+    if not attempt.dispatch():
+        emit({"result": "waiting", "state": str(state_path), "reason": "hosted_fix"})
+        return
     validated_hosted_result = False
     try:
-        result = load_agent_task_result(result_path)
-        result_sha256 = sha256_file(result_path)
-        dispatch_identity = load_state(state_path).get("agent_task", {}).get(
-            "dispatch_identity"
-        )
-        if dispatch_identity is not None:
-            result_task = result.get("task")
-            result_candidate = result.get("candidate")
-            candidate_task = (
-                result_candidate.get("task")
-                if isinstance(result_candidate, dict)
-                else None
-            )
-            if (
-                not isinstance(dispatch_identity, dict)
-                or not isinstance(result_task, dict)
-                or result_task.get("id") != dispatch_identity.get("task_id")
-                or (
-                    result.get("status") == "success"
-                    and (
-                        not isinstance(candidate_task, dict)
-                        or candidate_task.get("session_id")
-                        != dispatch_identity.get("session_id")
-                    )
-                )
-            ):
-                raise WorkflowError(
-                    "managed helper result does not match the retained hosted "
-                    "dispatch identity"
-                )
-        if result.get("status") != "success":
-            result_task = result.get("task")
-            result_task_id = (
-                result_task.get("id") if isinstance(result_task, dict) else None
-            )
-            if result_task_id is None:
-                failure = validate_candidate_task_creation_failure_result(
-                    result,
-                    preflight=preflight,
-                    requested_model=requested_model,
-                )
-                state = load_state(state_path)
-                task_state = state["agent_task"]
-                task_state.update(
-                    {
-                        "task": result["task"],
-                        "generated": result["generated"],
-                        "report": result["report"],
-                        "semantic_output": result.get("semantic_output"),
-                        "candidate": result.get("candidate"),
-                        "completion": result.get("completion"),
-                        "attestation": result.get("attestation"),
-                        "status": "failed",
-                        "task_id": None,
-                        "task_id_status": "not_created",
-                        "error": failure,
-                    }
-                )
-                save_state(state_path, state)
-            raise task_failure_from_result(result)
+        verified = attempt.verify_result()
         state = load_state(state_path)
         task_state = state["agent_task"]
-        remote = verify_runtime_candidate(
-            result,
-            helper=helper,
-            repo_root=repo_root,
-            preflight=preflight,
-            requested_model=requested_model,
-            prompt=prompt,
-        )
-        task_state.update(
-            {
-                "task": result["task"],
-                "generated": result["generated"],
-                "report": result["report"],
-                "semantic_output": result.get("semantic_output"),
-                "candidate": result.get("candidate"),
-                "completion": result.get("completion"),
-                "attestation": result.get("attestation"),
-            }
-        )
-        save_state(state_path, state)
+        remote, result_sha256 = verified
         admission = admit_ci_fix_candidate(
             state_path, state, target, preflight, remote,
             result_sha256=result_sha256,
@@ -11742,16 +11836,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
                     )
                 if not base_advanced:
                     require_live_check_snapshot(preflight)
-                imported = apply_verified_candidate_import(
-                    repo_root,
-                    helper=helper,
-                    requested_model=requested_model,
-                    prompt=prompt,
-                    result_path=result_path,
-                    result_sha256=result_sha256,
-                    preflight=preflight,
-                    remote=remote,
-                )
+                imported = attempt.import_candidate(remote)
                 task_state["status"] = "validated"
                 task_state["imported"] = imported
                 task_state["imported_head_sha"] = remote["final_local_head"]
@@ -11861,16 +11946,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             task_state["status"] = "published"
             save_state(state_path, state)
         else:
-            imported = apply_verified_candidate_import(
-                repo_root,
-                helper=helper,
-                requested_model=requested_model,
-                prompt=prompt,
-                result_path=result_path,
-                result_sha256=result_sha256,
-                preflight=preflight,
-                remote=remote,
-            )
+            imported = attempt.import_candidate(remote)
             task_state["status"] = "validated"
             task_state["imported"] = imported
             task_state["imported_head_sha"] = remote["final_local_head"]
@@ -11945,41 +12021,8 @@ def command_agent_task(args: argparse.Namespace) -> None:
         for field in ("error", "failed_at", "recovery_files"):
             task_state.pop(field, None)
         save_state(state_path, state)
-        cleanup_paths = [
-            *(
-                Path(failure["log_path"])
-                for failure in preflight["check_snapshot"]["failures"]
-            ),
-            prompt_path,
-            result_path,
-            briefing_path,
-            *(
-                Path(path)
-                for path in task_state.get("prior_result_files") or []
-                if isinstance(path, str) and path
-            ),
-            *(
-                Path(path)
-                for path in task_state.get("recovery_results") or []
-                if isinstance(path, str) and path
-            ),
-            *(
-                path
-                for archived in state.get("managed_task_history") or []
-                if isinstance(archived, dict)
-                for path in (
-                    managed_task_artifact_paths(archived)
-                    + managed_task_log_paths(archived)
-                )
-                if not bool(getattr(args, "preserve_artifacts", False))
-                or path.is_file()
-            ),
-        ]
-        finalize_agent_task_artifacts(
-            state_path,
-            state,
-            dict.fromkeys(cleanup_paths),
-            preserve=bool(getattr(args, "preserve_artifacts", False)),
+        attempt.finalize_artifacts(
+            state, preserve=bool(getattr(args, "preserve_artifacts", False)),
         )
         result_name = {
             "candidate": "published",
