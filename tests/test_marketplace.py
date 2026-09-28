@@ -22,10 +22,10 @@ ORDINARY_AGENT_TASK_PLUGINS = {
     "copilot-review-loop": "copilot_review_loop.py",
 }
 ORDINARY_HELPER_SHA256 = (
-    "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760"
+    "393ef906680b360c7fffa916ec349de64a61ac8bf08715e4981292b2d698c369"
 )
 CI_FIX_RELEASE_BOUNDARY_HELPER_SHA256 = (
-    "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760"
+    "393ef906680b360c7fffa916ec349de64a61ac8bf08715e4981292b2d698c369"
 )
 RUNTIME_PLUGIN = "agent-tasks-runtime"
 RUNTIME_SKILL = ROOT / "plugins" / RUNTIME_PLUGIN / "skills" / RUNTIME_PLUGIN
@@ -33,15 +33,15 @@ CONFLICT_HELPER_SHA256 = (
     "214a68b2651c2f194ef697a4484ea45259432264330fa80b8e6e39632f75b210"
 )
 EXPECTED_PACKAGE_VERSIONS = {
-    "agent-tasks-runtime": "1.0.44",
-    "ci-fix-loop": "1.6.116",
-    "copilot-review-loop": "1.1.107",
-    "historical-pr-audit": "1.1.48",
+    "agent-tasks-runtime": "1.0.45",
+    "ci-fix-loop": "1.6.117",
+    "copilot-review-loop": "1.1.108",
+    "historical-pr-audit": "1.1.49",
     "pr-conflict-resolver": "1.1.72",
-    "pr-description": "1.0.99",
-    "pr-pipeline": "1.5.67",
-    "pr-reviewer": "1.8.41",
-    "self-review-loop": "1.3.80",
+    "pr-description": "1.0.100",
+    "pr-pipeline": "1.5.68",
+    "pr-reviewer": "1.8.42",
+    "self-review-loop": "1.3.81",
 }
 
 

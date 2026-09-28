@@ -31,7 +31,7 @@
       "installed_path": "scripts/cloud_task.py",
       "loader": "load_cloud_task_runtime",
       "module": "_trask_agent_tasks_runtime",
-      "sha256": "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760",
+      "sha256": "393ef906680b360c7fffa916ec349de64a61ac8bf08715e4981292b2d698c369",
       "source": "plugins/agent-tasks-runtime/skills/agent-tasks-runtime/scripts/cloud_task.py"
     },
     "execution": {
@@ -103,7 +103,7 @@
       "installed_path": "scripts/pipeline_common.py",
       "loader": "load_common",
       "module": "pr_pipeline_common",
-      "sha256": "8cce896733cc2e844030e48a0db2002c9ac30e02f6d64e9fab2cb54a0526bff6",
+      "sha256": "05f7745327e99ae11b0802c79fda5720ab2e242e6b5cb4506034a5545827270d",
       "source": "plugins/pr-pipeline/scripts/pipeline_common.py"
     }
   },

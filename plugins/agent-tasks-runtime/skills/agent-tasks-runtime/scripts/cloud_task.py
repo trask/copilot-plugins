@@ -3339,6 +3339,16 @@ def collect_completed_task(
             f"task {final['id']} used base branch {refs.base}, but the "
             f"recorded base was {expected_base}"
         )
+    completion = validate_fresh_completion(
+        final,
+        expected_task_id=task_id,
+        repository=repository,
+        requested_model=options.model,
+        expected_prompt=submitted_prompt,
+        expected_base_ref=expected_base,
+        generated_ref=refs.head,
+        raw_task_response_sha256=getattr(api, "last_response_sha256", None),
+    )
 
     if options.pipeline_mode == "observe":
         git.require_identity_unchanged(root, policy_identity)
@@ -3371,16 +3381,6 @@ def collect_completed_task(
     generated_head = git.ref_sha(root, tracking_ref)
     base_sha = default_source.sha if default_source else pull_request.head_sha
     all_commits = git.cloud_commits(root, base_sha, tracking_ref)
-    completion = validate_fresh_completion(
-        final,
-        expected_task_id=task_id,
-        repository=repository,
-        requested_model=options.model,
-        expected_prompt=submitted_prompt,
-        expected_base_ref=expected_base,
-        generated_ref=refs.head,
-        raw_task_response_sha256=getattr(api, "last_response_sha256", None),
-    )
     if report_only and not all_commits:
         session_id = completion["session"]["id"]
         session_url = final["sessions"][0].get("html_url")

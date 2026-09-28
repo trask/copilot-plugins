@@ -191,7 +191,7 @@ def record_bytes(path: str, size: int, digest: str) -> bytes:
     )
 
 
-def package_digest(files: list[dict[str, Any]]) -> str:
+def package_metrics(files: list[dict[str, Any]]) -> tuple[int, str]:
     if not isinstance(files, list) or not files:
         raise ManifestError("canonical package file list is empty")
     for item in files:
@@ -204,14 +204,21 @@ def package_digest(files: list[dict[str, Any]]) -> str:
             or not isinstance(item.get("sha256"), str)
         ):
             raise ManifestError("canonical package file record is malformed")
-    ordered = sorted(files, key=lambda item: item["path"].encode("utf-8"))
+    try:
+        ordered = sorted(files, key=lambda item: item["path"].encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ManifestError("canonical package path is not UTF-8") from error
     if len({item["path"] for item in ordered}) != len(ordered):
         raise ManifestError("canonical package file paths are not unique")
-    framed = b"".join(
-        record_bytes(item["path"], item["size"], item["sha256"])
-        for item in ordered
-    )
-    return hashlib.sha256(framed).hexdigest()
+    digest = hashlib.sha256()
+    byte_count = 0
+    for item in ordered:
+        try:
+            digest.update(record_bytes(item["path"], item["size"], item["sha256"]))
+        except UnicodeEncodeError as error:
+            raise ManifestError("canonical package path is not UTF-8") from error
+        byte_count += item["size"]
+    return byte_count, digest.hexdigest()
 
 
 def package_evidence(
@@ -263,12 +270,13 @@ def package_evidence(
             text=True,
         )
     ).strip()
+    byte_count, digest = package_metrics(files)
     return resolved_commit, {
         "name": plugin,
         "version": manifest["version"],
         "file_count": len(files),
-        "byte_count": sum(item["size"] for item in files),
-        "package_sha256": package_digest(files),
+        "byte_count": byte_count,
+        "package_sha256": digest,
         "published_git_tree_oid": tree_oid,
         "files": files,
     }
@@ -365,13 +373,6 @@ def validate_manifest_shape(manifest: Any) -> list[str]:
             or not isinstance(package.get("byte_count"), int)
             or isinstance(package["byte_count"], bool)
             or not isinstance(package.get("files"), list)
-            or package["file_count"] != len(package["files"])
-            or package["byte_count"]
-            != sum(
-                item.get("size", -1)
-                for item in package["files"]
-                if isinstance(item, dict)
-            )
             or SHA256_PATTERN.fullmatch(
                 str(package.get("package_sha256", ""))
             )
@@ -381,20 +382,15 @@ def validate_manifest_shape(manifest: Any) -> list[str]:
                 str(package.get("published_git_tree_oid", "")),
             )
             is None
-            or [
-                item.get("path")
-                for item in package["files"]
-                if isinstance(item, dict)
-            ]
-            != sorted(
-                (
-                    item.get("path")
-                    for item in package["files"]
-                    if isinstance(item, dict)
-                ),
-                key=lambda value: str(value).encode("utf-8"),
-            )
-            or package_digest(package["files"]) != package["package_sha256"]
+        ):
+            raise ManifestError("package manifest entry is invalid")
+        byte_count, digest = package_metrics(package["files"])
+        paths = [item["path"] for item in package["files"]]
+        if (
+            package["file_count"] != len(paths)
+            or package["byte_count"] != byte_count
+            or paths != sorted(paths, key=lambda value: value.encode("utf-8"))
+            or package["package_sha256"] != digest
         ):
             raise ManifestError("package manifest entry is invalid")
         plugins.append(package["name"])

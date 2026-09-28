@@ -483,6 +483,41 @@ class FreshCompletionEvidenceTest(unittest.TestCase):
         task["sessions"][0].update(session_updates or {})
         return task
 
+    def collect(self, git, *, task=None, response_sha="a" * 64):
+        root = Path("C:/repo")
+        base_sha = "1" * 40
+        snapshot = MODULE.WorktreeSnapshot(
+            root, "owner/repo", "origin", "feature", base_sha,
+        )
+        final = {
+            **(self.task if task is None else task),
+            "artifacts": [{
+                "type": "branch",
+                "provider": "github",
+                "data": {"head_ref": "copilot/task-1", "base_ref": "feature"},
+            }],
+        }
+        result = MODULE.ResultEnvelope()
+        status = MODULE.collect_completed_task(
+            MODULE.Options(
+                report=False, model="gpt-5.6-sol", prompt=self.prompt,
+                pipeline_mode="observe",
+            ),
+            git=git, api=SimpleNamespace(last_response_sha256=response_sha),
+            runner=mock.Mock(), root=root, repository="owner/repo",
+            pull_request=MODULE.PullRequestSnapshot(
+                7, "https://github.com/owner/repo/pull/7", "OPEN",
+                "owner/repo", "main", "4" * 40, "owner/repo", "feature",
+                base_sha, False,
+            ),
+            snapshot=snapshot,
+            policy_identity=MODULE.LocalIdentity("feature", base_sha, "", None),
+            request_id="request-1", task_id="task-1",
+            submitted_prompt=self.prompt, final=final, result=result,
+            stderr=io.StringIO(),
+        )
+        return status, result, snapshot
+
     def test_persists_fresh_task_session_model_prompt_and_ref_evidence(self):
         evidence = self.validate()
 
@@ -538,6 +573,56 @@ class FreshCompletionEvidenceTest(unittest.TestCase):
             with self.subTest(task=task, overrides=overrides):
                 with self.assertRaises(MODULE.CloudError):
                     self.validate(task, **overrides)
+
+    def test_collect_rejects_invalid_completion_before_fetching_generated_refs(self):
+        for task, response_sha in (
+            (self.mutate(session_updates={"prompt": "other"}), "a" * 64),
+            (self.task, None),
+        ):
+            with self.subTest(task=task, response_sha=response_sha):
+                git = mock.Mock()
+                with self.assertRaises(MODULE.CloudError) as raised:
+                    self.collect(git, task=task, response_sha=response_sha)
+                self.assertEqual(raised.exception.code, "task_identity_mismatch")
+                git.fetch_generated.assert_not_called()
+                git.ref_sha.assert_not_called()
+                git.cloud_commits.assert_not_called()
+                git.require_identity_unchanged.assert_not_called()
+
+    def test_collect_fetches_valid_completion_and_reuses_its_evidence(self):
+        git = mock.Mock()
+        git.ref_sha.return_value = "2" * 40
+        git.cloud_commits.return_value = ["2" * 40]
+        git.candidate_history.return_value = MODULE.CandidateHistory(
+            "2" * 40, ({"sha": "2" * 40},), None,
+        )
+        with mock.patch.object(
+            MODULE, "validate_fresh_completion",
+            wraps=MODULE.validate_fresh_completion,
+        ) as validate:
+            def fetch_generated(*args):
+                validate.assert_called_once()
+                return "refs/cloud-agent-tasks/request-1/generated"
+
+            git.fetch_generated.side_effect = fetch_generated
+            status, result, snapshot = self.collect(git)
+
+        validate.assert_called_once()
+        self.assertEqual(status, 0)
+        git.fetch_generated.assert_called_once_with(
+            snapshot, "copilot/task-1", "request-1",
+        )
+        git.ref_sha.assert_called_once_with(
+            snapshot.root, "refs/cloud-agent-tasks/request-1/generated",
+        )
+        git.cloud_commits.assert_called_once_with(
+            snapshot.root, snapshot.head,
+            "refs/cloud-agent-tasks/request-1/generated",
+        )
+        git.candidate_history.assert_called_once()
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.completion_evidence, self.validate())
+        self.assertEqual(result.completion_evidence["session"]["id"], "session-1")
 
     def test_api_client_hashes_the_exact_success_response_body(self):
         body = '{\r\n "id": "task-1", "state": "completed"\r\n}\r\n'

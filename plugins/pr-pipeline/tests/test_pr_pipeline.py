@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import importlib.util
 from io import StringIO
@@ -7,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -2261,6 +2263,17 @@ class SweepTest(unittest.TestCase):
                 event["stage"] == MODULE.STAGE_CONFLICT for event in self.events),
         )
         self.assertEqual(1, sum(event["event"] == "pipeline_started" for event in self.events))
+        self.assertTrue(any(
+            cursor["pending_stage"] is not None
+            and cursor["pending_stage"]["phase"] == "executing"
+            for cursor in checkpoints
+        ))
+        for cursor in checkpoints:
+            status = (
+                "waiting" if cursor["pending_stage"] is not None
+                and cursor["pending_stage"]["phase"] == "waiting" else "active"
+            )
+            MODULE.validate_run_cursor(cursor, status)
 
     def test_bounded_calls_keep_the_second_sweep_and_one_run_identity(self):
         original_stage = self.run_stage
@@ -2297,6 +2310,17 @@ class SweepTest(unittest.TestCase):
             [(stage, sweep) for sweep in (1, 2) for stage in MODULE.STAGE_NAMES],
             self.launched,
         )
+        self.assertTrue(any(
+            cursor["sweep"] == 2 and cursor["stage_index"] == 0
+            and cursor["initialized"] is False
+            for cursor in checkpoints
+        ))
+        for cursor in checkpoints:
+            status = (
+                "waiting" if cursor["pending_stage"] is not None
+                and cursor["pending_stage"]["phase"] == "waiting" else "active"
+            )
+            MODULE.validate_run_cursor(cursor, status)
 
     def enable_ci_warnings(self):
         self.warning_payload = None
@@ -4156,6 +4180,79 @@ class CommandOutputTest(unittest.TestCase):
         self.assertEqual("duplicate progress field", event["error"])
 
 
+class AtomicStateWriterTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(dir=SCRIPT.parents[1])
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "state.json"
+
+    def test_replace_follows_flush_and_fsync(self):
+        real_replace = os.replace
+        real_fsync = os.fsync
+        synced = set()
+
+        def fsync(descriptor):
+            synced.add(descriptor)
+            return real_fsync(descriptor)
+
+        def replace(source, destination):
+            self.assertEqual(self.path, destination)
+            self.assertEqual({"new": 1}, json.loads(source.read_text(encoding="utf-8")))
+            self.assertTrue(synced)
+            return real_replace(source, destination)
+
+        with (
+            mock.patch.object(MODULE.common.os, "fsync", side_effect=fsync),
+            mock.patch.object(MODULE.common.os, "replace", side_effect=replace),
+        ):
+            MODULE.common.write_json_atomically(self.path, {"new": 1})
+        self.assertEqual({"new": 1}, json.loads(self.path.read_text(encoding="utf-8")))
+        self.assertEqual([self.path], list(self.path.parent.iterdir()))
+
+    def test_failed_replace_and_serialization_leave_original_without_temp(self):
+        MODULE.common.write_json_atomically(self.path, {"old": True})
+        with (
+            mock.patch.object(MODULE.common.os, "replace", side_effect=OSError("replace failed")),
+            self.assertRaisesRegex(OSError, "replace failed"),
+        ):
+            MODULE.common.write_json_atomically(self.path, {"new": True})
+        with (
+            mock.patch.object(MODULE.common.os, "fsync", side_effect=OSError("sync failed")),
+            self.assertRaisesRegex(OSError, "sync failed"),
+        ):
+            MODULE.common.write_json_atomically(self.path, {"new": True})
+        with self.assertRaises(TypeError):
+            MODULE.common.write_json_atomically(self.path, {"invalid": object()})
+        self.assertEqual({"old": True}, json.loads(self.path.read_text(encoding="utf-8")))
+        self.assertEqual([self.path], list(self.path.parent.iterdir()))
+
+    def test_same_process_writers_use_distinct_temp_files(self):
+        real_replace = os.replace
+        barrier = threading.Barrier(2)
+        replace_lock = threading.Lock()
+        sources = []
+
+        def replace(source, destination):
+            sources.append(source)
+            barrier.wait(timeout=10)
+            with replace_lock:
+                return real_replace(source, destination)
+
+        with mock.patch.object(MODULE.common.os, "replace", side_effect=replace):
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                futures = [
+                    workers.submit(MODULE.common.write_json_atomically, self.path, {"writer": n})
+                    for n in (1, 2)
+                ]
+                for future in futures:
+                    future.result(timeout=15)
+        self.assertEqual(2, len(set(sources)))
+        self.assertIn(json.loads(self.path.read_text(encoding="utf-8")), (
+            {"writer": 1}, {"writer": 2},
+        ))
+        self.assertEqual([self.path], list(self.path.parent.iterdir()))
+
+
 class BoundedCommandTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -4184,6 +4281,144 @@ class BoundedCommandTest(unittest.TestCase):
                 MODULE.build_parser().parse_args(["start", "owner/repo#7"])
             )
         return json.loads(output.getvalue())
+
+    def cursor(self):
+        return {
+            "sweep": 1, "stage_index": 1, "initialized": True,
+            "sweep_started_head": HEAD, "sweep_started_base": BASE,
+            "head_changed": False, "base_changed": False,
+            "known_safe_head": HEAD, "completed_sweeps": 0,
+            "completed_conflict_resolution": False, "pending_stage": None,
+            "runs": [{
+                "stage": MODULE.STAGE_CONFLICT, "sweep": 1,
+                "action": "already_clear", "started_head_sha": HEAD,
+                "ended_head_sha": HEAD,
+            }],
+        }
+
+    def test_advance_rejects_malformed_checkpoints_before_running_stages(self):
+        started = self.start()
+        state_path = Path(started["state"])
+        args = MODULE.build_parser().parse_args([
+            "advance", "owner/repo#7", "--run-id", started["run_id"],
+        ])
+        cases = {
+            "sweep": ("sweep", True),
+            "stage_index": ("stage_index", len(MODULE.STAGES) + 1),
+            "boolean index": ("stage_index", False),
+            "uninitialized nonzero index": ("initialized", False),
+            "completed_sweeps": ("completed_sweeps", -1),
+            "boolean completed": ("completed_sweeps", True),
+            "completed all sweeps": ("completed_sweeps", MODULE.MAX_SWEEPS),
+            "runs": ("runs", {}),
+            "run entry": ("runs", [{}]),
+            "empty action": ("runs", [{**self.cursor()["runs"][0], "action": ""}]),
+            "known_safe_head": ("known_safe_head", "bad-sha"),
+            "sweep_started_base": ("sweep_started_base", None),
+            "head_changed": ("head_changed", "false"),
+            "pending_stage": ("pending_stage", {"phase": "waiting"}),
+        }
+        with mock.patch.object(MODULE, "run_pipeline") as run_pipeline:
+            for name, (field, value) in cases.items():
+                with self.subTest(name=name):
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state["status"] = "active"
+                    state["cursor"] = self.cursor()
+                    state["cursor"][field] = value
+                    MODULE.save_run_state(state_path, state)
+                    with self.assertRaisesRegex(MODULE.WorkflowError, "invalid bounded PR Pipeline cursor"):
+                        MODULE.command_advance(args)
+                    run_pipeline.assert_not_called()
+
+            pending = {
+                "sweep": 1, "stage_index": 1, "phase": "waiting",
+                "started_head_sha": HEAD, "commits_before": {"commits": []},
+                "before_attempt_id": None,
+            }
+            for name, field, value in (
+                ("wrong stage", "stage_index", 0),
+                ("interrupted phase", "phase", "executing"),
+                ("invalid phase", "phase", []),
+                ("bad pending sha", "started_head_sha", "bad-sha"),
+                ("bad commits", "commits_before", {"commits": None}),
+            ):
+                with self.subTest(name=name):
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state["status"] = "waiting"
+                    state["cursor"] = self.cursor()
+                    state["cursor"]["pending_stage"] = {**pending, field: value}
+                    MODULE.save_run_state(state_path, state)
+                    with self.assertRaisesRegex(MODULE.WorkflowError, "invalid bounded PR Pipeline cursor"):
+                        MODULE.command_advance(args)
+                    run_pipeline.assert_not_called()
+
+    def test_executing_checkpoint_is_valid_but_cannot_advance(self):
+        started = self.start()
+        state_path = Path(started["state"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["cursor"] = self.cursor()
+        state["cursor"]["pending_stage"] = {
+            "sweep": 1, "stage_index": 1, "phase": "executing",
+            "started_head_sha": HEAD, "commits_before": {"commits": []},
+            "before_attempt_id": None,
+        }
+        MODULE.save_run_state(state_path, state)
+        self.assertEqual(
+            state["cursor"], MODULE.load_run_state(
+                state_path, session_id="session-one",
+            )["cursor"],
+        )
+        args = MODULE.build_parser().parse_args([
+            "advance", "owner/repo#7", "--run-id", started["run_id"],
+        ])
+        with mock.patch.object(MODULE, "run_pipeline") as run_pipeline:
+            with self.assertRaisesRegex(MODULE.WorkflowError, "did not finish safely"):
+                MODULE.command_advance(args)
+            run_pipeline.assert_not_called()
+
+    def test_advance_resumes_waiting_stage_and_second_sweep(self):
+        started = self.start()
+        state_path = Path(started["state"])
+        args = MODULE.build_parser().parse_args([
+            "advance", "owner/repo#7", "--run-id", started["run_id"],
+        ])
+        pending = self.cursor()
+        pending["sweep_started_base"] = BASE.upper()
+        pending["pending_stage"] = {
+            "sweep": 1, "stage_index": 1, "phase": "waiting",
+            "started_head_sha": HEAD, "commits_before": {"commits": [{"sha": HEAD}]},
+            "before_attempt_id": None,
+        }
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["status"] = "waiting"
+        state["cursor"] = pending
+        MODULE.save_run_state(state_path, state)
+
+        def resumed(_target, _repo, *, cursor, checkpoint, **_options):
+            self.assertEqual(pending, cursor)
+            checkpoint(self.cursor())
+            return {"result": "continue", "run_id": started["run_id"]}
+
+        with mock.patch.object(MODULE, "run_pipeline", side_effect=resumed):
+            with redirect_stdout(StringIO()):
+                MODULE.command_advance(args)
+        self.assertEqual("active", json.loads(state_path.read_text(encoding="utf-8"))["status"])
+
+        next_sweep = self.cursor()
+        next_sweep.update({
+            "sweep": 2, "stage_index": 0, "initialized": False,
+            "completed_sweeps": 1,
+            "sweep_started_base": BASE.upper(),
+        })
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["cursor"] = next_sweep
+        MODULE.save_run_state(state_path, state)
+        with mock.patch.object(MODULE, "run_pipeline", return_value={
+            "result": "continue", "run_id": started["run_id"],
+        }) as run_pipeline:
+            with redirect_stdout(StringIO()):
+                MODULE.command_advance(args)
+        self.assertEqual(next_sweep, run_pipeline.call_args.kwargs["cursor"])
 
     def test_start_and_advance_are_bound_to_one_session(self):
         started = self.start()

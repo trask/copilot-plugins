@@ -185,7 +185,7 @@ WINDOWS_REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.2)
 EMPTY_RERUN_COMMIT_MESSAGE = "ci: rerun checks"
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760"
+    "393ef906680b360c7fffa916ec349de64a61ac8bf08715e4981292b2d698c369"
 )
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
 CLOUD_TASK_INSTALL_SPEC = "agent-tasks-runtime@trask-plugins"

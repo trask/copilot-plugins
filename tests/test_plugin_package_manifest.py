@@ -88,7 +88,7 @@ class PluginPackageManifestTest(unittest.TestCase):
 
         self.assertEqual(
             "9b02609a6861d5527e4ca7b582893209cea2a9d9619d0ac6a43081dee88063a7",
-            MODULE.package_digest(files),
+            MODULE.package_metrics(files)[1],
         )
 
     def test_cli_creates_and_mechanically_verifies_manifest(self):
@@ -191,12 +191,57 @@ class PluginPackageManifestTest(unittest.TestCase):
             {"path": "a", "size": 0, "sha256": "0" * 64},
         ]
         self.assertEqual(
-            MODULE.package_digest(files),
-            MODULE.package_digest(list(reversed(files))),
+            MODULE.package_metrics(files),
+            MODULE.package_metrics(list(reversed(files))),
         )
         files[0]["path"] = "a"
         with self.assertRaisesRegex(MODULE.ManifestError, "not unique"):
-            MODULE.package_digest(files)
+            MODULE.package_metrics(files)
+
+    def test_verify_rejects_malformed_records_as_manifest_errors(self):
+        commit = str(
+            MODULE.run_git(self.repository, "rev-parse", "HEAD", text=True)
+        ).strip()
+        manifest = MODULE.build_manifest(
+            self.repository, self.installed, commit, ["demo"], []
+        )
+        for field, value in (
+            ("size", "3"),
+            ("size", -1),
+            ("path", None),
+            ("path", "\ud800"),
+            ("sha256", 42),
+        ):
+            with self.subTest(field=field, value=value):
+                altered = json.loads(json.dumps(manifest))
+                altered["packages"][0]["files"][0][field] = value
+                with self.assertRaises(MODULE.ManifestError):
+                    MODULE.validate_manifest_shape(altered)
+
+        manifest["packages"][0]["files"][0]["size"] = "3"
+        path = self.directory / "malformed-manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "verify",
+                "--repository-root",
+                str(self.repository),
+                "--installed-root",
+                str(self.installed),
+                "--manifest",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            **process_options(),
+        )
+        self.assertEqual(1, result.returncode)
+        self.assertEqual("error", json.loads(result.stdout)["result"])
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable
 from urllib.parse import quote
@@ -2459,11 +2460,21 @@ def write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
     if _EXECUTION is not None and payload.get("run_id") == _EXECUTION.run_id:
         _EXECUTION.record_state(path, payload)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    os.replace(temporary, path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n",
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+            delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            output.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def read_json(path: Path) -> Any:

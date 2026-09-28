@@ -39,7 +39,7 @@ COPILOT_LOGINS = {
 }
 IS_WINDOWS = os.name == "nt"
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760"
+    "393ef906680b360c7fffa916ec349de64a61ac8bf08715e4981292b2d698c369"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"
@@ -963,7 +963,7 @@ class DiffAnchors:
         return path in self._files
 
     def require_anchor(
-        self, index: int, path: str, side: str, line: int, start_line: int | None
+        self, index: int | str, path: str, side: str, line: int, start_line: int | None
     ) -> None:
         anchor = self._files[path][side]
         if start_line is None:
@@ -1243,65 +1243,11 @@ def validate_comments(
                 f"comment {index} must contain path, line, side, and body, "
                 "with optional start_line and start_side"
             )
-        path = comment["path"]
-        line = comment["line"]
-        side = comment["side"]
         body = comment["body"]
-        has_start_line = "start_line" in comment
-        has_start_side = "start_side" in comment
-        if not isinstance(path, str) or not path:
-            raise WorkflowError(f"comment {index} has an invalid path")
-        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
-            raise WorkflowError(f"comment {index} has an invalid line")
-        if not isinstance(side, str) or side not in {"LEFT", "RIGHT"}:
-            raise WorkflowError(f"comment {index} side must be LEFT or RIGHT")
         if not isinstance(body, str) or not body.strip():
             raise WorkflowError(f"comment {index} body must not be empty")
-        if has_start_line != has_start_side:
-            raise WorkflowError(
-                f"comment {index} must provide start_line and start_side together"
-            )
-        if not anchors.has_path(path):
-            raise WorkflowError(
-                f"comment {index} anchor is not a changed {side} line: {path}:{line}"
-            )
-        if not has_start_line:
-            anchors.require_anchor(index, path, side, line, None)
-            normalized.append(
-                {"path": path, "line": line, "side": side, "body": body}
-            )
-            continue
-
-        start_line = comment["start_line"]
-        start_side = comment["start_side"]
-        if (
-            isinstance(start_line, bool)
-            or not isinstance(start_line, int)
-            or start_line <= 0
-        ):
-            raise WorkflowError(f"comment {index} has an invalid start_line")
-        if not isinstance(start_side, str) or start_side not in {"LEFT", "RIGHT"}:
-            raise WorkflowError(
-                f"comment {index} start_side must be LEFT or RIGHT"
-            )
-        if start_side != side:
-            raise WorkflowError(
-                f"comment {index} range must stay on the same diff side"
-            )
-        if start_line >= line:
-            raise WorkflowError(
-                f"comment {index} start_line must be less than line"
-            )
-        anchors.require_anchor(index, path, side, line, start_line)
         normalized.append(
-            {
-                "path": path,
-                "start_line": start_line,
-                "start_side": start_side,
-                "line": line,
-                "side": side,
-                "body": body,
-            }
+            {**canonical_comment_location(comment, anchors, index=index), "body": body}
         )
     return normalized
 
@@ -1333,66 +1279,6 @@ def comment_signature(
         str(comment.get("side")),
         normalize_body(comment.get("body")),
     )
-
-
-def resolve_actual_comment(
-    comment: dict[str, Any],
-    anchors: DiffAnchors,
-) -> dict[str, Any]:
-    """Fill in ``line`` and ``side`` for a comment GitHub locates only by position.
-
-    ``GET /repos/{owner}/{repo}/pulls/{n}/reviews/{id}/comments`` returns the
-    legacy comment shape, which carries ``position`` but no ``line`` or ``side``
-    at all, so a review's own comments can only be located through the diff.
-    """
-    line = comment.get("line")
-    side = comment.get("side")
-    has_line_location = (
-        not isinstance(line, bool)
-        and isinstance(line, int)
-        and isinstance(side, str)
-        and side in {"LEFT", "RIGHT"}
-    )
-    path = str(comment.get("path"))
-    if not has_line_location:
-        position = comment.get("position")
-        if position is None:
-            position = comment.get("original_position")
-        if isinstance(position, bool) or not isinstance(position, int):
-            raise WorkflowError(
-                f"comment on {path} reports neither a line and side nor a diff position"
-            )
-        resolved = anchors.resolve_position(path, position)
-        if resolved is None:
-            raise WorkflowError(
-                f"comment on {path} has diff position {position}, "
-                "which is not a changed line in the authoritative diff"
-            )
-        side, line = resolved
-
-    start_line = comment.get("start_line")
-    if start_line is None:
-        start_line = comment.get("original_start_line")
-    if start_line is None:
-        return {
-            **comment,
-            "line": line,
-            "side": side,
-            "start_line": None,
-            "start_side": None,
-        }
-    if isinstance(start_line, bool) or not isinstance(start_line, int):
-        raise WorkflowError(f"comment on {path} has an invalid start line")
-    start_side = comment.get("start_side")
-    if not isinstance(start_side, str) or start_side not in {"LEFT", "RIGHT"}:
-        start_side = side
-    return {
-        **comment,
-        "line": line,
-        "side": side,
-        "start_line": start_line,
-        "start_side": start_side,
-    }
 
 
 def enrich_legacy_comment_location(comment: dict[str, Any]) -> dict[str, Any]:
@@ -1446,6 +1332,90 @@ def enrich_legacy_comment_location(comment: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
+def canonical_comment_location(
+    comment: dict[str, Any], anchors: DiffAnchors, *, index: int | None = None
+) -> dict[str, Any]:
+    """Resolve authored or GitHub review coordinates against the PR diff."""
+    if index is None:
+        comment = enrich_legacy_comment_location(comment)
+    path = comment.get("path")
+    label = f"comment {index}" if index is not None else f"comment on {path}"
+    if not isinstance(path, str) or not path:
+        raise WorkflowError(f"{label} has an invalid path")
+    line = comment.get("line")
+    side = comment.get("side")
+    if index is None and (
+        isinstance(line, bool)
+        or not isinstance(line, int)
+        or not isinstance(side, str)
+        or side not in {"LEFT", "RIGHT"}
+    ):
+        position = comment.get("position")
+        if position is None:
+            position = comment.get("original_position")
+        if isinstance(position, bool) or not isinstance(position, int):
+            raise WorkflowError(
+                f"{label} reports neither a line and side nor a diff position"
+            )
+        resolved = anchors.resolve_position(path, position)
+        if resolved is None:
+            raise WorkflowError(
+                f"{label} has diff position {position}, "
+                "which is not a changed line in the authoritative diff"
+            )
+        side, line = resolved
+    if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+        raise WorkflowError(f"{label} has an invalid line")
+    if not isinstance(side, str) or side not in {"LEFT", "RIGHT"}:
+        raise WorkflowError(f"{label} side must be LEFT or RIGHT")
+
+    start_line = comment.get("start_line")
+    start_side = comment.get("start_side")
+    if index is None:
+        if start_line is None:
+            start_line = comment.get("original_start_line")
+        if start_line is None:
+            start_side = None
+        elif not isinstance(start_side, str) or start_side not in {"LEFT", "RIGHT"}:
+            start_side = side
+    elif ("start_line" in comment) != ("start_side" in comment):
+        raise WorkflowError(
+            f"{label} must provide start_line and start_side together"
+        )
+    if start_line is None and start_side is not None:
+        raise WorkflowError(f"{label} must provide start_line and start_side together")
+    if not anchors.has_path(path):
+        raise WorkflowError(
+            f"{label} anchor is not a changed {side} line: {path}:{line}"
+        )
+    anchor_label = index if index is not None else f"on {path}"
+    if start_line is None:
+        if index is not None and "start_line" in comment:
+            raise WorkflowError(f"{label} has an invalid start_line")
+        anchors.require_anchor(anchor_label, path, side, line, None)
+        location = {"path": path, "line": line, "side": side}
+        if index is None:
+            return {**comment, **location, "start_line": None, "start_side": None}
+        return location
+    if isinstance(start_line, bool) or not isinstance(start_line, int) or start_line <= 0:
+        raise WorkflowError(f"{label} has an invalid start_line")
+    if not isinstance(start_side, str) or start_side not in {"LEFT", "RIGHT"}:
+        raise WorkflowError(f"{label} start_side must be LEFT or RIGHT")
+    if start_side != side:
+        raise WorkflowError(f"{label} range must stay on the same diff side")
+    if start_line >= line:
+        raise WorkflowError(f"{label} start_line must be less than line")
+    anchors.require_anchor(anchor_label, path, side, line, start_line)
+    location = {
+        "path": path,
+        "start_line": start_line,
+        "start_side": start_side,
+        "line": line,
+        "side": side,
+    }
+    return {**comment, **location} if index is None else location
+
+
 def verify_created_review(
     pr: dict[str, Any],
     viewer: str,
@@ -1471,7 +1441,7 @@ def verify_created_review(
             f"created review {review_id} is not a viewer-owned PENDING review"
         )
     actual_comments = [
-        resolve_actual_comment(enrich_legacy_comment_location(comment), anchors)
+        canonical_comment_location(comment, anchors)
         for comment in gh_paginated(f"{endpoint}/comments?per_page=100")
     ]
     expected = Counter(comment_signature(comment) for comment in expected_comments)

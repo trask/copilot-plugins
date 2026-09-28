@@ -336,7 +336,7 @@ class UnifiedDiffTest(unittest.TestCase):
         # The line right below the first "@@" is position 1, and each later
         # "@@" header consumes a position of its own.
         for position, side, line in ((2, "LEFT", 2), (8, "LEFT", 20)):
-            resolved = MODULE.resolve_actual_comment(
+            resolved = MODULE.canonical_comment_location(
                 {"path": "src/one.py", "position": position}, anchors
             )
             self.assertEqual((resolved["side"], resolved["line"]), (side, line))
@@ -365,7 +365,7 @@ diff --git a/data.txt b/data.txt
         for position, side, line in (
             (2, "LEFT", 2), (6, "LEFT", 11), (3, "RIGHT", 2), (8, "RIGHT", 11)
         ):
-            resolved = MODULE.resolve_actual_comment(
+            resolved = MODULE.canonical_comment_location(
                 {"path": "data.txt", "position": position}, anchors
             )
             self.assertEqual((resolved["side"], resolved["line"]), (side, line))
@@ -378,7 +378,7 @@ diff --git a/data.txt b/data.txt
             ("src/one.py", 8, "LEFT", 20),
             ("docs/two.md", 2, "LEFT", 11),
         ):
-            resolved = MODULE.resolve_actual_comment(
+            resolved = MODULE.canonical_comment_location(
                 {"path": path, "position": position}, anchors
             )
             self.assertEqual((resolved["side"], resolved["line"]), (side, line))
@@ -2229,6 +2229,205 @@ class PostingTest(unittest.TestCase):
         path.write_text(json.dumps(self.comments), encoding="utf-8")
         return path
 
+    def test_authored_and_returned_comments_share_diff_anchors(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "user": {"login": "viewer"},
+        }
+        for authored, returned in (
+            (
+                {"path": "src/one.py", "line": 2, "side": "RIGHT"},
+                {"path": "src/one.py", "line": 2, "side": "RIGHT", "position": 5},
+            ),
+            (
+                {"path": "src/one.py", "line": 2, "side": "LEFT"},
+                {"path": "src/one.py", "position": 2},
+            ),
+            (
+                {"path": "src/one.py", "line": 2, "side": "RIGHT"},
+                {"path": "src/one.py", "position": None, "original_position": 3},
+            ),
+            (
+                {
+                    "path": "src/one.py",
+                    "start_line": 2,
+                    "start_side": "RIGHT",
+                    "line": 4,
+                    "side": "RIGHT",
+                },
+                {
+                    "path": "src/one.py",
+                    "start_line": 2,
+                    "start_side": "RIGHT",
+                    "line": 4,
+                    "side": "RIGHT",
+                    "position": 5,
+                },
+            ),
+        ):
+            with self.subTest(authored=authored, returned=returned):
+                expected = [{**authored, "body": "Check this."}]
+                actual = [{**returned, "body": "Check this."}]
+                self.assertEqual(
+                    MODULE.validate_comments(expected, self.anchors), expected
+                )
+                with (
+                    mock.patch.object(MODULE, "gh_json", return_value=review),
+                    mock.patch.object(MODULE, "gh_paginated", return_value=actual),
+                    mock.patch.object(MODULE, "ensure_head_unchanged"),
+                ):
+                    self.assertEqual(
+                        MODULE.verify_created_review(
+                            self.pr, "viewer", review["id"], expected, self.anchors
+                        ),
+                        review,
+                    )
+
+    def test_authored_and_returned_comments_reject_malformed_anchors(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "user": {"login": "viewer"},
+        }
+        for location in (
+            {"line": 3, "side": "RIGHT"},
+            {"line": 4, "side": "LEFT"},
+            {"line": True, "side": "RIGHT"},
+            {"line": 4, "side": "RIGHT", "start_line": 2, "start_side": "LEFT"},
+            {"line": 2, "side": "RIGHT", "start_line": 4, "start_side": "RIGHT"},
+            {"line": 21, "side": "RIGHT", "start_line": 4, "start_side": "RIGHT"},
+        ):
+            with self.subTest(location=location):
+                malformed = {"path": "src/one.py", **location, "body": "Check this."}
+                with self.assertRaises(MODULE.WorkflowError):
+                    MODULE.validate_comments([malformed], self.anchors)
+                with (
+                    mock.patch.object(MODULE, "gh_json", return_value=review),
+                    mock.patch.object(MODULE, "gh_paginated", return_value=[malformed]),
+                ):
+                    with self.assertRaises(MODULE.WorkflowError):
+                        MODULE.verify_created_review(
+                            self.pr, "viewer", review["id"], self.comments, self.anchors
+                        )
+
+        with (
+            mock.patch.object(MODULE, "gh_json", return_value=review),
+            mock.patch.object(
+                MODULE,
+                "gh_paginated",
+                return_value=[
+                    {
+                        "path": "src/one.py",
+                        "line": 3,
+                        "side": "RIGHT",
+                        "position": 3,
+                        "body": self.comments[0]["body"],
+                    }
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "not a changed RIGHT line"
+            ):
+                MODULE.verify_created_review(
+                    self.pr, "viewer", review["id"], self.comments, self.anchors
+                )
+
+    def test_github_start_side_fallback_preserves_legacy_fields(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "user": {"login": "viewer"},
+        }
+        single = {"path": "src/one.py", "line": 2, "side": "RIGHT"}
+        range_location = {
+            "path": "src/one.py",
+            "start_line": 2,
+            "start_side": "RIGHT",
+            "line": 4,
+            "side": "RIGHT",
+        }
+        for authored, returned in (
+            (single, {"line": 2, "side": "RIGHT", "start_side": "LEFT"}),
+            (
+                single,
+                {
+                    "position": None,
+                    "original_position": 3,
+                    "start_line": None,
+                    "start_side": "RIGHT",
+                },
+            ),
+            (
+                range_location,
+                {"position": 5, "original_start_line": 2, "start_side": "MIDDLE"},
+            ),
+            (
+                range_location,
+                {"line": 4, "side": "RIGHT", "start_line": 2, "start_side": False},
+            ),
+            (range_location, {"position": 5, "start_line": 2, "start_side": None}),
+            (range_location, {"position": 5, "start_line": 2}),
+        ):
+            with self.subTest(returned=returned):
+                expected = [{**authored, "body": "Check this."}]
+                actual = {
+                    "id": 17,
+                    "path": "src/one.py",
+                    "body": "Check this.",
+                    **returned,
+                }
+                self.assertEqual(
+                    MODULE.validate_comments(expected, self.anchors), expected
+                )
+                resolved = MODULE.canonical_comment_location(actual, self.anchors)
+                self.assertEqual(
+                    (resolved["line"], resolved["side"]),
+                    (authored["line"], authored["side"]),
+                )
+                self.assertEqual(
+                    (resolved["start_line"], resolved["start_side"]),
+                    (authored.get("start_line"), authored.get("start_side")),
+                )
+                for key in (
+                    "id",
+                    "body",
+                    "position",
+                    "original_position",
+                    "original_start_line",
+                ):
+                    if key in actual:
+                        self.assertEqual(resolved[key], actual[key])
+                with (
+                    mock.patch.object(MODULE, "gh_json", return_value=review),
+                    mock.patch.object(MODULE, "gh_paginated", return_value=[actual]),
+                    mock.patch.object(MODULE, "ensure_head_unchanged"),
+                ):
+                    self.assertEqual(
+                        MODULE.verify_created_review(
+                            self.pr, "viewer", review["id"], expected, self.anchors
+                        ),
+                        review,
+                    )
+
+        for location, message in (
+            ({"start_side": "LEFT"}, "provide start_line and start_side"),
+            (
+                {"start_line": 2, "start_side": "MIDDLE", "line": 4},
+                "start_side must be LEFT or RIGHT",
+            ),
+            ({"start_line": 2, "line": 4}, "provide start_line and start_side"),
+        ):
+            with self.subTest(authored=location):
+                with self.assertRaisesRegex(MODULE.WorkflowError, message):
+                    MODULE.validate_comments(
+                        [{**single, **location, "body": "Check this."}],
+                        self.anchors,
+                    )
 
     def test_review_verification_rejects_commit_mismatch(self):
         review = {
@@ -2430,6 +2629,66 @@ class PostingTest(unittest.TestCase):
             )
 
         self.assertEqual(result, review)
+
+    def test_review_verification_uses_graphql_original_start_line(self):
+        review = {
+            "id": 9,
+            "commit_id": self.pr["head_sha"],
+            "state": "PENDING",
+            "user": {"login": "viewer"},
+        }
+        expected = {
+            "path": "src/one.py",
+            "start_line": 2,
+            "start_side": "RIGHT",
+            "line": 4,
+            "side": "RIGHT",
+            "body": "Check this.",
+        }
+        legacy = {
+            "id": 17,
+            "node_id": "PRRC_test",
+            "path": "src/one.py",
+            "original_position": 5,
+            "body": expected["body"],
+        }
+        graphql = {
+            "data": {
+                "node": {
+                    "databaseId": 17,
+                    "line": None,
+                    "originalLine": 4,
+                    "startLine": None,
+                    "originalStartLine": 2,
+                }
+            }
+        }
+        self.assertEqual(
+            MODULE.validate_comments([expected], self.anchors), [expected]
+        )
+        with (
+            mock.patch.object(MODULE, "gh_json", side_effect=[review, graphql]),
+            mock.patch.object(MODULE, "gh_paginated", return_value=[legacy]),
+            mock.patch.object(MODULE, "ensure_head_unchanged"),
+        ):
+            self.assertEqual(
+                MODULE.verify_created_review(
+                    self.pr, "viewer", review["id"], [expected], self.anchors
+                ),
+                review,
+            )
+
+        graphql["data"]["node"]["databaseId"] = 18
+        with (
+            mock.patch.object(MODULE, "gh_json", side_effect=[review, graphql]),
+            mock.patch.object(MODULE, "gh_paginated", return_value=[legacy]),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.WorkflowError, "unexpected database ID"
+            ):
+                MODULE.verify_created_review(
+                    self.pr, "viewer", review["id"], [expected], self.anchors
+                )
 
     def test_review_verification_rejects_a_different_multi_line_start(self):
         review = {

@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 COMMON_MODULE_NAME = "pr_pipeline_common"
 COMMON_PATH = Path(__file__).resolve().parent / "pipeline_common.py"
-COMMON_SHA256 = "8cce896733cc2e844030e48a0db2002c9ac30e02f6d64e9fab2cb54a0526bff6"
+COMMON_SHA256 = "05f7745327e99ae11b0802c79fda5720ab2e242e6b5cb4506034a5545827270d"
 
 
 def load_common() -> Any:
@@ -208,6 +208,97 @@ def save_run_state(path: Path, state: dict[str, Any]) -> None:
     common.write_json_atomically(path, state)
 
 
+def validate_run_cursor(cursor: dict[str, Any], status: str) -> None:
+    def invalid(field: str) -> None:
+        raise WorkflowError(f"invalid bounded PR Pipeline cursor: {field}")
+
+    def counter(value: Any, minimum: int, maximum: int) -> bool:
+        return type(value) is int and minimum <= value <= maximum
+
+    def sha(value: Any) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+    if not cursor:
+        if status != "active":
+            invalid("waiting state has no checkpoint")
+        return
+
+    sweep = cursor.get("sweep")
+    index = cursor.get("stage_index")
+    initialized = cursor.get("initialized", False)
+    if not counter(sweep, 1, MAX_SWEEPS):
+        invalid("sweep")
+    if not counter(index, 0, len(STAGES)):
+        invalid("stage_index")
+    if type(initialized) is not bool or (not initialized and index != 0):
+        invalid("initialized")
+    completed = cursor.get("completed_sweeps", 0)
+    if not counter(completed, 0, MAX_SWEEPS - 1) or completed != sweep - 1:
+        invalid("completed_sweeps")
+    if type(cursor.get("completed_conflict_resolution", False)) is not bool:
+        invalid("completed_conflict_resolution")
+    for field in ("known_safe_head", "sweep_started_head"):
+        value = cursor.get(field)
+        if not sha(value):
+            invalid(field)
+    if not isinstance(cursor.get("sweep_started_base"), str) or not cursor["sweep_started_base"]:
+        invalid("sweep_started_base")
+    for field in ("head_changed", "base_changed"):
+        if type(cursor.get(field, False)) is not bool:
+            invalid(field)
+
+    runs = cursor.get("runs", [])
+    if not isinstance(runs, list):
+        invalid("runs")
+    for record in runs:
+        if (
+            not isinstance(record, dict)
+            or record.get("stage") not in STAGE_NAMES
+            or not counter(record.get("sweep"), 1, sweep)
+            or not isinstance(record.get("action"), str)
+            or not record["action"]
+        ):
+            invalid("runs")
+        for field in ("started_head_sha", "ended_head_sha"):
+            if field in record and not sha(record[field]):
+                invalid(f"runs.{field}")
+
+    pending = cursor.get("pending_stage")
+    if pending is None:
+        if status == "waiting":
+            invalid("pending_stage")
+        return
+    if not isinstance(pending, dict):
+        invalid("pending_stage")
+    if not initialized or index == len(STAGES):
+        invalid("pending_stage.stage_index")
+    if (
+        not counter(pending.get("sweep"), 1, MAX_SWEEPS)
+        or pending["sweep"] != sweep
+        or not counter(pending.get("stage_index"), 0, len(STAGES) - 1)
+        or pending["stage_index"] != index
+    ):
+        invalid("pending_stage position")
+    phase = pending.get("phase")
+    if phase != "waiting" and phase != "executing":
+        invalid("pending_stage.phase")
+    if status != ("waiting" if phase == "waiting" else "active"):
+        invalid("pending_stage.phase")
+    if not sha(pending.get("started_head_sha")):
+        invalid("pending_stage.started_head_sha")
+    snapshot = pending.get("commits_before")
+    if (
+        not isinstance(snapshot, dict)
+        or not isinstance(snapshot.get("commits"), list)
+        or any(
+            not isinstance(commit, dict) or not sha(commit.get("sha"))
+            for commit in snapshot["commits"]
+        )
+        or ("error" in snapshot and not isinstance(snapshot["error"], str))
+    ):
+        invalid("pending_stage.commits_before")
+
+
 def load_run_state(path: Path, *, session_id: str) -> dict[str, Any]:
     state = common.read_json(path)
     if (
@@ -218,6 +309,8 @@ def load_run_state(path: Path, *, session_id: str) -> dict[str, Any]:
         or not isinstance(state.get("cursor"), dict)
     ):
         raise WorkflowError("bounded PR Pipeline state is missing or belongs to another session")
+    if state["status"] in {"active", "waiting"}:
+        validate_run_cursor(state["cursor"], state["status"])
     return state
 
 
