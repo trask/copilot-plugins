@@ -61,6 +61,38 @@ class RuntimeLoaderTest(unittest.TestCase):
 
 
 class CandidateOutcomeTest(unittest.TestCase):
+    def test_candidate_validation_requires_stored_snapshot_identity(self):
+        runtime = SimpleNamespace(
+            PullRequestSnapshot=SimpleNamespace,
+            verify_current_candidate=mock.Mock(),
+        )
+        for field in (
+            "head_sha", "base_sha", "repo_name",
+            "head_owner", "head_repo", "merged_at", "merge_commit",
+        ):
+            with self.subTest(field=field):
+                stored = {key: value for key, value in METADATA.items() if key != field}
+                with (
+                    mock.patch.object(MODULE, "load_cloud_task_runtime", return_value=runtime),
+                    self.assertRaisesRegex(MODULE.WorkflowError, "incomplete identity"),
+                ):
+                    MODULE.validate_audit_candidate(
+                        {}, helper=Path("helper.py"), repo_root=Path("repo"),
+                        metadata=stored, requested_model="gpt-5.6-sol",
+                        prompt="audit", max_iterations=5,
+                    )
+        runtime.verify_current_candidate.assert_not_called()
+
+    def test_deleted_head_repository_keeps_explicit_null_identity(self):
+        metadata = {**METADATA, "head_owner": None, "head_repo": None}
+        self.assertEqual(
+            "owner/repo",
+            MODULE.expected_result_pull_request(metadata)["head_repository"],
+        )
+        MODULE.require_unchanged(
+            metadata, dict(metadata), message="merged pull request changed",
+        )
+
     def test_missing_outcome_reports_task_and_session(self):
         runtime = MODULE.load_cloud_task_runtime(RUNTIME_ROOT / "cloud_task.py")
         for commits in ([], ["4" * 40]):
@@ -173,6 +205,31 @@ class CandidateOutcomeTest(unittest.TestCase):
                     push.assert_not_called()
                     remote_head.assert_not_called()
                     confirm.assert_not_called()
+
+    def test_publication_rejects_missing_stored_identity_before_push(self):
+        for field in (
+            "head_sha", "base_sha", "repo_name",
+            "head_owner", "head_repo", "merged_at", "merge_commit",
+        ):
+            with self.subTest(field=field):
+                stored = {key: value for key, value in METADATA.items() if key != field}
+                state = {
+                    "pr": stored, "audit_branch": "trask-pr-audit-7",
+                    "original": {"head_branch": "feature"},
+                }
+                with (
+                    mock.patch.object(MODULE, "local_identity", return_value={
+                        "branch": "trask-pr-audit-7", "head": "2" * 40, "status": "",
+                    }),
+                    mock.patch.object(MODULE, "merged_metadata_for", return_value=METADATA),
+                    mock.patch.object(MODULE, "run") as push,
+                    self.assertRaisesRegex(MODULE.WorkflowError, "incomplete identity"),
+                ):
+                    MODULE.publish_agent_task_result(
+                        Path("repo"), state_path=Path("state.json"), state=state,
+                        remote={"final_local_head": "2" * 40, "commits": ["4" * 40]},
+                    )
+                push.assert_not_called()
 
 
 class AgentTaskCoordinatorTest(unittest.TestCase):
@@ -304,7 +361,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
     def test_pins_shared_helper_and_current_policy(self):
         self.assertEqual(
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
-            "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760",
+            "393ef906680b360c7fffa916ec349de64a61ac8bf08715e4981292b2d698c369",
         )
         self.assertEqual(
             MODULE.AGENT_TASK_POLICY,

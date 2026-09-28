@@ -111,7 +111,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
             },
         }
 
-    def execute(self, result, *, returncode=0, observed=None, pipeline=False):
+    def execute(self, result, *, returncode=0, observed=None, stored=None, pipeline=False):
         code_tip = self.code[-1]["sha"] if self.code else METADATA["head_sha"]
         repository = mock.Mock()
         repository.identity.return_value = SimpleNamespace(branch=self.identity["branch"])
@@ -170,7 +170,7 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         if not pipeline:
             args.repo_root = str(self.repo)
             args.state = str(self.state_path)
-        metadata_values = iter([METADATA, METADATA, observed or METADATA])
+        metadata_values = iter([stored or METADATA, stored or METADATA, observed or METADATA])
 
         def metadata(*_args):
             try:
@@ -298,3 +298,30 @@ class CurrentCandidateCoordinatorTest(unittest.TestCase):
         self.assertEqual(result["task"], state["agent_task"]["task"])
         self.assertEqual(result["generated"], state["agent_task"]["generated"])
         self.assertTrue(Path(state["agent_task"]["result_file"]).is_file())
+
+    def test_preflight_rejects_missing_stored_identity(self):
+        for field in (
+            "head_sha", "base_sha", "repo_name",
+            "head_owner", "head_repo", "merged_at", "merge_commit",
+        ):
+            with self.subTest(field=field):
+                self.state_path = self.root / f"missing-{field}.json"
+                stored = {key: value for key, value in METADATA.items() if key != field}
+                with self.assertRaisesRegex(MODULE.WorkflowError, "incomplete identity"):
+                    self.execute(self.candidate(), stored=stored)
+                self.assertEqual([], self.commands)
+                self.assertFalse(self.state_path.exists())
+
+    def test_incomplete_live_identity_supersedes_candidate_before_import(self):
+        for field in (
+            "head_sha", "base_sha", "repo_name",
+            "head_owner", "head_repo", "merged_at", "merge_commit",
+        ):
+            with self.subTest(field=field):
+                self.state_path = self.root / f"live-missing-{field}.json"
+                observed = {key: value for key, value in METADATA.items() if key != field}
+                output = self.execute(self.candidate(with_code=True), observed=observed)
+                self.assertEqual("head_moved", output["result"])
+                self.assertFalse(output["import_performed"])
+                self.assertFalse(output["publication_performed"])
+                self.assertEqual([], self.commands)

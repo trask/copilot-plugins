@@ -107,6 +107,48 @@ class ClearanceSnapshotTest(unittest.TestCase):
             mutate(self.state)
             self.assertEqual("unverified", MODULE.verify_clearance_snapshot(self.state)["result"])
 
+    def test_missing_stored_head_base_or_repository_cannot_record_or_reuse_clearance(self):
+        self.record()
+        original = copy.deepcopy(self.state)
+        for field, container in (
+            ("head_sha", "pr"),
+            ("sha", "base"),
+            ("repository", "base"),
+            ("repo_name", "pr"),
+        ):
+            with self.subTest(field=field, container=container):
+                state = copy.deepcopy(original)
+                record = state["pr"]["base"] if container == "base" else state["pr"]
+                record.pop(field)
+                self.state = state
+                self.assertEqual("unverified", MODULE.verify_clearance_snapshot(state)["result"])
+                with self.assertRaisesRegex(MODULE.WorkflowError, "no reusable clearance"):
+                    self.record()
+
+    def test_malformed_observed_clearance_cannot_match(self):
+        self.record()
+        recorded = copy.deepcopy(self.state["validation"]["clearance_snapshot"])
+        for corrupt in (
+            lambda snapshot: snapshot.pop("base_sha"),
+            lambda snapshot: snapshot["viewer"].pop("login"),
+            lambda snapshot: snapshot["viewer"]["permissions"].pop("push"),
+        ):
+            with self.subTest(corrupt=corrupt):
+                malformed = copy.deepcopy(recorded)
+                corrupt(malformed)
+                with mock.patch.object(
+                    MODULE, "clearance_snapshot", side_effect=[recorded, malformed]
+                ):
+                    result = MODULE.verify_clearance_snapshot(self.state)
+                self.assertEqual("stale", result["result"])
+                self.assertIsNone(result["observed_snapshot_sha256"])
+                with mock.patch.object(
+                    MODULE, "clearance_snapshot", side_effect=[recorded, malformed]
+                ), self.assertRaisesRegex(
+                    MODULE.WorkflowError, "no reusable clearance"
+                ):
+                    self.record()
+
     def test_capture_accepts_moved_base_and_retains_pinned_provenance(self):
         pinned = self.state["pr"]["base"]["sha"]
         self.live["pr"]["base"]["sha"] = "9" * 40

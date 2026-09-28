@@ -261,6 +261,82 @@ def agent_task_preflight(**pr_overrides):
     }
 
 
+class PinnedSnapshotCallerTest(unittest.TestCase):
+    def test_apply_and_validation_reject_live_repository_drift(self):
+        for caller in ("apply", "no_change"):
+            for live_repository in (None, "other/repo"):
+                with self.subTest(caller=caller, live_repository=live_repository):
+                    pr = pr_metadata()
+                    live = dict(pr)
+                    if live_repository is None:
+                        live.pop("repo_name")
+                    else:
+                        live["repo_name"] = live_repository
+                    state = {"run_id": "run-1", "pr": dict(pr)}
+                    if caller == "apply":
+                        proposal = {
+                            "run_id": "run-1", "number": 1,
+                            "base": {key: pr[key] for key in ("head_sha", "title", "body")},
+                            "title": "Updated title", "body": "Updated body",
+                        }
+                        proposal["token"] = MODULE.proposal_token_for(proposal)
+                        state["proposal"] = proposal
+                    with (
+                        mock.patch.object(MODULE, "metadata_for", return_value=live),
+                        mock.patch.object(MODULE, "update_pr") as update,
+                        mock.patch.object(MODULE, "save_state") as save,
+                        self.assertRaises(MODULE.WorkflowError),
+                    ):
+                        if caller == "apply":
+                            MODULE.apply_proposal(
+                                Path("state.json"), state,
+                                expected_head=pr["head_sha"], expected_run_id="run-1",
+                                expected_proposal_token=proposal["token"],
+                            )
+                        else:
+                            MODULE.validate_no_change(
+                                Path("state.json"), state,
+                                expected_head=pr["head_sha"], expected_run_id="run-1",
+                            )
+                    update.assert_not_called()
+                    save.assert_not_called()
+
+    def test_apply_and_validation_reject_missing_stored_identity_before_mutation(self):
+        for caller in ("apply", "no_change"):
+            for missing in ("head_sha", "repo_name"):
+                with self.subTest(caller=caller, missing=missing):
+                    pr = pr_metadata()
+                    state = {"run_id": "run-1", "pr": dict(pr)}
+                    if caller == "apply":
+                        proposal = {
+                            "run_id": "run-1", "number": 1,
+                            "base": {key: pr[key] for key in ("head_sha", "title", "body")},
+                            "title": "Updated title", "body": "Updated body",
+                        }
+                        proposal["token"] = MODULE.proposal_token_for(proposal)
+                        state["proposal"] = proposal
+                    state["pr"].pop(missing)
+                    with (
+                        mock.patch.object(MODULE, "metadata_for", return_value=pr),
+                        mock.patch.object(MODULE, "update_pr") as update,
+                        mock.patch.object(MODULE, "save_state") as save,
+                        self.assertRaises(MODULE.WorkflowError),
+                    ):
+                        if caller == "apply":
+                            MODULE.apply_proposal(
+                                Path("state.json"), state,
+                                expected_head=pr["head_sha"], expected_run_id="run-1",
+                                expected_proposal_token=proposal["token"],
+                            )
+                        else:
+                            MODULE.validate_no_change(
+                                Path("state.json"), state,
+                                expected_head=pr["head_sha"], expected_run_id="run-1",
+                            )
+                    update.assert_not_called()
+                    save.assert_not_called()
+
+
 def agent_task_result(preflight=None, **overrides):
     preflight = preflight or agent_task_preflight()
     pr = preflight["pr"]
@@ -661,7 +737,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         entry = next(
             item for item in marketplace["plugins"] if item["name"] == plugin["name"]
         )
-        self.assertEqual(plugin["version"], "1.0.99")
+        self.assertEqual(plugin["version"], "1.0.101")
         self.assertEqual(entry["version"], plugin["version"])
 
     def test_authenticated_preflight_pins_base_head_viewer_and_permissions(self):
@@ -722,6 +798,37 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertEqual(context["viewer"]["login"], "viewer")
         self.assertIsNone(context["viewer"]["repository_role"])
         self.assertTrue(context["viewer"]["permissions"]["push"])
+
+    def test_authenticated_preflight_rejects_missing_stored_repository(self):
+        pinned = pr_metadata(head_sha="1" * 40)
+        pinned.pop("repo_name")
+        payload = {
+            "state": "open", "title": pinned["title"], "body": pinned["body"],
+            "base": {
+                "repo": {"full_name": "owner/repo"},
+                "ref": "main", "sha": "2" * 40,
+            },
+            "head": {
+                "repo": {"full_name": "owner/repo"},
+                "ref": "feature", "sha": pinned["head_sha"],
+            },
+        }
+        repository = {
+            "permissions": dict.fromkeys(
+                ("admin", "maintain", "push", "triage", "pull"), True
+            ),
+        }
+        with (
+            mock.patch.object(MODULE, "metadata_for", return_value=pinned),
+            mock.patch.object(
+                MODULE, "gh_json", side_effect=[payload, repository, {"login": "viewer"}],
+            ),
+            mock.patch.object(MODULE, "live_branch_tip", return_value=pinned["head_sha"]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "inconsistent PR metadata"),
+        ):
+            MODULE.agent_task_preflight(
+                Path("repo"), MODULE.parse_target("owner/repo#7")
+            )
 
     def test_authenticated_preflight_rejects_mismatched_live_base_ref(self):
         head_sha = self.preflight["pr"]["head_sha"]
@@ -2007,7 +2114,7 @@ class RecommendationContractTest(unittest.TestCase):
 
     def test_runtime_policy_and_proposal_versions_are_pinned(self):
         self.assertEqual(
-            "7bc8f8c6f56670bb5e138ef68b5f6557b0aa3fcc7ee0f8cf748743121d56d760",
+            "393ef906680b360c7fffa916ec349de64a61ac8bf08715e4981292b2d698c369",
             MODULE.REQUIRED_CLOUD_TASK_SHA256,
         )
         self.assertEqual(

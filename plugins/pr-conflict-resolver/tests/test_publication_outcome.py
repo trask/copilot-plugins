@@ -22,9 +22,11 @@ class PublicationOutcomeTest(unittest.TestCase):
             "history": [], "repo_root": str(self.root),
             "agent_task": {
                 "status": "verified", "code_refs": self.refs,
+                "artifact": {},
                 "preflight": {"repository_root": str(self.root), "request": self.request},
             },
         }
+        self.candidate = MODULE.publication_evidence(self.request, self.refs, {})
         self.metadata = existing.pr_metadata()
         self.metadata.update(head_sha="c" * 40, base_sha="a" * 40)
         self.context = self.enterContext(ExitStack())
@@ -48,7 +50,7 @@ class PublicationOutcomeTest(unittest.TestCase):
             self.mocks[name] = self.context.enter_context(mock.patch.object(MODULE, name, **options))
 
     def publish(self):
-        result = MODULE.publish_conflict_result(self.path, self.state)
+        result = MODULE.publish_conflict_result(self.path, self.state, self.candidate)
         persisted = MODULE.load_state(self.path)
         self.assertEqual(result["stage_outcome"], MODULE.stage_outcome(persisted))
         args = MODULE.build_parser().parse_args(["status", "--state", str(self.path)])
@@ -84,6 +86,10 @@ class PublicationOutcomeTest(unittest.TestCase):
             "selected": [6, 7], "topology_fingerprint": "ordered-topology",
         }
         self.state["agent_task"]["preflight"]["stack_request"] = authorization
+        self.state["agent_task"]["artifact"] = {"members": [{"pr_number": 6}, {"pr_number": 7}]}
+        self.candidate = MODULE.publication_evidence(
+            self.request, self.refs, self.state["agent_task"]["artifact"]
+        )
         result = self.publish()
         self.assertEqual("c" * 40, result["head_sha"])
         publication = self.state["agent_task"]["publication"]
@@ -116,7 +122,7 @@ class PublicationOutcomeTest(unittest.TestCase):
         }
         self.mocks["require_stack_request_owner"].side_effect = MODULE.WorkflowError("owner changed")
         with self.assertRaisesRegex(MODULE.WorkflowError, "owner changed"):
-            MODULE.publish_conflict_result(self.path, self.state)
+            MODULE.publish_conflict_result(self.path, self.state, self.candidate)
         self.assertIsNone(MODULE.stage_outcome(MODULE.load_state(self.path)))
         self.mocks["git_try"].assert_not_called()
 
@@ -125,7 +131,7 @@ class PublicationOutcomeTest(unittest.TestCase):
         evidence = self.root / "candidate.json"
         evidence.write_text("retained", encoding="utf-8")
         self.state["agent_task"]["recovery_files"] = [str(evidence)]
-        result = MODULE.publish_conflict_result(self.path, self.state)
+        result = MODULE.publish_conflict_result(self.path, self.state, self.candidate)
         self.assertFalse(result["clearance_stale"])
         self.assertEqual("cleared", result["stage_outcome"])
         self.assertEqual("retained", evidence.read_text(encoding="utf-8"))
@@ -148,23 +154,57 @@ class PublicationOutcomeTest(unittest.TestCase):
                 self.mocks["remote_publication_heads"].side_effect = None
                 self.mocks["remote_publication_heads"].return_value = heads
                 with self.assertRaises(MODULE.WorkflowError):
-                    MODULE.publish_conflict_result(self.path, self.state)
+                    MODULE.publish_conflict_result(self.path, self.state, self.candidate)
                 self.assertIsNone(MODULE.stage_outcome(self.state))
                 self.assertIsNone(MODULE.cleared_head_sha(self.state))
+
+    def test_changed_cached_single_branch_command_cannot_push(self):
+        self.state["agent_task"]["push_command"] = ["git", "push", "other-branch"]
+        self.mocks["remote_publication_heads"].side_effect = None
+        self.mocks["remote_publication_heads"].return_value = ["b" * 40]
+        with self.assertRaisesRegex(MODULE.WorkflowError, "publication command changed"):
+            MODULE.publish_conflict_result(self.path, self.state, self.candidate)
+        self.mocks["run"].assert_not_called()
 
     def test_member_change_after_publication_does_not_complete(self):
         self.mocks["remote_publication_heads"].side_effect = [["c" * 40], ["changed"]]
         with self.assertRaisesRegex(MODULE.WorkflowError, "heads changed"):
-            MODULE.publish_conflict_result(self.path, self.state)
+            MODULE.publish_conflict_result(self.path, self.state, self.candidate)
         self.assertIsNone(MODULE.stage_outcome(MODULE.load_state(self.path)))
         self.mocks["git_try"].assert_not_called()
 
-    def test_missing_invoked_member_cannot_publish(self):
+    def test_changed_invoked_member_cannot_publish(self):
         self.refs[0]["pr_number"] = 8
-        with self.assertRaisesRegex(MODULE.WorkflowError, "invoked pull request"):
-            MODULE.publish_conflict_result(self.path, self.state)
+        with self.assertRaisesRegex(MODULE.WorkflowError, "evidence changed"):
+            MODULE.publish_conflict_result(self.path, self.state, self.candidate)
         self.mocks["run"].assert_not_called()
         self.mocks["remote_publication_heads"].assert_not_called()
+
+    def test_recovered_publication_reverifies_the_saved_result(self):
+        result = existing.ManagedConflictCoordinatorTest().success_result(self.request)
+        artifact = result["generated"]["artifact"]
+        self.state["agent_task"].update(result=result, artifact=artifact)
+        with mock.patch.object(
+            MODULE, "verify_quarantined_result",
+            return_value=MODULE.publication_evidence(
+                self.request, self.refs, artifact, result
+            ),
+        ) as verify:
+            published = MODULE.publish_conflict_result(self.path, self.state)
+        self.assertEqual("published", published["result"])
+        verify.assert_called_once_with(self.root, self.request, self.refs, artifact, result)
+
+    def test_recovered_publication_rejects_missing_saved_artifact(self):
+        result = existing.ManagedConflictCoordinatorTest().success_result(self.request)
+        self.state["agent_task"]["result"] = result
+        with (
+            mock.patch.object(MODULE, "verify_quarantined_result") as verify,
+            self.assertRaisesRegex(MODULE.WorkflowError, "evidence changed"),
+        ):
+            MODULE.publish_conflict_result(self.path, self.state)
+        verify.assert_not_called()
+        self.mocks["remote_publication_heads"].assert_not_called()
+        self.mocks["run"].assert_not_called()
 
     def test_incomplete_failed_and_changed_receipts_cannot_reuse_clearance(self):
         self.metadata["mergeable"] = "MERGEABLE"

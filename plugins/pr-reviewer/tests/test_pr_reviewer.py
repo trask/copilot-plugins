@@ -68,6 +68,47 @@ class WindowsSubprocessTest(unittest.TestCase):
         self.assertNotIn("creationflags", subprocess_run.call_args.kwargs)
 
 
+class OutputPublicationTest(unittest.TestCase):
+    def test_diff_and_context_use_atomic_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            diff = root / "diff.txt"
+            context = root / "context.json"
+            self.assertEqual(
+                str(diff.resolve()), MODULE.write_diff_file(str(diff), DIFF)
+            )
+            self.assertEqual(
+                str(context.resolve()),
+                MODULE.write_context_file(str(context), {"head_sha": "abc"}),
+            )
+            self.assertEqual(DIFF, diff.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {"head_sha": "abc"},
+                json.loads(context.read_text(encoding="utf-8")),
+            )
+            self.assertEqual([], list(root.glob(".*.tmp")))
+
+    def test_failed_replacement_keeps_previous_diff_and_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, publish, value in (
+                ("diff.txt", MODULE.write_diff_file, DIFF),
+                ("context.json", MODULE.write_context_file, {"head_sha": "abc"}),
+            ):
+                with self.subTest(name=name):
+                    destination = root / name
+                    destination.write_text("previous", encoding="utf-8")
+                    with mock.patch.object(
+                        MODULE.os, "replace", side_effect=OSError("disk full")
+                    ):
+                        with self.assertRaisesRegex(MODULE.WorkflowError, "disk full"):
+                            publish(str(destination), value)
+                    self.assertEqual(
+                        "previous", destination.read_text(encoding="utf-8")
+                    )
+                    self.assertEqual([], list(root.glob(f".{name}.*.tmp")))
+
+
 DIFF = """\
 diff --git a/src/one.py b/src/one.py
 index 1111111..2222222 100644

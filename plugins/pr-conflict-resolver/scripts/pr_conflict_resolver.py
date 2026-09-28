@@ -20,7 +20,7 @@ import tempfile
 import time
 import urllib.parse
 from types import ModuleType
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 
 STATE_VERSION = 1
@@ -112,6 +112,99 @@ _BOUNDED_STACK_AUTH: tuple[Path, str] | None = None
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class PublicationRef(NamedTuple):
+    role: str
+    pr_number: int
+    base_sha: str
+    lease_sha: str
+    new_sha: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "pr_number": self.pr_number,
+            "base_sha": self.base_sha,
+            "lease_sha": self.lease_sha,
+            "new_sha": self.new_sha,
+        }
+
+
+class VerifiedPublication(NamedTuple):
+    request_json: str
+    code_refs_json: str
+    artifact_json: str
+    result_json: str | None
+    refs: tuple[PublicationRef, ...]
+    artifact_members: tuple[int, ...]
+
+    def require_unchanged(self, request: dict[str, Any], task: dict[str, Any]) -> None:
+        if (
+            not isinstance(task.get("code_refs"), list)
+            or not isinstance(task.get("artifact"), dict)
+            or canonical_json(request) != self.request_json
+            or canonical_json(task["code_refs"]) != self.code_refs_json
+            or canonical_json(task["artifact"]) != self.artifact_json
+            or (
+                self.result_json is not None
+                and (
+                    not isinstance(task.get("result"), dict)
+                    or canonical_json(task["result"]) != self.result_json
+                )
+            )
+        ):
+            raise WorkflowError("verified conflict publication evidence changed")
+
+    def publication_refs(self) -> list[dict[str, Any]]:
+        return [ref.as_dict() for ref in self.refs]
+
+
+def publication_evidence(
+    request: dict[str, Any],
+    code_refs: list[dict[str, Any]],
+    artifact: dict[str, Any],
+    result: dict[str, Any] | None = None,
+) -> VerifiedPublication:
+    try:
+        refs = tuple(
+            PublicationRef(
+                role=item["role"],
+                pr_number=item["pr_number"],
+                base_sha=item["base_sha"],
+                lease_sha=item["lease_sha"],
+                new_sha=item["new_sha"],
+            )
+            for item in code_refs
+        )
+        members = (
+            tuple(item["pr_number"] for item in artifact["members"])
+            if request["strategy"] == "native-stack" else ()
+        )
+        if (
+            not refs
+            or any(
+                not isinstance(ref.role, str)
+                or type(ref.pr_number) is not int
+                or any(
+                    not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha)
+                    for sha in (ref.base_sha, ref.lease_sha, ref.new_sha)
+                )
+                for ref in refs
+            )
+            or any(type(number) is not int for number in members)
+        ):
+            raise ValueError("invalid publication fields")
+        return VerifiedPublication(
+            request_json=canonical_json(request),
+            code_refs_json=canonical_json(code_refs),
+            artifact_json=canonical_json(artifact),
+            result_json=canonical_json(result) if result is not None else None,
+            refs=refs,
+            artifact_members=members,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise WorkflowError("verified conflict publication evidence is incomplete") from error
 
 
 class NativeStackNormalizationRequired(WorkflowError):
@@ -2771,11 +2864,13 @@ def command_descendant_propagate(args: argparse.Namespace) -> None:
                 )
                 if code_refs != task["code_refs"] or artifact != task["artifact"]:
                     raise WorkflowError("preserved hosted result identity changed")
-                verify_quarantined_result(workspace, preflight["request"], code_refs, artifact)
+                candidate = verify_quarantined_result(
+                    workspace, preflight["request"], code_refs, artifact, task["result"]
+                )
                 state["retry_allowed"] = False
                 save_state(state_path, state)
                 started = True
-                result = publish_conflict_result(state_path, state)
+                result = publish_conflict_result(state_path, state, candidate)
             intended = [
                 {"number": item["pr_number"], "head_sha": item["new_sha"]}
                 for item in state["agent_task"]["code_refs"]
@@ -4951,7 +5046,8 @@ def verify_quarantined_result(
     request: dict[str, Any],
     code_refs: list[dict[str, Any]],
     artifact: dict[str, Any],
-) -> None:
+    result: dict[str, Any] | None = None,
+) -> VerifiedPublication:
     if (
         not isinstance(code_refs, list)
         or not all(isinstance(item, dict) for item in code_refs)
@@ -5137,6 +5233,7 @@ def verify_quarantined_result(
         raise WorkflowError(
             "mechanical conflict receipt does not match the pinned request"
         )
+    return publication_evidence(request, code_refs, artifact, result)
 
 
 def require_live_conflict_guards(
@@ -5393,11 +5490,26 @@ def published_conflict_snapshot(
 def publish_conflict_result(
     state_path: Path,
     state: dict[str, Any],
+    candidate: VerifiedPublication | None = None,
 ) -> dict[str, Any]:
     task = state["agent_task"]
     preflight = task["preflight"]
     request = preflight["request"]
-    code_refs = task["code_refs"]
+    if candidate is None:
+        if not isinstance(task.get("result"), dict):
+            raise WorkflowError("verified conflict publication evidence is missing")
+        repo_root = Path(preflight["repository_root"])
+        code_refs, artifact = validate_conflict_result_identity(task["result"], request)
+        if code_refs != task.get("code_refs") or artifact != task.get("artifact"):
+            raise WorkflowError("verified conflict publication evidence changed")
+        candidate = verify_quarantined_result(
+            repo_root, request, code_refs, artifact, task["result"]
+        )
+    if not isinstance(candidate, VerifiedPublication):
+        raise WorkflowError("verified conflict publication evidence is missing")
+    candidate.require_unchanged(request, task)
+    repo_root = Path(preflight["repository_root"])
+    code_refs = candidate.publication_refs()
     invoked = next(
         (
             item for item in code_refs
@@ -5407,10 +5519,10 @@ def publish_conflict_result(
     )
     if invoked is None:
         raise WorkflowError("verified conflict members do not include the invoked pull request")
-    repo_root = Path(preflight["repository_root"])
     require_clean_worktree(repo_root)
     require_no_integration_in_progress(repo_root)
     guarded = require_live_conflict_guards(repo_root, preflight)
+    candidate.require_unchanged(request, task)
     if (
         guarded["base_sha"] != invoked["base_sha"]
         and not commit_contains(
@@ -5430,6 +5542,7 @@ def publish_conflict_result(
     expected_old = [item["lease_sha"] for item in code_refs]
     expected_new = [item["new_sha"] for item in code_refs]
     current = remote_publication_heads(request, code_refs)
+    candidate.require_unchanged(request, task)
     if current == expected_new:
         pushed = True
     elif current != expected_old:
@@ -5438,23 +5551,23 @@ def publish_conflict_result(
         )
     else:
         command = task.get("push_command")
-        if preflight.get("stack_request") is not None:
-            expected_command = conflict_push_command(repo_root, request, code_refs)
-            if command is not None and command != expected_command:
-                raise WorkflowError("preserved stack publication command changed")
-            command = expected_command
-        if not isinstance(command, list):
-            command = conflict_push_command(repo_root, request, code_refs)
+        expected_command = conflict_push_command(repo_root, request, code_refs)
+        if command is not None and command != expected_command:
+            raise WorkflowError("preserved publication command changed")
+        command = expected_command
         task["push_command"] = command
         task["status"] = "publishing"
         save_state(state_path, state)
+        candidate.require_unchanged(request, task)
         if preflight.get("stack_request") is not None:
             require_live_conflict_guards(repo_root, preflight)
+            candidate.require_unchanged(request, task)
         process = run(command, check=False)
         current = remote_publication_heads(request, code_refs)
         if current == expected_old:
             if preflight.get("stack_request") is not None:
                 require_live_conflict_guards(repo_root, preflight)
+                candidate.require_unchanged(request, task)
             process = run(command, check=False)
             current = remote_publication_heads(request, code_refs)
         if current != expected_new:
@@ -5482,7 +5595,7 @@ def publish_conflict_result(
     state["last_result"] = "published"
     state["attempts"] = int(state.get("attempts", 0))
     save_state(state_path, state)
-    publication = published_conflict_snapshot(task, refreshed)
+    publication = published_conflict_snapshot({**task, "code_refs": code_refs}, refreshed)
     base_advanced = publication["clearance_stale"]
     mergeability = publication["mergeability"]
     if preflight.get("stack_request") is not None:
@@ -5527,12 +5640,12 @@ def publish_conflict_result(
     task["publication"] = publication
     task["status"] = "completed"
     save_state(state_path, state)
-    for role in [item["role"] for item in code_refs] + ["artifact"]:
+    for role in [item.role for item in candidate.refs] + ["artifact"]:
         git_try(repo_root, "update-ref", "-d", quarantine_ref(request["request_id"], role))
-    for member in task.get("artifact", {}).get("members", []):
+    for number in candidate.artifact_members:
         git_try(
             repo_root, "update-ref", "-d",
-            quarantine_ref(request["request_id"], f"artifact-member-{member['pr_number']}"),
+            quarantine_ref(request["request_id"], f"artifact-member-{number}"),
         )
     for file_name in task.get("audit_files") or []:
         try:
@@ -6046,18 +6159,19 @@ def command_agent_task(args: argparse.Namespace, *, result_sink=None) -> None:
     code_refs, artifact = validate_conflict_result_identity(
         result, preflight["request"]
     )
-    verify_quarantined_result(
+    candidate = verify_quarantined_result(
         repo_root,
         preflight["request"],
         code_refs,
         artifact,
+        result,
     )
     require_live_conflict_guards(repo_root, preflight)
     task["code_refs"] = code_refs
     task["artifact"] = artifact
     task["status"] = "verified"
     save_state(state_path, state)
-    output(publish_conflict_result(state_path, state))
+    output(publish_conflict_result(state_path, state, candidate))
 
 
 def record_mergeable_conflict(
@@ -6518,11 +6632,13 @@ def advance_bounded_conflict(
     if phase != "collect" or receipt.get("status") != "completed":
         raise WorkflowError("bounded conflict success did not follow completed task observation")
     code_refs, artifact = validate_conflict_result_identity(result, request)
-    verify_quarantined_result(Path(state["repo_root"]), request, code_refs, artifact)
+    candidate = verify_quarantined_result(
+        Path(state["repo_root"]), request, code_refs, artifact, result
+    )
     require_live_conflict_guards(Path(state["repo_root"]), task["preflight"])
     task.update(code_refs=code_refs, artifact=artifact, status="verified")
     save_state(state_path, state)
-    emit(publish_conflict_result(state_path, state))
+    emit(publish_conflict_result(state_path, state, candidate))
 
 
 def command_bounded_pipeline(args: argparse.Namespace) -> int:

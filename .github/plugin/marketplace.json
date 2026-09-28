@@ -17,7 +17,7 @@
     {
       "name": "pr-reviewer",
       "description": "Review a GitHub pull request and create a verified pending review with high-confidence inline comments.",
-      "version": "1.8.42",
+      "version": "1.8.43",
       "source": "./plugins/pr-reviewer"
     },
     {
@@ -35,7 +35,7 @@
     {
       "name": "pr-description",
       "description": "Review and update a pull request title and description through a managed GitHub Agent Task.",
-      "version": "1.0.100",
+      "version": "1.0.101",
       "source": "./plugins/pr-description"
     },
     {
@@ -47,19 +47,19 @@
     {
       "name": "pr-conflict-resolver",
       "description": "Resolve the merge conflicts on a pull request in one pass by keeping both sides' intent, then push the resolution.",
-      "version": "1.1.72",
+      "version": "1.1.73",
       "source": "./plugins/pr-conflict-resolver"
     },
     {
       "name": "ci-fix-loop",
       "description": "Run one sealed, stateless CI repair invocation against a frozen pull request head.",
-      "version": "1.6.117",
+      "version": "1.6.118",
       "source": "./plugins/ci-fix-loop"
     },
     {
       "name": "historical-pr-audit",
       "description": "Audit an already-merged GitHub pull request against its own historical snapshot, verify each finding independently, and commit the fixes on a separate audit branch.",
-      "version": "1.1.49",
+      "version": "1.1.50",
       "source": "./plugins/historical-pr-audit"
     }
   ]

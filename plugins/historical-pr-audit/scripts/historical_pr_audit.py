@@ -1114,7 +1114,11 @@ def local_identity(repo_root: Path) -> dict[str, str]:
     }
 
 
-def same_snapshot(left: dict[str, Any], right: dict[str, Any]) -> bool:
+class SnapshotDrift(WorkflowError):
+    pass
+
+
+def pinned_snapshot_identity(metadata: dict[str, Any]) -> dict[str, Any]:
     fields = (
         "number",
         "pr_url",
@@ -1131,7 +1135,43 @@ def same_snapshot(left: dict[str, Any], right: dict[str, Any]) -> bool:
         "base_branch",
         "base_sha",
     )
-    return all(left.get(field) == right.get(field) for field in fields)
+    if not isinstance(metadata, dict) or (
+        not set(fields).issubset(metadata)
+        or type(metadata.get("number")) is not int
+        or metadata["number"] < 1
+        or any(
+            not isinstance(metadata.get(field), str) or not metadata[field]
+            for field in ("pr_url", "repo_name", "state", "title", "merged_at",
+                          "head_branch", "head_sha", "base_branch", "base_sha")
+        )
+        or not isinstance(metadata.get("body"), str)
+        or (
+            metadata["merge_commit"] is not None
+            and (
+                not isinstance(metadata["merge_commit"], str)
+                or not metadata["merge_commit"]
+            )
+        )
+        or any(
+            value is not None and (not isinstance(value, str) or not value)
+            for value in (metadata["head_owner"], metadata["head_repo"])
+        )
+        or (metadata["head_owner"] is None) != (metadata["head_repo"] is None)
+    ):
+        raise WorkflowError("merged pull request snapshot has incomplete identity")
+    return {field: metadata[field] for field in fields}
+
+
+def require_unchanged(
+    pinned: dict[str, Any], live: dict[str, Any], *, message: str
+) -> None:
+    expected = pinned_snapshot_identity(pinned)
+    try:
+        observed = pinned_snapshot_identity(live)
+    except WorkflowError as error:
+        raise SnapshotDrift(message) from error
+    if expected != observed:
+        raise SnapshotDrift(message)
 
 
 def build_worker_prompt(
@@ -1296,20 +1336,21 @@ def load_agent_task_result(path: Path) -> dict[str, Any]:
 
 
 def expected_result_pull_request(metadata: dict[str, Any]) -> dict[str, Any]:
+    pinned = pinned_snapshot_identity(metadata)
     head_repository = (
-        f"{metadata['head_owner']}/{metadata['head_repo']}"
-        if metadata.get("head_owner") and metadata.get("head_repo")
-        else metadata["repo_name"]
+        f"{pinned['head_owner']}/{pinned['head_repo']}"
+        if pinned["head_owner"] is not None
+        else pinned["repo_name"]
     )
     return {
-        "number": metadata["number"],
-        "url": metadata["pr_url"],
-        "base_repository": metadata["repo_name"],
-        "base_ref": metadata["base_branch"],
-        "base_sha": metadata["base_sha"].lower(),
+        "number": pinned["number"],
+        "url": pinned["pr_url"],
+        "base_repository": pinned["repo_name"],
+        "base_ref": pinned["base_branch"],
+        "base_sha": pinned["base_sha"].lower(),
         "head_repository": head_repository,
-        "head_ref": metadata["head_branch"],
-        "head_sha": metadata["head_sha"].lower(),
+        "head_ref": pinned["head_branch"],
+        "head_sha": pinned["head_sha"].lower(),
     }
 
 
@@ -1545,8 +1586,10 @@ def publish_agent_task_result(
     if local_identity(repo_root) != expected_identity:
         raise WorkflowError("local repository changed before authenticated publication")
     live = merged_metadata_for(parse_target(metadata["pr_url"]))
-    if not same_snapshot(metadata, live):
-        raise WorkflowError("merged pull request identity, title, or body changed before publication")
+    require_unchanged(
+        metadata, live,
+        message="merged pull request identity, title, or body changed before publication",
+    )
     commits = remote["commits"]
     pushed = False
     if commits:
@@ -1789,8 +1832,10 @@ def command_agent_task(args: argparse.Namespace) -> None:
     }
     metadata = merged_metadata_for(target)
     refreshed = merged_metadata_for(target)
-    if not same_snapshot(metadata, refreshed):
-        raise WorkflowError("merged pull request changed during immutable preflight")
+    require_unchanged(
+        metadata, refreshed,
+        message="merged pull request changed during immutable preflight",
+    )
     audit_branch = audit_branch_name(metadata["number"])
     artifacts = agent_task_artifacts(state_path, 1)
     for artifact in artifacts.values():
@@ -2032,7 +2077,12 @@ def command_agent_task(args: argparse.Namespace) -> None:
                 "local audit branch drifted before report validation"
             )
         live = merged_metadata_for(target)
-        if not same_snapshot(metadata, live):
+        try:
+            require_unchanged(
+                metadata, live,
+                message="merged pull request changed before candidate import",
+            )
+        except SnapshotDrift:
             current = load_state(state_path)
             pipeline_iteration = args.pipeline_iteration
             pipeline_max_iterations = args.pipeline_max_iterations
@@ -2044,7 +2094,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
             )
             source_drift = {
                 "expected_head_sha": metadata["head_sha"],
-                "observed_head_sha": live["head_sha"],
+                "observed_head_sha": live.get("head_sha"),
                 "pipeline_iteration": pipeline_iteration,
                 "pipeline_max_iterations": pipeline_max_iterations,
                 "consumed_allowance": 1,

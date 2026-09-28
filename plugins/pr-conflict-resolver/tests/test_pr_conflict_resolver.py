@@ -38,6 +38,17 @@ sys.modules[CLOUD_SPEC.name] = CLOUD_MODULE
 CLOUD_SPEC.loader.exec_module(CLOUD_MODULE)
 
 
+class ModuleImportTest(unittest.TestCase):
+    def test_publication_types_import_without_module_registration(self):
+        spec = importlib.util.spec_from_file_location("unregistered_conflict_resolver", SCRIPT)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        self.assertNotIn(spec.name, sys.modules)
+        spec.loader.exec_module(module)
+        self.assertTrue(issubclass(module.VerifiedPublication, tuple))
+        self.assertTrue(issubclass(module.PublicationRef, tuple))
+
+
 class BaseDriftPublicationTest(unittest.TestCase):
     def task(self):
         old_base = "1" * 40
@@ -2249,6 +2260,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
                     "repository_root": str(directory),
                 },
                 "code_refs": code_refs,
+                "artifact": {},
             }
         }
         with (
@@ -2270,7 +2282,10 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
             mock.patch.object(MODULE, "run") as runner,
             self.assertRaisesRegex(MODULE.WorkflowError, "mixed or unexpected"),
         ):
-            MODULE.publish_conflict_result(directory / "state.json", state)
+            MODULE.publish_conflict_result(
+                directory / "state.json", state,
+                MODULE.publication_evidence(request, code_refs, {}),
+            )
         runner.assert_not_called()
 
     def test_native_stack_publication_is_atomic_with_one_lease_per_branch(self):

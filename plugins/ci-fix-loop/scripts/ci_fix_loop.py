@@ -3621,7 +3621,7 @@ def decide(
     }
 
 
-def approval_blocked_runs(payload: Any) -> list[dict[str, Any]]:
+def approval_blocked_runs(payload: Any, head_sha: str) -> list[dict[str, Any]]:
     runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
     if not isinstance(runs, list):
         return []
@@ -3634,6 +3634,11 @@ def approval_blocked_runs(payload: Any) -> list[dict[str, Any]]:
         status = str(entry.get("status") or "").upper()
         conclusion = str(entry.get("conclusion") or "").upper()
         if status in APPROVAL_RUN_STATES or conclusion == "ACTION_REQUIRED":
+            run_head = entry.get("head_sha")
+            if not isinstance(run_head, str) or not run_head:
+                raise WorkflowError("approval-blocked workflow run has no head commit")
+            if run_head.lower() != head_sha.lower():
+                continue
             blocked.append(
                 {
                     "id": entry.get("id"),
@@ -4876,7 +4881,7 @@ def snapshot_checks(
     tracking = update_check_tracking(run_state.get("tracking"), checks, now)
     approval_runs: list[dict[str, Any]] = []
     if not checks:
-        approval_runs = approval_blocked_runs(fetch_workflow_runs(pr, pinned))
+        approval_runs = approval_blocked_runs(fetch_workflow_runs(pr, pinned), pinned)
     decision = decide(
         checks,
         now=now,
@@ -5444,7 +5449,7 @@ def command_resolve(args: argparse.Namespace) -> None:
             f"got {live_head}"
         )
     approval_runs = (
-        approval_blocked_runs(fetch_workflow_runs(state["pr"], pinned))
+        approval_blocked_runs(fetch_workflow_runs(state["pr"], pinned), pinned)
         if not checks
         else []
     )
@@ -8905,7 +8910,9 @@ class CIObservation:
             tracking={},
             deadline_expired=True,
             approval_runs=(
-                approval_blocked_runs(fetch_workflow_runs(pr, pr["head_sha"]))
+                approval_blocked_runs(
+                    fetch_workflow_runs(pr, pr["head_sha"]), pr["head_sha"]
+                )
                 if not checks else []
             ),
         )
@@ -9042,7 +9049,7 @@ class CIObservation:
             tracking={}, deadline_expired=True,
             approval_runs=(
                 approval_blocked_runs(
-                    fetch_workflow_runs(self.pr, self.pr["head_sha"])
+                    fetch_workflow_runs(self.pr, self.pr["head_sha"]), self.pr["head_sha"]
                 ) if not self.checks else []
             ),
         )
@@ -10372,7 +10379,7 @@ def sealed_ci_fix_live_snapshot(
         tracking={},
         deadline_expired=False,
         approval_runs=(
-            approval_blocked_runs(fetch_workflow_runs(pull_request, head_sha))
+            approval_blocked_runs(fetch_workflow_runs(pull_request, head_sha), head_sha)
             if not checks
             else []
         ),

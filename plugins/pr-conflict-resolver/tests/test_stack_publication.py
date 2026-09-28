@@ -329,6 +329,39 @@ class StackPublicationTest(unittest.TestCase):
         self.calls["create_stack_workspace"].assert_not_called()
         self.calls["command_agent_task"].assert_not_called()
 
+    def test_hosted_retry_rejects_deleted_verified_member_field_before_push(self):
+        fixture = existing.ManagedConflictCoordinatorTest()
+        request = fixture.request()
+        result = fixture.success_result(request)
+        refs = result["generated"]["code_refs"]
+        artifact = result["generated"]["artifact"]
+        state = {
+            "version": MODULE.STATE_VERSION, "operation": "hosted_descendant_propagation",
+            "stack_request": self.request, "retry_allowed": True,
+            "workspace": str(self.workspace), "repo_root": str(self.workspace),
+            "agent_task": {
+                "status": "verified", "invocation_id": "run-1",
+                "result": result, "code_refs": copy.deepcopy(refs), "artifact": artifact,
+                "preflight": {
+                    "stack_request": self.request, "request": request,
+                    "repository_root": str(self.workspace),
+                },
+            },
+        }
+        state["agent_task"]["code_refs"][0].pop("lease_sha")
+        MODULE.save_state(self.state_path, state)
+
+        with (
+            mock.patch.object(MODULE, "validate_conflict_result_identity", return_value=(refs, artifact)),
+            mock.patch.object(MODULE, "verify_quarantined_result") as verify,
+            mock.patch.object(MODULE, "remote_publication_heads") as remote,
+            self.assertRaisesRegex(MODULE.WorkflowError, "preserved hosted result identity changed"),
+        ):
+            MODULE.command_descendant_propagate(self.args)
+        verify.assert_not_called()
+        remote.assert_not_called()
+        self.calls["command_agent_task"].assert_not_called()
+
     def test_interrupted_same_run_cannot_reuse_verified_candidate(self):
         MODULE.save_state(self.state_path, {
             "version": MODULE.STATE_VERSION, "operation": "hosted_descendant_propagation",
@@ -470,22 +503,22 @@ class StackPublicationTest(unittest.TestCase):
             MODULE.require_authorized_stack(self.request, existing.pr_metadata(number=11), projected)
 
     def test_retry_cannot_reuse_a_changed_cached_push_command(self):
+        request = {
+            "repository": "owner/repo", "strategy": "merge", "request_id": "request-1",
+            "pull_request": {"number": 12},
+        }
+        refs = [{
+            "role": "code", "pr_number": 12,
+            "lease_sha": "a" * 40, "new_sha": "b" * 40, "base_sha": "c" * 40,
+        }]
         state = {
             "agent_task": {
                 "preflight": {
                     "repository_root": str(self.workspace),
                     "stack_request": self.request,
-                    "request": {
-                        "repository": "owner/repo",
-                        "pull_request": {"number": 12},
-                    },
+                    "request": request,
                 },
-                "code_refs": [{
-                    "pr_number": 12,
-                    "lease_sha": "old",
-                    "new_sha": "new",
-                    "base_sha": "base",
-                }],
+                "code_refs": refs, "artifact": {},
                 "push_command": ["git", "push", "unselected"],
             },
         }
@@ -496,16 +529,18 @@ class StackPublicationTest(unittest.TestCase):
                 MODULE,
                 "require_live_conflict_guards",
                 return_value={
-                    "base_sha": "base",
+                    "base_sha": "c" * 40,
                     "_candidate_base_advanced": False,
                 },
             ),
-            mock.patch.object(MODULE, "remote_publication_heads", return_value=["old"]),
+            mock.patch.object(MODULE, "remote_publication_heads", return_value=["a" * 40]),
             mock.patch.object(MODULE, "conflict_push_command", return_value=["git", "push", "--atomic"]),
             mock.patch.object(MODULE, "save_state") as save,
             mock.patch.object(MODULE, "run") as run,
             self.assertRaisesRegex(MODULE.WorkflowError, "publication command changed"),
         ):
-            MODULE.publish_conflict_result(self.state_path, state)
+            MODULE.publish_conflict_result(
+                self.state_path, state, MODULE.publication_evidence(request, refs, {}),
+            )
         save.assert_not_called()
         run.assert_not_called()

@@ -427,7 +427,13 @@ class SequentialStackTest(unittest.TestCase):
             mock.patch.object(MODULE, "run", side_effect=run),
             self.assertRaisesRegex(MODULE.WorkflowError, "mixed or unexpected"),
         ):
-            MODULE.publish_conflict_result(self.directory / "state.json", state)
+            MODULE.publish_conflict_result(
+                self.directory / "state.json", state,
+                MODULE.publication_evidence(
+                    self.request, state["agent_task"]["code_refs"],
+                    state["agent_task"]["artifact"],
+                ),
+            )
         self.assertEqual([self.lower, raced], self.publication_heads())
 
 

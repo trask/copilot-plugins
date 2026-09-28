@@ -1343,13 +1343,19 @@ def agent_task_preflight(
     head_identity["sha"] = live_branch_tip(
         head_identity["repository"], head_identity["ref"]
     )
-    if (
-        base_identity["repository"].casefold() != target["repo_name"].casefold()
-        or head_identity["sha"] != pr["head_sha"].lower()
-        or payload.get("title") != pr["title"]
-        or (payload.get("body") or "") != pr["body"]
-    ):
-        raise WorkflowError("authenticated preflight returned inconsistent PR metadata")
+    try:
+        require_unchanged(
+            pr,
+            {
+                "number": target["number"],
+                "repo_name": base_identity["repository"],
+                "head_sha": head_identity["sha"],
+                "title": payload.get("title"),
+                "body": payload.get("body") or "",
+            },
+        )
+    except WorkflowError as error:
+        raise WorkflowError("authenticated preflight returned inconsistent PR metadata") from error
     permissions = repository.get("permissions")
     role_name = repository.get("role_name")
     permission_names = ("admin", "maintain", "push", "triage", "pull")
@@ -1428,26 +1434,77 @@ def require_run_id(state: dict[str, Any], expected_run_id: str) -> str:
     return run_id
 
 
-def require_live_snapshot(
-    snapshot: dict[str, Any], live: dict[str, Any], expected_head: str
+def pinned_snapshot_identity(
+    snapshot: dict[str, Any], *, clearance: bool = False
+) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        raise WorkflowError("pinned PR snapshot has no identity")
+    fields = ("number", "repo_name", "head_sha", "title", "body")
+    if (
+        type(snapshot.get("number")) is not int
+        or snapshot["number"] < 1
+        or any(
+            not isinstance(snapshot.get(key), str) or not snapshot[key]
+            for key in ("repo_name", "head_sha", "title")
+        )
+        or not isinstance(snapshot.get("body"), str)
+    ):
+        raise WorkflowError("pinned PR snapshot has incomplete identity")
+    if clearance:
+        fields += (
+            "url", "is_draft", "head_repository", "head_ref",
+            "base_repository", "base_ref", "viewer",
+        )
+        viewer = snapshot.get("viewer")
+        permissions = viewer.get("permissions") if isinstance(viewer, dict) else None
+        if (
+            any(
+                not isinstance(snapshot.get(key), str) or not snapshot[key]
+                for key in ("url", "head_repository", "head_ref",
+                            "base_repository", "base_ref")
+            )
+            or type(snapshot.get("is_draft")) is not bool
+            or not isinstance(snapshot.get("base_sha"), str)
+            or not SHA_PATTERN.fullmatch(snapshot["base_sha"])
+            or not SHA_PATTERN.fullmatch(snapshot["head_sha"])
+            or not isinstance(viewer, dict)
+            or not isinstance(viewer.get("login"), str)
+            or not viewer["login"]
+            or not isinstance(permissions, dict)
+            or any(
+                type(permissions.get(key)) is not bool
+                for key in ("admin", "maintain", "push", "triage", "pull")
+            )
+        ):
+            raise WorkflowError("pinned PR clearance has incomplete identity")
+    identity = {key: snapshot[key] for key in fields}
+    if not clearance:
+        identity["repo_name"] = identity["repo_name"].casefold()
+    return identity
+
+
+def require_unchanged(
+    snapshot: dict[str, Any], live: dict[str, Any], *, clearance: bool = False
 ) -> None:
-    if live["head_sha"] != expected_head:
+    expected = pinned_snapshot_identity(snapshot, clearance=clearance)
+    try:
+        observed = pinned_snapshot_identity(live, clearance=clearance)
+    except WorkflowError as error:
+        raise WorkflowError("live PR snapshot has incomplete identity") from error
+    if observed["head_sha"] != expected["head_sha"] and not clearance:
         raise WorkflowError(
-            f"PR head moved: expected {expected_head}, got {live['head_sha']}; "
+            f"PR head moved: expected {expected['head_sha']}, got {observed['head_sha']}; "
             "no mutation was performed",
             details={
-                "expected_head": expected_head,
-                "live_head": live["head_sha"],
-                "live_title": live["title"],
-                "live_body": live["body"],
+                "expected_head": expected["head_sha"],
+                "live_head": observed["head_sha"],
+                "live_title": observed["title"],
+                "live_body": observed["body"],
             },
         )
-    if (
-        live["title"] != snapshot.get("title")
-        or live["body"] != snapshot.get("body")
-    ):
+    if expected != observed:
         raise WorkflowError(
-            "live PR title or body no longer matches the exact pinned snapshot; "
+            "live PR no longer matches the exact pinned snapshot; "
             "no mutation was performed; run preflight again"
         )
 
@@ -2044,11 +2101,11 @@ def apply_proposal(
         )
     target = target_from_state(state)
     live = metadata_for(target)
-    require_live_snapshot(base, live, pinned_head)
+    require_unchanged(state["pr"], live)
     # GitHub does not support conditional requests for this unsafe endpoint, so keep
     # the final exact read adjacent to the direct PATCH and verify again afterward.
     immediately_before = metadata_for(target)
-    require_live_snapshot(base, immediately_before, pinned_head)
+    require_unchanged(state["pr"], immediately_before)
     update_pr(path, state, proposal)
     verified = metadata_for(target)
     if verified["head_sha"] != pinned_head:
@@ -2109,7 +2166,7 @@ def validate_no_change(
     run_id = require_run_id(state, expected_run_id)
     pinned_head = require_expected_head(state, expected_head)
     live = metadata_for(target_from_state(state))
-    require_live_snapshot(state["pr"], live, pinned_head)
+    require_unchanged(state["pr"], live)
     state["pr"] = {**state["pr"], **live}
     state["validated_head_sha"] = pinned_head
     state["validation"] = {
@@ -2663,7 +2720,7 @@ def command_agent_task(args: argparse.Namespace) -> None:
         )
         live = metadata_for(target)
         try:
-            require_live_snapshot(pr, live, pr["head_sha"])
+            require_unchanged(pr, live)
         except WorkflowError:
             current = load_run_state(path)
             remaining_allowance = (
@@ -2925,7 +2982,7 @@ def clearance_snapshot(state: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def clearance_identity(snapshot: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in snapshot.items() if key != "base_sha"}
+    return pinned_snapshot_identity(snapshot, clearance=True)
 
 
 def verify_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
@@ -2952,13 +3009,20 @@ def verify_clearance_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     live = agent_task_preflight(Path(state["repo_root"]), target_from_state(state))
     observed = clearance_snapshot(live)
     expected_identity = clearance_identity(expected)
-    observed_identity = clearance_identity(observed) if observed is not None else None
+    try:
+        observed_identity = clearance_identity(observed)
+    except WorkflowError:
+        observed_identity = None
     expected_hash = canonical_json_sha256(expected_identity)
     observed_hash = (
         canonical_json_sha256(observed_identity)
         if observed_identity is not None else None
     )
-    current = expected_identity == observed_identity
+    try:
+        require_unchanged(expected, observed, clearance=True)
+        current = True
+    except WorkflowError:
+        current = False
     return {
         "result": "current" if current else "stale",
         "reason": (
@@ -2976,10 +3040,15 @@ def record_clearance_snapshot(
     live = agent_task_preflight(repo_root, target)
     observed = clearance_snapshot(live)
     validation = state.get("validation") or {}
+    try:
+        require_unchanged(expected, observed, clearance=True)
+        unchanged = True
+    except WorkflowError:
+        unchanged = False
     if (
         expected is None
         or observed is None
-        or clearance_identity(expected) != clearance_identity(observed)
+        or not unchanged
         or recorded_validated_head_sha(state) != expected["head_sha"]
         or validation.get("run_id") != state.get("run_id")
         or validation.get("mode") not in {"applied", "no_change"}

@@ -1191,7 +1191,7 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 MODULE, "fetch_workflow_runs",
                 return_value={"workflow_runs": [{
                     "event": "pull_request", "status": "waiting",
-                    "name": "CI", "id": 42,
+                    "name": "CI", "id": 42, "head_sha": lower["head_sha"],
                 }]},
             ),
         ):
@@ -4126,7 +4126,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.116", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.118", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")
@@ -10084,21 +10084,54 @@ class ApprovalRunTest(unittest.TestCase):
             {
                 "workflow_runs": [
                     {"id": 1, "name": "CI", "status": "waiting",
-                     "event": "pull_request"},
+                     "event": "pull_request", "head_sha": "head1"},
                     {"id": 2, "name": "Lint", "status": "completed",
-                     "conclusion": "action_required", "event": "pull_request"},
+                     "conclusion": "action_required", "event": "pull_request",
+                     "head_sha": "head1"},
                     {"id": 3, "name": "Done", "status": "completed",
                      "conclusion": "success", "event": "pull_request"},
                     {"id": 4, "name": "Copilot cloud agent",
                      "status": "waiting", "event": "dynamic"},
                 ]
-            }
+            }, "head1"
         )
         self.assertEqual([1, 2], [entry["id"] for entry in blocked])
 
+    def test_stale_approval_does_not_block_and_unidentified_approval_fails_closed(self):
+        runs = {"workflow_runs": [
+            {"id": 1, "event": "pull_request", "status": "waiting",
+             "head_sha": "old-head"},
+        ]}
+        self.assertEqual([], MODULE.approval_blocked_runs(runs, "new-head"))
+        runs["workflow_runs"][0].pop("head_sha")
+        with self.assertRaisesRegex(MODULE.WorkflowError, "no head commit"):
+            MODULE.approval_blocked_runs(runs, "new-head")
+
     def test_an_unexpected_payload_finds_nothing(self):
-        self.assertEqual([], MODULE.approval_blocked_runs(None))
-        self.assertEqual([], MODULE.approval_blocked_runs({"workflow_runs": None}))
+        self.assertEqual([], MODULE.approval_blocked_runs(None, "head1"))
+        self.assertEqual(
+            [], MODULE.approval_blocked_runs({"workflow_runs": None}, "head1")
+        )
+
+    def test_clearance_observation_ignores_stale_approval_runs(self):
+        pr = {"head_sha": "a" * 40}
+        observation = MODULE.CIObservation(pr, [], {})
+        run = {
+            "id": 42, "event": "pull_request", "status": "waiting",
+            "head_sha": pr["head_sha"],
+        }
+        with mock.patch.object(
+            MODULE, "fetch_workflow_runs", return_value={"workflow_runs": [run]}
+        ):
+            self.assertEqual(
+                "approval_required", observation.clearance_decision()["reason"]
+            )
+            run["head_sha"] = "b" * 40
+            self.assertEqual("no_checks", observation.clearance_decision()["decision"])
+            run["head_sha"] = pr["head_sha"]
+            run["status"] = "completed"
+            run["conclusion"] = "success"
+            self.assertEqual("no_checks", observation.clearance_decision()["decision"])
 
 
 class PrCheckWorkflowSnapshotTest(unittest.TestCase):
@@ -11563,7 +11596,7 @@ class ChecksCommandTest(unittest.TestCase):
             ("head1", []),
             None,
             {"workflow_runs": [{"id": 3, "name": "CI", "status": "waiting",
-                                "event": "pull_request"}]},
+                                "event": "pull_request", "head_sha": "head1"}]},
         )
         self.assertEqual("escalate", payload["result"])
         self.assertEqual("approval_required", payload["reason"])

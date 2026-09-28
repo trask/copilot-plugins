@@ -16,6 +16,7 @@ import test_stack_publication as stack_auth
 
 MODULE = existing.MODULE
 CLOUD = existing.CLOUD_MODULE
+PUBLISH = MODULE.publish_conflict_result
 
 
 class BoundedPipelineTest(unittest.TestCase):
@@ -42,7 +43,12 @@ class BoundedPipelineTest(unittest.TestCase):
         }
         self.patch("build_conflict_prompt", return_value="Resolve the conflict")
         self.patch("discover_conflict_task", return_value=self.root / "cloud_conflict_task.py")
-        self.patch("verify_quarantined_result")
+        self.patch(
+            "verify_quarantined_result",
+            side_effect=lambda root, request, refs, artifact, result: MODULE.publication_evidence(
+                request, refs, artifact, result
+            ),
+        )
         self.patch("require_live_conflict_guards")
         self.published = self.patch("publish_conflict_result", side_effect=self.publish)
         self.dispatches = 0
@@ -55,7 +61,8 @@ class BoundedPipelineTest(unittest.TestCase):
         self.addCleanup(patch.stop)
         return value
 
-    def publish(self, path, state):
+    def publish(self, path, state, candidate):
+        self.assertIsInstance(candidate, MODULE.VerifiedPublication)
         state["agent_task"]["status"] = "completed"
         state["last_result"] = "published"
         MODULE.save_state(path, state)
@@ -323,6 +330,57 @@ class BoundedPipelineTest(unittest.TestCase):
             MODULE.command_pipeline(self.args)
         self.published.assert_not_called()
         self.assertEqual("interrupted", MODULE.load_state(self.path)["agent_task"]["status"])
+
+    def test_verified_result_field_deletion_rejects_bounded_publication(self):
+        for _ in range(3):
+            self.assertEqual(0, MODULE.command_pipeline(self.args))
+
+        def publish_without_artifact(path, state, candidate):
+            state["agent_task"].pop("artifact")
+            return PUBLISH(path, state, candidate)
+
+        self.published.side_effect = publish_without_artifact
+        with (
+            mock.patch.object(MODULE, "remote_publication_heads") as remote,
+            self.assertRaisesRegex(MODULE.WorkflowError, "evidence changed"),
+        ):
+            MODULE.command_pipeline(self.args)
+        self.published.assert_called_once()
+        remote.assert_not_called()
+
+    def test_verified_ref_field_deletion_rejects_bounded_publication(self):
+        for _ in range(3):
+            self.assertEqual(0, MODULE.command_pipeline(self.args))
+
+        def publish_without_lease(path, state, candidate):
+            state["agent_task"]["code_refs"][0].pop("lease_sha")
+            return PUBLISH(path, state, candidate)
+
+        self.published.side_effect = publish_without_lease
+        with (
+            mock.patch.object(MODULE, "remote_publication_heads") as remote,
+            self.assertRaisesRegex(MODULE.WorkflowError, "evidence changed"),
+        ):
+            MODULE.command_pipeline(self.args)
+        self.published.assert_called_once()
+        remote.assert_not_called()
+
+    def test_verified_raw_result_deletion_rejects_bounded_publication(self):
+        for _ in range(3):
+            self.assertEqual(0, MODULE.command_pipeline(self.args))
+
+        def publish_without_raw_artifact(path, state, candidate):
+            state["agent_task"]["result"]["generated"].pop("artifact")
+            return PUBLISH(path, state, candidate)
+
+        self.published.side_effect = publish_without_raw_artifact
+        with (
+            mock.patch.object(MODULE, "remote_publication_heads") as remote,
+            self.assertRaisesRegex(MODULE.WorkflowError, "evidence changed"),
+        ):
+            MODULE.command_pipeline(self.args)
+        self.published.assert_called_once()
+        remote.assert_not_called()
 
     def test_helper_failure_without_task_id_preserves_stale_target_error(self):
         self.assertEqual(0, MODULE.command_pipeline(self.args))
@@ -926,7 +984,15 @@ class BoundedNativeControllerTest(unittest.TestCase):
         )
         fixture.patch(
             "validate_conflict_result_identity",
-            return_value=([{"role": "member:6"}, {"role": "member:7"}], {"members": []}),
+            return_value=(
+                [
+                    {"role": "member:6", "pr_number": 6, "base_sha": "a" * 40,
+                     "lease_sha": "b" * 40, "new_sha": "c" * 40},
+                    {"role": "member:7", "pr_number": 7, "base_sha": "c" * 40,
+                     "lease_sha": "d" * 40, "new_sha": "e" * 40},
+                ],
+                {"members": [{"pr_number": 6}, {"pr_number": 7}]},
+            ),
         )
         launches = []
 

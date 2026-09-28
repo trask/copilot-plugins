@@ -1190,8 +1190,7 @@ def fetch_changed_paths(pr: dict[str, Any]) -> list[str]:
 def write_output_file(path_value: str, text: str, description: str) -> str:
     path = Path(path_value).expanduser()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8", newline="")
+        atomic_write_text(path, text)
     except OSError as error:
         raise WorkflowError(
             f"could not write the {description} file: {error}"
