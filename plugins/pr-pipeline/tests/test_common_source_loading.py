@@ -6,6 +6,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
+from types import ModuleType
 import unittest
 from unittest import mock
 
@@ -58,6 +59,17 @@ class CommonSourceLoadingTest(unittest.TestCase):
         self.assertEqual(str(self.path), single.common.run.__code__.co_filename)
         self.assertFalse(sys.dont_write_bytecode)
         self.assertFalse(self.cache.parent.exists())
+
+    def test_stage_access_loads_without_a_registered_module(self):
+        common = ModuleType("_unregistered_pipeline_common")
+        exec(
+            compile(self.source, str(self.path), "exec", dont_inherit=True),
+            common.__dict__,
+        )
+        self.assertNotIn(common.__name__, sys.modules)
+        access = common.StageAccess("run-1", {}, "high", 2)
+        self.assertEqual("run-1", access.run_id)
+        self.assertEqual("allow", access.github_mutation_policy)
 
     def test_both_entrypoints_ignore_wrong_stale_and_malformed_caches(self):
         body = marshal.dumps(compile(

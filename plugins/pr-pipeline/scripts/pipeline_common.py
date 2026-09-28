@@ -9,7 +9,6 @@ by both pipeline helpers.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -2122,17 +2121,18 @@ def stage_command(
     ]
 
 
-@dataclass(frozen=True)
 class StageAccess:
-    run_id: str
-    models: dict[str, str]
-    effort: str
-    max_iterations: int
-    github_mutation_policy: str = "allow"
-
-    def __post_init__(self) -> None:
-        if not self.run_id or self.github_mutation_policy not in {"allow", "source-only"}:
+    def __init__(
+        self, run_id: str, models: dict[str, str], effort: str,
+        max_iterations: int, github_mutation_policy: str = "allow",
+    ) -> None:
+        if not run_id or github_mutation_policy not in {"allow", "source-only"}:
             raise WorkflowError("invalid stage run or GitHub mutation policy")
+        self.run_id = run_id
+        self.models = models
+        self.effort = effort
+        self.max_iterations = max_iterations
+        self.github_mutation_policy = github_mutation_policy
 
     def state_path(self, entry: dict[str, Any], target: dict[str, Any]) -> Path:
         return stage_state_path(entry, target, self.run_id)
