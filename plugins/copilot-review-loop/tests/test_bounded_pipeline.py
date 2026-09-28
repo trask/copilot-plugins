@@ -138,6 +138,7 @@ class BoundedPipelineTest(unittest.TestCase):
             MODULE.command_bounded_pipeline(self.args)
         self.assertEqual("waiting", self.output[-1]["result"])
         self.assertEqual("review_feedback", self.output[-1]["reason"])
+        self.assertEqual("head", self.state["monitoring"]["result"]["head_sha"])
         dispatch.assert_not_called()
 
     def complete_watch(self, state, result):

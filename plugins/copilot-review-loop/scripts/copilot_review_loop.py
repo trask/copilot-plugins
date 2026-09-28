@@ -3966,6 +3966,7 @@ def command_watch(args: argparse.Namespace) -> None:
                             ),
                             "review_id": review["id"],
                             "review_url": review["html_url"],
+                            "head_sha": monitoring["head_sha"],
                             "comment_ids": [comment["id"] for comment in comments],
                             "suppressed_comment_count": sum(
                                 item["source"] == "suppressed" for item in body_feedback
@@ -8022,6 +8023,7 @@ def bounded_review_observation(
     watcher_result(state, {
         "result": WATCHER_REVIEW_CLEAN if clean else WATCHER_REVIEW_COMMENTS,
         "review_id": review["id"], "review_url": review["html_url"],
+        "head_sha": monitoring["head_sha"],
         "comment_ids": [comment["id"] for comment in comments],
         "suppressed_comment_count": sum(
             item["source"] == "suppressed" for item in body_feedback

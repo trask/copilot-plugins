@@ -1892,7 +1892,7 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.108")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.109")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
@@ -7477,6 +7477,7 @@ class CleanAtHeadShaTest(unittest.TestCase):
         )
 
         self.assertEqual(payload["result"], "review_comments")
+        self.assertEqual(payload["head_sha"], "head")
         self.assertIsNone(payload["clean_at_head_sha"])
         self.assertIsNone(saved.get("clean_at_head_sha"))
 
@@ -7498,9 +7499,36 @@ class CleanAtHeadShaTest(unittest.TestCase):
         review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
         payload, saved = self.run_watch(review_comments=[], body=review["body"])
         self.assertEqual(payload["result"], "review_comments")
+        self.assertEqual(payload["head_sha"], "head")
         self.assertEqual(payload["overview_comment_count"], 1)
         self.assertEqual(payload["suppressed_comment_count"], 0)
         self.assertIsNone(saved.get("clean_at_head_sha"))
+
+    def test_overview_review_result_can_be_checked_for_fresh_feedback(self):
+        review = json.loads(CCR_V2_OVERVIEW_REVIEW.read_text(encoding="utf-8"))
+        payload, saved = self.run_watch(
+            review_comments=[{"id": 5}], body=review["body"]
+        )
+        threads = [{
+            "id": "thread",
+            "isResolved": False,
+            "comments": {
+                "nodes": [{"databaseId": 5, "url": "https://example.test/comment/5"}]
+            },
+        }]
+
+        with (
+            mock.patch.object(
+                MODULE, "fetch_copilot_threads", return_value=(threads, [])
+            ),
+            mock.patch.object(MODULE, "fetch_reviews", return_value=[review]),
+            mock.patch.object(
+                MODULE, "latest_copilot_feedback_review", return_value=review
+            ) as latest,
+        ):
+            MODULE.wait_for_fresh_copilot_state(saved, payload)
+
+        latest.assert_called_once_with([review], None, "head")
 
     def test_watch_routes_ccr_v2_body_only_feedback_without_clean_marker(self):
         review = json.loads(CCR_V2_REVIEW.read_text(encoding="utf-8"))
