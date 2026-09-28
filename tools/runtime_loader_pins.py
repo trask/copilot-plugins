@@ -7,8 +7,11 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -210,11 +213,62 @@ def update_spec(path: Path) -> None:
     data = read_spec(path)
     files, _ = prepared_pins(data, update=True)
     spec_bytes = (json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    for consumer_path, content in files.items():
-        if consumer_path.read_bytes() != content:
-            consumer_path.write_bytes(content)
-    if path.read_bytes() != spec_bytes:
-        path.write_bytes(spec_bytes)
+    updates = {**files, path: spec_bytes}
+    staged: list[tuple[Path, Path, Path]] = []
+    temporary_files: list[Path] = []
+    applied: list[tuple[Path, Path]] = []
+    retained: set[Path] = set()
+    try:
+        for target, content in updates.items():
+            original = target.read_bytes()
+            if original == content:
+                continue
+            replacement = stage_file(target, content)
+            temporary_files.append(replacement)
+            backup = stage_file(target, original)
+            temporary_files.append(backup)
+            staged.append((target, replacement, backup))
+        for target, replacement, backup in staged:
+            os.replace(replacement, target)
+            applied.append((target, backup))
+    except OSError as error:
+        restore_errors = []
+        for target, backup in reversed(applied):
+            try:
+                os.replace(backup, target)
+            except OSError as restore_error:
+                retained.add(backup)
+                restore_errors.append(f"{target}: {restore_error} (backup: {backup})")
+        detail = f"could not update Runtime loader pins: {error}"
+        if restore_errors:
+            detail += "; could not restore " + "; ".join(restore_errors)
+        raise PinError(detail) from error
+    finally:
+        for temporary in temporary_files:
+            if temporary not in retained:
+                temporary.unlink(missing_ok=True)
+
+
+def stage_file(target: Path, content: bytes) -> Path:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.chmod(temporary, stat.S_IMODE(target.stat().st_mode))
+    except OSError:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+    assert temporary is not None
+    return temporary
 
 
 def render_loader(name: str, dependency: dict[str, str]) -> str:

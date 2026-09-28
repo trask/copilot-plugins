@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,8 +54,19 @@ class RuntimeLoaderPinsTest(unittest.TestCase):
             root = Path(directory)
             spec = self.fixture(root)
             with mock.patch.object(MODULE, "ROOT", root):
+                modes = {
+                    path.name: stat.S_IMODE(path.stat().st_mode)
+                    for path in root.iterdir()
+                }
                 MODULE.update_spec(spec)
                 MODULE.check_spec(spec)
+                self.assertEqual(
+                    modes,
+                    {
+                        path.name: stat.S_IMODE(path.stat().st_mode)
+                        for path in root.iterdir()
+                    },
+                )
                 data = MODULE.read_spec(spec)["dependencies"]
                 middle = (root / "middle.py").read_bytes()
                 self.assertEqual(
@@ -111,6 +123,92 @@ class RuntimeLoaderPinsTest(unittest.TestCase):
                         self.assertEqual(before, {path: path.read_bytes() for path in root.iterdir()})
                         if mutation == "ambiguous":
                             break
+
+    def test_update_restores_every_consumer_after_a_late_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self.fixture(root)
+            with mock.patch.object(MODULE, "ROOT", root):
+                MODULE.update_spec(spec)
+                (root / "base.py").write_text("VALUE = 4\n", encoding="utf-8")
+                before = {path.name: path.read_bytes() for path in root.iterdir()}
+                replace = MODULE.os.replace
+                calls = 0
+
+                def fail_second_replace(source, destination):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise OSError("second replacement failed")
+                    return replace(source, destination)
+
+                with mock.patch.object(
+                    MODULE.os, "replace", side_effect=fail_second_replace
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.PinError, "second replacement failed"
+                    ):
+                        MODULE.update_spec(spec)
+
+                self.assertEqual(
+                    before, {path.name: path.read_bytes() for path in root.iterdir()}
+                )
+                self.assertGreaterEqual(calls, 3)
+
+    def test_update_keeps_backup_and_reports_failed_restoration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self.fixture(root)
+            with mock.patch.object(MODULE, "ROOT", root):
+                original = (root / "middle.py").read_bytes()
+                replace = MODULE.os.replace
+                calls = 0
+
+                def fail_replace_and_restore(source, destination):
+                    nonlocal calls
+                    calls += 1
+                    if calls in (2, 3):
+                        raise OSError(f"replacement {calls} failed")
+                    return replace(source, destination)
+
+                with mock.patch.object(
+                    MODULE.os, "replace", side_effect=fail_replace_and_restore
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.PinError, "could not restore"
+                    ) as failure:
+                        MODULE.update_spec(spec)
+
+                backups = list(root.glob(".*.tmp"))
+                self.assertEqual(1, len(backups))
+                self.assertEqual(original, backups[0].read_bytes())
+                self.assertIn(str(backups[0]), str(failure.exception))
+
+    def test_update_removes_staged_files_if_preparation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = self.fixture(root)
+            with mock.patch.object(MODULE, "ROOT", root):
+                before = {path.name: path.read_bytes() for path in root.iterdir()}
+                stage = MODULE.stage_file
+                calls = 0
+
+                def fail_second_stage(target, content):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise OSError("staging failed")
+                    return stage(target, content)
+
+                with mock.patch.object(
+                    MODULE, "stage_file", side_effect=fail_second_stage
+                ):
+                    with self.assertRaisesRegex(MODULE.PinError, "staging failed"):
+                        MODULE.update_spec(spec)
+
+                self.assertEqual(
+                    before, {path.name: path.read_bytes() for path in root.iterdir()}
+                )
 
     def test_committed_pins_match_runtime_sources(self):
         MODULE.check_spec(SPEC_PATH)

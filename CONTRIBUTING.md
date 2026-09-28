@@ -35,7 +35,10 @@ constants and dependent source hashes in order. Run
 `python tools/runtime_loader_pins.py check` before publishing. The source-pin
 spec in `tools/runtime-loader-pins.json` lists the exact consumer assignments;
 the update command rejects missing assignments and invalid dependencies before
-writing files. Installed loaders still verify the source bytes they compile.
+writing files. If a write fails, the command restores already-replaced files.
+If restoration also fails, it reports the retained backup path so you can
+recover it before publishing. Installed loaders still verify the source bytes
+they compile.
 
 Shared code and documentation must not contain credentials, employer details,
 internal hostnames, or personal filesystem paths.
