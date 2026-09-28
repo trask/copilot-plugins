@@ -1,7 +1,7 @@
 ---
 name: Copilot Review Loop
 description: "Explicit invocation only: never select automatically; address Copilot review comments through a verified hosted Sol candidate."
-argument-hint: "PR URL, PR number, or owner/repo#number; optional iteration limit or review-request-only mode"
+argument-hint: "PR URL or owner/repo#number; optional iteration limit or review-request-only mode"
 tools: [execute, rename_session]
 model: gpt-6-sol
 user-invocable: true
@@ -18,7 +18,7 @@ Find this installed plugin's `scripts/copilot_review_loop.py`, then run:
 python <helper> agent-task <target> [--max-iterations <count>] [--request-review-only] [--github-mutation-policy source-only]
 ```
 
-Use `python3` when needed. The helper resolves bare numbers and the repository root. `--request-review-only` is valid only when the user authorized one fresh Copilot review request. Source-only forbids replies, thread resolution, review requests, draft changes, title or body edits, and other GitHub metadata changes. Pass only the options shown above.
+Use `python3` when needed. Pass the complete PR URL or `owner/repo#number` from the request to the helper unchanged. Never shorten a qualified target to its bare number or derive the target from the session title. A bare number is not a valid helper target; if the request has no qualified target, ask for the repository before launching. The helper resolves the repository root when needed. `--request-review-only` is valid only when the user authorized one fresh Copilot review request. Source-only forbids replies, thread resolution, review requests, draft changes, title or body edits, and other GitHub metadata changes. Pass only the options shown above.
 
 Launch once through the official execution tool with `mode: async`. Set `detach: true` only when the user explicitly requests continuation after client exit. Otherwise leave it false. The controller stays in the foreground and owns its children. Do not imitate this with shell backgrounding, self-detachment, another controller, or a retry after launch denial.
 

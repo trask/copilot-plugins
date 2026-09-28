@@ -1892,12 +1892,40 @@ class AgentTaskCoordinatorTest(unittest.TestCase):
         self.assertNotIn("--pipeline-run", instructions)
         self.assertNotIn("tools: [read", instructions)
         self.assertNotIn("tools: [edit", instructions)
-        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.109")
+        self.assertEqual(json.loads(PLUGIN.read_text())["version"], "1.1.110")
         self.assertEqual(3, MODULE.LOCAL_DECISION_RESULT_SCHEMA["version"])
         self.assertEqual(2, MODULE.DECISION_COPILOT_REVIEW_REPORT_SCHEMA["version"])
         self.assertEqual(
             "marketplace-local-review-decision-worker@3",
             MODULE.LOCAL_DECISION_POLICY,
+        )
+
+    def test_agent_preserves_the_qualified_pr_target(self):
+        instructions = AGENT.read_text(encoding="utf-8")
+        self.assertIn('argument-hint: "PR URL or owner/repo#number;', instructions)
+        self.assertIn(
+            "Pass the complete PR URL or `owner/repo#number` from the request "
+            "to the helper unchanged.",
+            instructions,
+        )
+        self.assertIn(
+            "Never shorten a qualified target to its bare number", instructions
+        )
+        self.assertIn(
+            "if the request has no qualified target, ask for the repository "
+            "before launching.",
+            instructions,
+        )
+        self.assertNotIn("The helper resolves bare numbers", instructions)
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError, "target must be a GitHub PR URL or owner/repo#number"
+        ):
+            MODULE.parse_target("20137")
+        self.assertEqual(
+            MODULE.parse_target("open-telemetry/opentelemetry-java-instrumentation#20137")[
+                "number"
+            ],
+            20137,
         )
 
     def test_successful_retained_preparation_clears_prior_failure(self):
