@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "3040170b2be621f06a72c7d8f7fa273c760a798cd4dfbc3dc102612e1bbfd97d"
+    "3a7e483a8bc20e89b08fad579522a78cffe5475841516c2f9296dfd0469af0e2"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@14"
@@ -4775,7 +4775,13 @@ def verify_rebased_range_mechanically(
         or commits[replay_count:] != fixes
         or len(mappings) != len(old_commits)
     ):
-        raise WorkflowError("rewritten range dropped, added, squashed, or reordered commits")
+        raise WorkflowError(
+            "rewritten range dropped, added, squashed, or reordered commits: "
+            f"expected {replay_count} replay commits and "
+            f"{len(fixes) if isinstance(fixes, list) else 'invalid'} fixes, "
+            f"observed {len(commits)} source commits and {len(mappings)} "
+            f"linear mappings above {base}"
+        )
     merge_by_position = {
         merge["position"]: ("sync", merge)
         for merge in synchronizations

@@ -1937,14 +1937,31 @@ def replay_task_instructions(request: Mapping[str, object]) -> str:
         "onto the source. The frozen source head is input evidence, not the "
         "task base. Fetch its objects without checking it out using "
         f"`git fetch --no-tags origin {pr['head_sha']}`. "
-        "Cherry-pick each `head_commits` SHA from the compact contract below "
-        "in its listed order onto the existing task branch. Resolve each "
-        "conflict and continue that cherry-pick before starting the next. "
+        f"Replay all {len(request['head_commits'])} listed `head_commits` SHAs "
+        "from the compact contract below, in order, before formatting, testing, "
+        "or making companion fixes. For each SHA use "
+        "`git cherry-pick --allow-empty --keep-redundant-commits <old-sha>` "
+        "on the existing task branch. Resolve each conflict and continue that "
+        "cherry-pick before starting the next. If resolving a conflict makes "
+        "the replay empty, preserve it with "
+        "`git commit --allow-empty --allow-empty-message --cleanup=verbatim "
+        "-C <old-sha>` and continue any remaining cherry-pick sequence. "
+        "Never use `git cherry-pick --skip`. After each replay, verify HEAD "
+        "advanced by exactly one single-parent commit with the previous HEAD "
+        "as its parent and the original message preserved. A successful "
+        "command or clean working tree does not prove a commit was retained. "
         "Preserve the complete original commit message bytes, including subjects, "
         "body, trailers, and line endings. Do not add attribution yourself. "
         "Do not use `-x`, squash, reorder, "
         "or skip a listed commit, including an empty replay. Do not derive "
         "the replay range from main or from a commit count. "
+        "Before formatting or testing, enumerate "
+        f"`git rev-list --reverse --first-parent {pr['base_sha']}..HEAD` "
+        "and verify a one-to-one, in-order replay of every listed SHA, "
+        "including any required normalization commits. Do not finish with "
+        "only a prefix of the replay or fold later commits into earlier "
+        "conflict resolutions. Complete and verify the replay first; "
+        "report validation limits separately if time is running out. "
         "Before finishing, verify "
         f"`git merge-base --is-ancestor {pr['base_sha']} HEAD` succeeds. "
         "Commit the complete source deliverable on this same task branch; "
@@ -2873,7 +2890,10 @@ def prove_rebase_range_mechanically(
         not allow_fix_suffix and len(commits) != replay_count
     ):
         raise ConflictError(
-            "rewritten range dropped, squashed, reordered, or added commits",
+            "rewritten range dropped, squashed, reordered, or added commits: "
+            f"expected {replay_count} replay commits"
+            f"{' before optional fixes' if allow_fix_suffix else ''}, "
+            f"observed {len(commits)} source commits above {base_sha}",
             "unexpected_history",
         )
     mappings: list[Mapping[str, object]] = []

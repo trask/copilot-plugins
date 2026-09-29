@@ -245,8 +245,11 @@ ordinary branch with dependents. For a native GitHub stack, the coordinator
 starts each member's hosted task at its verified new base. The worker replays
 only that member's commits onto its assigned branch. The coordinator collects
 committed code from each task's authoritative branch and verifies the complete
-result before publishing with one atomic, exact-lease push. A run that publishes and
-then still reads as conflicting is finished rather than failed, and a caller
+result before publishing with one atomic, exact-lease push. Replays retain empty
+commits and finish the full listed history before formatting or testing. An
+incomplete replay blocks publication and reports expected and observed commit
+counts. A run that publishes and then still reads as conflicting is finished
+rather than failed, and a caller
 that wants another integration starts another run. It never posts anything to
 GitHub. Its
 machine-facing descendant propagation operation uses the same topology checks and

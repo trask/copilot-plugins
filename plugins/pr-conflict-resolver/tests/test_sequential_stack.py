@@ -15,6 +15,15 @@ CLOUD = existing.CLOUD_MODULE
 
 
 class ReplayTaskBaseTest(unittest.TestCase):
+    def test_invalid_fix_list_is_reported_as_a_history_error(self):
+        with (
+            mock.patch.object(MODULE, "ordered_commits", return_value=[]),
+            self.assertRaisesRegex(MODULE.WorkflowError, "invalid fixes"),
+        ):
+            MODULE.verify_rebased_range_mechanically(
+                Path.cwd(), "a" * 40, "b" * 40, [], [], fix_commits=True,
+            )
+
     def test_creation_and_collection_share_the_policy_11_task_base(self):
         for strategy, base_key in (
             ("merge", "head_sha"),
@@ -48,6 +57,14 @@ class ReplayTaskBaseTest(unittest.TestCase):
                 self.assertEqual(
                     strategy == "rebase",
                     "The task branch starts at the exact replay base" in prompt,
+                )
+                self.assertEqual(
+                    strategy == "rebase",
+                    "git cherry-pick --allow-empty --keep-redundant-commits <old-sha>" in prompt,
+                )
+                self.assertEqual(
+                    strategy == "rebase",
+                    "Do not finish with only a prefix of the replay" in prompt,
                 )
 
     def test_controller_keeps_source_identity_separate_from_rebase_task_base(self):
@@ -358,7 +375,133 @@ class SequentialStackTest(unittest.TestCase):
                 prompt,
             )
             self.assertIn("Do not switch branches", prompt)
-            self.assertIn("Cherry-pick each `head_commits` SHA", prompt)
+            self.assertIn(
+                f"Replay all {len(options.request['head_commits'])} listed `head_commits` SHAs",
+                prompt,
+            )
+            self.assertIn(
+                "before formatting, testing, or making companion fixes", prompt,
+            )
+            self.assertIn(
+                "git cherry-pick --allow-empty --keep-redundant-commits <old-sha>", prompt,
+            )
+            self.assertIn(
+                "git commit --allow-empty --allow-empty-message --cleanup=verbatim -C <old-sha>",
+                prompt,
+            )
+            self.assertIn("Never use `git cherry-pick --skip`", prompt)
+            self.assertIn(
+                f"git rev-list --reverse --first-parent {options.request['pull_request']['base_sha']}..HEAD",
+                prompt,
+            )
+
+    def test_five_of_eight_replays_are_rejected_even_with_optional_fixes(self):
+        history = self.import_commits(self.root, [
+            (
+                f"source-{index}", self.seed if index == 1 else index - 1,
+                f"Replay {index}", "replay.py", f"source {index}\n",
+            )
+            for index in range(1, 9)
+        ], ref="refs/test-fixtures/source-replay")
+        generated = self.import_commits(self.root, [
+            (
+                f"generated-{index}", self.trunk if index == 1 else index - 1,
+                f"Replay {index}", "replay.py", f"source {index}\n",
+            )
+            for index in range(1, 6)
+        ], ref="refs/test-fixtures/generated-replay")
+        old = [
+            MODULE.commit_identity(self.root, sha, linear=True)
+            for sha in history.values()
+        ]
+        tip = generated["generated-5"]
+        with self.assertRaisesRegex(
+            CLOUD.ConflictError,
+            "expected 8 replay commits before optional fixes, observed 5 source commits",
+        ) as failure:
+            CLOUD.prove_rebase_range_mechanically(
+                subprocess.run, self.root, self.trunk, tip, old, allow_fix_suffix=True,
+            )
+        self.assertEqual("unexpected_history", failure.exception.code)
+        with self.assertRaisesRegex(
+            MODULE.WorkflowError,
+            "expected 8 replay commits and 0 fixes, observed 5 source commits",
+        ):
+            MODULE.verify_rebased_range_mechanically(self.root, self.trunk, tip, old, [])
+
+    def test_cherry_pick_retains_initially_empty_and_redundant_commits(self):
+        history = self.import_commits(self.root, [
+            ("source", self.seed, "Apply change", "replay.py", "change\n"),
+            ("empty", 1, "Empty source", "replay.py", "change\n"),
+            ("redundant", 2, "Already applied", "app.py", "seed\ntrunk\n"),
+        ], ref="refs/test-fixtures/empty-replay")
+        old = [
+            MODULE.commit_identity(self.root, sha, linear=True)
+            for sha in history.values()
+        ]
+        self.run_git("config", "user.name", "Test")
+        self.run_git("config", "user.email", "test@example.com")
+        self.run_git("config", "commit.gpgsign", "false")
+        self.run_git("checkout", "--quiet", "--detach", self.trunk)
+        generated = []
+        for sha in history.values():
+            self.run_git(
+                "cherry-pick", "--allow-empty", "--keep-redundant-commits", sha,
+            )
+            generated.append(self.run_git("rev-parse", "HEAD"))
+        for parent, commit in zip(generated, generated[1:]):
+            self.assertEqual(
+                self.run_git("rev-parse", f"{parent}^{{tree}}"),
+                self.run_git("rev-parse", f"{commit}^{{tree}}"),
+            )
+        commits, mappings = CLOUD.prove_rebase_range_mechanically(
+            subprocess.run, self.root, self.trunk, generated[-1], old,
+        )
+        self.assertEqual(generated, commits)
+        self.assertEqual(list(history.values()), [item["old_sha"] for item in mappings])
+        MODULE.verify_rebased_range_mechanically(
+            self.root, self.trunk, generated[-1], old, mappings,
+        )
+
+    def test_conflict_resolved_to_empty_keeps_the_original_commit(self):
+        history = self.import_commits(self.root, [
+            (
+                "source", self.seed, "Resolve conflict\n\nOriginal body",
+                "app.py", "source\n",
+            ),
+        ], ref="refs/test-fixtures/conflicted-replay")
+        source = history["source"]
+        old = [MODULE.commit_identity(self.root, source, linear=True)]
+        self.run_git("config", "user.name", "Test")
+        self.run_git("config", "user.email", "test@example.com")
+        self.run_git("config", "commit.gpgsign", "false")
+        self.run_git("checkout", "--quiet", "--detach", self.trunk)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_git(
+                "cherry-pick", "--allow-empty", "--keep-redundant-commits", source,
+            )
+        self.run_git("restore", "--source=HEAD", "--staged", "--worktree", "app.py")
+        self.run_git(
+            "commit", "--allow-empty", "--allow-empty-message", "--cleanup=verbatim",
+            "-C", source,
+        )
+        tip = self.run_git("rev-parse", "HEAD")
+        self.assertEqual(self.trunk, self.run_git("rev-parse", f"{tip}^"))
+        self.assertEqual(
+            self.run_git("rev-parse", f"{self.trunk}^{{tree}}"),
+            self.run_git("rev-parse", f"{tip}^{{tree}}"),
+        )
+        self.assertEqual(
+            CLOUD.commit_message_bytes(subprocess.run, self.root, source),
+            CLOUD.commit_message_bytes(subprocess.run, self.root, tip),
+        )
+        commits, mappings = CLOUD.prove_rebase_range_mechanically(
+            subprocess.run, self.root, self.trunk, tip, old,
+        )
+        self.assertEqual([tip], commits)
+        MODULE.verify_rebased_range_mechanically(
+            self.root, self.trunk, tip, old, mappings,
+        )
 
     def test_each_completed_member_records_its_own_terminal_observation(self):
         execution = mock.Mock(run=subprocess.run)
