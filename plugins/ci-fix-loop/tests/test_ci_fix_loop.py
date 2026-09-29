@@ -770,6 +770,108 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 loaded["seal"],
             )
 
+    def test_sealed_invocation_waits_for_pending_checks_before_freezing(self):
+        with tempfile.TemporaryDirectory(prefix="sealed waiting ") as directory:
+            root = Path(directory)
+            repo, _, artifact_path, _, ready, _ = self.fixture(
+                root, write_artifact=False,
+            )
+            pending = copy.deepcopy(ready)
+            pending["checks"]["rollup"] = [
+                {"key": "check:unit", "name": "unit tests"},
+            ]
+            pending["checks"]["decision"] = {
+                "decision": "failures",
+                "reason": "checks_failed",
+                "pending_checks": ["check:unit"],
+                "detail": "one failed check and one pending check",
+            }
+            with (
+                mock.patch.object(
+                    MODULE.uuid, "uuid4",
+                    return_value=SimpleNamespace(hex="f" * 32),
+                ),
+                mock.patch.object(
+                    MODULE, "sealed_ci_fix_invocation_path",
+                    return_value=artifact_path,
+                ),
+                mock.patch.object(
+                    MODULE, "sealed_ci_fix_live_snapshot",
+                    side_effect=[pending, ready],
+                ) as observe,
+                mock.patch.object(MODULE.time, "sleep") as sleep,
+            ):
+                created = MODULE.create_sealed_ci_fix_invocation(
+                    repo_root=repo,
+                    target=MODULE.parse_target("owner/repo#7"),
+                    owner_session_id="87654321-4321-4321-4321-cba987654321",
+                )
+
+            self.assertEqual(artifact_path, created)
+            self.assertEqual(2, observe.call_count)
+            self.assertTrue(all(
+                call.kwargs["allow_pending"] for call in observe.call_args_list
+            ))
+            sleep.assert_called_once()
+            self.assertEqual(
+                ready, MODULE.load_sealed_ci_fix_artifact(created)[1]
+                ["request"]["initial_snapshot"],
+            )
+
+    def test_pending_checks_timeout_names_the_checks_without_sealing(self):
+        with tempfile.TemporaryDirectory(prefix="sealed pending timeout ") as directory:
+            repo, _, artifact_path, _, pending, _ = self.fixture(
+                Path(directory), write_artifact=False,
+            )
+            pending["checks"]["rollup"] = [
+                {"key": "check:unit", "name": "unit tests"},
+            ]
+            pending["checks"]["decision"] = {
+                "decision": "waiting",
+                "reason": "checks_running",
+                "pending_checks": ["check:unit"],
+                "detail": "waiting for one check",
+            }
+            with (
+                mock.patch.object(
+                    MODULE.uuid, "uuid4",
+                    return_value=SimpleNamespace(hex="f" * 32),
+                ),
+                mock.patch.object(
+                    MODULE, "sealed_ci_fix_invocation_path",
+                    return_value=artifact_path,
+                ),
+                mock.patch.object(
+                    MODULE, "sealed_ci_fix_live_snapshot",
+                    return_value=pending,
+                ) as observe,
+                mock.patch.object(
+                    MODULE, "sealed_ci_fix_limits",
+                    return_value={"wait_timeout": 1, "poll_interval": 0.5},
+                ),
+                mock.patch.object(
+                    MODULE.time, "monotonic", side_effect=[10, 10, 11],
+                ),
+                mock.patch.object(MODULE.time, "sleep") as sleep,
+                self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "timed out after 1 seconds.*still pending: unit tests",
+                ) as caught,
+            ):
+                MODULE.create_sealed_ci_fix_invocation(
+                    repo_root=repo,
+                    target=MODULE.parse_target("owner/repo#7"),
+                    owner_session_id="87654321-4321-4321-4321-cba987654321",
+                )
+
+            self.assertEqual(
+                {"reason": "timeout", "pending_checks": ["check:unit"]},
+                caught.exception.details,
+            )
+            self.assertEqual(2, observe.call_count)
+            sleep.assert_called_once_with(0.5)
+            self.assertFalse(artifact_path.exists())
+
     def test_each_sealed_invocation_has_a_unique_state_path(self):
         with tempfile.TemporaryDirectory(prefix="sealed states ") as directory:
             root = Path(directory)
@@ -922,6 +1024,49 @@ class SealedCiFixCommandTest(unittest.TestCase):
 
             fetch_rollup.assert_not_called()
 
+    def test_sealed_snapshot_names_pending_checks_outside_admission_wait(self):
+        with tempfile.TemporaryDirectory(prefix="sealed snapshot pending ") as directory:
+            repo = Path(directory)
+            state_path = repo / "new-state.json"
+            head = "d" * 40
+            pr = {
+                "state": "OPEN", "head_sha": head,
+                "base_sha": "e" * 40, "head_branch": "feature",
+            }
+            checks = [{
+                "key": "check:unit", "name": "unit tests", "class": "running",
+            }]
+            with (
+                mock.patch.object(
+                    MODULE, "local_identity",
+                    return_value={"branch": "feature", "head": head, "status": ""},
+                ),
+                mock.patch.object(MODULE, "metadata_for", return_value=pr),
+                mock.patch.object(MODULE, "fetch_rollup", return_value=(head, checks)),
+                mock.patch.object(MODULE, "require_live_pr_snapshot"),
+                mock.patch.object(
+                    MODULE, "sealed_ci_fix_stack_identity", return_value=None,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.WorkflowError,
+                    "cannot freeze a terminal check snapshot; pending checks: unit tests",
+                ):
+                    MODULE.sealed_ci_fix_live_snapshot(
+                        repo_root=repo,
+                        target=MODULE.parse_target("owner/repo#7"),
+                        state_path=state_path,
+                    )
+                admitted = MODULE.sealed_ci_fix_live_snapshot(
+                    repo_root=repo,
+                    target=MODULE.parse_target("owner/repo#7"),
+                    state_path=state_path,
+                    allow_pending=True,
+                )
+            self.assertEqual(
+                ["check:unit"], admitted["checks"]["decision"]["pending_checks"],
+            )
+
     def test_direct_command_owns_preflight_and_complete_loop(self):
         with tempfile.TemporaryDirectory(prefix="sealed run ") as directory:
             root = Path(directory)
@@ -989,6 +1134,40 @@ class SealedCiFixCommandTest(unittest.TestCase):
                 "sealed_ci_fix_completed",
                 json.loads(output.getvalue())["result"],
             )
+
+    def test_identity_pass_waits_for_newly_pending_checks(self):
+        with tempfile.TemporaryDirectory(prefix="sealed identity wait ") as directory:
+            repo, _, artifact_path, _, ready, artifact = self.fixture(
+                Path(directory), failing=False,
+            )
+            pending = copy.deepcopy(ready)
+            pending["checks"]["rollup"] = [
+                {"key": "check:unit", "name": "unit tests"},
+            ]
+            pending["checks"]["decision"] = {
+                "decision": "waiting",
+                "reason": "checks_running",
+                "pending_checks": ["check:unit"],
+                "detail": "waiting for one check",
+            }
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, None, ready):
+                    stack.enter_context(patch)
+                observe = stack.enter_context(mock.patch.object(
+                    MODULE, "sealed_ci_fix_live_snapshot",
+                    side_effect=[ready, pending, ready],
+                ))
+                sleep = stack.enter_context(mock.patch.object(MODULE.time, "sleep"))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    MODULE.consume_sealed_ci_fix_invocation(artifact_path)
+
+            self.assertEqual(3, observe.call_count)
+            sleep.assert_called_once()
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual("succeeded", result["status"])
+            self.assertEqual(2, result["steps"]["identity_passes"])
 
     def test_clear_clicked_pr_does_not_inspect_or_modify_the_stack(self):
         with tempfile.TemporaryDirectory(prefix="sealed clear ") as directory:
@@ -4127,7 +4306,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.120", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.121", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

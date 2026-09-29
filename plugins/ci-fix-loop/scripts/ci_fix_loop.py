@@ -10350,6 +10350,7 @@ def sealed_ci_fix_live_snapshot(
     repo_root: Path,
     target: dict[str, Any],
     state_path: Path,
+    allow_pending: bool = False,
 ) -> dict[str, Any]:
     source = local_identity(repo_root)
     if source["status"]:
@@ -10405,9 +10406,15 @@ def sealed_ci_fix_live_snapshot(
     )
     if not ci_preflight_is_stable_candidate(
         {"check_snapshot": {"decision": decision}}
-    ):
+    ) and not (allow_pending and decision.get("pending_checks")):
+        pending = decision.get("pending_checks") or []
+        detail = (
+            f"pending checks: {describe_checks(checks, pending) or ', '.join(pending)}"
+            if pending else
+            f"{decision['reason']}: {decision['detail']}"
+        )
         raise WorkflowError(
-            "sealed CI Fix requires a stable terminal check snapshot"
+            f"sealed CI Fix cannot freeze a terminal check snapshot; {detail}"
         )
     check_identity = {
         "head_sha": head_sha,
@@ -10426,6 +10433,39 @@ def sealed_ci_fix_live_snapshot(
         "native_stack": sealed_ci_fix_stack_identity(target),
         "active_owner": None,
     }
+
+
+def wait_for_sealed_ci_fix_snapshot(
+    *,
+    repo_root: Path,
+    target: dict[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    limits = sealed_ci_fix_limits()
+    timeout = float(limits["wait_timeout"])
+    deadline = time.monotonic() + timeout
+    while True:
+        snapshot = sealed_ci_fix_live_snapshot(
+            repo_root=repo_root,
+            target=target,
+            state_path=state_path,
+            allow_pending=True,
+        )
+        decision = snapshot["checks"]["decision"]
+        if ci_preflight_is_stable_candidate(
+            {"check_snapshot": {"decision": decision}}
+        ):
+            return snapshot
+        pending = decision["pending_checks"]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            names = describe_checks(snapshot["checks"]["rollup"], pending)
+            raise WorkflowError(
+                f"CI Fix timed out after {timeout:g} seconds waiting for checks "
+                f"to finish; still pending: {names or ', '.join(pending)}",
+                details={"reason": "timeout", "pending_checks": pending},
+            )
+        time.sleep(min(float(limits["poll_interval"]), remaining))
 
 
 def sealed_ci_fix_inner_argv(
@@ -10858,7 +10898,7 @@ def create_sealed_ci_fix_invocation(
     )
     for path in (state_path, artifact_path, digest_path):
         require_outside_repository(path, repo_root)
-    snapshot = sealed_ci_fix_live_snapshot(
+    snapshot = wait_for_sealed_ci_fix_snapshot(
         repo_root=repo_root,
         target=target,
         state_path=state_path,
@@ -10962,7 +11002,7 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
         ACTIVE_GITHUB_MUTATION_POLICY = request["github_mutation_policy"]["id"]
         expected_snapshot = request["initial_snapshot"]
         for pass_number in (1, 2):
-            live = sealed_ci_fix_live_snapshot(
+            live = wait_for_sealed_ci_fix_snapshot(
                 repo_root=repo_root,
                 target=target,
                 state_path=state_path,
