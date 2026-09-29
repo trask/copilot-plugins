@@ -72,7 +72,7 @@ STAGE_OUTCOMES = ("cleared", "skipped", "completed", "escalated")
 RECORDED_ENDINGS = ("mergeable", "published", "escalated", "aborted")
 
 REQUIRED_CONFLICT_TASK_SHA256 = (
-    "214a68b2651c2f194ef697a4484ea45259432264330fa80b8e6e39632f75b210"
+    "2a07d9e9c6b4b6e3a1ff6c3ee2ef44b42d2cc1eabe7219ee8e2ac65254d71e20"
 )
 CONFLICT_TASK_FILENAME = "cloud_conflict_task.py"
 CONFLICT_POLICY = "marketplace-conflict-worker@14"
@@ -4677,8 +4677,7 @@ def verify_replay_message_bytes(
         or (
             generated != original
             and (
-                not original.endswith(b"\n")
-                or line in original.splitlines()
+                line in original.splitlines()
                 or generated != original + b"\n" + line + b"\n"
             )
         )

@@ -34,12 +34,14 @@ class ReplayMessageProofTest(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.WorkflowError, "message bytes changed"):
                     MODULE.verify_replay_message_bytes(Path.cwd(), old, "c" * 40, ATTRIBUTION)
 
-    def test_exact_bytes_and_one_blank_paragraph_appendix(self):
+    def test_exact_bytes_and_verified_attribution_appendix(self):
         for original in (
             b"Subject\n\nSigned-off-by: Original\n",
             "Subject\n\nBody caf\u00e9 \U0001f642\n\nSigned-off-by: Original\n".encode("utf-8"),
             b"Subject\r\n\r\nBody\r\n\r\nSigned-off-by: Original\r\n",
             b"Subject\n\nOpaque body \xff\n\nSigned-off-by: Original\n",
+            b"Subject",
+            b"Subject\n\nSigned-off-by: Original",
         ):
             for suffix in (b"", b"\n" + LINE + b"\n"):
                 with self.subTest(original=original, suffix=suffix):
@@ -70,7 +72,14 @@ class ReplayMessageProofTest(unittest.TestCase):
             with self.subTest(generated=generated):
                 self.verify_both(original, generated, accepted=False)
         self.verify_both(original[:-1], original[:-1], accepted=True)
-        self.verify_both(original[:-1], original[:-1] + b"\n" + LINE + b"\n", accepted=False)
+        for generated in (
+            original[:-1] + b"\n\n" + LINE + b"\n",
+            original[:-1] + b"\n" + LINE,
+            original[:-1] + b"\n" + LINE + b"\n\n",
+            original[:-1] + b"\nCo-authored-by: other <123+other@users.noreply.github.com>\n",
+        ):
+            with self.subTest(generated=generated):
+                self.verify_both(original[:-1], generated, accepted=False)
 
     def test_raw_reader_is_binary_and_hides_windows_console(self):
         root = Path.cwd()

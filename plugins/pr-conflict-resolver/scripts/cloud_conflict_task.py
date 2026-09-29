@@ -1157,8 +1157,7 @@ def preserved_replay_message(
         or (
             generated != original
             and (
-                not original.endswith(b"\n")
-                or line in original.splitlines()
+                line in original.splitlines()
                 or generated != original + b"\n" + line + b"\n"
             )
         )
