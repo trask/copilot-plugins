@@ -552,6 +552,21 @@ class PipelineConflictEntryTest(unittest.TestCase):
         self.assertEqual(3, sleep.call_count)
         self.assertEqual("completed", progress.task_state)
 
+    def test_failed_child_keeps_terminal_observation(self):
+        initial = {"id": "task-1", "state": "queued"}
+        failed = {"id": "task-1", "state": "failed"}
+        progress = CLOUD.Progress()
+        with (
+            mock.patch.object(CLOUD, "get_task", return_value=failed),
+            self.assertRaisesRegex(CLOUD.ConflictError, "ended in state failed"),
+        ):
+            CLOUD.monitor_task(
+                mock.sentinel.runner, mock.sentinel.snapshot, initial,
+                progress, mock.Mock(),
+            )
+        self.assertEqual("task-1", progress.task_id)
+        self.assertEqual("failed", progress.task_state)
+
     def test_policy_seven_refuses_a_single_task_stack_boundary_guess(self):
         request = existing.ManagedTaskPromptTest().minimal_request()
         request.update(policy=CLOUD.POLICY, strategy="native-stack")

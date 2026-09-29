@@ -3597,7 +3597,7 @@ def execute_native_stack(
             return
         elif final["state"] != "completed":
             raise ConflictError("completed stack task changed state", "task_failed")
-        result.task_state = str(final["state"])
+        result.task_state = progress.task_state = str(final["state"])
         result.task_url = task_link(final) or result.task_url
         source_drift = None
         try:
@@ -3828,7 +3828,7 @@ def execute(
         result.task_base_ref = result.task_base_sha = task_base_sha(request)
     final = monitor_task(runner, snapshot, initial, progress, sleep)
     if result is not None:
-        result.task_state = str(final["state"])
+        result.task_state = progress.task_state = str(final["state"])
         result.task_url = task_link(final) or result.task_url
     source_drift = None
     try:
@@ -4103,7 +4103,7 @@ def main(
     except ConflictError as error:
         result.status = "error"
         result.task_id = result.task_id or progress.task_id
-        result.task_state = result.task_state or progress.task_state
+        result.task_state = progress.task_state or result.task_state
         result.error = {
             "code": error.code,
             "message": str(error),
@@ -4121,7 +4121,7 @@ def main(
     except Exception as error:
         result.status = "error"
         result.task_id = result.task_id or progress.task_id
-        result.task_state = result.task_state or progress.task_state
+        result.task_state = progress.task_state or result.task_state
         result.error = {
             "code": "unexpected_helper_error",
             "message": str(error),

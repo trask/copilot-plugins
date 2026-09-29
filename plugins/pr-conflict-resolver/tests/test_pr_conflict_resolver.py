@@ -1114,7 +1114,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "2a07d9e9c6b4b6e3a1ff6c3ee2ef44b42d2cc1eabe7219ee8e2ac65254d71e20",
+            "3040170b2be621f06a72c7d8f7fa273c760a798cd4dfbc3dc102612e1bbfd97d",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -5363,6 +5363,42 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
         self.assertEqual("unexpected_helper_error", result["error"]["code"])
         self.assertEqual("task-1", result["task"]["id"])
         self.assertEqual("in_progress", result["task"]["state"])
+
+    def test_terminal_observation_replaces_initial_task_state_on_failure(self):
+        for failure in (
+            CLOUD_MODULE.ConflictError(
+                "Agent Task task-1 ended in state failed", "task_failed"
+            ),
+            RuntimeError("monitor failed"),
+        ):
+            with self.subTest(failure=failure):
+                def fail_after_observation(_options, **kwargs):
+                    kwargs["result"].task_id = kwargs["progress"].task_id = "task-1"
+                    kwargs["result"].task_state = "queued"
+                    kwargs["progress"].task_state = "failed"
+                    raise failure
+
+                exit_code, result, _stderr = self.invoke(fail_after_observation)
+                self.assertEqual(2, exit_code)
+                self.assertEqual("failed", result["task"]["state"])
+                self.assertEqual("task-1", result["task"]["id"])
+                self.assertEqual(
+                    "task_failed"
+                    if isinstance(failure, CLOUD_MODULE.ConflictError)
+                    else "unexpected_helper_error",
+                    result["error"]["code"],
+                )
+
+    def test_completed_observation_survives_later_validation_failure(self):
+        def fail_after_completion(_options, **kwargs):
+            kwargs["result"].task_id = kwargs["progress"].task_id = "task-1"
+            kwargs["result"].task_state = kwargs["progress"].task_state = "completed"
+            raise CLOUD_MODULE.ConflictError("candidate invalid", "unexpected_history")
+
+        exit_code, result, _stderr = self.invoke(fail_after_completion)
+        self.assertEqual(2, exit_code)
+        self.assertEqual("completed", result["task"]["state"])
+        self.assertEqual("unexpected_history", result["error"]["code"])
 
     def test_unexpected_exception_keeps_error_detail(self):
         detail = "Authorization: Basic example"
