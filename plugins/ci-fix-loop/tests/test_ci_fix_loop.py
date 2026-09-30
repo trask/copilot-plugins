@@ -1948,6 +1948,60 @@ class SealedCiFixCommandTest(unittest.TestCase):
             self.assertFalse(result["terminal"])
             self.assertEqual(os.getpid(), result["owner"]["process_id"])
 
+    def test_sealed_loop_failure_reports_underlying_error_and_task_evidence(self):
+        with tempfile.TemporaryDirectory(prefix="sealed diagnostics ") as directory:
+            repo, _, artifact_path, package, snapshot, artifact = self.fixture(
+                Path(directory),
+            )
+            detail = "could not load the pinned Agent Tasks runtime: source digest changed"
+            evidence = {
+                "task_id": "hosted-task",
+                "task_url": "https://github.com/owner/repo/tasks/hosted-task",
+                "receipt_path": "receipt.json",
+                "reason": "coordinator_error",
+            }
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(mock.patch.object(
+                    MODULE, "command_loop",
+                    side_effect=MODULE.WorkflowError(detail, details=evidence),
+                ))
+                with self.assertRaisesRegex(MODULE.WorkflowError, detail) as raised:
+                    MODULE.consume_sealed_ci_fix_invocation(artifact_path)
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8"),
+            )
+            inner = result["steps"]["loop"]["outcome"]
+            self.assertEqual({"result": "error", "error": detail, **evidence}, inner)
+            self.assertEqual(inner, result["outcome"]["selected_pr_result"])
+            self.assertEqual(inner, raised.exception.details["selected_pr_result"])
+            self.assertIn(detail, result["outcome"]["error"])
+            self.assertEqual("failed", result["status"])
+            self.assertEqual("loop", result["stage"])
+            self.assertEqual(1, result["exit_code"])
+
+    def test_sealed_failure_does_not_present_an_unverified_loop_outcome(self):
+        with tempfile.TemporaryDirectory(prefix="sealed unverified ") as directory:
+            repo, _, artifact_path, package, snapshot, artifact = self.fixture(
+                Path(directory),
+            )
+            with contextlib.ExitStack() as stack:
+                for patch in self.run_patches(repo, package, snapshot):
+                    stack.enter_context(patch)
+                stack.enter_context(mock.patch.object(
+                    MODULE, "execute_managed_command",
+                    return_value={"outcome": {"error": "unverified error"}},
+                ))
+                with self.assertRaises(MODULE.WorkflowError) as raised:
+                    MODULE.consume_sealed_ci_fix_invocation(artifact_path)
+            result = json.loads(
+                Path(artifact["outputs"]["result"]).read_text(encoding="utf-8"),
+            )
+            self.assertIsNone(result["outcome"]["selected_pr_result"])
+            self.assertIsNone(raised.exception.details["selected_pr_result"])
+            self.assertNotIn("unverified error", str(raised.exception))
+
     def test_source_only_policy_refuses_reruns(self):
         MODULE.ACTIVE_GITHUB_MUTATION_POLICY = "source-only"
         with (
@@ -3774,6 +3828,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
             / "agent-tasks-runtime" / "scripts" / "cloud_task.py"
         )
         self.runtime = MODULE.load_candidate_runtime(helper)
+        self.runtime_loader = MODULE.load_candidate_runtime
         runtime_loader = mock.patch.object(
             MODULE, "load_candidate_runtime", return_value=self.runtime,
         )
@@ -3859,6 +3914,106 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.trusted_validation_mock = self.trusted_validation.start()
         self.addCleanup(self.hosted_helper.stop)
         self.addCleanup(self.trusted_validation.stop)
+
+    def test_foreground_attempt_retains_verified_runtime_across_marketplace_update(self):
+        helper = self.root / "cloud_task.py"
+        source = (
+            SCRIPT.parents[2] / "agent-tasks-runtime" / "skills"
+            / "agent-tasks-runtime" / "scripts" / "cloud_task.py"
+        )
+        helper.write_bytes(source.read_bytes())
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        args = SimpleNamespace(
+            model="sol", bounded_step=False,
+            hosted_timeout=60, hosted_discovery_interval=1,
+        )
+        attempt = MODULE.HostedRepairAttempt(
+            args, repo, state_path, self.preflight, "gpt-5.6-sol",
+            bounded_resume=False,
+        )
+        attempt.prepare({"version": MODULE.STATE_VERSION, "history": []})
+        result = self.candidate_result(["5" * 40])
+        verified = {
+            "task": result["task"],
+            "completion": result["completion"],
+            "candidate": result["candidate"],
+            "artifact_commit": None,
+            "code_tip": "5" * 40,
+            "commits": ["5" * 40],
+        }
+
+        def complete(_command, **_kwargs):
+            helper.write_text("updated Runtime source\n", encoding="utf-8")
+            attempt.result_path.write_text(json.dumps(result), encoding="utf-8")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with (
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(
+                MODULE, "load_candidate_runtime", wraps=self.runtime_loader,
+            ) as load_runtime,
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(MODULE, "run_hosted_helper", side_effect=complete),
+            mock.patch.object(
+                MODULE, "run", side_effect=AssertionError("external work is forbidden"),
+            ),
+        ):
+            self.assertTrue(attempt.dispatch())
+            runtime = attempt.runtime
+            with (
+                mock.patch.object(runtime, "verify_current_candidate", return_value=verified) as verify,
+                mock.patch.object(
+                    runtime, "guarded_fast_forward_candidate",
+                    return_value={"final_local_head": "5" * 40, "application": "fast_forwarded"},
+                ) as guarded_import,
+                mock.patch.object(MODULE, "local_identity", side_effect=[
+                    self.preflight["identity"],
+                    {**self.preflight["identity"], "head": "5" * 40},
+                ]),
+            ):
+                remote = attempt.verify_result().remote
+                self.assertEqual(["5" * 40], remote["commits"])
+                self.assertTrue(attempt.import_candidate(remote))
+            load_runtime.assert_called_once_with(helper)
+            verify.assert_called_once()
+            guarded_import.assert_called_once()
+            self.assertEqual(
+                attempt.prompt, verify.call_args.kwargs["options"].prompt,
+            )
+            self.assertEqual(
+                attempt.prompt, guarded_import.call_args.kwargs["options"].prompt,
+            )
+            with self.assertRaisesRegex(RuntimeError, "source digest changed"):
+                MODULE.load_cloud_task_runtime(helper)
+
+    def test_foreground_attempt_rejects_runtime_mismatch_before_hosted_dispatch(self):
+        helper = self.root / "cloud_task.py"
+        helper.write_text("unverified Runtime\n", encoding="utf-8")
+        repo = self.root / "repo"
+        repo.mkdir()
+        state_path = self.root / "state.json"
+        attempt = MODULE.HostedRepairAttempt(
+            SimpleNamespace(model="sol", bounded_step=False),
+            repo, state_path, self.preflight, "gpt-5.6-sol",
+            bounded_resume=False,
+        )
+        attempt.prepare({"version": MODULE.STATE_VERSION, "history": []})
+        with (
+            mock.patch.object(MODULE, "discover_cloud_task", return_value=helper),
+            mock.patch.object(
+                MODULE, "load_candidate_runtime", wraps=self.runtime_loader,
+            ),
+            mock.patch.object(MODULE, "require_live_check_snapshot"),
+            mock.patch.object(MODULE, "run_hosted_helper") as dispatch,
+            self.assertRaisesRegex(MODULE.WorkflowError, "source digest changed"),
+        ):
+            attempt.dispatch()
+        dispatch.assert_not_called()
+        self.assertEqual(
+            "not_created", MODULE.load_state(state_path)["agent_task"]["task_id_status"],
+        )
 
     def trusted_evidence(self, commit_sha=None):
         return [
@@ -4306,7 +4461,7 @@ class ManagedAgentTaskContractTest(unittest.TestCase):
         self.assertNotIn("model:", instructions)
         self.assertNotIn("sealed", instructions.lower())
         self.assertNotIn("manifest", instructions.lower())
-        self.assertEqual("1.6.122", json.loads(PLUGIN.read_text())["version"])
+        self.assertEqual("1.6.123", json.loads(PLUGIN.read_text())["version"])
 
     def test_agent_requires_one_pull_request_target(self):
         instructions = AGENT.read_text(encoding="utf-8")

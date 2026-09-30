@@ -59,6 +59,7 @@ class HostedRepairAttemptTest(unittest.TestCase):
         responses = iter((lambda *_: {"status": "pending"}, observe))
         with (
             mock.patch.object(MODULE, "discover_cloud_task", return_value=self.helper),
+            mock.patch.object(MODULE, "load_candidate_runtime"),
             mock.patch.object(MODULE, "local_ci_briefing", return_value="briefing"),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(MODULE, "bounded_worker_prompt", return_value=("prompt", "evidence")),
@@ -148,6 +149,7 @@ class HostedRepairAttemptTest(unittest.TestCase):
 
         with (
             mock.patch.object(MODULE, "discover_cloud_task", return_value=self.helper),
+            mock.patch.object(MODULE, "load_candidate_runtime") as load_runtime,
             mock.patch.object(MODULE, "local_ci_briefing", return_value="briefing"),
             mock.patch.object(MODULE, "require_live_check_snapshot"),
             mock.patch.object(MODULE, "bounded_worker_prompt", return_value=("prompt", "evidence")),
@@ -172,6 +174,10 @@ class HostedRepairAttemptTest(unittest.TestCase):
         import_candidate.assert_called_once()
         self.assertEqual(self.helper, import_candidate.call_args.kwargs["helper"])
         self.assertEqual("prompt", import_candidate.call_args.kwargs["prompt"])
+        load_runtime.assert_called_once_with(self.helper)
+        self.assertIs(
+            load_runtime.return_value, import_candidate.call_args.kwargs["runtime"],
+        )
         self.assertIn(attempt.result_path, finalize.call_args.args[2])
         self.assertIn(attempt.briefing_path, finalize.call_args.args[2])
 

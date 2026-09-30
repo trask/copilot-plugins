@@ -7266,8 +7266,10 @@ def bounded_worker_prompt(
     preflight: dict[str, Any], *, helper: Path, iteration_allowance: int,
     prior_history: list[dict[str, Any]], requested_model: str,
     briefing: str,
+    runtime: ModuleType | None = None,
 ) -> tuple[str, str]:
-    runtime = load_candidate_runtime(helper)
+    if runtime is None:
+        runtime = load_candidate_runtime(helper)
     source = expected_cloud_pull_request(preflight)
     snapshot = runtime.PullRequestSnapshot(
         **source, state="OPEN",
@@ -7468,10 +7470,12 @@ def verify_runtime_candidate(
     preflight: dict[str, Any],
     requested_model: str,
     prompt: str,
+    runtime: ModuleType | None = None,
 ) -> dict[str, Any]:
     if result.get("status") != "success" or result.get("error") is not None:
         raise task_failure_from_result(result)
-    runtime = load_candidate_runtime(helper)
+    if runtime is None:
+        runtime = load_candidate_runtime(helper)
     pr = preflight["pr"]
     snapshot = runtime.PullRequestSnapshot(
         state=pr["state"],
@@ -9327,6 +9331,7 @@ def apply_verified_candidate_import(
     result_sha256: str,
     preflight: dict[str, Any],
     remote: dict[str, Any],
+    runtime: ModuleType | None = None,
 ) -> bool:
     if sha256_file(result_path) != result_sha256:
         raise WorkflowError("Agent Task result changed after candidate validation")
@@ -9339,7 +9344,8 @@ def apply_verified_candidate_import(
         or identity["head"] != source_head
     ):
         raise WorkflowError("local repository identity drifted before guarded import")
-    runtime = load_candidate_runtime(helper)
+    if runtime is None:
+        runtime = load_candidate_runtime(helper)
     pr = preflight["pr"]
     snapshot = runtime.PullRequestSnapshot(
         state=pr["state"],
@@ -10997,6 +11003,7 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
     )
 
     stage = "identity_pass_1"
+    selected_pr_result: dict[str, Any] | None = None
     previous_policy = ACTIVE_GITHUB_MUTATION_POLICY
     try:
         ACTIVE_GITHUB_MUTATION_POLICY = request["github_mutation_policy"]["id"]
@@ -11057,8 +11064,12 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
                 output_paths["loop_result"],
                 loop_result,
             )
+            selected_pr_result = loop_result["outcome"]
             if loop_result["status"] != "succeeded":
-                raise WorkflowError("sealed CI Fix loop returned a failed result")
+                raise WorkflowError(
+                    "sealed CI Fix loop returned a failed result: "
+                    + loop_result["outcome"]["error"]
+                )
             workflow = loop_result["outcome"]
             if stack_identity is not None:
                 stage = "propagation"
@@ -11103,11 +11114,7 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
             "result": "sealed_ci_fix_failed",
             "stage": stage,
             "error": str(error),
-            "selected_pr_result": (
-                steps["loop"]["outcome"]
-                if stage == "propagation" and steps["loop"] is not None
-                else None
-            ),
+            "selected_pr_result": selected_pr_result,
             "result_file": str(result_path),
             "state": str(state_path),
             "github_mutation_policy": request["github_mutation_policy"]["id"],
@@ -11126,7 +11133,10 @@ def consume_sealed_ci_fix_invocation(artifact_path: Path) -> None:
         )
         raise WorkflowError(
             f"sealed CI Fix stopped during {stage}: {error}",
-            details={"result_file": str(result_path)},
+            details={
+                "result_file": str(result_path),
+                "selected_pr_result": outcome["selected_pr_result"],
+            },
         ) from error
     finally:
         ACTIVE_GITHUB_MUTATION_POLICY = previous_policy
@@ -11316,6 +11326,7 @@ class HostedRepairAttempt:
         self.result_path: Path | None = None
         self.briefing_path: Path | None = None
         self.helper: Path | None = None
+        self.runtime: ModuleType | None = None
         self.prompt: str | None = None
         self.result_sha256: str | None = None
 
@@ -11393,12 +11404,14 @@ class HostedRepairAttempt:
                     briefing = local_ci_briefing(self.preflight, model=self.requested_model)
                     require_live_check_snapshot(self.preflight)
                     atomic_write_text(self.briefing_path, briefing + "\n")
+                    self.runtime = load_candidate_runtime(self.helper)
                     self.prompt, ci_evidence = bounded_worker_prompt(
                         self.preflight, helper=self.helper,
                         iteration_allowance=1,
                         prior_history=state.get("history") or [],
                         requested_model=self.requested_model,
                         briefing=briefing,
+                        runtime=self.runtime,
                     )
                     task_state["evidence_sha256"] = sha256_text(ci_evidence)
                     atomic_write_text(self.prompt_path, self.prompt)
@@ -11542,6 +11555,8 @@ class HostedRepairAttempt:
                 )
                 save_state(self.state_path, state)
             raise task_failure_from_result(result)
+        if self.runtime is None:
+            self.runtime = load_candidate_runtime(self.helper)
         remote = verify_runtime_candidate(
             result,
             helper=self.helper,
@@ -11549,6 +11564,7 @@ class HostedRepairAttempt:
             preflight=self.preflight,
             requested_model=self.requested_model,
             prompt=self.prompt,
+            runtime=self.runtime,
         )
         state = load_state(self.state_path)
         state["agent_task"].update(
@@ -11577,6 +11593,7 @@ class HostedRepairAttempt:
             result_sha256=self.result_sha256,
             preflight=self.preflight,
             remote=remote,
+            runtime=self.runtime,
         )
 
     def finalize_artifacts(

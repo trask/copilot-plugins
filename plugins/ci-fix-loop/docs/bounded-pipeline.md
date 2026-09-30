@@ -6,6 +6,8 @@ The hosted helper prints pending v5 JSON to stdout for direct CLI calls. Under m
 
 The hosted repair attempt owns prompt and result artifacts, dispatch and bounded resume, helper pin and dispatch-identity checks, candidate verification, and artifact cleanup. The coordinator owns CI admission, iteration budgets, candidate acceptance, and publication. Both the foreground and bounded helper paths reach publication only through a verified attempt result.
 
+Within a foreground repair attempt, prompt construction, candidate verification, and guarded import use the same byte-verified Runtime module. A marketplace update while the hosted task runs does not replace that module. A new process, including a bounded observation, must still verify the installed Runtime against its source pin. Sealed failures report the underlying loop error and retain its task identity and result paths.
+
 The standalone `run` command waits for pending checks before sealing its initial snapshot and during its identity checks. It polls within the coordinator's wait limit, then reports the names of any checks still pending if the limit expires.
 
 The standalone loop and bounded step use the same CI rerun transition. The coordinator stores the selected preflight, task result, and completed checks in one pending rerun receipt before requesting a check. A bounded call resumes from that receipt without repeating completed requests; saved bounded checkpoints from earlier versions are accepted when they match the coordinator receipt. The bounded step yields after one check; the standalone loop completes the available checks before observing CI again. An unsupported rerun ends the step and preserves its processed-snapshot receipt.
