@@ -250,8 +250,12 @@ commits and finish the full listed history before formatting or testing. An
 incomplete replay blocks publication and reports expected and observed commit
 counts. Hosted failures report available task and session errors, the task URL,
 and each session's `gh agent-task view <session-id> --log` command. A failed
-hosted task blocks publication even if its branch contains commits. A run that
-publishes and then still reads as conflicting is finished
+hosted task blocks publication even if its branch contains commits. Replay
+messages retain their original bytes, with only one optional platform-added
+task-creator attribution appendix. Workers leave hosted signing, hooks, and
+committer identity intact; persistent signing failures stop the task rather
+than produce unsigned fallback commits. A run that publishes and then still
+reads as conflicting is finished
 rather than failed, and a caller
 that wants another integration starts another run. It never posts anything to
 GitHub. Its

@@ -66,6 +66,33 @@ class ReplayTaskBaseTest(unittest.TestCase):
                     strategy == "rebase",
                     "Do not finish with only a prefix of the replay" in prompt,
                 )
+                for required in (
+                    "Keep the hosted Git signing configuration, hooks, and committer identity intact",
+                    "Never use `--no-gpg-sign`, `commit.gpgsign=false`, unsigned `git commit-tree`",
+                    "retry through the normal hosted commit path at most once",
+                    "stop and report the exact error",
+                    "without claiming completion or creating an unsigned fallback commit",
+                ):
+                    self.assertIn(required, prompt)
+
+    def test_replay_prompt_matches_verified_platform_attribution_contract(self):
+        request = existing.ManagedTaskPromptTest().minimal_request()
+        request.update(policy=CLOUD.POLICY, strategy="rebase")
+        prompt = CLOUD.validated_task_prompt(
+            existing.ManagedTaskPromptTest().options(request)
+        )
+        for required in (
+            "read raw commit objects with `git cat-file commit`",
+            "not `git show --format=%B` or shell command substitution",
+            "the exact original message or those exact bytes followed only by one LF",
+            "one platform-added `Co-authored-by: <task creator>` line",
+            "The dispatcher independently verifies that creator against the task",
+            "accept only the exact original message without a duplicate",
+            "Do not add attribution yourself or remove that permitted platform appendix",
+            "Do not reconstruct commits merely to strip it",
+            "No other message change or extra trailing newline is allowed",
+        ):
+            self.assertIn(required, prompt)
 
     def test_controller_keeps_source_identity_separate_from_rebase_task_base(self):
         fixture = existing.ManagedConflictCoordinatorTest()
@@ -390,6 +417,18 @@ class SequentialStackTest(unittest.TestCase):
                 prompt,
             )
             self.assertIn("Never use `git cherry-pick --skip`", prompt)
+            self.assertIn(
+                "Do not add attribution yourself or remove that permitted platform appendix",
+                prompt,
+            )
+            self.assertIn(
+                "Keep the hosted Git signing configuration, hooks, and committer identity intact",
+                prompt,
+            )
+            self.assertIn(
+                "without claiming completion or creating an unsigned fallback commit",
+                prompt,
+            )
             self.assertIn(
                 f"git rev-list --reverse --first-parent {options.request['pull_request']['base_sha']}..HEAD",
                 prompt,
