@@ -1114,7 +1114,7 @@ class ManagedConflictCoordinatorTest(unittest.TestCase):
     def test_pins_the_independent_helper_policy_and_schemas(self):
         self.assertEqual(
             MODULE.REQUIRED_CONFLICT_TASK_SHA256,
-            "3a7e483a8bc20e89b08fad579522a78cffe5475841516c2f9296dfd0469af0e2",
+            "9ab5eb7bcaffaabcefcec3a33ac79ff1b01a453351451bb71d8dadcd063a6e3b",
         )
         self.assertEqual(
             MODULE.CONFLICT_POLICY_SHA256,
@@ -5302,6 +5302,9 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
         request = self.minimal_request()
         for mutation in (
             lambda task: task.update(error={"message": "platform failed"}),
+            lambda task: task["sessions"][0].update(
+                error={"message": "session failed"},
+            ),
             lambda task: task.update(
                 repository={"full_name": "other/repo"},
             ),
@@ -5321,6 +5324,93 @@ class MinimalConflictContractTest(ManagedTaskPromptTest):
         remote = CLOUD_MODULE.discover_minimal_artifact_ref(task, request)
 
         self.assertEqual("copilot/generated-task", remote.ref)
+
+
+class TaskFailureDiagnosticsTest(unittest.TestCase):
+    def task(self, state="failed"):
+        return {
+            "id": "task-1", "state": state,
+            "html_url": "https://github.com/owner/repo/tasks/task-1",
+            "error": {"message": "task platform error"},
+            "sessions": [{
+                "id": "session-1", "state": state,
+                "error": {"message": "signing service returned Bad Request"},
+                "html_url": "https://github.com/owner/repo/tasks/task-1/session-1",
+            }, {
+                "id": "session-2", "state": state,
+                "error": {"message": "validation stopped"},
+            }],
+        }
+
+    def assert_diagnostics(self, message):
+        for detail in (
+            "https://github.com/owner/repo/tasks/task-1",
+            "task platform error",
+            "signing service returned Bad Request",
+            "https://github.com/owner/repo/tasks/task-1/session-1",
+            "validation stopped",
+            "gh agent-task view session-1 --log",
+            "gh agent-task view session-2 --log",
+        ):
+            self.assertIn(detail, message)
+
+    def test_every_terminal_state_preserves_task_and_session_diagnostics(self):
+        for state in sorted(CLOUD_MODULE.TERMINAL_STATES):
+            with self.subTest(state=state):
+                progress = CLOUD_MODULE.Progress()
+                with (
+                    mock.patch.object(CLOUD_MODULE, "get_task", return_value=self.task(state)),
+                    self.assertRaises(CLOUD_MODULE.ConflictError) as failure,
+                ):
+                    CLOUD_MODULE.monitor_task(
+                        mock.sentinel.runner, SimpleNamespace(repository="owner/repo"),
+                        {"id": "task-1", "state": "queued"}, progress, mock.Mock(),
+                    )
+                self.assertEqual("task_failed", failure.exception.code)
+                self.assertEqual(state, progress.task_state)
+                self.assert_diagnostics(str(failure.exception))
+
+    def test_missing_error_still_identifies_the_session_log(self):
+        task = self.task()
+        del task["error"]
+        for session in task["sessions"]:
+            del session["error"]
+        message = CLOUD_MODULE.task_failure_message(task, "owner/repo")
+        self.assertIn("ended in state failed", message)
+        self.assertIn("gh agent-task view session-1 --log", message)
+        self.assertIn("gh agent-task view session-2 --log", message)
+
+    def test_malformed_optional_sessions_do_not_mask_the_hosted_failure(self):
+        for sessions in (None, {}, "invalid", [None, {}, {"id": ["invalid"]}]):
+            with self.subTest(sessions=sessions):
+                task = {"id": "task-1", "state": "failed", "sessions": sessions}
+                message = CLOUD_MODULE.task_failure_message(task, "owner/repo")
+                self.assertIn("ended in state failed", message)
+                self.assertIn("https://github.com/owner/repo/tasks/task-1", message)
+                self.assertNotIn("gh agent-task view", message)
+
+    def test_structured_platform_errors_retain_their_detail(self):
+        task = {
+            "id": "task-1", "state": "failed",
+            "errors": [{"message": "validation unavailable"}],
+            "failure_reason": "worker stopped",
+        }
+        message = CLOUD_MODULE.task_failure_message(task, "owner/repo")
+        self.assertIn("validation unavailable", message)
+        self.assertIn("worker stopped", message)
+
+    def test_completed_task_with_session_error_cannot_supply_candidate_code(self):
+        request = ManagedTaskPromptTest().minimal_request()
+        task = MinimalConflictContractTest().task(request)
+        task["sessions"][0].update(self.task("completed")["sessions"][0])
+        with self.assertRaisesRegex(
+            CLOUD_MODULE.ConflictError,
+            "completed task reports a platform error",
+        ) as failure:
+            CLOUD_MODULE.discover_minimal_artifact_ref(task, request)
+        self.assertEqual("task_failed", failure.exception.code)
+        self.assertIn("signing service returned Bad Request", str(failure.exception))
+        self.assertIn("gh agent-task view session-1 --log", str(failure.exception))
 
 
 class ManagedTaskResultPersistenceTest(unittest.TestCase):
@@ -5399,6 +5489,22 @@ class ManagedTaskResultPersistenceTest(unittest.TestCase):
         self.assertEqual(2, exit_code)
         self.assertEqual("completed", result["task"]["state"])
         self.assertEqual("unexpected_history", result["error"]["code"])
+
+    def test_hosted_failure_diagnostics_survive_terminal_result_serialization(self):
+        fixture = TaskFailureDiagnosticsTest()
+
+        def fail_after_task(_options, **kwargs):
+            CLOUD_MODULE.monitor_task(
+                mock.sentinel.runner, SimpleNamespace(repository="owner/repo"),
+                fixture.task(), kwargs["progress"], mock.Mock(),
+            )
+
+        exit_code, result, stderr = self.invoke(fail_after_task)
+        self.assertEqual(2, exit_code)
+        self.assertEqual("task_failed", result["error"]["code"])
+        self.assertEqual("failed", result["task"]["state"])
+        fixture.assert_diagnostics(result["error"]["message"])
+        fixture.assert_diagnostics(stderr.getvalue())
 
     def test_unexpected_exception_keeps_error_detail(self):
         detail = "Authorization: Basic example"

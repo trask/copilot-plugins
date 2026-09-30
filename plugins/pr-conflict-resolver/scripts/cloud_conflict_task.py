@@ -2121,6 +2121,46 @@ def get_task(
     )
 
 
+def task_error_details(task: Mapping[str, object]) -> list[str]:
+    details = []
+    for field in ("error", "errors", "failure_reason"):
+        error = task.get(field)
+        if not error:
+            continue
+        message = error.get("message") if isinstance(error, dict) else error
+        if not isinstance(message, str) or not message:
+            message = canonical_json(error).decode("utf-8")
+        details.append(f"{field}: {message}")
+    return details
+
+
+def task_failure_message(task: Mapping[str, object], repository: str) -> str:
+    task_id = task["id"]
+    link = task_link(task) or f"https://github.com/{repository}/tasks/{task_id}"
+    details = [
+        f"Agent Task {task_id} ended in state {task['state']}",
+        f"Task: {link}",
+        *task_error_details(task),
+    ]
+    sessions = task.get("sessions")
+    if isinstance(sessions, list):
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            session_id = session.get("id")
+            if isinstance(session_id, str) and TASK_ID_RE.fullmatch(session_id):
+                details.append(f"Session {session_id}: {session.get('state')}")
+            details.extend(f"Session {detail}" for detail in task_error_details(session))
+            link = session.get("html_url")
+            if isinstance(link, str) and re.fullmatch(
+                r"https://(?:api\.)?github\.com/\S+", link
+            ):
+                details.append(link)
+            if isinstance(session_id, str) and TASK_ID_RE.fullmatch(session_id):
+                details.append(f"gh agent-task view {session_id} --log")
+    return "; ".join(details)
+
+
 def monitor_task(
     runner: Runner,
     snapshot: LocalSnapshot,
@@ -2155,7 +2195,7 @@ def monitor_task(
             return task
         if state in TERMINAL_STATES:
             raise ConflictError(
-                f"Agent Task {task['id']} ended in state {state}",
+                task_failure_message(task, snapshot.repository),
                 "task_failed",
             )
         sleep(POLL_SECONDS)
@@ -2243,14 +2283,21 @@ def discover_task_artifact_ref(
 def discover_minimal_artifact_ref(
     task: Mapping[str, object], request: Mapping[str, object]
 ) -> RemoteRef:
-    for field in ("error", "errors", "failure_reason"):
-        if task.get(field):
-            raise ConflictError(
-                "completed task reports a platform error",
-                "task_failed",
-            )
-    normalized_task = task
     sessions = task.get("sessions")
+    if task_error_details(task) or (
+        isinstance(sessions, list)
+        and any(
+            task_error_details(session)
+            for session in sessions
+            if isinstance(session, dict)
+        )
+    ):
+        raise ConflictError(
+            "completed task reports a platform error; "
+            + task_failure_message(task, str(request["repository"])),
+            "task_failed",
+        )
+    normalized_task = task
     if (
         isinstance(sessions, list)
         and len(sessions) == 1
@@ -3558,8 +3605,16 @@ def execute_native_stack(
                 if options.bounded_phase == "collect" and receipt["status"] != "completed":
                     raise ConflictError("stack member has not completed", "policy_rejected")
                 final = get_task(runner, snapshot, str(initial["id"]))
+                result.task_id = progress.task_id = str(final["id"])
+                result.task_state = progress.task_state = str(final["state"])
+                result.task_url = task_link(final)
+                result.task_base_ref = result.task_base_sha = base_sha
                 if receipt["status"] == "completed" and final["state"] != "completed":
-                    raise ConflictError("completed stack task changed state", "task_failed")
+                    raise ConflictError(
+                        "completed stack task changed state; "
+                        + task_failure_message(final, snapshot.repository),
+                        "task_failed",
+                    )
                 if options.bounded_phase == "observe":
                     receipt.update(
                         status="completed" if final["state"] == "completed" else "active",
@@ -3579,6 +3634,10 @@ def execute_native_stack(
         result.task_state = progress.task_state = str(initial["state"])
         result.task_url = task_link(initial)
         result.task_base_ref = result.task_base_sha = base_sha
+        if initial["state"] in TERMINAL_STATES:
+            raise ConflictError(
+                task_failure_message(initial, snapshot.repository), "task_failed"
+            )
         if options.bounded_phase is None:
             atomic_write_json(options.result_file, result.as_dict())
             progress.result_path = member_options.result_file
@@ -3604,21 +3663,19 @@ def execute_native_stack(
                     "url": task_link(final),
                 },
             )
+        result.task_state = progress.task_state = str(final["state"])
+        result.task_url = task_link(final) or result.task_url
+        if final["state"] in TERMINAL_STATES:
+            raise ConflictError(
+                task_failure_message(final, snapshot.repository), "task_failed"
+            )
         if options.bounded_phase == "observe":
-            result.task_state = progress.task_state = str(final["state"])
-            result.task_url = task_link(final) or result.task_url
-            if final["state"] in TERMINAL_STATES:
-                raise ConflictError(
-                    f"stack task {task_id} ended in state {final['state']}", "task_failed"
-                )
             result.status = "waiting"
             result.code_refs = []
             result.artifact = None
             return
         elif final["state"] != "completed":
             raise ConflictError("completed stack task changed state", "task_failed")
-        result.task_state = progress.task_state = str(final["state"])
-        result.task_url = task_link(final) or result.task_url
         source_drift = None
         try:
             require_target_fresh(runner, snapshot, request)
@@ -4011,7 +4068,15 @@ def execute_bounded(
         if options.bounded_phase == "observe":
             task = get_task(runner, snapshot, str(initial["id"]))
             if receipt["status"] == "completed" and task["state"] != "completed":
-                raise ConflictError("completed task changed state", "task_failed")
+                progress.task_id = str(task["id"])
+                progress.task_state = str(task["state"])
+                result.task_url = task_link(task)
+                result.task_base_ref = result.task_base_sha = task_base_sha(request)
+                raise ConflictError(
+                    "completed task changed state; "
+                    + task_failure_message(task, snapshot.repository),
+                    "task_failed",
+                )
             receipt.update(
                 status="completed" if task["state"] == "completed" else "active",
                 task=task,
@@ -4027,7 +4092,7 @@ def execute_bounded(
     result.task_url = task_link(task)
     result.task_base_ref = result.task_base_sha = task_base_sha(request)
     if task["state"] in TERMINAL_STATES:
-        raise ConflictError(f"Agent Task {task['id']} ended in state {task['state']}", "task_failed")
+        raise ConflictError(task_failure_message(task, snapshot.repository), "task_failed")
     if options.bounded_phase != "collect":
         result.status = "waiting"
         return 0

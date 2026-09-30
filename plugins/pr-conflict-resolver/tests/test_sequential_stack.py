@@ -704,7 +704,7 @@ class PipelineConflictEntryTest(unittest.TestCase):
             self.assertRaisesRegex(CLOUD.ConflictError, "ended in state failed"),
         ):
             CLOUD.monitor_task(
-                mock.sentinel.runner, mock.sentinel.snapshot, initial,
+                mock.sentinel.runner, mock.Mock(repository="owner/repo"), initial,
                 progress, mock.Mock(),
             )
         self.assertEqual("task-1", progress.task_id)

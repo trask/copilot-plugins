@@ -772,6 +772,58 @@ class BoundedBackendTest(unittest.TestCase):
                     )
                 post.assert_called_once()
 
+    def test_terminal_tasks_keep_diagnostics_in_every_bounded_phase(self):
+        fixture = existing.TaskFailureDiagnosticsTest()
+        for phase in ("dispatch", "observe", "collect"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                request = existing.ManagedConflictCoordinatorTest().request()
+                options = CLOUD.Options(
+                    "merge", "gpt-5.6-sol", request["pull_request"]["url"],
+                    root / "request.json", root / "prompt.txt", root / "result.json",
+                    request, "prompt", phase, "session-1",
+                )
+                snapshot = CLOUD.LocalSnapshot(
+                    root / "repo", root, "owner/repo", "origin",
+                    "feature", "b" * 40, "", None,
+                )
+                snapshot.root.mkdir()
+                if phase != "dispatch":
+                    CLOUD.atomic_write_json(CLOUD.bounded_receipt_path(options), {
+                        "session": "session-1",
+                        "request_id": request["request_id"],
+                        "request_sha256": request["request_sha256"],
+                        "repository": request["repository"],
+                        "model": options.model, "strategy": options.strategy,
+                        "status": "completed",
+                        "task": {"id": "task-1", "state": "completed"},
+                    })
+                with (
+                    mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": "session-1"}),
+                    mock.patch.object(CLOUD, "parse_args", return_value=options),
+                    mock.patch.object(CLOUD, "local_snapshot", return_value=snapshot),
+                    mock.patch.object(CLOUD, "require_target_fresh"),
+                    mock.patch.object(CLOUD, "require_local_unchanged"),
+                    mock.patch.object(CLOUD, "fetch_pinned_inputs"),
+                    mock.patch.object(CLOUD, "verify_frozen_ranges"),
+                    mock.patch.object(CLOUD, "already_satisfied", return_value=False),
+                    mock.patch.object(CLOUD, "start_task", return_value=fixture.task()) as post,
+                    mock.patch.object(CLOUD, "get_task", return_value=fixture.task()),
+                    mock.patch.object(CLOUD, "prove_generated") as prove,
+                ):
+                    self.assertEqual(2, CLOUD.main(
+                        ["--result-file", str(options.result_file)],
+                        cwd=snapshot.root,
+                    ))
+                result = json.loads(options.result_file.read_text(encoding="utf-8"))
+                self.assertEqual("task_failed", result["error"]["code"])
+                self.assertEqual("task-1", result["task"]["id"])
+                self.assertEqual("failed", result["task"]["state"])
+                self.assertEqual("not_started", result["application"]["status"])
+                fixture.assert_diagnostics(result["error"]["message"])
+                self.assertEqual(1 if phase == "dispatch" else 0, post.call_count)
+                prove.assert_not_called()
+
 
 class BoundedSweepTest(unittest.TestCase):
     def test_prior_policy_no_task_clearance_can_be_revalidated(self):
@@ -912,6 +964,56 @@ class BoundedNativeStackTest(unittest.TestCase):
             self.assertEqual("dispatching", receipt["status"])
             self.assertEqual(0, receipt["member_index"])
             post.assert_called_once()
+
+    def test_failed_member_blocks_advancement_in_every_bounded_phase(self):
+        diagnostics = existing.TaskFailureDiagnosticsTest()
+        for phase in ("dispatch", "observe", "collect"):
+            with self.subTest(phase=phase):
+                fixture = stack_tests.SequentialStackTest()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                options = replace(
+                    fixture.options, bounded_phase="dispatch",
+                    bounded_session="session-1",
+                )
+                with (
+                    mock.patch.dict(os.environ, {"COPILOT_AGENT_SESSION_ID": "session-1"}),
+                    mock.patch.object(CLOUD, "parse_args", return_value=options) as parse,
+                    mock.patch.object(CLOUD, "local_snapshot", return_value=fixture.snapshot),
+                    mock.patch.object(CLOUD, "require_target_fresh"),
+                    mock.patch.object(CLOUD, "already_satisfied", return_value=False),
+                    mock.patch.object(CLOUD, "fetch_pinned_inputs"),
+                    mock.patch.object(CLOUD, "start_task", side_effect=(
+                        lambda *args: diagnostics.task() if phase == "dispatch"
+                        else {**fixture.start(*args), "state": "queued"}
+                    )) as post,
+                    mock.patch.object(CLOUD, "get_task", return_value=diagnostics.task()) as get,
+                    mock.patch.object(CLOUD, "prove_rebase_range_mechanically") as prove,
+                ):
+                    if phase != "dispatch":
+                        self.assertEqual(0, CLOUD.main(
+                            ["--result-file", str(options.result_file)], cwd=fixture.root,
+                        ))
+                        if phase == "collect":
+                            parse.return_value = replace(options, bounded_phase="observe")
+                            get.return_value = fixture.tasks["task-1"]
+                            self.assertEqual(0, CLOUD.main(
+                                ["--result-file", str(options.result_file)], cwd=fixture.root,
+                            ))
+                            get.return_value = diagnostics.task()
+                        parse.return_value = replace(options, bounded_phase=phase)
+                    self.assertEqual(2, CLOUD.main(
+                        ["--result-file", str(options.result_file)], cwd=fixture.root,
+                    ))
+                result = json.loads(options.result_file.read_text(encoding="utf-8"))
+                self.assertEqual("task_failed", result["error"]["code"])
+                self.assertEqual("task-1", result["task"]["id"])
+                self.assertEqual("failed", result["task"]["state"])
+                diagnostics.assert_diagnostics(result["error"]["message"])
+                self.assertEqual("not_started", result["application"]["status"])
+                self.assertEqual([], result["generated"]["code_refs"])
+                post.assert_called_once()
+                prove.assert_not_called()
 
     def test_second_member_preflight_rejection_keeps_member_position(self):
         fixture = stack_tests.SequentialStackTest()
