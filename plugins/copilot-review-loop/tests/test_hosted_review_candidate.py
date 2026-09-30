@@ -292,6 +292,29 @@ class HostedReviewCandidateTest(unittest.TestCase):
         self.assertFalse((self.repo / MODULE.HOSTED_DECISION_PATH).exists())
         self.assertEqual("", self.git("status", "--porcelain"))
 
+    def test_hosted_failure_preserves_session_diagnostic_without_importing(self):
+        message = self.runtime.task_failure_message(
+            {
+                "id": "task-fixture",
+                "state": "failed",
+                "sessions": [{
+                    "id": "session-fixture", "state": "failed",
+                    "error": {"message": "Failed to send pr_summary after 3 attempts: Error: HTTP 500: Internal Server Error"},
+                }],
+            },
+            "owner/repo",
+        )
+        self.result = self.runtime.ResultEnvelope(
+            task_id="task-fixture", task_state="failed",
+            error_code="task_failed", error_message=message,
+        ).as_dict()
+        with self.assertRaises(MODULE.WorkflowError) as raised:
+            self.run_worker()
+        self.assertEqual(f"Agent Task failed [task_failed]: {message}", str(raised.exception))
+        self.assertEqual(self.head, self.git("rev-parse", "HEAD"))
+        self.assertFalse(self.canonical_path.exists())
+        self.assertFalse(self.decision_path.exists())
+
     def test_hosted_candidate_accepts_only_forward_base_drift(self):
         tip = self.candidate()
         self.result["pull_request"]["base_sha"] = "2" * 40

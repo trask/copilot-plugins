@@ -767,6 +767,73 @@ class DetachedCandidateCheckoutTest(unittest.TestCase):
             self.repository.require_unchanged(snapshot)
 
 
+class TaskFailureDiagnosticsTest(unittest.TestCase):
+    def test_terminal_states_retain_every_session_error_and_log_selector(self):
+        for state in sorted(MODULE.ERROR_STATES | MODULE.BLOCKED_STATES):
+            with self.subTest(state=state):
+                task = {
+                    "id": "task-1",
+                    "state": state,
+                    "sessions": [
+                        {
+                            "id": "session-1", "state": state,
+                            "error": {"message": "Failed to send pr_summary after 3 attempts: Error: HTTP 500: Internal Server Error"},
+                        },
+                        {
+                            "id": "session-2", "state": state,
+                            "error": {"message": "Worker stopped"},
+                            "html_url": "https://github.com/owner/repo/agent-sessions/session-2",
+                        },
+                    ],
+                }
+                api = mock.Mock()
+                report = mock.Mock()
+                sleep = mock.Mock()
+                progress = MODULE.Progress()
+                with self.assertRaises(MODULE.CloudError) as raised:
+                    MODULE.monitor_task(
+                        api, "owner/repo", task, progress, sleep, report,
+                    )
+                message = str(raised.exception)
+                self.assertIn(f"Agent Task task-1 ended in state {state}", message)
+                self.assertIn("https://github.com/owner/repo/tasks/task-1", message)
+                self.assertIn(task["sessions"][0]["error"]["message"], message)
+                self.assertIn("Worker stopped", message)
+                for session in task["sessions"]:
+                    self.assertIn(f"Session {session['id']}: {state}", message)
+                    self.assertIn(f"gh agent-task view {session['id']} --log", message)
+                self.assertIn(task["sessions"][1]["html_url"], message)
+                self.assertEqual(
+                    "task_failed" if state in MODULE.ERROR_STATES else "cloud_error",
+                    raised.exception.code,
+                )
+                if state in MODULE.BLOCKED_STATES:
+                    self.assertIn("open the task in GitHub to provide input or resume it", message)
+                self.assertEqual("task-1", progress.task_id)
+                self.assertEqual(state, progress.last_state)
+                report.assert_called_once_with(task)
+                sleep.assert_not_called()
+                api.request_json.assert_not_called()
+
+    def test_missing_session_errors_do_not_hide_task_identity(self):
+        for sessions in (
+            None,
+            [],
+            [{"id": "session-1", "state": "failed"}],
+            [{"id": "session-1", "state": "failed", "error": {}}],
+            [{"id": "session-1", "state": "failed", "error": {"message": ""}}],
+        ):
+            with self.subTest(sessions=sessions):
+                task = {"id": "task-1", "state": "failed", "sessions": sessions}
+                message = MODULE.task_failure_message(task, "owner/repo")
+                self.assertIn("Agent Task task-1 ended in state failed", message)
+                self.assertIn("https://github.com/owner/repo/tasks/task-1", message)
+                self.assertNotIn("Session error:", message)
+                self.assertNotIn("None", message)
+                if sessions:
+                    self.assertIn("gh agent-task view session-1 --log", message)
+
+
 class CandidateDispatcherTest(unittest.TestCase):
     def test_required_candidate_output_reports_verified_task_and_session(self):
         for commits in ([], ["2" * 40]):
@@ -1674,12 +1741,11 @@ class PipelineStagesTest(unittest.TestCase):
 
     def invoke(
         self, stage="dispatch", *, run=None, prompt=None, session=None,
-        report=False,
+        report=False, sleep=None,
     ):
         if prompt is not None:
             self.prompt.write_text(prompt, encoding="utf-8")
         argv = [
-            "--pipeline-" + stage, "--pipeline-run", run or self.run_id,
             "--model", "sol", "--report" if report else "--apply-with-report",
             "--pr", "owner/repo#7",
             "--prompt-file", str(self.prompt), "--result-file", str(self.result_path),
@@ -1688,6 +1754,8 @@ class PipelineStagesTest(unittest.TestCase):
                 if report else MODULE.MARKETPLACE_CODE_CANDIDATE_POLICY_SELECTOR
             ),
         ]
+        if stage is not None:
+            argv[:0] = ["--pipeline-" + stage, "--pipeline-run", run or self.run_id]
         with mock.patch.dict(
             MODULE.os.environ,
             {"COPILOT_AGENT_SESSION_ID": session or "session-root"},
@@ -1696,7 +1764,7 @@ class PipelineStagesTest(unittest.TestCase):
             code = MODULE.main(
                 argv, cwd=self.root, uuid_factory=lambda: "request-1",
                 stdout=output, stderr=io.StringIO(),
-                sleep=lambda seconds: self.fail(f"unexpected sleep: {seconds}"),
+                sleep=sleep or (lambda seconds: self.fail(f"unexpected sleep: {seconds}")),
             )
             self.stdout_result = output.getvalue()
             return code
@@ -1847,6 +1915,28 @@ class PipelineStagesTest(unittest.TestCase):
         self.assertEqual(2, self.invoke("observe"))
         self.assertEqual(1, self.api._request_once.call_count)
 
+    def test_failed_post_response_retains_session_error(self):
+        self.api._request_once.return_value = {
+            **self.initial,
+            "state": "failed",
+            "sessions": [{
+                "id": "session-1", "state": "failed",
+                "created_at": "2026-09-18T12:00:01Z",
+                "error": {"message": "HTTP 500: Internal Server Error"},
+            }],
+        }
+        self.assertEqual(2, self.invoke())
+        failed = self.result()
+        self.assertEqual("pipeline_dispatch_not_active", failed["error"]["code"])
+        self.assertIn("HTTP 500: Internal Server Error", failed["error"]["message"])
+        self.assertIn("https://github.com/owner/repo/tasks/task-1", failed["error"]["message"])
+        self.assertIn("gh agent-task view session-1 --log", failed["error"]["message"])
+        self.assertIsNone(failed["candidate"])
+        self.assertIsNone(failed["completion"])
+        self.repository.fetch_generated.assert_not_called()
+        self.assertEqual(2, self.invoke("observe"))
+        self.assertEqual(1, self.api._request_once.call_count)
+
     def test_unknown_get_fences_later_observation_without_a_final_file(self):
         self.api._request_once.return_value = self.initial
         self.assertEqual(0, self.invoke())
@@ -1963,13 +2053,64 @@ class PipelineStagesTest(unittest.TestCase):
     def test_failed_task_does_not_forge_candidate_completion(self):
         self.api._request_once.return_value = self.initial
         self.assertEqual(0, self.invoke())
-        self.api._request_once.return_value = {**self.initial, "state": "failed"}
+        self.api._request_once.return_value = {
+            **self.initial,
+            "state": "failed",
+            "sessions": [{
+                "id": "session-1", "state": "failed",
+                "created_at": "2026-09-18T12:00:01Z",
+                "error": {"message": "Failed to send pr_summary after 3 attempts: Error: HTTP 500: Internal Server Error"},
+            }],
+        }
         self.assertEqual(2, self.invoke("observe"))
         failed = self.result()
         self.assertEqual("task_failed", failed["error"]["code"])
         self.assertEqual("task-1", failed["task"]["id"])
+        self.assertEqual("failed", failed["task"]["state"])
+        self.assertIn(
+            "Failed to send pr_summary after 3 attempts: Error: HTTP 500: Internal Server Error",
+            failed["error"]["message"],
+        )
+        self.assertIn("https://github.com/owner/repo/tasks/task-1", failed["error"]["message"])
+        self.assertIn("gh agent-task view session-1 --log", failed["error"]["message"])
         self.assertIsNone(failed["candidate"])
         self.assertIsNone(failed["completion"])
+        self.repository.fetch_generated.assert_not_called()
+
+    def test_standalone_failure_retains_diagnostics_in_result_file(self):
+        self.api.request_json.side_effect = [
+            self.initial,
+            {
+                **self.initial,
+                "state": "failed",
+                "sessions": [{
+                    "id": "session-1", "state": "failed",
+                    "created_at": "2026-09-18T12:00:01Z",
+                    "error": {"message": "Failed to send pr_summary after 3 attempts: Error: HTTP 500: Internal Server Error"},
+                }],
+            },
+        ]
+        sleep = mock.Mock()
+        self.assertEqual(2, self.invoke(stage=None, sleep=sleep))
+        sleep.assert_called_once_with(MODULE.AGENT_TASK_POLL_INTERVAL_SECONDS)
+        self.assertTrue(self.result_path.exists())
+        failed = self.result()
+        self.assertEqual("task_failed", failed["error"]["code"])
+        self.assertEqual("task-1", failed["task"]["id"])
+        self.assertEqual("failed", failed["task"]["state"])
+        self.assertIn(
+            "Failed to send pr_summary after 3 attempts: Error: HTTP 500: Internal Server Error",
+            failed["error"]["message"],
+        )
+        self.assertIn("https://github.com/owner/repo/tasks/task-1", failed["error"]["message"])
+        self.assertIn("gh agent-task view session-1 --log", failed["error"]["message"])
+        self.assertIsNone(failed["candidate"])
+        self.assertIsNone(failed["completion"])
+        self.repository.fetch_generated.assert_not_called()
+        self.assertEqual(
+            ["POST", "GET"],
+            [call.args[0] for call in self.api.request_json.call_args_list],
+        )
 
     def test_interrupt_during_dispatch_leaves_non_adoptable_checkpoint(self):
         self.api._request_once.side_effect = KeyboardInterrupt()

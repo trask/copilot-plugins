@@ -55,7 +55,7 @@ SHARED_STATE_CONFIG = Path(".copilot/extensions/pr-flight/state-repo.json")
 SHARED_STATE_VERSION = 1
 SHARED_STATE_MAX_ATTEMPTS = 3
 REQUIRED_CLOUD_TASK_SHA256 = (
-    "393ef906680b360c7fffa916ec349de64a61ac8bf08715e4981292b2d698c369"
+    "57779871956b6af09118f16c1d5ee22c54cb94d2c1ae989fb1e1c4469605e0dd"
 )
 REQUIRED_CLOUD_TASK_RELATIVE_PATH = Path("scripts", "cloud_task.py")
 CLOUD_TASK_SKILL_NAME = "agent-tasks-runtime"

@@ -2698,6 +2698,26 @@ def get_task(api: ApiClient, repository: str, task_id: str) -> dict[str, object]
     )
     return validate_task(data, task_id)
 
+def task_failure_message(task: Mapping[str, object], repository: str) -> str:
+    task_id = task["id"]
+    state = task["state"]
+    details = [
+        f"Agent Task {task_id} ended in state {state}",
+        f"Task: https://github.com/{repository}/tasks/{task_id}",
+    ]
+    for session in task.get("sessions") or []:
+        details.append(f"Session {session['id']}: {session['state']}")
+        error = session.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message:
+                details.append(f"Session error: {message}")
+        link = session.get("html_url")
+        if isinstance(link, str) and link:
+            details.append(link)
+        details.append(f"gh agent-task view {session['id']} --log")
+    return "; ".join(details)
+
 def monitor_task(
     api: ApiClient,
     repository: str,
@@ -2734,12 +2754,12 @@ def monitor_task(
         if state in ERROR_STATES:
             if report_stopped is not None:
                 report_stopped(current)
-            raise CloudError(f"Agent Task {progress.task_id} ended in state {state}")
+            raise CloudError(task_failure_message(current, repository), "task_failed")
         if state in BLOCKED_STATES:
             if report_stopped is not None:
                 report_stopped(current)
             raise CloudError(
-                f"Agent Task {progress.task_id} is {state}; open the task in GitHub "
+                f"{task_failure_message(current, repository)}; open the task in GitHub "
                 "to provide input or resume it"
             )
         if state not in ACTIVE_STATES:
@@ -3252,7 +3272,8 @@ def execute(
         if progress.last_state not in ACTIVE_STATES:
             raise CloudError(
                 f"Agent Task {progress.task_id} entered {progress.last_state} "
-                "before pipeline dispatch could confirm an active task",
+                "before pipeline dispatch could confirm an active task; "
+                f"{task_failure_message(initial, repository)}",
                 "pipeline_dispatch_not_active",
             )
     else:
@@ -3642,7 +3663,7 @@ def execute_pipeline_observe(
     report_metadata(current, stderr)
     if state not in SUCCESS_STATES:
         set_pipeline_checkpoint_state(checkpoint_path, checkpoint, "terminal_error")
-        raise CloudError(f"Agent Task {task_id} ended in state {state}", "task_failed")
+        raise CloudError(task_failure_message(current, repository), "task_failed")
     set_pipeline_checkpoint_state(checkpoint_path, checkpoint, "collecting")
     return collect_completed_task(
         options, git=git, api=api, runner=runner, root=root,

@@ -69,6 +69,11 @@ that did not run, and mocked coverage is not native qualification.
 
 ## Current contracts
 
+Failed-task errors retain GitHub's session error messages, the task URL, and
+each session's `gh agent-task view <session-id> --log` selector in the result
+diagnostics. A hosted failure remains a failed operation even when the generated
+branch contains commits; those commits are not accepted or imported.
+
 `marketplace-agent-code-candidate-worker@1` permits zero or more linear single-parent code commits and an optional final output-only commit under `.github/agent-task-output/`. Review, Self Review, CI Fix and Historical Audit use it.
 Consumers that require a workflow outcome artifact call `require_output_commit` after verifying candidate provenance. It rejects a missing output commit with `missing_output_commit`, the task URL, and the session log selector, while leaving optional-output consumers unchanged. Self Review requires that artifact only when no code was committed.
 
