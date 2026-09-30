@@ -34,7 +34,7 @@ CONFLICT_HELPER_SHA256 = (
 )
 EXPECTED_PACKAGE_VERSIONS = {
     "agent-tasks-runtime": "1.0.46",
-    "ci-fix-loop": "1.6.122",
+    "ci-fix-loop": "1.6.123",
     "copilot-review-loop": "1.1.111",
     "historical-pr-audit": "1.1.51",
     "pr-conflict-resolver": "1.1.78",
