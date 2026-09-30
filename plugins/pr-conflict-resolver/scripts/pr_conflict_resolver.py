@@ -5277,17 +5277,17 @@ def require_live_conflict_guards(
             )
         )
     ):
-        raise WorkflowError("pull request target changed after cloud resolution")
+        raise WorkflowError("pull request target changed after conflict preflight")
     methods = repository_merge_methods(request["repository"])
     if {
         "merge_commit": methods["allow_merge_commit"],
         "rebase_merge": methods["allow_rebase_merge"],
         "squash_merge": methods["allow_squash_merge"],
     } != request["guards"]["merge_methods"]:
-        raise WorkflowError("repository merge settings changed after cloud resolution")
+        raise WorkflowError("repository merge settings changed after conflict preflight")
     merge_base = git(repo_root, "merge-base", pr["head_sha"], pr["base_sha"])
     if merge_base != request["merge_base"]:
-        raise WorkflowError("merge base changed after cloud resolution")
+        raise WorkflowError("merge base changed after conflict preflight")
     if request["strategy"] == "native-stack":
         detection = stack_membership(current, repo_root=repo_root)
         stack = detection["stack"]
@@ -5303,11 +5303,20 @@ def require_live_conflict_guards(
             request["repository"], expected["trunk"]["ref"]
         )
         trunk_advanced = current_trunk_sha != expected["trunk"]["sha"]
+        if trunk_advanced and not commit_contains(
+            request["repository"], expected["trunk"]["sha"], current_trunk_sha,
+        ):
+            raise WorkflowError(
+                "native stack trunk changed non-linearly after conflict preflight"
+            )
         direct_bases_match = all(
             (
-                base_ref_tip(
-                    request["repository"],
-                    member["direct_base_ref"],
+                (
+                    current_trunk_sha
+                    if member["direct_base_ref"] == expected["trunk"]["ref"]
+                    else base_ref_tip(
+                        request["repository"], member["direct_base_ref"],
+                    )
                 )
                 == member["direct_base_sha"]
             )
@@ -5326,7 +5335,6 @@ def require_live_conflict_guards(
                     member["head_branch"],
                     member["head_sha"],
                     member["base_branch"],
-                    member["base_sha"],
                 )
                 for member in stack["members"]
             ]
@@ -5336,17 +5344,12 @@ def require_live_conflict_guards(
                     member["head_ref"],
                     member["head_sha"],
                     member["direct_base_ref"],
-                    (
-                        current_trunk_sha
-                        if index == 0 and trunk_advanced
-                        else member["observed_base_sha"]
-                    ),
                 )
-                for index, member in enumerate(expected["members"])
+                for member in expected["members"]
             ]
             or not direct_bases_match
         ):
-            raise WorkflowError("native stack topology changed after cloud resolution")
+            raise WorkflowError("native stack topology changed after conflict preflight")
         current_outside = []
         dependents = external_stack_dependents(current, stack)
         if len(dependents) != len(expected["outside_dependents"]):
@@ -5355,8 +5358,7 @@ def require_live_conflict_guards(
             value = metadata_for(parse_target(dependent["url"]))
             observed_base_sha = value["base_sha"]
             if (
-                trunk_advanced
-                and pinned["pr_number"] == value["number"]
+                pinned["pr_number"] == value["number"]
                 and pinned["base_ref"] == value["base_branch"] == expected["trunk"]["ref"]
                 and observed_base_sha != pinned["base_sha"]
                 and commit_contains(
@@ -5364,6 +5366,7 @@ def require_live_conflict_guards(
                 )
             ):
                 observed_base_sha = pinned["base_sha"]
+                base_advanced = True
             current_outside.append(
                 {
                     "pr_number": value["number"],

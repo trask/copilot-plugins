@@ -227,7 +227,7 @@ class LiveConflictBaseAdvanceTest(unittest.TestCase):
                 current, MODULE.require_live_conflict_guards(Path("repo"), preflight)
             )
             self.assertTrue(current["_candidate_base_advanced"])
-            self.assertEqual(2, contains.call_count)
+            self.assertEqual(3, contains.call_count)
             contains.assert_any_call("owner/repo", old_base, new_base)
             dependents.return_value.append(
                 {"url": "https://github.com/owner/repo/pull/10"}
@@ -237,11 +237,237 @@ class LiveConflictBaseAdvanceTest(unittest.TestCase):
             ):
                 MODULE.require_live_conflict_guards(Path("repo"), preflight)
             dependents.return_value.pop()
-            contains.side_effect = [True, False]
+            contains.side_effect = [True, True, False]
             with self.assertRaisesRegex(
                 MODULE.WorkflowError, "outside dependents changed"
             ):
                 MODULE.require_live_conflict_guards(Path("repo"), preflight)
+
+
+class NativeStackLiveGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.old_trunk = "a" * 40
+        self.new_trunk = "d" * 40
+        self.stack = {
+            "id": "stack-1", "number": 1, "size": 2, "trunk": "main",
+            "members": [
+                {
+                    "number": 7, "head_branch": "feature", "head_sha": "b" * 40,
+                    "base_branch": "main", "base_sha": "e" * 40,
+                },
+                {
+                    "number": 8, "head_branch": "child", "head_sha": "c" * 40,
+                    "base_branch": "feature", "base_sha": "f" * 40,
+                },
+            ],
+        }
+        self.request = {
+            "repository": "owner/repo", "strategy": "native-stack",
+            "pull_request": {
+                "url": "https://github.com/owner/repo/pull/7", "number": 7,
+                "head_sha": "b" * 40, "head_ref": "feature",
+                "base_sha": self.old_trunk, "base_ref": "main",
+            },
+            "guards": {"merge_methods": {
+                "merge_commit": True, "rebase_merge": True, "squash_merge": True,
+            }},
+            "merge_base": "1" * 40,
+            "native_stack": {
+                "trunk": {"ref": "main", "sha": self.old_trunk},
+                "members": [
+                    {
+                        "pr_number": member["number"],
+                        "head_ref": member["head_branch"],
+                        "head_sha": member["head_sha"],
+                        "direct_base_ref": member["base_branch"],
+                        "direct_base_sha": (
+                            self.old_trunk if index == 0 else "b" * 40
+                        ),
+                        "observed_base_sha": member["base_sha"],
+                    }
+                    for index, member in enumerate(self.stack["members"])
+                ],
+                "outside_dependents": [],
+            },
+        }
+        self.current = {
+            "repo_name": "owner/repo", "state": "OPEN", "number": 7,
+            "head_sha": "b" * 40, "head_branch": "feature",
+            "base_sha": self.new_trunk, "base_branch": "main",
+        }
+        self.preflight = {
+            "request": self.request,
+            "identity": {"branch": "feature", "head": "b" * 40},
+            "stack_request": {
+                "owner": {"kind": "pr-conflict-resolver"},
+                "repository": "owner/repo", "fixed_pr": 7,
+                "operation": "whole-stack", "selected": [7, 8],
+                "topology_fingerprint": MODULE.stack_topology_fingerprint(self.stack),
+                "source_snapshot": MODULE.stack_snapshot_fingerprint(self.stack),
+            },
+        }
+        self.live_refs = {"main": self.new_trunk, "feature": "b" * 40}
+        self.calls = {}
+        for name, options in {
+            "require_stack_request_owner": {},
+            "git": {"side_effect": self.git_call},
+            "metadata_for": {"side_effect": lambda *a, **kw: dict(self.current)},
+            "repository_merge_methods": {"return_value": {
+                "allow_merge_commit": True, "allow_rebase_merge": True,
+                "allow_squash_merge": True,
+            }},
+            "stack_membership": {"side_effect": lambda *a, **kw: {"stack": self.stack}},
+            "base_ref_tip": {"side_effect": lambda repo, ref: self.live_refs[ref]},
+            "external_stack_dependents": {"return_value": []},
+            "commit_contains": {"return_value": True},
+        }.items():
+            patcher = mock.patch.object(MODULE, name, **options)
+            self.calls[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def git_call(self, _root, *args):
+        return {
+            ("branch", "--show-current"): self.preflight["identity"]["branch"],
+            ("rev-parse", "HEAD"): self.preflight["identity"]["head"],
+            ("status", "--porcelain=v1"): "",
+            (
+                "merge-base", self.request["pull_request"]["head_sha"],
+                self.request["pull_request"]["base_sha"],
+            ): self.request["merge_base"],
+        }[args]
+
+    def guard(self):
+        return MODULE.require_live_conflict_guards(Path("repo"), self.preflight)
+
+    def invoke_descendant(self):
+        self.request["pull_request"].update({
+            "url": "https://github.com/owner/repo/pull/8", "number": 8,
+            "head_sha": "c" * 40, "head_ref": "child",
+            "base_sha": "b" * 40, "base_ref": "feature",
+        })
+        self.current.update({
+            "number": 8, "head_sha": "c" * 40, "head_branch": "child",
+            "base_sha": "b" * 40, "base_branch": "feature",
+        })
+        self.preflight["identity"] = {"branch": "child", "head": "c" * 40}
+        self.preflight["stack_request"]["fixed_pr"] = 8
+
+    def test_forward_trunk_advance_accepts_cached_and_refreshed_base_snapshots(self):
+        frozen = copy.deepcopy(self.preflight)
+        for trunk_snapshot in ("e" * 40, self.old_trunk, self.new_trunk):
+            for child_snapshot in ("f" * 40, "b" * 40):
+                with self.subTest(trunk=trunk_snapshot, child=child_snapshot):
+                    self.stack["members"][0]["base_sha"] = trunk_snapshot
+                    self.stack["members"][1]["base_sha"] = child_snapshot
+                    self.assertTrue(self.guard()["_candidate_base_advanced"])
+                    self.assertEqual(frozen, self.preflight)
+        self.calls["commit_contains"].assert_any_call(
+            "owner/repo", self.old_trunk, self.new_trunk,
+        )
+
+    def test_cache_refresh_without_live_base_advance_does_not_invalidate_request(self):
+        self.current["base_sha"] = self.old_trunk
+        self.live_refs["main"] = self.old_trunk
+        self.stack["members"][0]["base_sha"] = self.old_trunk
+        self.stack["members"][1]["base_sha"] = "b" * 40
+        self.assertFalse(self.guard()["_candidate_base_advanced"])
+        self.calls["commit_contains"].assert_not_called()
+
+    def test_repeated_forward_advances_keep_the_original_frozen_request(self):
+        frozen = copy.deepcopy(self.preflight)
+        for live_trunk in (self.new_trunk, "2" * 40, "3" * 40):
+            self.current["base_sha"] = live_trunk
+            self.live_refs["main"] = live_trunk
+            self.assertTrue(self.guard()["_candidate_base_advanced"])
+            self.assertEqual(frozen, self.preflight)
+            self.calls["commit_contains"].assert_any_call(
+                "owner/repo", self.old_trunk, live_trunk,
+            )
+
+    def test_descendant_invocation_accepts_forward_trunk_advance(self):
+        self.invoke_descendant()
+        self.assertTrue(self.guard()["_candidate_base_advanced"])
+        self.calls["commit_contains"].assert_called_once_with(
+            "owner/repo", self.old_trunk, self.new_trunk,
+        )
+
+    def test_outside_dependent_accepts_trunk_advance_after_the_trunk_observation(self):
+        self.current["base_sha"] = self.old_trunk
+        self.live_refs["main"] = self.old_trunk
+        self.request["native_stack"]["outside_dependents"] = [{
+            "pr_number": 9, "repository": "owner/repo",
+            "head_ref": "outside", "head_sha": "9" * 40,
+            "base_ref": "main", "base_sha": self.old_trunk,
+        }]
+        dependent = {
+            "number": 9, "head_branch": "outside", "head_sha": "9" * 40,
+            "base_branch": "main", "base_sha": self.new_trunk,
+        }
+        self.calls["external_stack_dependents"].return_value = [{
+            "url": "https://github.com/owner/repo/pull/9",
+        }]
+        self.calls["metadata_for"].side_effect = (
+            lambda target, **kw: dict(self.current) if target["number"] == 7 else dependent
+        )
+        self.assertTrue(self.guard()["_candidate_base_advanced"])
+        self.calls["commit_contains"].assert_called_once_with(
+            "owner/repo", self.old_trunk, self.new_trunk,
+        )
+        self.calls["commit_contains"].return_value = False
+        with self.assertRaisesRegex(MODULE.WorkflowError, "outside dependents changed"):
+            self.guard()
+
+    def test_descendant_invocation_rejects_a_rewritten_trunk(self):
+        self.invoke_descendant()
+        self.calls["commit_contains"].return_value = False
+        with self.assertRaisesRegex(MODULE.WorkflowError, "trunk changed non-linearly"):
+            self.guard()
+        self.calls["external_stack_dependents"].assert_not_called()
+
+    def test_root_invocation_rejects_a_rewritten_base(self):
+        self.calls["commit_contains"].return_value = False
+        with self.assertRaisesRegex(MODULE.WorkflowError, "pull request target changed"):
+            self.guard()
+        self.calls["external_stack_dependents"].assert_not_called()
+
+    def test_live_target_head_or_base_ref_changes_still_block(self):
+        original = dict(self.current)
+        for change in (
+            {"head_sha": "9" * 40},
+            {"head_branch": "renamed"},
+            {"base_branch": "other"},
+            {"state": "CLOSED"},
+        ):
+            self.current = {**original, **change}
+            with self.subTest(change=change), self.assertRaisesRegex(
+                MODULE.WorkflowError, "pull request target changed",
+            ):
+                self.guard()
+        self.calls["external_stack_dependents"].assert_not_called()
+
+    def test_changed_live_child_base_is_not_treated_as_cache_refresh(self):
+        self.live_refs["feature"] = "9" * 40
+        with self.assertRaisesRegex(MODULE.WorkflowError, "native stack topology changed"):
+            self.guard()
+
+    def test_authorization_still_rejects_head_topology_and_selection_changes(self):
+        original = copy.deepcopy(self.stack)
+        for change in (
+            lambda s: s["members"][0].update(head_sha="9" * 40),
+            lambda s: s["members"][1].update(head_sha="9" * 40),
+            lambda s: s["members"][1].update(base_branch="main"),
+            lambda s: s["members"].reverse(),
+            lambda s: s["members"].pop(),
+            lambda s: s["members"].append({**s["members"][-1], "number": 9}),
+            lambda s: s.update(id="other-stack"),
+        ):
+            self.stack = copy.deepcopy(original)
+            change(self.stack)
+            with self.subTest(change=change), self.assertRaisesRegex(
+                MODULE.WorkflowError, "authorized stack source snapshot or topology changed",
+            ):
+                self.guard()
+        self.calls["base_ref_tip"].assert_not_called()
 
 
 class WindowsSubprocessTest(unittest.TestCase):

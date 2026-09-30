@@ -31,6 +31,8 @@ The worker discovers conflict locations from the pinned Git history. For a nativ
 
 When the selected PR needs native-stack conflict resolution, the helper discovers every current open stack member, including predecessors and descendants. It creates its own one-use authorization bound to the active Resolver run, process, repository, complete source snapshot, topology, member order, selected PR, Pipeline position when present, and exact branch leases. It prepares members in order and publishes every verified member in one atomic push. Callers never supply stack membership, `--whole-stack`, or a request file.
 
+Native-stack guards use live branch refs, not cached PR base SHAs. Forward trunk advances keep the frozen replay valid even when invoked on a descendant. A cached base snapshot staying old or catching up does not invalidate the run. Rewritten trunks, changed member heads, retargeting, and changed membership still block. Publication rechecks live mergeability; a trunk advance does not establish clearance for the complete stack.
+
 The helper rechecks task provenance, model, prompt and request digests, source identity, topology, outside dependents, candidate history, process ownership, cancellation, and exact remote heads before publication and final clearance. Stale work remains retained evidence and consumes its attempt. It is never adopted into a new run.
 
 This agent may push only verified conflict-resolution commits to the selected PR branch or the complete native stack. It must not merge or approve pull requests, change draft state, post comments or reviews, edit labels, or use a local conflict-resolution fallback.
