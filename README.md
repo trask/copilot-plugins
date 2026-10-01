@@ -35,11 +35,14 @@ runtime only for local execution ownership.
 
 ## Controller execution
 
-All nine agent entrypoints launch their existing foreground Python controller
+The nine existing controller entrypoints launch their foreground Python controller
 once. The shared Runtime execution library owns process generations, child
 launches, durable output and explicit local cancellation. Controllers keep their
 workflow-specific stages, permissions, candidate checks and budgets. Hosted
 agents still diagnose, edit and validate.
+
+The opt-in Actions agent instead uses a short-lived, data-only central API
+client. Its dispatch receipts are not Runtime execution handles.
 
 Except for sealed CI, pass a fresh absolute path outside the checkout:
 
@@ -154,6 +157,12 @@ The plugin verifies the shared Agent Tasks runtime. Authentication stays in
 local `gh api`; repository analysis and execution stay in GitHub Agent Tasks.
 Local candidate validation compiles the exact runtime source bytes whose digest
 it verified. It neither reads nor writes installed Python bytecode caches.
+
+The separate **Actions Copilot Review Loop** agent explicitly opts into private
+central `trask/copilot-workflows` dispatch and data-only status. It supports OTel
+instrumentation preview/shadow and personal `trask/copilot-review-loop-test#1`,
+not upstream publication. The existing agent and Pipeline stay on Agent Tasks,
+with no backend fallback. See [Actions commands and gates](plugins/copilot-review-loop/docs/actions-backend.md).
 
 ### Self Review Loop
 
