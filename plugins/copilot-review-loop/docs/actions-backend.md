@@ -13,6 +13,15 @@ author and source identity. A preview still requires findings at the frozen
 head; it freezes data without inference. Shadow spends central inference and
 validation budgets but does not publish.
 
+Newly frozen central requests default to a budget of five total model/worker
+pipelines, including the first run, not five retries. Personal publication can
+use that budget; shadow still performs one investigation per request.
+Each request freezes its own `budgets.max_iterations` and matching
+`publication.max_pipelines`, with a 7200-second elapsed cap. The current default
+does not change an existing phase. Historical phases frozen with a two-run
+budget remain at that limit. A phase exhausted at 2/2 stays exhausted, and this
+adapter never reopens it or resets its count, bound, or deadline.
+
 Find `scripts/actions_review_loop.py` inside the installed plugin. Use
 `python3` if needed. All commands select `--backend actions` explicitly:
 
@@ -59,7 +68,7 @@ work, not already admitted remote effects. A queued cancel is not a confirmed
 cancellation.
 
 The guard pins CLI, coordinator, state transaction, and workflow bytes qualified
-at `e297cce23148656d414136ade81523d21fbf8608`. Changing those trusted sources
+at `c82e5d9a86a183e8357539f219a28785ae0638ef`. Changing those trusted sources
 requires a reviewed plugin pin update before cancellation is available again.
 Operator-only repair, reconciliation, and `continue-personal-test` operations
 are not exposed by this client.

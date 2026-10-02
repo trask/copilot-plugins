@@ -37,8 +37,8 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 REQUEST = re.compile(r"[0-9a-f]{32}\Z")
 # Source pins admit only the central handler with transactional cancellation.
 CANCEL_SOURCE_SHA256 = {
-    "loop/cli.py": "37092a09394bc4509ea1d899c6e6099fc48f90ee8c43ee43a8dca860af7fe322",
-    "loop/coordinator.py": "f295837bd4699dab209c717e689c78ee715a4e70d2206c639bcc567107773187",
+    "loop/cli.py": "cb45112189f63ae244f628952a0c243d77bac3b3d7016e4b28ccdf6d15b51e95",
+    "loop/coordinator.py": "58cd9e6fdaaead7995429745fe9fb6fe07710e1fd063174daceb49329bbbbe3d",
     "loop/state.py": "08880c7021e4418f618e861602a6323c67e7257783f4b2777a0f710ce95028c2",
     ".github/workflows/coordinator.yml": "14bafb312d0d54eb9bbfdf67b972143a4da82d829c983bccebd579984b7519ff",
 }

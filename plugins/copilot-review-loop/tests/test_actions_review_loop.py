@@ -261,6 +261,37 @@ def test_pending_and_terminal_results_remain_explicit(stage, reason):
     assert result["pipeline_success"] is False
 
 
+@pytest.mark.parametrize("limit", [2, 5])
+def test_exhausted_frozen_budget_remains_terminal_and_read_only(limit):
+    api = FakeAPI()
+    api.state["request"]["budgets"] = {"max_iterations": limit}
+    api.state["request"]["publication"] = {"max_pipelines": limit}
+    api.state["report"]["request_digest"] = hashlib.sha256(
+        adapter.canonical(api.state["request"])).hexdigest()
+    api.state.update(stage="exhausted", iteration=limit,
+                     reason="remaining_findings_pipeline_budget")
+    original = copy.deepcopy(api.state)
+    result = adapter.execute(api, args("status"))
+    assert result["central_stage"] == "exhausted"
+    assert result["reason"] == "remaining_findings_pipeline_budget"
+    assert result["workflow_revision"] == REVISION
+    assert result["terminal"] is True
+    assert result["pipeline_success"] is False
+    assert api.state == original
+    assert not api.posts
+
+
+def test_frozen_budget_cannot_be_replaced_by_new_default_under_old_report():
+    api = FakeAPI()
+    api.state["request"]["budgets"] = {"max_iterations": 2}
+    api.state["report"]["request_digest"] = hashlib.sha256(
+        adapter.canonical(api.state["request"])).hexdigest()
+    api.state["request"]["budgets"]["max_iterations"] = 5
+    with pytest.raises(adapter.AdapterError, match="report identity"):
+        adapter.execute(api, args("status"))
+    assert not api.posts
+
+
 @pytest.mark.parametrize("container,key,value", [
     ("state", "schema", 2), ("state", "schema", True),
     ("state", "generation", 11), ("state", "stage", "unknown"),
@@ -464,7 +495,27 @@ def test_cancel_refuses_unqualified_central_handler_before_post():
     assert not api.posts
 
 
-def test_cancel_uses_exact_request_generation_and_guard_source_pin():
+@pytest.mark.parametrize("identity", [
+    {"request_id": "d" * 32}, {"generation": 11}, {"revision": "e" * 40},
+])
+def test_cancel_stale_identity_cannot_create_receipt_or_dispatch(identity):
+    api = FakeAPI()
+    api.state.update(stage="verify_pending", report=None)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "receipt.json"
+        with pytest.raises(adapter.AdapterError, match="trusted revision mismatch"):
+            adapter.execute(api, args("cancel", receipt=str(path), **identity))
+        assert not path.exists()
+    assert not api.posts
+    assert not any(isinstance(call, tuple) and call[1] in adapter.CANCEL_SOURCE_SHA256
+                   for call in api.calls)
+
+
+@pytest.mark.parametrize("changed_source", [
+    "loop/cli.py", "loop/coordinator.py", "loop/state.py",
+    ".github/workflows/coordinator.yml",
+])
+def test_cancel_uses_exact_request_generation_and_guard_source_pin(changed_source):
     api = FakeAPI()
     api.state.update(stage="verify_pending", report=None)
     pins = {"loop/cli.py": hashlib.sha256(api.cli).hexdigest(),
@@ -481,17 +532,19 @@ def test_cancel_uses_exact_request_generation_and_guard_source_pin():
         assert api.posts[0]["previous_generation"] == "10"
     api = FakeAPI()
     api.state.update(stage="verify_pending", report=None)
-    with mock.patch.object(adapter, "CANCEL_SOURCE_SHA256", dict(pins, **{"loop/coordinator.py": "0" * 64})):
+    with mock.patch.object(adapter, "CANCEL_SOURCE_SHA256", dict(pins, **{changed_source: "0" * 64})):
         with pytest.raises(adapter.AdapterError, match="mismatch"):
             adapter.execute(api, args("cancel", receipt=str(Path(tempfile.gettempdir()) / "unused-receipt.json")))
     assert not api.posts
 
 
 def test_release_pins_all_qualified_cancellation_boundaries():
-    assert set(adapter.CANCEL_SOURCE_SHA256) == {
-        "loop/cli.py", "loop/coordinator.py", "loop/state.py", ".github/workflows/coordinator.yml"}
-    assert all(len(value) == 64 and all(char in "0123456789abcdef" for char in value)
-               for value in adapter.CANCEL_SOURCE_SHA256.values())
+    assert adapter.CANCEL_SOURCE_SHA256 == {
+        "loop/cli.py": "cb45112189f63ae244f628952a0c243d77bac3b3d7016e4b28ccdf6d15b51e95",
+        "loop/coordinator.py": "58cd9e6fdaaead7995429745fe9fb6fe07710e1fd063174daceb49329bbbbe3d",
+        "loop/state.py": "08880c7021e4418f618e861602a6323c67e7257783f4b2777a0f710ce95028c2",
+        ".github/workflows/coordinator.yml": "14bafb312d0d54eb9bbfdf67b972143a4da82d829c983bccebd579984b7519ff",
+    }
 
 
 def test_cancelled_generation_does_not_accept_retained_old_candidate():
