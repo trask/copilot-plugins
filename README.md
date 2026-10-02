@@ -159,9 +159,9 @@ Local candidate validation compiles the exact runtime source bytes whose digest
 it verified. It neither reads nor writes installed Python bytecode caches.
 
 The separate **Actions Copilot Review Loop** agent explicitly opts into private
-central `trask/copilot-workflows` dispatch and data-only status. It supports OTel
-instrumentation preview/shadow and personal `trask/copilot-review-loop-test#1`,
-not upstream publication. The existing agent and Pipeline stay on Agent Tasks,
+central `trask/copilot-workflows` dispatch and data-only status for the user's
+PR target. Publication needs separate authorization and effective central
+credentials for that target. The existing agent and Pipeline stay on Agent Tasks,
 with no backend fallback. See [Actions commands and gates](plugins/copilot-review-loop/docs/actions-backend.md).
 
 ### Self Review Loop
